@@ -128,8 +128,8 @@ impl Qwen3AttentionLayer {
                 // Issue #31: the slide-before-alloc loop in
                 // `block_mgmt::ensure_blocks_through_prefill` advanced the
                 // sliding window past `logical_pos` before this layer got
-                // a chance to offload. The invariant declared at line 122-127
-                // of `block_mgmt.rs` (every attention layer must catch up
+                // a chance to offload. The invariant declared in
+                // `block_mgmt.rs` (every attention layer must catch up
                 // its offloads before any slide) is debug-asserted only —
                 // release builds silently let the slide proceed, then this
                 // check trips at the next offload pass.

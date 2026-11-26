@@ -39,6 +39,9 @@ jobs:
       contents: read
     container:
       image: nvidia/cuda:13.0.0-devel-ubuntu24.04
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

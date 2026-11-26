@@ -21,8 +21,8 @@
       <stop offset="100%" stop-color="#D97706"/>
     </linearGradient>
     <radialGradient id="topGlow" cx="72%" cy="18%" r="55%">
-      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.12"/>
-      <stop offset="55%" stop-color="#10B981" stop-opacity="0.04"/>
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.13"/>
+      <stop offset="55%" stop-color="#10B981" stop-opacity="0.05"/>
       <stop offset="100%" stop-color="#0d1117" stop-opacity="0"/>
     </radialGradient>
     <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
@@ -39,100 +39,95 @@
   <rect x="24" y="24" width="1232" height="592" rx="22" fill="none" stroke="#30363d" stroke-width="2"/>
   <path d="M 48 25 H 1232" stroke="url(#accentGrad)" stroke-width="4.5" stroke-linecap="round"/>
 
-  <!-- Left Emblem Card (x=56..276, y=58..290) -->
-  <g transform="translate(56, 58)">
+  <!-- Left Emblem Card (x=56..276, y=62..294) -->
+  <g transform="translate(56, 62)">
     <rect x="0" y="0" width="220" height="232" rx="22" fill="#161b22" stroke="#30363d" stroke-width="1.8"/>
-    <!-- Hexagon Tensor Core Geometry centered at (110, 96) -->
     <polygon points="110,22 176,60 176,132 110,170 44,132 44,60" fill="url(#coreGrad)" stroke="#38BDF8" stroke-width="2.6" stroke-linejoin="round"/>
-    <!-- Gold Dashed Hexagon & Directional Vectors -->
     <polygon points="110,40 160,69 160,123 110,152 60,123 60,69" fill="none" stroke="#FBBF24" stroke-width="2.3" stroke-dasharray="6 3.5"/>
     <line x1="44" y1="60" x2="110" y2="96" stroke="#F59E0B" stroke-width="2.1" stroke-dasharray="5 3.5" opacity="0.85"/>
     <line x1="176" y1="60" x2="110" y2="96" stroke="#F59E0B" stroke-width="2.1" stroke-dasharray="5 3.5" opacity="0.85"/>
     <line x1="110" y1="96" x2="110" y2="170" stroke="#FBBF24" stroke-width="2.1" stroke-dasharray="5 3.5" opacity="0.85"/>
-    <!-- Gold Arrow Tips -->
     <polygon points="110,35 116,45 104,45" fill="#FBBF24"/>
     <polygon points="163,125 153,127 158,117" fill="#FBBF24"/>
     <polygon points="57,125 62,117 67,127" fill="#FBBF24"/>
-    <!-- Gold Flux Lightning Bolt -->
     <path d="M 88 62 H 136 L 110 92 H 134 L 86 134 L 99 98 H 80 Z" fill="url(#goldBoltGrad)" stroke="#FEF08A" stroke-width="1.6" stroke-linejoin="round"/>
-    <!-- Bottom Architecture Pill -->
     <rect x="20" y="186" width="180" height="30" rx="15" fill="#0d1117" stroke="#F59E0B" stroke-width="1.6"/>
     <text x="110" y="206" font-family="'DejaVu Sans Mono', 'JetBrains Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#FBBF24" text-anchor="middle">SM121a · SM120a</text>
   </g>
 
   <!-- Right Header Block (x=308..1224) -->
-  <g transform="translate(308, 62)">
+  <g transform="translate(308, 66)">
     <!-- Status Pills Row -->
-    <rect x="0" y="0" width="174" height="32" rx="16" fill="#122d1f" stroke="#10B981" stroke-width="1.5"/>
-    <text x="87" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#34D399" text-anchor="middle">v1.0.3 · RELEASE</text>
+    <rect x="0" y="0" width="150" height="32" rx="16" fill="#122d1f" stroke="#10B981" stroke-width="1.5"/>
+    <text x="75" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#34D399" text-anchor="middle">PURE RUST</text>
 
-    <rect x="188" y="0" width="204" height="32" rx="16" fill="#111d2e" stroke="#38BDF8" stroke-width="1.5"/>
-    <text x="290" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#38BDF8" text-anchor="middle">0 REGISTER SPILLS</text>
+    <rect x="164" y="0" width="212" height="32" rx="16" fill="#111d2e" stroke="#38BDF8" stroke-width="1.5"/>
+    <text x="270" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#38BDF8" text-anchor="middle">CUDA / PTX KERNELS</text>
 
-    <rect x="406" y="0" width="194" height="32" rx="16" fill="#211433" stroke="#A855F7" stroke-width="1.5"/>
-    <text x="503" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#C084FC" text-anchor="middle">SLSA L3 · SIGNED</text>
+    <rect x="390" y="0" width="194" height="32" rx="16" fill="#211433" stroke="#A855F7" stroke-width="1.5"/>
+    <text x="487" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#C084FC" text-anchor="middle">SLSA L3 · SIGNED</text>
 
-    <rect x="614" y="0" width="166" height="32" rx="16" fill="#271c0c" stroke="#F59E0B" stroke-width="1.5"/>
-    <text x="697" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#FBBF24" text-anchor="middle">AGPL-3.0-only</text>
+    <rect x="598" y="0" width="166" height="32" rx="16" fill="#271c0c" stroke="#F59E0B" stroke-width="1.5"/>
+    <text x="681" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#FBBF24" text-anchor="middle">AGPL-3.0-only</text>
 
     <!-- Main Wordmark -->
-    <text x="0" y="106" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="60" font-weight="800" fill="#F0F6FC" letter-spacing="1.5">FLUX ENGINE</text>
+    <text x="0" y="108" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="62" font-weight="800" fill="#F0F6FC" letter-spacing="1.5">FLUX ENGINE</text>
 
     <!-- Technical Subtitle -->
-    <text x="0" y="148" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="18.5" font-weight="700" fill="#38BDF8" letter-spacing="0.8">PURE RUST + BLACKWELL CUDA/PTX LLM INFERENCE RUNTIME</text>
+    <text x="0" y="150" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="18.5" font-weight="700" fill="#38BDF8" letter-spacing="0.8">BLACKWELL-NATIVE RUST + CUDA LLM INFERENCE RUNTIME</text>
 
     <!-- Tagline -->
-    <text x="0" y="182" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="18.5" font-weight="400" fill="#9CA3AF">Hardware-specific NVFP4 / MXFP8 / W4A8 kernels &amp; DFlash2 speculation</text>
-    <text x="0" y="209" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="18.5" font-weight="400" fill="#9CA3AF">for NVIDIA DGX Spark (GB10) and Discrete Blackwell (RTX PRO 6000 SM120)</text>
+    <text x="0" y="184" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="19" font-weight="400" fill="#9CA3AF">Hardware-specific NVFP4, MXFP8 &amp; W4A8 kernels with speculative decoding</text>
+    <text x="0" y="212" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="19" font-weight="400" fill="#9CA3AF">for NVIDIA DGX Spark (GB10) and Discrete Blackwell (RTX PRO 6000 SM120)</text>
   </g>
 
   <!-- Divider -->
-  <line x1="56" y1="318" x2="1224" y2="318" stroke="#21262d" stroke-width="2"/>
+  <line x1="56" y1="322" x2="1224" y2="322" stroke="#21262d" stroke-width="2"/>
 
-  <!-- 4 Certified Telemetry Cards (x=56..1224, width=278 each, gap=19, y=344..544) -->
-  <g transform="translate(56, 344)">
-    <!-- Card 1: SM120 Flash-Next -->
-    <rect x="0" y="0" width="278" height="200" rx="16" fill="#161b22" stroke="#10B981" stroke-width="1.8"/>
+  <!-- 4 Timeless Architectural Pillar Cards (Zero Benchmark Numbers) -->
+  <g transform="translate(56, 348)">
+    <!-- Card 1: Blackwell Native -->
+    <rect x="0" y="0" width="278" height="194" rx="16" fill="#161b22" stroke="#10B981" stroke-width="1.8"/>
     <circle cx="24" cy="30" r="6" fill="#10B981"/>
-    <text x="40" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">SM120 · FLASH-NEXT</text>
-    <text x="24" y="93" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="32" font-weight="800" fill="#34D399">661 tok/s</text>
-    <text x="24" y="125" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="12.5" font-weight="600" fill="#E6EDF3">C=1 DFlash2 · 11.66 ms/rnd</text>
-    <line x1="24" y1="144" x2="254" y2="144" stroke="#262c36" stroke-width="1.2"/>
-    <text x="24" y="168" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">30.9K 16K prefill · 3,687 C=16</text>
-    <text x="24" y="187" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">678 tok/s opt-in NVFP4 head</text>
+    <text x="40" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">BLACKWELL NATIVE</text>
+    <text x="24" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="25" font-weight="800" fill="#34D399">SM121a · SM120a</text>
+    <line x1="24" y1="112" x2="254" y2="112" stroke="#262c36" stroke-width="1.2"/>
+    <text x="24" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Custom NVFP4, MXFP8 &amp; W4A8</text>
+    <text x="24" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">PTX / SASS kernels with formal</text>
+    <text x="24" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">zero-register-spill verification</text>
 
-    <!-- Card 2: GB10 DGX Spark -->
-    <rect x="297" y="0" width="278" height="200" rx="16" fill="#161b22" stroke="#38BDF8" stroke-width="1.8"/>
+    <!-- Card 2: Pure Rust Runtime -->
+    <rect x="297" y="0" width="278" height="194" rx="16" fill="#161b22" stroke="#38BDF8" stroke-width="1.8"/>
     <circle cx="321" cy="30" r="6" fill="#38BDF8"/>
-    <text x="337" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">GB10 · DGX SPARK</text>
-    <text x="321" y="93" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="32" font-weight="800" fill="#38BDF8">6,381 tok/s</text>
-    <text x="321" y="125" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="12.5" font-weight="600" fill="#E6EDF3">16K cold prefill · 128 GB UMA</text>
-    <line x1="321" y1="144" x2="551" y2="144" stroke="#262c36" stroke-width="1.2"/>
-    <text x="321" y="168" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">91.3 peak decode · 298.8 C=16</text>
-    <text x="321" y="187" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">5,906 @ 128K · 0-ULP exact</text>
+    <text x="337" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">ZERO-OVERHEAD CORE</text>
+    <text x="321" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="27" font-weight="800" fill="#38BDF8">Pure Rust</text>
+    <line x1="321" y1="112" x2="551" y2="112" stroke="#262c36" stroke-width="1.2"/>
+    <text x="321" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Single native binary with zero</text>
+    <text x="321" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Python runtime, CUDA graphs,</text>
+    <text x="321" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">multi-GPU KV &amp; Metal support</text>
 
-    <!-- Card 3: SM120 Qwen3.8-27B -->
-    <rect x="594" y="0" width="278" height="200" rx="16" fill="#161b22" stroke="#A855F7" stroke-width="1.8"/>
+    <!-- Card 3: Speculative & Long Context -->
+    <rect x="594" y="0" width="278" height="194" rx="16" fill="#161b22" stroke="#A855F7" stroke-width="1.8"/>
     <circle cx="618" cy="30" r="6" fill="#A855F7"/>
-    <text x="634" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">SM120 · QWEN3.8-27B</text>
-    <text x="618" y="93" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="32" font-weight="800" fill="#C084FC">1,975 tok/s</text>
-    <text x="618" y="125" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="12.5" font-weight="600" fill="#E6EDF3">C=64 · 97.3% GDDR7 roofline</text>
-    <line x1="618" y1="144" x2="848" y2="144" stroke="#262c36" stroke-width="1.2"/>
-    <text x="618" y="168" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">1,074 C=8 hoisted DFlash2</text>
-    <text x="618" y="187" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">16.2K 8K prefill · 438 C=1</text>
+    <text x="634" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">DECODE &amp; CONTEXT</text>
+    <text x="618" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="27" font-weight="800" fill="#C084FC">DFlash2 · MTP</text>
+    <line x1="618" y1="112" x2="848" y2="112" stroke="#262c36" stroke-width="1.2"/>
+    <text x="618" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Lossless batched speculation,</text>
+    <text x="618" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">TurboQuant+ KV compression,</text>
+    <text x="618" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">and ultra-long YaRN context</text>
 
-    <!-- Card 4: 1M Context & Pooled KV -->
-    <rect x="891" y="0" width="278" height="200" rx="16" fill="#161b22" stroke="#F59E0B" stroke-width="1.8"/>
+    <!-- Card 4: Drop-In APIs & Supply Chain -->
+    <rect x="891" y="0" width="278" height="194" rx="16" fill="#161b22" stroke="#F59E0B" stroke-width="1.8"/>
     <circle cx="915" cy="30" r="6" fill="#F59E0B"/>
-    <text x="931" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">1M YARN4 · POOLED KV</text>
-    <text x="915" y="93" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="32" font-weight="800" fill="#FBBF24">1,011K tok</text>
-    <text x="915" y="125" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="12.5" font-weight="600" fill="#E6EDF3">3/3 passkey PASS on 1× 96 GB</text>
-    <line x1="915" y1="144" x2="1145" y2="144" stroke="#262c36" stroke-width="1.2"/>
-    <text x="915" y="168" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">12.3K tok/s TTFT · 82.1 s</text>
-    <text x="915" y="187" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="11.8" fill="#8B949E">Up to 16.8M KV across 8× GPUs</text>
+    <text x="931" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">DROP-IN &amp; VERIFIED</text>
+    <text x="915" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="25" font-weight="800" fill="#FBBF24">OpenAI · Claude</text>
+    <line x1="915" y1="112" x2="1145" y2="112" stroke="#262c36" stroke-width="1.2"/>
+    <text x="915" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">OpenAI, Anthropic &amp; Ollama</text>
+    <text x="915" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">endpoints, tool calling, xgrammar,</text>
+    <text x="915" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">Cosign &amp; SLSA L3 provenance</text>
   </g>
 
   <!-- Bottom Footer Strip -->
-  <text x="56" y="586" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="14" font-weight="600" fill="#8B949E">OpenAI · Anthropic · Ollama APIs  ·  21/21 PTX+SASS ISA Proved  ·  Cosign + SLSA Level 3</text>
+  <text x="56" y="586" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="14" font-weight="600" fill="#8B949E">AGPL-3.0-only  ·  Signed Releases &amp; GHCR Images  ·  Deterministic SPDX SBOM</text>
   <text x="1224" y="586" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="14.5" font-weight="700" fill="#E6EDF3" text-anchor="end">github.com/TheApathy/flux-engine</text>
 </svg>

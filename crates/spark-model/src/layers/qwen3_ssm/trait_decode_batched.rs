@@ -1510,7 +1510,7 @@ impl Qwen3SsmLayer {
             )?;
         } else {
             // Per-token MoE fallback for K!=2.
-            // CONCURRENT-DECODE BUG (sibling of decode_multi_seq fix at line 1102):
+            // Sibling of the `decode_multi_seq` BF16 stride fix:
             // hardcoded `t * h * 4` over-strides for BF16 hidden (GB10 default).
             let residual_elem = if ctx.config.use_fp32_residual() {
                 4usize

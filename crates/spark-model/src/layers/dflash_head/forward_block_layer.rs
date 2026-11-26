@@ -2645,7 +2645,7 @@ impl BlockDiffusionDraftHead {
         //   * End-to-end propose savings 5.3ms (~5% of propose)
         // The earlier note that M_TILE=16 collapsed accept to <25% does
         // not reproduce on the current build — likely fixed by the ctx
-        // zeroing at line 1102 (the same FFN gate/up at M=528 already
+        // pre-zeroing earlier in this function (the same FFN gate/up at M=528 already
         // run on M_TILE=16 with identical pre-zeroing semantics). Output
         // is coherent and accept rates are comparable to or higher than
         // the M_TILE=64 path across 18+ seed runs. Opt out with

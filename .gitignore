@@ -42,16 +42,16 @@ id_ecdsa*
 authorized_keys
 known_hosts
 
-# Allow tracked sanitized runtime recipes and token/tokenizer source files
+# Allow tracked sanitized runtime recipes and first-party Rust/CUDA source files
+# (prevents broad *token* / core / *.env rules from dropping source files on fresh clone)
 !recipes/*.env
 !repro-kit/recipes/*.env
+!qualification/accuracy/*.env
+!crates/**/*.rs
+!kernels/**/*.cu
+!kernels/**/*.cuh
 !crates/spark-server/src/tokenizer/
 !/crates/xgrammar/src/tokenizer/
-!crates/spark-server/src/tokenizer/glm_tool_contract_template_tests.rs
-!crates/spark-server/src/grammar/tests/glm_native_tokenizer.rs
-!/crates/atlas-embed/src/token.rs
-!/kernels/gb10/glm5.3-flash/exl3/ggml_q6_token_embedding.cu
-!/kernels/gb10/glm5.3-flash/iq3/ggml_q6_token_embedding.cu
 
 # --- Local Agent / IDE / Host Lock & Telemetry Guardrails ---
 # AGENTS.md stays strictly gitignored for private local notes; public
@@ -116,7 +116,7 @@ ptxas.log
 *.nohup
 nohup.out
 core
-core.*
+core.[0-9]*
 vgcore.*
 
 # --- Model Weights, Quantized Shards & Large Tensor Dumps ---

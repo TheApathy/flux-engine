@@ -284,7 +284,10 @@ jobs:
       actions: read
       id-token: write
       contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    # Official SLSA Build Level 3 reusable workflow: slsa-github-generator and
+    # slsa-verifier require referencing the official release tag (@v2.1.0) so
+    # OIDC job_workflow_ref matches the trusted builder ID and release binary.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
       base64-subjects: ${{ needs.build-artifacts.outputs.slsa_subjects }}
       provenance-name: flux-engine-${{ needs.preflight.outputs.release_tag }}.intoto.jsonl

@@ -1,0 +1,351 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Tokenizer-derived runtime: vocab cap, reasoning parser, think tokens,
+//! ChatML im_start hard-stop, reflection suppression, tool-call open/close
+//! tokens, and the XGrammar engine.
+
+use atlas_core::config::ModelConfig;
+
+use crate::cli;
+
+pub(crate) struct TokenizerRuntime {
+    pub(crate) reasoning_parser_box: Option<Box<dyn crate::reasoning_parser::ReasoningParser>>,
+    pub(crate) think_end_token: Option<u32>,
+    pub(crate) think_start_token: Option<u32>,
+    /// Token ID for a markdown code fence (```). Used to suppress the
+    /// confidence-based thinking early-stop (F2) while the model is
+    /// productively emitting a fenced code block inside `<think>`:
+    /// code tokens are near-deterministic (top-1 prob ≥ 0.95 for long
+    /// runs) but that is NOT a "done reasoning" signal. `None` =
+    /// tokenizer has no atomic fence token → guard disabled (fail-open,
+    /// F2 keeps its prior behaviour).
+    pub(crate) code_fence_token: Option<u32>,
+    pub(crate) reflection_suppress_ids: Vec<u32>,
+    pub(crate) tool_call_start_token: Option<u32>,
+    pub(crate) tool_call_end_token: Option<u32>,
+    pub(crate) grammar_engine: Option<crate::grammar::GrammarEngine>,
+}
+
+pub(crate) fn resolve_tokenizer_runtime(
+    args: &cli::ServeArgs,
+    ptx_set: &atlas_kernels::TargetPtxSet,
+    config: &mut ModelConfig,
+    tokenizer: &crate::tokenizer::ChatTokenizer,
+    eos_tokens: &mut Vec<u32>,
+    supports_thinking: bool,
+) -> anyhow::Result<TokenizerRuntime> {
+    use crate::{grammar, reasoning_parser};
+
+    // Not for GLM-5.3 (`glm5_next`): the payload pads the embedding to 154,880
+    // physical rows while tokenizer.json holds 154,856 tokens; capping here
+    // would undo `serve_load`'s physical-vocab override and hand XGrammar a
+    // truncated vocab size.
+    let tokenizer_vocab = tokenizer.inner().get_vocab_size(true);
+    if config.model_type != "glm5_next"
+        && tokenizer_vocab > 0
+        && tokenizer_vocab < config.vocab_size
+    {
+        tracing::info!(
+            "Capping vocab_size from {} (config) to {} (tokenizer incl. special tokens)",
+            config.vocab_size,
+            tokenizer_vocab,
+        );
+        config.vocab_size = tokenizer_vocab;
+    }
+
+    let reasoning_parser_box: Option<Box<dyn reasoning_parser::ReasoningParser>> = {
+        let defaults_toml = include_str!("../../../tool_defaults.toml");
+        let defaults: toml::Value =
+            toml::from_str(defaults_toml).unwrap_or(toml::Value::Table(Default::default()));
+        let auto_format = defaults
+            .get("reasoning")
+            .and_then(|t| t.get(config.model_type.as_str()))
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse::<reasoning_parser::ReasoningFormat>().ok());
+        if let Some(fmt) = auto_format {
+            let p = fmt.into_parser();
+            tracing::info!(
+                "Reasoning parser: {} (auto-detected from model_type '{}')",
+                p.name(),
+                config.model_type
+            );
+            Some(p)
+        } else if supports_thinking {
+            let p = reasoning_parser::ReasoningFormat::Qwen.into_parser();
+            tracing::info!(
+                "Reasoning parser: {} (default for thinking-capable model)",
+                p.name()
+            );
+            Some(p)
+        } else {
+            None
+        }
+    };
+    let think_end_token = reasoning_parser_box
+        .as_ref()
+        .and_then(|p| p.end_token_id(tokenizer));
+    let think_start_tag = reasoning_parser_box
+        .as_ref()
+        .map_or("<think>", |p| p.start_tag());
+    let think_start_token: Option<u32> = tokenizer
+        .encode(think_start_tag)
+        .ok()
+        .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
+    // Markdown code fence (```) as a single atomic token (Qwen3.x BPE:
+    // id 71093). Resolved the same way as think_start_token; `None` if
+    // the tokenizer splits it (guard fails open — see struct doc).
+    let code_fence_token: Option<u32> = tokenizer
+        .encode("```")
+        .ok()
+        .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
+    if let Some(fid) = code_fence_token {
+        tracing::info!("Code-fence token: {} (``` — fence guard active)", fid);
+    }
+
+    // Digit-normalized content-loop watchdog mask (Qwen3.6-27B greedy
+    // template degeneration: `- B(46) = N\n- B(47) = M\n …` to the cap).
+    // `mask[id] == true` iff the token decodes to a pure ASCII-digit run
+    // with at most one leading space. `decode_with_special` drives the
+    // byte-level decoder so a leading space is ' ' (NOT the raw `Ġ` BPE
+    // marker that `id_to_token` would yield). Built unconditionally
+    // (cheap, model-agnostic, one-time); only *consumed* under the
+    // per-model `enable_loop_watchdog()` gate. Fail-open: any decode
+    // error leaves that id `false`.
+    {
+        let vocab_size = tokenizer.inner().get_vocab_size(true);
+        let mut mask: Vec<bool> = vec![false; vocab_size];
+        let mut numeric_count = 0usize;
+        for (id, slot) in mask.iter_mut().enumerate() {
+            if let Ok(s) = tokenizer.decode_with_special(&[id as u32]) {
+                let body = s.strip_prefix(' ').unwrap_or(&s);
+                if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) {
+                    *slot = true;
+                    numeric_count += 1;
+                }
+            }
+        }
+        crate::scheduler::set_numeric_token_mask(std::sync::Arc::from(mask));
+        tracing::info!(
+            "Numeric-token mask: {numeric_count}/{vocab_size} ids classified \
+             as digit-runs (digit-normalized content-loop path active)"
+        );
+    }
+
+    // Phase-C boundary-token mask (drives rollback-to-boundary). `mask[id]`
+    // is true iff the token decodes to text *ending* in a well-formed
+    // generation boundary: a newline, or sentence-ending punctuation
+    // (`.`/`!`/`?`) optionally trailed by a closing quote / bracket /
+    // whitespace. Built unconditionally (cheap, model-agnostic, one-time);
+    // consumed only when a watchdog fires under `rollback_resteer`.
+    // Fail-open: any decode error leaves that id `false`.
+    {
+        let vocab_size = tokenizer.inner().get_vocab_size(true);
+        let mut mask: Vec<bool> = vec![false; vocab_size];
+        let mut boundary_count = 0usize;
+        let is_boundary = |s: &str| -> bool {
+            // Trim trailing closing quotes / brackets / whitespace, then
+            // check the last meaningful byte.
+            let trimmed = s.trim_end_matches([' ', '\t', '"', '\'', ')', ']', '}', '\r']);
+            match trimmed.chars().last() {
+                Some('\n') => true,
+                Some('.') | Some('!') | Some('?') => true,
+                _ => s.ends_with('\n'),
+            }
+        };
+        for (id, slot) in mask.iter_mut().enumerate() {
+            if let Ok(s) = tokenizer.decode_with_special(&[id as u32])
+                && !s.is_empty()
+                && is_boundary(&s)
+            {
+                *slot = true;
+                boundary_count += 1;
+            }
+        }
+        crate::scheduler::set_boundary_token_mask(std::sync::Arc::from(mask));
+        tracing::info!(
+            "Boundary-token mask: {boundary_count}/{vocab_size} ids end in a \
+             newline / sentence boundary (rollback-to-boundary active)"
+        );
+    }
+
+    // CFG jump-forward classification table (ATLAS_DFLASH_CFG_JF=1, default
+    // off). Classifies every vocab id into a structural delimiter class
+    // (open/close bracket, quote, triple-quote, colon, newline) so the DFlash
+    // draft-splice path ([`scheduler::cfg_jump_forward`]) can force closing
+    // delimiters into the draft chain by pure table lookup on the hot path.
+    // Built ONLY when the flag is set (skips ~250K decodes otherwise). Fully
+    // lossless: only changes what is proposed, never what is committed.
+    if crate::scheduler::cfg_jf_enabled() {
+        let vocab_size = tokenizer.inner().get_vocab_size(true);
+        let decode = |id: u32| tokenizer.decode_with_special(&[id]).ok();
+        let (table, structural) = crate::scheduler::build_delim_table(vocab_size, decode);
+        crate::scheduler::set_delim_table(std::sync::Arc::from(table));
+        let forced = crate::scheduler::build_forced_ids(vocab_size, |id| {
+            tokenizer.decode_with_special(&[id]).ok()
+        });
+        crate::scheduler::set_forced_ids(std::sync::Arc::new(forced));
+        tracing::info!(
+            "CFG jump-forward: ENABLED — {structural}/{vocab_size} ids classified \
+             as structural delimiters (ATLAS_DFLASH_CFG_JF=1, lossless draft splice)"
+        );
+    }
+
+    if let Some(tid) = think_end_token {
+        tracing::info!(
+            "Thinking end token: {} ({})",
+            tid,
+            reasoning_parser_box.as_ref().unwrap().end_tag()
+        );
+    }
+    if let Some(tid) = think_start_token {
+        tracing::info!("Thinking start token: {tid} ({think_start_tag})");
+    }
+
+    let im_start_id: Option<u32> = tokenizer
+        .encode("<|im_start|>")
+        .ok()
+        .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
+    if let Some(id) = im_start_id {
+        if !eos_tokens.contains(&id) {
+            eos_tokens.push(id);
+        }
+        crate::scheduler::set_im_start_hard_stop(id);
+        tracing::info!("ChatML role-boundary hard stop: <|im_start|> (id {id}) registered");
+    }
+
+    let reflection_mode = super::reflection_gate::parse_reflection_mode(
+        std::env::var(super::reflection_gate::REFLECTION_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    let reflection_suppress_ids =
+        super::reflection_gate::resolve_reflection_ids(reflection_mode, |word| {
+            tokenizer.encode(word).ok()
+        });
+    tracing::info!(
+        "{}",
+        super::reflection_gate::reflection_receipt(reflection_mode, reflection_suppress_ids.len())
+    );
+
+    // Decoding-efficiency wave (all default-OFF, env-gated): hesitation
+    // penalty (ATLAS_HESITATION_PENALTY), soft </think> exit bias
+    // (ATLAS_THINK_EXIT_BIAS + ATLAS_THINK_SOFT_START), and adaptive thinking
+    // budget (ATLAS_ADAPTIVE_THINK). With all vars unset this installs an
+    // inert config and resolves NO hesitation ids — every apply site is a
+    // no-op, so the committed token stream (and counting-eval md5) is
+    // byte-identical. Only when a var is set does behaviour change, and then
+    // it is OUTPUT-SHAPING (fewer thinking tokens), validated by eval quality.
+    {
+        let mut cfg = crate::scheduler::parse_think_efficiency_config(
+            std::env::var("ATLAS_HESITATION_PENALTY").ok().as_deref(),
+            std::env::var("ATLAS_THINK_EXIT_BIAS").ok().as_deref(),
+            std::env::var("ATLAS_THINK_SOFT_START").ok().as_deref(),
+            std::env::var("ATLAS_ADAPTIVE_THINK").ok().as_deref(),
+        );
+        // Build the hesitation id set only when the penalty is on (skips the
+        // ~50 tokenizer encodes otherwise). Single-token variants only —
+        // multi-token phrases can't be penalised at one logit position.
+        if let Some(hesitation_penalty) = cfg.hesitation_penalty {
+            cfg.hesitation_ids =
+                crate::scheduler::build_hesitation_ids(|s| tokenizer.encode(s).ok());
+            tracing::info!(
+                "Hesitation penalty ENABLED (ATLAS_HESITATION_PENALTY={}): {} token IDs resolved",
+                hesitation_penalty,
+                cfg.hesitation_ids.len(),
+            );
+        }
+        if let Some(bias) = cfg.think_exit_bias {
+            tracing::info!(
+                "Soft </think> exit bias ENABLED (ATLAS_THINK_EXIT_BIAS={bias}, \
+                 soft_start={} tokens): linear ramp to budget",
+                cfg.think_soft_start,
+            );
+        }
+        if cfg.adaptive_think {
+            tracing::info!(
+                "Adaptive thinking budget ENABLED (ATLAS_ADAPTIVE_THINK=1): \
+                 difficulty-scaled over first {} thinking tokens",
+                crate::scheduler::ADAPTIVE_PROBE_TOKENS_LOG,
+            );
+        }
+        crate::scheduler::set_think_efficiency_config(cfg);
+    }
+
+    let tool_call_format_name: Option<String> = args
+        .tool_call_parser
+        .clone()
+        .or_else(|| {
+            (!ptx_set.behavior.tool_call_parser.is_empty())
+                .then(|| ptx_set.behavior.tool_call_parser.to_string())
+        })
+        .or_else(|| {
+            let defaults: toml::Table = toml::from_str(include_str!("../../../tool_defaults.toml"))
+                .expect("invalid tool_defaults.toml");
+            defaults
+                .get("model_type")
+                .and_then(|t| t.as_table())
+                .and_then(|t| t.get(config.model_type.as_str()))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    let (tc_start_str, tc_end_str): (&str, &str) = match tool_call_format_name.as_deref() {
+        Some("minimax_xml") => ("<minimax:tool_call>", "</minimax:tool_call>"),
+        Some("gemma4") => ("<|tool_call>", "<tool_call|>"),
+        Some("mistral") => ("[TOOL_CALLS]", ""),
+        Some("dsml_v41") => ("<｜DSML｜ calls>", "</｜DSML｜ calls>"),
+        _ => ("<tool_call>", "</tool_call>"),
+    };
+    let tool_call_start_token = tokenizer
+        .encode(tc_start_str)
+        .ok()
+        .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
+    if let Some(tid) = tool_call_start_token {
+        tracing::info!("Tool call start token: {} ({})", tid, tc_start_str);
+    } else {
+        tracing::warn!(
+            "Tool call start token unresolved for {tc_start_str} — \
+             require_tool_call / suppress / force-emit-after-think will be no-ops"
+        );
+    }
+    let tool_call_end_token = if tc_end_str.is_empty() {
+        None
+    } else {
+        tokenizer
+            .encode(tc_end_str)
+            .ok()
+            .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None })
+    };
+    if let Some(tid) = tool_call_end_token {
+        tracing::info!("Tool call end token: {} ({})", tid, tc_end_str);
+    }
+
+    let grammar_engine = {
+        let stop_ids: Vec<i32> = eos_tokens.iter().map(|&id| id as i32).collect();
+        let model_vocab_size = Some(config.vocab_size);
+        match grammar::GrammarEngine::from_tokenizer(tokenizer.inner(), model_vocab_size, &stop_ids)
+        {
+            Ok(engine) => {
+                tracing::info!(
+                    "Grammar engine initialized (vocab_size={}, vocab_type=auto-detected from tokenizer)",
+                    engine.vocab_size()
+                );
+                Some(engine)
+            }
+            Err(e) => {
+                tracing::warn!("Grammar engine init failed (constrained decoding disabled): {e}");
+                None
+            }
+        }
+    };
+
+    Ok(TokenizerRuntime {
+        reasoning_parser_box,
+        think_end_token,
+        think_start_token,
+        code_fence_token,
+        reflection_suppress_ids,
+        tool_call_start_token,
+        tool_call_end_token,
+        grammar_engine,
+    })
+}
