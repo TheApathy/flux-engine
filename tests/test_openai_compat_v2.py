@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import urllib.parse
 
 try:
     import requests
@@ -291,7 +293,11 @@ def main() -> int:
         ann = getattr(msg, "annotations", None)
         if ann is not None and any("url_citation" in str(a) for a in ann):
             record("bare URL extracted as annotation", PASS, f"n={len(ann)}")
-        elif "https://example.com" in content:
+        elif any(
+            urllib.parse.urlparse(u).scheme == "https"
+            and urllib.parse.urlparse(u).hostname == "example.com"
+            for u in re.findall(r"https?://[^\s)\"'<>]+", content)
+        ):
             record(
                 "bare URL extracted as annotation",
                 FAIL,

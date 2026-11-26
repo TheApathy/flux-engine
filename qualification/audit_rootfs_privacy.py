@@ -242,9 +242,12 @@ def main() -> int:
     print(f"    Files scanned: {results['files_scanned']}")
     print(f"    Bytes scanned: {results['bytes_scanned']}")
     print(f"    Violations:    {results['violations_count']}")
-    print(f"    Host paths:    {results['host_path_violations']}")
-    print(f"    Secrets:       {results['secret_violations']}")
-    print(f"    State tokens:  {results['state_token_violations']}")
+    host_path_count = int(results["host_path_violations"])
+    cred_count = int(results["secret_violations"])
+    state_token_count = int(results["state_token_violations"])
+    print(f"    Host paths:    {host_path_count}")
+    print(f"    Secrets:       {cred_count}")
+    print(f"    State tokens:  {state_token_count}")
     print(f"    Status:        {results['status']}")
 
     if results["violations"]:

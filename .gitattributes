@@ -25,3 +25,18 @@ Makefile text eol=lf
 *.ico binary
 *.gz binary
 *.tgz binary
+
+# GitHub Linguist classification: keep the repository language bar focused on
+# the Flux Engine runtime (Rust + CUDA/PTX/Metal) rather than vendored eval
+# harnesses, AGPL source-closure archives, and offline benchmark/docs scripts.
+repro-kit/llm-inference-bench/** linguist-vendored
+repro-kit/source-closure/** linguist-vendored
+repro-kit/** linguist-documentation
+qualification/** linguist-documentation
+bench/** linguist-documentation
+repro/** linguist-documentation
+examples/** linguist-documentation
+docs/** linguist-documentation
+tests/** linguist-documentation
+scripts/** linguist-documentation
+tools/** linguist-documentation

@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import socket
@@ -459,7 +460,7 @@ def test_no_network_is_a_clear_install_error(monkeypatch, cache):
         BENCH.ensure_tool_eval_install(BENCH.TOOL_EVAL_PINNED_REF)
     error = exc.value
     assert error.kind == "network"
-    assert "no network access" in error.message and "github.com" in error.message
+    assert "no network access" in error.message and re.search(r"\bgithub\.com\b", error.message)
     assert "--tool-eval-bin" in error.hint and "LLM_BENCH_CACHE_DIR" in error.hint
     assert "Could not resolve host" in error.detail
     assert not (cache / BENCH.TOOL_EVAL_PINNED_REF / "install.json").exists()

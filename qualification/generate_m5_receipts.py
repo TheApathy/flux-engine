@@ -394,9 +394,9 @@ Milestone 5 qualifies the production container packaging, provenance attestation
 
 - **Files Scanned**: {files_scanned:,} files
 - **Bytes Scanned**: {bytes_scanned:,} bytes ({bytes_scanned / 1e9:.2f} GB)
-- **Host Path Violations**: {privacy_data.get('host_path_violations', 0)}
-- **Secret & Credential Violations**: {privacy_data.get('secret_violations', 0)}
-- **State Token Violations**: {privacy_data.get('state_token_violations', 0)}
+- **Host Path Violations**: {int(privacy_data.get('host_path_violations', 0))}
+- **Secret & Credential Violations**: {int(privacy_data.get('secret_violations', 0))}
+- **State Token Violations**: {int(privacy_data.get('state_token_violations', 0))}
 - **Total Leaks Detected**: **{violations_count}**
 - **Audit Verdict**: **{privacy_status}** (Receipt: `{receipt_json["artifacts"]["privacy_scan_results"]["path"]}`)
 

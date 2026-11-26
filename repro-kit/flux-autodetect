@@ -5655,7 +5655,7 @@ def export_submission_bundle(results_dir: Path, opts: Dict[str, bool]) -> Dict[s
         # This bundle is uploaded publicly: drop any line that mentions a
         # prompt, content or credentials outright, then scrub what is left.
         for line in srv_log.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]:
-            if any(secret in line.lower() for secret in ("prompt", "content", "authorization", "bearer")):
+            if any(blocked_kw in line.lower() for blocked_kw in ("prompt", "content", "authorization", "bearer")):
                 continue
             clean_lines.append(_scrub_text(line))
         dst_log = bundle_dir / "flux-server.sanitized.log"

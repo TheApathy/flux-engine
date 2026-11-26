@@ -29,7 +29,7 @@ def _load(path, name):
 fa = _load(SCRIPT, "flux_autodetect_debug_bundle")
 
 # Planted values that must never survive scrubbing.
-SECRETS = {
+PLANTED_FIXTURES = {
     "bearer": "Bearer abcDEF123456ghiJKL",
     "hf": "hf_PlantedHuggingFace0123",
     "sk": "sk-ant-planted-0123456789",
@@ -41,14 +41,14 @@ PROMPT = "Write a haiku about my secret project Bluebird"
 ENVIRON = {
     "USER": "alice",
     "HOSTNAME": "dgx-alice-07",
-    "MY_SERVICE_TOKEN": SECRETS["env"],
+    "MY_SERVICE_TOKEN": PLANTED_FIXTURES["env"],
     "WANDB_API_KEY": "wandbplanted99",
     "FLUX_MODE": "auto",
 }
 LOG = f"""2026-10-29T13:33:09.565672Z  INFO spark::model_resolver: Model path: /home/alice/models/fn (local directory)
 2026-10-29T13:33:09.565700Z  INFO spark::main_modules::serve_router: Listening on 192.168.1.20:8899 (peer 10.0.0.3, fd12:3456::1) started by alice
-2026-10-29T13:33:09.565800Z  WARN spark::auth: header Authorization: {SECRETS['bearer']} from alice@example.com on dgx-alice-07
-2026-10-29T13:33:09.565900Z  INFO spark::download: token {SECRETS['hf']} {SECRETS['sk']} {SECRETS['ghp']} {SECRETS['kv']} svc={SECRETS['env']} wandbplanted99
+2026-10-29T13:33:09.565800Z  WARN spark::auth: header Authorization: {PLANTED_FIXTURES['bearer']} from alice@example.com on dgx-alice-07
+2026-10-29T13:33:09.565900Z  INFO spark::download: token {PLANTED_FIXTURES['hf']} {PLANTED_FIXTURES['sk']} {PLANTED_FIXTURES['ghp']} {PLANTED_FIXTURES['kv']} svc={PLANTED_FIXTURES['env']} wandbplanted99
 2026-10-29T13:33:09.566000Z  INFO spark::api::chat_stream::tool_handlers: Tool call: write_file({{"path": "/tmp/bluebird.txt", "content": "{PROMPT}"}})
 2026-10-29T13:33:09.566100Z  INFO spark::api::chat::msg_entry: Dropped content-free client system message (would bias the model toward terse output) dropped={PROMPT}
 2026-10-29T13:33:09.566200Z  INFO atlas::tool_debug: raw pre-parse output (tools_active, choice 0): "{PROMPT}"
@@ -66,7 +66,7 @@ def _scrub(text, include_prompts=False):
 class ScrubTextTest(TestCase):
     def test_planted_secrets_paths_ips_and_prompts_are_removed(self):
         out, counts = _scrub(LOG)
-        for value in list(SECRETS.values()) + ["hunter2planted", "wandbplanted99"]:
+        for value in list(PLANTED_FIXTURES.values()) + ["hunter2planted", "wandbplanted99"]:
             self.assertNotIn(value.split("=")[-1].split()[-1], out, value)
         for ident in ("/home/alice", "alice@example.com", "dgx-alice-07", "192.168.1.20", "10.0.0.3", "fd12:3456::1"):
             self.assertNotIn(ident, out)
@@ -87,7 +87,7 @@ class ScrubTextTest(TestCase):
         out, counts = _scrub(LOG, include_prompts=True)
         self.assertIn("Bluebird", out)
         self.assertIn("151644", out)
-        self.assertNotIn(SECRETS["hf"], out)
+        self.assertNotIn(PLANTED_FIXTURES["hf"], out)
         self.assertNotIn("/home/alice", out)
         self.assertNotIn("prompt_text", counts)
 
@@ -164,7 +164,7 @@ class BundleTest(_BundleBase):
                    "Error: Failed to parse config.json\n\nCaused by:\n    0: EOF\n")
         (self.results / "flux-server.log").write_text(LOG + failure)
         (self.results / "flux-debug.log").write_text(LOG)
-        (self.results / "flux-debug.log.1").write_text("older " + SECRETS["sk"] + "\n")
+        (self.results / "flux-debug.log.1").write_text("older " + PLANTED_FIXTURES["sk"] + "\n")
         (self.results / "flux-load-debug.log").write_text("DEBUG killed mid-load at /home/alice/m\n")
         (self.results / "flux-launch.json").write_text(json.dumps({"argv": ["/opt/flux/bin/flux-server-real", "--model-from-path", "/home/alice/m"]}))
         res = self._bundle()
@@ -180,7 +180,7 @@ class BundleTest(_BundleBase):
                      "system/facts.json", "system/endpoint.json"):
             self.assertIn(name, members)
         blob = "\n".join(members.values())
-        for value in list(SECRETS.values()) + ["/home/alice", "dgx-alice-07", "192.168.1.20", "Bluebird", "151644"]:
+        for value in list(PLANTED_FIXTURES.values()) + ["/home/alice", "dgx-alice-07", "192.168.1.20", "Bluebird", "151644"]:
             self.assertNotIn(value, blob)
         self.assertIn("Caused by:", members["load-failure/from-flux-server-log.txt"])
         manifest = json.loads(members["MANIFEST.json"])
@@ -203,7 +203,7 @@ class BundleTest(_BundleBase):
         (self.results / "flux-server.log").write_text(LOG)
         members = self._members(self._bundle(include_prompts=True)["archive"])
         self.assertIn("Bluebird", members["logs/flux-server.log"])
-        self.assertNotIn(SECRETS["hf"], members["logs/flux-server.log"])
+        self.assertNotIn(PLANTED_FIXTURES["hf"], members["logs/flux-server.log"])
 
     def test_unwritable_results_is_a_clear_error(self):
         err = io.StringIO()
@@ -630,8 +630,8 @@ class BundleImageLabelsTest(_BundleBase):
 
     def test_labels_still_pass_through_the_scrubber(self):
         path = self.results / "IMAGE_LABELS.json"
-        path.write_text(json.dumps({"labels": {"com.example.note": f"built on dgx-alice-07 {SECRETS['hf']}"}}))
+        path.write_text(json.dumps({"labels": {"com.example.note": f"built on dgx-alice-07 {PLANTED_FIXTURES['hf']}"}}))
         rec, members, listed = self._labels_bundle(path)
-        self.assertNotIn(SECRETS["hf"], members["system/image-labels.json"])
+        self.assertNotIn(PLANTED_FIXTURES["hf"], members["system/image-labels.json"])
         self.assertNotIn("dgx-alice-07", members["system/image-labels.json"])
         self.assertGreater(listed["system/image-labels.json"]["redactions"].get("api_key", 0), 0)

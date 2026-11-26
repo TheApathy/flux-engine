@@ -119,7 +119,7 @@ class FakeStreamingServer:
     def chat(self, handler, payload: dict) -> None:
         text = "".join(str(m.get("content") or "") for m in payload.get("messages") or [])
         prompt_tokens = len(text) // 4 + 16
-        tag = re.search(r"\[((?:MIXED|BENCH|WARMUP)_[^\]]*)\]", text)
+        tag = re.search(r"\[((?:MIXED|BENCH|WARMUP)_[A-Za-z0-9_.:-]{1,64})\]", text)
         options = payload.get("stream_options") or {}
         record = {
             "tag": tag.group(1) if tag else "",
