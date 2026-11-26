@@ -1,0 +1,60 @@
+name: ClusterFuzzLite
+
+# Continuous fuzzing of Flux Engine's pure-Rust untrusted-input parsers
+# (`crates/xgrammar` JSON Schema & EBNF compiler) via Google ClusterFuzzLite.
+
+on:
+  pull_request:
+    paths:
+      - "crates/xgrammar/**"
+      - "fuzz/**"
+      - ".clusterfuzzlite/**"
+      - ".github/workflows/cifuzz.yml"
+  schedule:
+    # Weekly fuzzing sweep every Sunday at 05:00 UTC.
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cifuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz xgrammar (ClusterFuzzLite / AddressSanitizer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Harden runner (eBPF egress audit)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Build Fuzzers
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c
+        with:
+          language: rust
+          sanitizer: address
+          mode: code-change
+
+      - name: Run Fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c
+        with:
+          fuzz-seconds: 120
+          mode: code-change
+          sanitizer: address
+          report-unreproducible-crashes: false
+          output-sarif: true
+
+      - name: Upload Fuzzing SARIF to GitHub Security
+        if: always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          sarif_file: results.sarif
+          category: clusterfuzzlite

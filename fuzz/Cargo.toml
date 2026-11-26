@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "flux-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-only"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+xgrammar = { path = "../crates/xgrammar" }
+
+[[bin]]
+name = "xgrammar_schema"
+path = "fuzz_targets/xgrammar_schema.rs"
+test = false
+doc = false
+bench = false

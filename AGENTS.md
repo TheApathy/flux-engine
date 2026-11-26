@@ -127,3 +127,12 @@ any of the following will be closed or returned without merge:
 - **Branch & tag integrity:** `main` and `v*` release tags enforce verified SSH commit/tag signatures against [`.github/allowed_signers`](.github/allowed_signers) (see [`SIGNING.md`](SIGNING.md)).
 - **Vulnerability reporting:** Never open public issues for security vulnerabilities; follow [`.github/SECURITY.md`](.github/SECURITY.md) (GitHub Private Vulnerability Reporting).
 - **Companion docs:** See [`CLAUDE.md`](CLAUDE.md) for quick-reference build recipes, [`CONTRIBUTING.md`](CONTRIBUTING.md) for contributor workflow, and [`docs/verification/`](docs/verification/) for hardware qualification methodology.
+
+---
+
+## 7. Continuous Self-Improvement Loop
+
+Flux Engine operates on an automated weekly quality ratchet:
+
+- **Automated signals (weekly):** [`.github/workflows/weekly-health.yml`](.github/workflows/weekly-health.yml) (`scripts/self_improvement_audit.py`), OpenSSF Scorecard (`scorecard.yml`), ClusterFuzzLite (`cifuzz.yml`), CodeQL SAST (`codeql.yml`), `cargo-deny` (`security.yml`), and grouped Dependabot updates (`.github/dependabot.yml`).
+- **Ratchet rule:** Whenever a bug, fuzz crash, CI flake, or Scorecard deduction is fixed, **encode the invariant** (add a Z3/TLA+ assertion, a fuzz corpus seed, a Python contract test, or a `ci_local.sh` check) so the same class of defect can never regress.

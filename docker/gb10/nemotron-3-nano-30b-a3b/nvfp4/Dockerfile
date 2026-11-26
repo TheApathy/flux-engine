@@ -9,7 +9,7 @@
 #     atlas-nemotron serve nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
 
 # ── Build stage ──────────────────────────────────────────────────
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04@sha256:1e8ac7a54c184a1af8ef2167f28fa98281892a835c981ebcddb1fad04bdd452d AS builder
 
 RUN apt-get update -qq && \
     apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev && \
@@ -41,7 +41,7 @@ ENV ATLAS_TARGET_QUANT=nvfp4
 RUN cargo build --release -p spark-server
 
 # ── Runtime stage ────────────────────────────────────────────────
-FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04@sha256:95318efecfd68ab3d109da5277863257b06137c84f34a87f38de970d5cd035d3
 
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.source="https://github.com/TheApathy/flux-engine"

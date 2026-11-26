@@ -2,7 +2,7 @@
 # Release-packaging runtime Dockerfile (build context: repro-kit/; expects pre-staged bin/flux-server-real).
 # To build from source (which executes `COPY build-support/ build-support/` from repository root),
 # use docker/gb10/Dockerfile or docker/sm120/Dockerfile.
-FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04@sha256:95318efecfd68ab3d109da5277863257b06137c84f34a87f38de970d5cd035d3
 
 ARG FLUX_ENGINE_VERSION="1.0.2"
 ARG FLUX_SOURCE_REVISION

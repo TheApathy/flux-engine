@@ -1,0 +1,44 @@
+name: Weekly Self-Improvement Audit
+
+# Continuous quality, supply-chain, formal-verification, and OpenSSF Scorecard
+# ratchet. Runs read-only every Monday and publishes a structured summary of
+# actionable improvements.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: weekly-health-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Engineering Health & Scorecard Ratchet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (eBPF egress audit, disable sudo/containers)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+          disable-sudo-and-containers: true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Z3 solver
+        run: python3 -m pip install --disable-pip-version-check --quiet z3-solver
+
+      - name: Run weekly self-improvement & Scorecard audit
+        run: python3 -B scripts/self_improvement_audit.py

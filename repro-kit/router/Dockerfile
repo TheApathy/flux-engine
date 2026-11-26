@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM haproxy:2.8
+FROM haproxy:2.8@sha256:456f54adfd26f350512a9e38330b08c5376d4f4fdf2084021f0f79869e589d6c
 
 ARG FLUX_ENGINE_VERSION="1.0.2"
 ARG FLUX_SOURCE_REVISION="unknown"

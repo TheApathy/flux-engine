@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+homepage: "https://github.com/TheApathy/flux-engine"
+language: rust
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer
