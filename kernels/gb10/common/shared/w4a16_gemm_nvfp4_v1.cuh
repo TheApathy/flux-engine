@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Atlas W4A16 GEMM — Qwen3-Next-80B model shadow.
+// Atlas W4A16 GEMM — Shared NVFP4 implementation (SM120/SM121/SM103).
+//
+// Optional compile-time specialization macros (define before #include):
+//   ATLAS_W4A16_USE_BLOCKSCALE_MMA    — use block-scaled FP8 MMA on SM120+
+//   ATLAS_W4A16_GEMM_T_LAUNCH_BOUNDS  — optional __launch_bounds__ on w4a16_gemm_t
 //
 // Optimizations:
 // - w4a16_gemm_t: cp.async 2-stage double-buffered pipeline (overlaps next tile
@@ -12,6 +16,24 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+
+#ifndef ATLAS_MMA_FP8_UNIT_M16N8K32
+#if defined(ATLAS_W4A16_USE_BLOCKSCALE_MMA) && (__CUDA_ARCH__ >= 1200)
+#define ATLAS_MMA_FP8_UNIT_M16N8K32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3) \
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},{%14},{0,0},{%14},{0,0};" \
+        :"=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3) \
+        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+         "f"(c0),"f"(c1),"f"(c2),"f"(c3),"r"(0x7fu))
+#else
+#define ATLAS_MMA_FP8_UNIT_M16N8K32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        :"=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3) \
+        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+         "f"(c0),"f"(c1),"f"(c2),"f"(c3))
+#endif
+#endif
 
 #define M_TILE 64
 #define N_TILE_SM 64
@@ -197,7 +219,13 @@ __device__ __forceinline__ unsigned int bf16x4_to_e4m3x4(const unsigned short* s
     return ((unsigned int)h1 << 16) | (unsigned int)h0;
 }
 
+#ifdef ATLAS_W4A16_GEMM_T_LAUNCH_BOUNDS
+extern "C" __global__
+ATLAS_W4A16_GEMM_T_LAUNCH_BOUNDS
+void w4a16_gemm_t(
+#else
 extern "C" __global__ void w4a16_gemm_t(
+#endif
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale,
@@ -303,11 +331,10 @@ extern "C" __global__ void w4a16_gemm_t(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]); \
         } \
     } while(0)
 
@@ -427,14 +454,10 @@ extern "C" __global__ void fp8_gemm_t(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B[(b_buf)][nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B[(b_buf)][nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
-                 "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3), \
-                 "r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]), \
-                 "f"(acc[nt][2]),"f"(acc[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]); \
         } \
     } while(0)
 
@@ -613,14 +636,10 @@ extern "C" __global__ void fp8_fp8_gemm_t(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_Bf[(b_buf)][nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_Bf[(b_buf)][nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
-                 "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3), \
-                 "r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]), \
-                 "f"(acc[nt][2]),"f"(acc[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]); \
         } \
     } while(0)
 
@@ -813,12 +832,10 @@ extern "C" __global__ void w4a16_gemm_t_k64(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8_k64[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8_k64[nc][16 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]); \
         } \
         unsigned int a4 = bf16x4_to_e4m3x4(&sA[fr0 * ast64 + 32 + tid * 4]); \
         unsigned int a5 = bf16x4_to_e4m3x4(&sA[fr1 * ast64 + 32 + tid * 4]); \
@@ -829,12 +846,10 @@ extern "C" __global__ void w4a16_gemm_t_k64(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8_k64[nc][32 + 4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8_k64[nc][48 + 4 * tid]; \
-            asm volatile( \
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
-                :"r"(a4),"r"(a5),"r"(a6),"r"(a7),"r"(b0),"r"(b1), \
-                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], \
+                a4, a5, a6, a7, b0, b1, \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]); \
         } \
     } while(0)
 
@@ -1010,11 +1025,10 @@ void w4a16_gemm_t_m128(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc0[nt][0]),"=f"(acc0[nt][1]),"=f"(acc0[nt][2]),"=f"(acc0[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc0[nt][0]),"f"(acc0[nt][1]),"f"(acc0[nt][2]),"f"(acc0[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc0[nt][0], acc0[nt][1], acc0[nt][2], acc0[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc0[nt][0], acc0[nt][1], acc0[nt][2], acc0[nt][3]); \
         } \
         /* Chunk 1: smem rows 64..127 (offset M_TILE=64) */ \
         fr0 = M_TILE + warp_m_offset + group_id; \
@@ -1028,11 +1042,10 @@ void w4a16_gemm_t_m128(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc1[nt][0]),"=f"(acc1[nt][1]),"=f"(acc1[nt][2]),"=f"(acc1[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc1[nt][0]),"f"(acc1[nt][1]),"f"(acc1[nt][2]),"f"(acc1[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc1[nt][0], acc1[nt][1], acc1[nt][2], acc1[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc1[nt][0], acc1[nt][1], acc1[nt][2], acc1[nt][3]); \
         } \
     } while(0)
 
@@ -1169,11 +1182,10 @@ void fp8_gemm_t_m128(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B[(b_buf)][nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B[(b_buf)][nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc0[nt][0]),"=f"(acc0[nt][1]),"=f"(acc0[nt][2]),"=f"(acc0[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc0[nt][0]),"f"(acc0[nt][1]),"f"(acc0[nt][2]),"f"(acc0[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc0[nt][0], acc0[nt][1], acc0[nt][2], acc0[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc0[nt][0], acc0[nt][1], acc0[nt][2], acc0[nt][3]); \
         } \
         /* Chunk 1: smem rows 64..127 */ \
         fr0 = M_TILE + warp_m_offset + group_id; \
@@ -1187,11 +1199,10 @@ void fp8_gemm_t_m128(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_B[(b_buf)][nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_B[(b_buf)][nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc1[nt][0]),"=f"(acc1[nt][1]),"=f"(acc1[nt][2]),"=f"(acc1[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc1[nt][0]),"f"(acc1[nt][1]),"f"(acc1[nt][2]),"f"(acc1[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc1[nt][0], acc1[nt][1], acc1[nt][2], acc1[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc1[nt][0], acc1[nt][1], acc1[nt][2], acc1[nt][3]); \
         } \
     } while(0)
 
@@ -1320,11 +1331,10 @@ void fp8_fp8_gemm_t_m128(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_Bf[(b_buf)][nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_Bf[(b_buf)][nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc0[nt][0]),"=f"(acc0[nt][1]),"=f"(acc0[nt][2]),"=f"(acc0[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc0[nt][0]),"f"(acc0[nt][1]),"f"(acc0[nt][2]),"f"(acc0[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc0[nt][0], acc0[nt][1], acc0[nt][2], acc0[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc0[nt][0], acc0[nt][1], acc0[nt][2], acc0[nt][3]); \
         } \
         /* Chunk 1: smem rows 64..127 */ \
         fr0 = M_TILE + warp_m_offset + group_id; \
@@ -1338,11 +1348,10 @@ void fp8_fp8_gemm_t_m128(
             unsigned int nc = nt * 8 + group_id; \
             unsigned int b0 = *(const unsigned int*)&smem_Bf[(b_buf)][nc][4 * tid]; \
             unsigned int b1 = *(const unsigned int*)&smem_Bf[(b_buf)][nc][16 + 4 * tid]; \
-            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
-                :"=f"(acc1[nt][0]),"=f"(acc1[nt][1]),"=f"(acc1[nt][2]),"=f"(acc1[nt][3]) \
-                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
-                 "f"(acc1[nt][0]),"f"(acc1[nt][1]),"f"(acc1[nt][2]),"f"(acc1[nt][3])); \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc1[nt][0], acc1[nt][1], acc1[nt][2], acc1[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc1[nt][0], acc1[nt][1], acc1[nt][2], acc1[nt][3]); \
         } \
     } while(0)
 
