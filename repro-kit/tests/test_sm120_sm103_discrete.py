@@ -1031,7 +1031,17 @@ class ContainerTagAndDiagnosticsTests(TestCase):
             env={"FLUX_CONCURRENCY": "8", "FLUX_KV_CACHE_DTYPE": "bf16", "FLUX_MAX_SEQ_LEN": "32768"},
         )
         self.assertEqual(plan_c8["concurrency"], 8)
-        self.assertLessEqual(int(_arg_value(plan_c8["command"], "--kv-pool-tokens")), 393216)
+        self.assertLessEqual(int(_arg_value(plan_c8["command"], "--kv-pool-tokens")), 524288)
+        self.assertEqual(plan_c8["env"].get("ATLAS_DFLASH_BATCHED_VERIFY"), "1")
+
+        plan_c64 = _plan_on_hw(
+            _qwen27b_model(with_dflash=True),
+            hw_96,
+            env={"FLUX_CONCURRENCY": "64", "FLUX_DISABLE_SPECULATION": "1"},
+        )
+        self.assertEqual(plan_c64["concurrency"], 64)
+        self.assertFalse(plan_c64["speculative_enabled"])
+        self.assertGreaterEqual(int(_arg_value(plan_c64["command"], "--kv-pool-tokens")), 393216)
 
         with self.assertRaisesRegex(ValueError, r"qualified through C8"):
             _plan_on_hw(
@@ -1039,6 +1049,20 @@ class ContainerTagAndDiagnosticsTests(TestCase):
                 hw_96,
                 env={"FLUX_CONCURRENCY": "9"},
             )
+
+    def test_disable_speculation_clears_batched_k5_on_sm120(self):
+        hw_96 = _make_hw_via_smi("NVIDIA RTX PRO 6000 Blackwell, 97887, 12.0\n", host_ram_gib=384.0)
+        plan_c64 = _plan_on_hw(
+            _flash_next_model(with_dflash=True),
+            hw_96,
+            env={"FLUX_CONCURRENCY": "64", "FLUX_DISABLE_SPECULATION": "1"},
+        )
+        self.assertEqual(plan_c64["concurrency"], 64)
+        self.assertFalse(plan_c64["speculative_enabled"])
+        self.assertNotIn("ATLAS_QWEN4_BATCHED_K5", plan_c64["env"])
+        self.assertNotIn("FLUX_QWEN4_BATCHED_K5", plan_c64["env"])
+        self.assertEqual(plan_c64["env"].get("FLUX_QWEN4_CONCURRENCY_TARGET_ONLY"), "1")
+
 
 
 

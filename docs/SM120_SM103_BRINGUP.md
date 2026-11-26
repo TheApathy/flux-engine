@@ -281,7 +281,7 @@ Measured on `1x NVIDIA RTX PRO 6000 Blackwell Workstation Edition` (`SM12.0`, `1
 
 | Concurrency | Best Mode | Steady-State Aggregate | Per-Request Steady | End-to-End Wall Aggregate | Peak Power |
 |---:|---|---:|---:|---:|---:|
-| **`C=1`** (`arith` / `code` / `prose`) | **DFlash2 (`W=8`, coalesced `v2_n16_sk4` + `WY17`)** | **`438.4` / `276.1` / `266.0 tok/s`** | `438.4` / `276.1` / `266.0 tok/s` | `403.1` / `268.2` / `258.7 tok/s` | — |
+| **`C=1`** (`arith` / `code_edit` / `code` / `prose`) | **DFlash2 (`W=8`, coalesced `v2_n16_sk4` + `WY17`)** | **`497.1` / `312.3` / `300.0` / `266.0 tok/s`** | `497.1` / `312.3` / `300.0` / `266.0 tok/s` | `461.3` / `299.7` / `286.9` / `258.7 tok/s` | — |
 | **`C=2`** | **Hoisted Batched DFlash2 (`W=8`, `forward=15.97 ms`, `20.1 ms/round`, graphed)** | **`~796 tok/s`** (arith) | **`~398 tok/s`** | **`590.1 tok/s`** (arith) / **`575.5 tok/s`** (mixed) | `568.0 W` |
 | **`C=4`** | **Hoisted Batched DFlash2 (`W=8`, `forward=18.47 ms`, `23.5 ms/round`, graphed)** | **`~1,362 tok/s`** (arith) | **`~340 tok/s`** | **`600.1 tok/s`** (arith) / **`514.3 tok/s`** (mixed) | `568.0 W` |
 | **`C=8`** | **Hoisted Batched DFlash2 (`W=8`, `forward=21.09 ms`, `27.5 ms/round`, graphed)** | **`~2,327 tok/s`** (arith; plain `561.5`) | **`~291 tok/s`** | **`1,073.8 tok/s`** (arith) / **`711.4 tok/s`** (mixed) | `568.0 W` |

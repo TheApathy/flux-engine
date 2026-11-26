@@ -76,8 +76,8 @@
   <text x="705.0" y="427" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">1,074 arith wall (~2,327 steady)</text>
   <text x="612" y="452" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Qwen3.8-27B C=1 (DFlash2 W=8)</text>
   <rect x="612" y="458" width="496" height="18" rx="4" fill="#161b22"/>
-  <rect x="612" y="458" width="34.7" height="18" rx="4" fill="#818CF8" opacity="0.92"/>
-  <text x="654.7" y="471" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">438 arith · 276 code · 266 prose</text>
+  <rect x="612" y="458" width="39.3" height="18" rx="4" fill="#818CF8" opacity="0.92"/>
+  <text x="659.3" y="471" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">497 arith · 312 edit · 300 code</text>
 
 
   <!-- Bottom Footer Strip -->

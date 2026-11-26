@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 552" width="1160" height="552">
+  <rect x="2" y="2" width="1156" height="548" rx="16" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+
+  <text x="36" y="38" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="800" fill="#F0F6FC">NVIDIA GB10 / DGX Spark (sm_121a) — 128 GB Unified LPDDR5x</text>
+  <text x="36" y="60" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" fill="#8B949E">48 SMs · 273 GB/s UMA · v1.0.3 Certified End-to-End HTTP (0 Register Spills · 0-ULP Lossless Speculation)</text>
+
+  <!-- Left Panel Frame -->
+  <rect x="36" y="80" width="528" height="412" rx="12" fill="#0b0f15" stroke="#21262d" stroke-width="1.4"/>
+  <text x="52" y="108" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#34D399">Prefill Throughput (2K → 262K Native Context)</text>
+  <line x1="52" y1="118" x2="548" y2="118" stroke="#21262d" stroke-width="1"/>
+
+  <text x="52" y="144" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next 8K (warm prefix cache)</text>
+  <rect x="52" y="150" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="150" width="295.0" height="18" rx="4" fill="#34D399" opacity="0.92"/>
+  <text x="355.0" y="163" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">12,056 eff. tok/s</text>
+
+  <text x="52" y="188" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next 16K (w16384 max-prefill)</text>
+  <rect x="52" y="194" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="194" width="159.1" height="18" rx="4" fill="#10B981" opacity="0.92"/>
+  <text x="219.1" y="207" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">6,501 tok/s (peak cold)</text>
+
+  <text x="52" y="232" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next 32K (w16384 max-prefill)</text>
+  <rect x="52" y="238" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="238" width="155.6" height="18" rx="4" fill="#10B981" opacity="0.92"/>
+  <text x="215.6" y="251" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">6,359 tok/s</text>
+
+  <text x="52" y="276" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next 8K / 128K (w16384)</text>
+  <rect x="52" y="282" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="282" width="146.7" height="18" rx="4" fill="#10B981" opacity="0.92"/>
+  <text x="206.7" y="295" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">5,994 @ 8K · 5,937 @ 128K</text>
+
+  <text x="52" y="320" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next 255K (262K native · 5/5)</text>
+  <rect x="52" y="326" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="326" width="135.2" height="18" rx="4" fill="#F59E0B" opacity="0.92"/>
+  <text x="195.2" y="339" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">5,525 tok/s (4,991 w4096)</text>
+
+  <text x="52" y="364" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next 136.5K Estonia (5/5 PASS)</text>
+  <rect x="52" y="370" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="370" width="132.1" height="18" rx="4" fill="#F59E0B" opacity="0.92"/>
+  <text x="192.1" y="383" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">5,400 tok/s (25.3 s TTFT)</text>
+
+  <text x="52" y="408" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next Interactive (w4096 · 8K–128K)</text>
+  <rect x="52" y="414" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="414" width="133.3" height="18" rx="4" fill="#38BDF8" opacity="0.92"/>
+  <text x="193.3" y="427" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">5,448 @ 8K · 5,063 @ 128K</text>
+
+  <text x="52" y="452" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Qwen3.8-27B 2K / 8K (NVFP4 + DFlash2)</text>
+  <rect x="52" y="458" width="490" height="18" rx="4" fill="#161b22"/>
+  <rect x="52" y="458" width="43.4" height="18" rx="4" fill="#A855F7" opacity="0.92"/>
+  <text x="103.4" y="471" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">1,773 @ 2K · 1,636 @ 8K</text>
+
+  <!-- Right Panel Frame -->
+  <rect x="596" y="80" width="528" height="412" rx="12" fill="#0b0f15" stroke="#21262d" stroke-width="1.4"/>
+  <text x="612" y="108" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#38BDF8">Lossless Decode &amp; Concurrency Scaling (C=1 → C=16)</text>
+  <line x1="612" y1="118" x2="1108" y2="118" stroke="#21262d" stroke-width="1"/>
+
+  <text x="612" y="144" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next C=8 (batched K=5 MTP)</text>
+  <rect x="612" y="150" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="150" width="285.0" height="18" rx="4" fill="#10B981" opacity="0.92"/>
+  <text x="905.0" y="163" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">580.7 tok/s agg</text>
+
+  <text x="612" y="188" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next C=5 (batched K=5 MTP)</text>
+  <rect x="612" y="194" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="194" width="206.3" height="18" rx="4" fill="#10B981" opacity="0.92"/>
+  <text x="826.3" y="207" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">420.3 code · 295.7 prose</text>
+
+  <text x="612" y="232" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next C=16 (batched DFlash2)</text>
+  <rect x="612" y="238" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="238" width="115.1" height="18" rx="4" fill="#34D399" opacity="0.92"/>
+  <text x="735.1" y="251" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">234.5 tok/s agg</text>
+
+  <text x="612" y="276" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Qwen3.8-27B C=8 (hoisted DFlash2)</text>
+  <rect x="612" y="282" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="282" width="84.7" height="18" rx="4" fill="#A855F7" opacity="0.92"/>
+  <text x="704.7" y="295" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">172.6 tok/s agg</text>
+
+  <text x="612" y="320" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next C=1 (DFlash2 W=8)</text>
+  <rect x="612" y="326" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="326" width="55.7" height="18" rx="4" fill="#38BDF8" opacity="0.92"/>
+  <text x="675.7" y="339" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">113.4 arith · 95.4 edit · 89.1 code</text>
+
+  <text x="612" y="364" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next C=1 (Native K=5 MTP)</text>
+  <rect x="612" y="370" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="370" width="44.8" height="18" rx="4" fill="#38BDF8" opacity="0.92"/>
+  <text x="664.8" y="383" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">91.3 code · 64.0 mixed · 43.1 K=1</text>
+
+  <text x="612" y="408" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Qwen3.8-27B C=1 (DFlash2 / γ=15)</text>
+  <rect x="612" y="414" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="414" width="39.8" height="18" rx="4" fill="#C084FC" opacity="0.92"/>
+  <text x="659.8" y="427" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">81.1 arith · 72.4 FP8 · 64.0 BF16</text>
+
+  <text x="612" y="452" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.8" font-weight="700" fill="#C9D1D9">Flash-Next Long-Context Decode</text>
+  <rect x="612" y="458" width="496" height="18" rx="4" fill="#161b22"/>
+  <rect x="612" y="458" width="23.7" height="18" rx="4" fill="#F59E0B" opacity="0.92"/>
+  <text x="643.7" y="471" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#F0F6FC">48.2 @ 136.5K · 46.1 @ 128K · 41.8 @ 262K</text>
+
+  <!-- Bottom Footer Strip -->
+  <g transform="translate(36, 502)">
+    <rect x="0" y="0" width="1088" height="34" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.2"/>
+    <text x="544" y="21" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#C9D1D9" text-anchor="middle">Lossless Parity: <tspan fill="#34D399">0-ULP (2,560/2,560)</tspan> · GSM8K: <tspan fill="#38BDF8">97.27% (1,283/1,319)</tspan> · Estonia 136.5K &amp; 262K Needle: <tspan fill="#FBBF24">5/5 PASS</tspan> · Free UMA: <tspan fill="#C084FC">&gt;=11.5 GiB</tspan></text>
+  </g>
+</svg>

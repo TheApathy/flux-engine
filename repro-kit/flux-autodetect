@@ -1753,11 +1753,15 @@ def calculate_discrete_vram_budget(
             # prefill/decode weights (~19.9 GiB) + BF16 lm_head/scales (~4.5 GiB).
             scratch_gib += 24.4 / ssm_shard_div
         if concurrency > 1:
-            # 48-layer SSM state + rollback snapshot pools (~2.4 GiB/slot sharded by TP*PP)
-            # plus batched DFlash2 proposer state (~1.6 GiB).
-            scratch_gib += float(min(max(1, int(concurrency)), 64)) * (2.4 / ssm_shard_div)
             if speculative_enabled:
+                # 48-layer SSM state + rollback snapshot + DFlash2 proposer rings (~2.4 GiB/slot)
+                # plus shared batched DFlash2 proposer state (~1.6 GiB).
+                scratch_gib += float(min(max(1, int(concurrency)), 64)) * (2.4 / ssm_shard_div)
                 scratch_gib += 1.6 / float(max(1, pp_size))
+            else:
+                # Plain target-only C2..C64: 48-layer f32 SSM + conv state + per-slot decode buffers
+                # plus ~3.5 GiB headroom for lazy cuBLASLt NVFP4 128x4 weight-scale caches on first prefill.
+                scratch_gib += float(min(max(1, int(concurrency)), 128)) * (0.62 / ssm_shard_div)
         elif per_gpu_vram_gib >= 80.0:
             scratch_gib += 2.4 / ssm_shard_div
 
@@ -4505,6 +4509,11 @@ def build_launch_plan(
                 # eliminates Sync #3 and k<4 verify graph churn while keeping full
                 # K=8 DFlash2 speculative width (GB10 UMA untouched).
                 _set_dflash_default("QWEN4_DFLASH_PCUM_THRESH", "0", force_over_base_recipe=True)
+        elif kt in ("qwen3.8-27b", "qwen3.6-27b", "qwen3.5-27b"):
+            if concurrency >= 2:
+                # Engage cross-sequence hoisted batched DFlash2 verify (`C=2..8`) automatically
+                # unless the user explicitly overrides ATLAS_DFLASH_BATCHED_VERIFY / FLUX_DFLASH_BATCHED_VERIFY.
+                _set_dflash_default("DFLASH_BATCHED_VERIFY", "1")
     if (
         not qsa_concurrency
         and requires_qsa
@@ -4574,6 +4583,17 @@ def build_launch_plan(
                     flush=True,
                 )
             env_vars["FLUX_QWEN4_CONCURRENCY_TARGET_ONLY"] = "1"
+            for _k5_key in (
+                "ATLAS_QWEN4_BATCHED_K5",
+                "FLUX_QWEN4_BATCHED_K5",
+                "ATLAS_QWEN4_BATCHED_K5_GDN_MULTI",
+                "FLUX_QWEN4_BATCHED_K5_GDN_MULTI",
+                "ATLAS_QWEN4_BATCHED_ADAPTIVE_K",
+                "FLUX_QWEN4_BATCHED_ADAPTIVE_K",
+                "ATLAS_QWEN4_HYBRID_ALL_K",
+                "FLUX_QWEN4_HYBRID_ALL_K",
+            ):
+                env_vars.pop(_k5_key, None)
 
     if qsa_concurrency:
         # Same rule as qwen4_concurrency.rs: past native context only a shared
@@ -4631,6 +4651,17 @@ def build_launch_plan(
         model_info = dict(model_info)
         model_info["speculative"] = {"mode": "none", "drafter_path": None, "gamma": 0, "native_mtp_k": 0}
         spec = model_info["speculative"]
+        for _k5_key in (
+            "ATLAS_QWEN4_BATCHED_K5",
+            "FLUX_QWEN4_BATCHED_K5",
+            "ATLAS_QWEN4_BATCHED_K5_GDN_MULTI",
+            "FLUX_QWEN4_BATCHED_K5_GDN_MULTI",
+            "ATLAS_QWEN4_BATCHED_ADAPTIVE_K",
+            "FLUX_QWEN4_BATCHED_ADAPTIVE_K",
+            "ATLAS_QWEN4_HYBRID_ALL_K",
+            "FLUX_QWEN4_HYBRID_ALL_K",
+        ):
+            env_vars.pop(_k5_key, None)
 
     thinking_raw = str(env_vars.get("FLUX_THINKING") or os.environ.get("FLUX_THINKING") or "").strip().lower()
     thinking_budget_raw = public_selector("FLUX_THINKING_BUDGET").strip()

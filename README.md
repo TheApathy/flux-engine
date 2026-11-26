@@ -43,10 +43,10 @@
 | Hardware / Model | Measured Result | Verification |
 |---|---|---|
 | **GB10 (`sm_121a`) · `Qwen3.8-Flash-Next-NVFP4`** (`125B + 51B` PLE, `6B` active) — Prefill | **6,501 tok/s** (`16K` peak) · **6,359** (`32K`) · **5,937** (`128K`) · **5,525** (`255K`) · **12,056** warm 8K cache | `w16384` default; interactive `w4096` delivers **4,991–5,448 tok/s** (`~12 GiB` free UMA) |
-| **GB10 (`sm_121a`) · `Qwen3.8-Flash-Next-NVFP4`** — Lossless Speculative Decode | **91.3 tok/s** (`K=5` MTP code) · **89.1** (`DFlash2 W=8` greedy code, **86.1** math) · **43.1** (`K=1` oracle) · **580.7** (`C=8` `K=5`) | `0` token divergence vs `K=1`; **97.27%** GSM8K (`1,283/1,319`); **5/5 PASS** `262K` & `136.6K` 6-hop needle |
-| **GB10 (`sm_121a`) · `Qwen3.8-27B-NVFP4`** (dense hybrid + `DFlash` / `DFlash2`) | **72.4 tok/s** (`DFlash γ=15`, `FP8` KV) · **64.0 tok/s** (`BF16` KV) · **58.0 tok/s** (`DFlash2 γ=7`) · **172.6 tok/s** (`C=8` hoisted) | Prefill **1,773 tok/s** (`2K`) / **1,395 tok/s** (`8K`); `5/5` bit-identical verification |
+| **GB10 (`sm_121a`) · `Qwen3.8-Flash-Next-NVFP4`** — Lossless Speculative Decode | **91.3 tok/s** (`K=5` MTP code) · **113.4** (`DFlash2 W=8` arith, **89.1** code, **86.1** math) · **43.1** (`K=1` oracle) · **580.7** (`C=8` `K=5`) | `0` token divergence vs `K=1`; **97.27%** GSM8K (`1,283/1,319`); **5/5 PASS** `262K` & `136.6K` 6-hop needle |
+| **GB10 (`sm_121a`) · `Qwen3.8-27B-NVFP4`** (dense hybrid + `DFlash` / `DFlash2`) | **81.1 tok/s** (`DFlash2` arith) · **72.4** (`DFlash γ=15`, `FP8` KV) · **64.0** (`BF16` KV) · **172.6** (`C=8` hoisted) | Prefill **1,773 tok/s** (`2K`) / **1,636 tok/s** (`8K`); `5/5` bit-identical verification |
 | **SM120 (`1× RTX PRO 6000 WS`, `600 W`) · `Qwen3.8-Flash-Next-NVFP4`** | **30,869 tok/s** `16K` W4A8 (**34,308** W4A4) · **678 tok/s** `C=1` `DFlash2` · **3,406 tok/s** `C=64` steady (**3,687** `C=16` arith) | **`1M` YaRN4: 3/3 PASS** (`1,011,019` tok in `82.1 s`, `12,319 tok/s`); `1.46M–2.30M` resident KV pool |
-| **SM120 (`1× RTX PRO 6000 WS`, `600 W`) · `Qwen3.8-27B-NVFP4`** | **16,248 tok/s** `8K` prefill · **438.4 tok/s** `C=1` `DFlash2` · **1,073.8 tok/s** `C=8` wall · **1,974.8 tok/s** `C=64` plain | `C=64` hits **`97.3%`** of `1,792 GB/s` GDDR7 roofline · [full profile tables](#why-the-defaults-are-baked-in) |
+| **SM120 (`1× RTX PRO 6000 WS`, `600 W`) · `Qwen3.8-27B-NVFP4`** | **16,248 tok/s** `8K` prefill · **497.1 tok/s** `C=1` `DFlash2` · **1,073.8 tok/s** `C=8` wall · **1,974.8 tok/s** `C=64` plain | `C=1` code **300.0** / edit **312.3**; `C=64` hits **`97.3%`** of `1,792 GB/s` GDDR7 roofline · [full profile tables](#why-the-defaults-are-baked-in) |
 
 <a id="serve-it-now"></a>
 
@@ -494,17 +494,21 @@ Every model below runs on NVIDIA GB10 (`sm_121a`) with hand-tuned
 
 ## ⚡ Performance
 
+<p align="center">
+  <img src="assets/gb10-benchmarks.svg" alt="NVIDIA GB10 / DGX Spark (sm_121a) Prefill, Lossless Decode & Concurrency Benchmarks (v1.0.3)" width="880" />
+</p>
+
 Measured end-to-end through the HTTP API on a single NVIDIA GB10 (`sm_121a`,
 128 GB unified LPDDR5x):
 
 | Model | Mode / Recipe | Prefill (`tok/s`) | Decode (`tok/s`) | Notes |
 |---|---|---:|---:|---|
-| **Qwen3.8-Flash-Next-NVFP4** | `max-prefill` (`w16384`, `K=5` MTP / `DFlash2 W=8`) | **5,994** @ 8K \| **6,501** @ 16K \| **6,359** @ 32K \| **5,937** @ 128K | **91.3** (`K=5` code) \| **89.1** (`DFlash2` code, **86.1** math) \| **43.1** (`K=1` oracle) | `LOSSLESS` 0-ULP exact, GSM8K `97.27%` (`1,283/1,319`); warm 8K prefix cache `12,056 eff. tok/s` |
+| **Qwen3.8-Flash-Next-NVFP4** | `max-prefill` (`w16384`, `K=5` MTP / `DFlash2 W=8`) | **5,994** @ 8K \| **6,501** @ 16K \| **6,359** @ 32K \| **5,937** @ 128K | **91.3** (`K=5` code) \| **113.4** (`DFlash2` arith, **89.1** code, **86.1** math) \| **43.1** (`K=1` oracle) | `LOSSLESS` 0-ULP exact, GSM8K `97.27%` (`1,283/1,319`); warm 8K prefix cache `12,056 eff. tok/s` |
 | **Qwen3.8-Flash-Next-NVFP4** | `interactive` (`w4096`) | **5,448** @ 8K \| **5,327** @ 16K \| **5,063** @ 128K | **91.3** peak code (`62.6–64.0` mixed) | `5/5 >= 5,000 tok/s` (`8K..128K`), `>= 9,890 MiB` free UMA floor |
 | **Qwen3.8-Flash-Next-NVFP4** | Native Concurrency (`C=5 / C=8` batched `K=5`, `C=16` `DFlash2`) | — | **420.3** (`C=5` code) \| **580.7** (`C=8` `K=5`) \| **234.5** (`C=16` `DFlash2`) | `295.7 tok/s` (`C=5` prose), `85.5 tok/s` (`C=8` `K=1` QSA) |
 | **Qwen3.8-Flash-Next-NVFP4** | `256k` (`262,144` native context) | **5,525** (`w16384`) / **4,991** (`w4096`) | **41.8** @ 255K–262K (`46.1` @ 128K) | **5/5 (100% PASS)** exact needle retrieval (`1%..99%` depth), `>= 11,452 MiB` free |
 | **Qwen3.8-Flash-Next-NVFP4** | `estonia-136k` (`136,576` tokens) | **5,400.4** (`25.29 s` TTFT) | **48.2** client (`48.6` srv) | **5/5 (100% PASS)** 6-hop needle past `Latvia` decoy |
-| **Qwen3.8-27B-NVFP4** | `DFlash` (`γ=15`) / `DFlash2` (`γ=7`, hoisted `C=8`) | **1,773** @ 2K \| **1,395** @ 8K | **72.4** (`FP8` KV) \| **64.0** (`BF16` KV) \| **58.0** (`DFlash2`) \| **172.6** (`C=8`) | `5/5` bit-identical verification; plain `13.9` (`25.7` NVFP4 KV) |
+| **Qwen3.8-27B-NVFP4** | `DFlash` (`γ=15`) / `DFlash2` (`γ=7`, hoisted `C=8`) | **1,773** @ 2K \| **1,636** @ 8K | **81.1** (`DFlash2` arith) \| **72.4** (`FP8` KV) \| **64.0** (`BF16` KV) \| **172.6** (`C=8`) | `5/5` bit-identical verification; plain `13.9` (`25.7` NVFP4 KV) |
 | **Qwen3.6-35B-A3B** | NVFP4 / FP8 + MTP (`K=2`) | **3,600+** | **157** (`NVFP4`) / **130** (`FP8`) | Hybrid MoE with native `K=2` MTP and tool calling |
 | **Qwen3.5-35B-A3B** | NVFP4 + MTP (`K=2`) | **3,800+** | **131** | 35B-A3B MoE with native `K=2` MTP speculation on a single GB10 |
 | **Qwen3-Next-80B-A3B** | FP8 KV + MTP | **2,900+** | **74–104** | Pure-Rust FP8 KV + native MTP speculative decode on a single GB10 |
@@ -530,7 +534,7 @@ Certified end-to-end results (see [`docs/SM120_SM103_BRINGUP.md`](docs/SM120_SM1
 |---|---|---:|---:|---|
 | **Qwen3.8-Flash-Next-NVFP4** | `C=1` `DFlash2` (`W=8`, `BF16` KV, `mmap` PLE) | **30,869** @ 16K \| **30,394** @ 32K (`34,308` opt-in `W4A4`) | **661.1** arith \| **507.0** code-edit \| **370.1** code \| **330.9** reasoning | **`11.66 ms/round`** default FP8 `lm_head`; **`678.3`** arith / **`550.5`** code-edit at **`11.29–11.40 ms/round`** (opt-in NVFP4 `lm_head`); `5/5` needles |
 | **Qwen3.8-Flash-Next-NVFP4** | Concurrency (`C=16..64`) | — | **3,687.1** (`C=16` arith wall) \| **3,405.7** (`C=64` steady) | `1,886.0 tok/s` `C=16` mixed steady; `2,023.5 tok/s` `C=64` wall |
-| **Qwen3.8-27B-NVFP4** | Hoisted Batched `DFlash2` (`C=1..8`) & `C=64` plain | **16,248** @ 8K \| **15,012** @ 16K (`3/3` needles) | **438.4** (`C=1` arith) \| **1,073.8** (`C=8` arith wall) \| **1,974.8** (`C=64` plain) | `C=1` code `276.1`; `C=2` `590.1` wall (`~796` steady); `C=4` `600.1` arith / `514.3` mixed wall; `C=8` `711.4` mixed wall (`~2,327` steady); `C=64` `97.3%` GDDR7 roofline |
+| **Qwen3.8-27B-NVFP4** | Hoisted Batched `DFlash2` (`C=1..8`) & `C=64` plain | **16,248** @ 8K \| **15,012** @ 16K (`3/3` needles) | **497.1** (`C=1` arith) \| **1,073.8** (`C=8` arith wall) \| **1,974.8** (`C=64` plain) | `C=1` edit `312.3` / code `300.0`; `C=2` `590.1` wall (`~796` steady); `C=4` `600.1` arith / `514.3` mixed wall; `C=8` `711.4` mixed wall (`~2,327` steady); `C=64` `97.3%` GDDR7 roofline |
 | **Qwen3.8-Flash-Next-NVFP4** | `1M` YaRN4 (`1,011,019` tok) & Pooled NVFP4 KV | **12,303–12,319** (`82.07–82.18 s` TTFT) | **3/3 PASS** (`1,011,019`-tok passkey) | `1× 96 GB`: `1.46M` (`hp=auto` `4×BF16+8×NVFP4`) to `2.30M` (`hp=0`, `2.0M` in `13.50 GiB`); auto-pools `6.3M → 8.4M → 16.8M` across `2×/4×/8×` GPUs via `flux-autodetect` |
 
 ---

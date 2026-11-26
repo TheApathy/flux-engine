@@ -339,6 +339,8 @@ jobs:
         # fixable HIGH/CRITICAL findings in GitHub Code Scanning Security alerts.
         if: needs.preflight.outputs.dry_run != 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
         with:
           scan-type: image
           image-ref: ghcr.io/theapathy/flux-engine@${{ steps.build.outputs.digest }}
@@ -478,6 +480,8 @@ jobs:
         # fixable HIGH/CRITICAL findings in GitHub Code Scanning Security alerts.
         if: needs.preflight.outputs.dry_run != 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
         with:
           scan-type: image
           image-ref: ghcr.io/theapathy/flux-engine@${{ steps.build.outputs.digest }}
