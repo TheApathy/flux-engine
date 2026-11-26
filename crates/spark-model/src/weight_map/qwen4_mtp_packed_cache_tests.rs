@@ -240,7 +240,7 @@ fn packed_mtp_cache_and_qwen4_mtp_head_pin_rne_weight_quantizer() {
         TARGET_KERNELS,
         "quantize_nvfp4/nvfp4_global_absmax+quantize_bf16_to_nvfp4_weight_rne"
     );
-    let qwen4_mtp = include_str!("../layers/qwen4_mtp.rs");
+    let qwen4_mtp = include_str!("../layers/qwen4_mtp/init.rs");
     assert!(
         qwen4_mtp.contains("quantize_bf16_to_nvfp4_weight_rne"),
         "Qwen4MtpHead::new must prefer hardware-RNE NVFP4 weight quantizer"

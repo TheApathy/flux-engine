@@ -91,6 +91,15 @@ mod tests {
 
         for auxiliary in [
             include_str!("../layers/qwen4_mtp.rs"),
+            include_str!("../layers/qwen4_mtp/forward.rs"),
+            include_str!("../layers/qwen4_mtp/graph_cache.rs"),
+            include_str!("../layers/qwen4_mtp/graphed_chain.rs"),
+            include_str!("../layers/qwen4_mtp/gumbel_draft.rs"),
+            include_str!("../layers/qwen4_mtp/init.rs"),
+            include_str!("../layers/qwen4_mtp/policy.rs"),
+            include_str!("../layers/qwen4_mtp/proposer_impl.rs"),
+            include_str!("../layers/qwen4_mtp/ragged_propose.rs"),
+            include_str!("../layers/qwen4_mtp/state.rs"),
             include_str!("../layers/mtp_head/new.rs"),
         ] {
             assert!(
