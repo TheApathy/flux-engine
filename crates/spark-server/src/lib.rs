@@ -40,6 +40,9 @@ pub mod prefill_twophase_gate;
 // `rm`, and `device` unit tests without linking the full server binary.
 pub mod display_carveout;
 
+// Typed Tier-1 public operator configuration surface (`FluxConfig`).
+pub mod flux_config;
+
 // REST retrieval draft store runtime binding. The binary crate declares its
 // own `mod rest_store;` (`main.rs`) next to the scheduler call site; this
 // declaration exists so `cargo test -p spark-server --lib` can exercise the

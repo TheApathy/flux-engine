@@ -36,6 +36,8 @@ mod refusal_tests;
 mod resolved_tests;
 #[cfg(test)]
 mod test_fixtures;
+#[cfg(test)]
+mod tier_tests;
 
 use crate::cli::ServeArgs;
 use std::collections::BTreeMap;

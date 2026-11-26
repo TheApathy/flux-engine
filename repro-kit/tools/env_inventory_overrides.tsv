@@ -67,7 +67,6 @@ ATLAS_DFLASH_QUANT	ROUTE	draft-only; verify keeps the target argmax
 ATLAS_MTP_FP8_CALIB	ROUTE	draft-only; verify keeps the target argmax
 ATLAS_TARGET_QUANT	RESOURCE	build selector; at runtime read only as a transform-cache key (transform_cache.rs), option_env! is compile-time
 ATLAS_TARGET_MODEL	RESOURCE	build selector; at runtime read only as a transform-cache key (transform_cache.rs), option_env! is compile-time
-FLUX_TARGET_QUANT	RESOURCE	build selector; at runtime read only as a transform-cache key (transform_cache.rs), option_env! is compile-time
 ATLAS_QWEN4_DENSE_NATIVE	NUMERICS	umbrella native-dense precision selector (qwen4_native_selectors.rs:20), owned by [precision]
 ATLAS_QWEN4_PREFILL_NATIVE	NUMERICS	native-dense prefill precision selector (qwen4_prefill_native.rs:48), owned by [precision]
 ATLAS_QWEN4_RELEASE_MXFP8_SOURCES	RESOURCE	mxfp8_release.rs:34 frees consumed checkpoint MXFP8 store originals after conversion; byte-identical output
@@ -107,3 +106,8 @@ FLUX_SPEC_INITIAL_RATE	ROUTE	adaptive speculative draft depth cold-start surviva
 ATLAS_QWEN4_ROUTER_BF16_TK64	ROUTE	tile shape selector for BF16 MoE router GEMM (layers/moe/forward_prefill.rs); bit-identical output
 ATLAS_CUBLASLT_CACHE	RESOURCE	enable/disable persistent on-disk cuBLASLt heuristic plan cache (cublaslt/plan_cache.rs)
 ATLAS_CUBLASLT_CACHE_PATH	RESOURCE	override filesystem path for persistent cuBLASLt heuristic plan cache (cublaslt/plan_cache.rs)
+ATLAS_QWEN4_TARGET_LMHEAD_MODE	NUMERICS	selects target lm_head precision (fp8/bf16/nvfp4)
+FLUX_QWEN4_TARGET_LMHEAD_MODE	NUMERICS	selects target lm_head precision (fp8/bf16/nvfp4)
+ATLAS_DFLASH_HONOR_IS_CAUSAL	DEBUG	validated by cli_dflash_environment_rules.rs and pinned by built-in DFlash2 recipes
+ATLAS_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
+FLUX_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
