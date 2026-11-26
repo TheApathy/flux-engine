@@ -15,10 +15,10 @@ file ownership and machine-verified regression gates:
 
 | Track | Focus Area | Key Deliverable | Verified Impact (v1.0.3 → v1.1) |
 |---|---|---|---|
-| **Track A** | CUDA `.cu` Deduplication | Shared common kernel headers / deduplicated Blackwell `.cu` sources | *[TBD — filled by Track A on merge]* |
+| **Track A** | CUDA `.cu` Deduplication | Layer-2 `kernels/gb10/nvfp4/` hoist + 14 canonical headers in `kernels/gb10/common/shared/` + thin `#include` shims; zero-ref legacy kernel removal | `kernels/gb10/`: **-32,554 net LOC** (`-40,422` `.cu` LOC, `+7,868` shared `.cuh` LOC), **15 duplicate groups (34 copies) → 0**, 2 zero-ref `.cu` deleted; **0 stem/symbol diffs** across all 57 `(hw, model, quant)` targets & 153 `nvcc --ptx` compiles (`sm_121f`/`sm_120a`/`sm_103a`) |
 | **Track B** | Env-Var Governance & `FluxConfig` | Typed 40-knob Tier-1 `FluxConfig` surface, `EnvTier` catalog boundary, lexer-aware `env_inventory.py --check`, dead-reader pruning | `env_catalog.tsv`: **1,275 → 1,189** (`DEBUG` **150 → 54**, `-96`; **111** dead/stale/false-positive/test-only entries removed; **25** previously-hidden production readers recovered; **40** curated Tier-1 public knobs vs **1,155** Tier-2 internal catalog entries) |
-| **Track C** | Rust Monolith Decomposition | Modular decomposition of oversized model/scheduler modules (`dense_ffn`, `verify_qwen4_batched_step`, `qwen4_mtp`, `noise_pass`) | *[TBD — filled by Track C on merge]* |
-| **Track D** | CUDA Kernel Shape Templatization | Parameterized shape templates replacing copy-pasted kernel instantiations | *[TBD — filled by Track D on merge]* |
+| **Track C** | Rust Monolith Decomposition | Rust 2018+ modular decomposition of the 4 largest `.rs` files (`dense_ffn`, `verify_qwen4_batched_step`, `qwen4_mtp`, `noise_pass`) | **35,175 LOC** across 4 monoliths (max **11,867 LOC**) → 49 cohesive modules, **max 1,471 LOC** (`-87.6%` peak file size); zero API/behavior changes, zero `env_catalog.tsv` drift, `clippy --workspace --all-targets -- -D warnings` clean |
+| **Track D** | CUDA Kernel Modularization & Shape Templatization | Canonical `Qwen4MoeGeometry<Hidden, Inter, NumExperts, TopK, MhcStreams, MhcRank>` + `Qwen4Ts4eLayout` in `qwen4_geometry.cuh`; split 4 hottest Flash-Next `.cu` monoliths into 26 `detail/*.cuh` headers | Top-level Flash-Next `.cu`: **18,281 → 571 LOC** (`v28` `8,175 → 52`, `hc_combine` `6,614 → 25`, `v32` `1,815 → 272`, `v33` `1,677 → 222`; all `.cuh` ≤ **1,398 LOC**); **408 / 408** `(file, arch, entry)` `ptxas -v` rows **0 diffs / 0 regressions / 0 B spills** on `sm_121a`/`sm_120a`/`sm_103a`; live GB10 parity **4/4 PASS** (`cos = 1.000000`) |
 
 ---
 
@@ -180,7 +180,48 @@ Regenerated directly from source via `python3 repro-kit/tools/env_inventory.py .
 
 ---
 
-## 5. Related Documentation
+## 5. CUDA Kernel Deduplication & Shared Layering (Track A)
+
+`crates/atlas-kernels/build_hw.rs` resolves `.cu` sources through a three-layer priority hierarchy (`$hw/common/` → `$hw/$quant/` → `$hw/$model/$quant/`), with recursive quoted `#include` dependency tracking in `build_deps.rs`. Track A eliminated all **15 non-shim code-identical duplicate groups (34 redundant copies)** under `kernels/gb10/` (**`-32,554` net LOC** across `.cu` + `.cuh`):
+
+- **Layer-2 NVFP4 Hoist (`w4a16_gemm.cu`):** Created [`kernels/gb10/common/shared/w4a16_gemm_nvfp4_v1.cuh`](../kernels/gb10/common/shared/w4a16_gemm_nvfp4_v1.cuh) and Layer-2 [`kernels/gb10/nvfp4/w4a16_gemm.cu`](../kernels/gb10/nvfp4/w4a16_gemm.cu), removing 10 identical per-model copies and reducing `gemma-4-31b` from 1,394 → 6 LOC while leaving non-`nvfp4` targets (`cb3`, `exl3`, `iq3`) and specialized overrides untouched.
+- **Canonical Shared Headers (`kernels/gb10/common/shared/`):** Consolidated `moe_w4a16_grouped_gemm` (10 targets via 2 shared headers), `vision_encoder` (6 targets), `rms_norm` (7 targets via `rms_norm_standard_core.cuh` + Mamba/Gemma-4 extensions), `gated_delta_rule` (3 targets), `moe_shared_expert_fused_batch2` (2 targets), and all 5 Gemma-4 512-dim/activation kernel pairs.
+- **Zero-Ref Dead Kernels Removed:** Deleted unreferenced `kernels/gb10/common/inferspark_prefill_v47.cu` (494 LOC) and `w4a16_dequant_prmt_proto.cu` (270 LOC), saving 38 unnecessary `nvcc` compilations across a 19-target build.
+- **Bit-Exact Verification:** Across all **57** `(hw, model, quant)` targets (`gb10`, `rtx6000`, `gb300`), `stem_mismatches = 0` and `sym_mismatches = 0`; across all **153** direct `nvcc --ptx` compiles (`sm_121f`/`sm_120a`/`sm_103a`), `entry_mismatches = 0` with zero per-entry PTX instruction diffs.
+
+---
+
+## 6. Rust Monolith Decomposition (Track C)
+
+The four largest Rust files (**35,175 LOC** total) were decomposed into cohesive Rust 2018+ module trees (`foo.rs` coordinator + `foo/*.rs` submodules + `*_tests.rs` test suites) with zero public API changes, zero performance regressions, and **every resulting file ≤ 1,471 LOC**:
+
+| Module | Before (LOC) | After Layout | Peak File (LOC) |
+|---|---:|---|---:|
+| [`crates/spark-model/src/layers/dense_ffn.rs`](../crates/spark-model/src/layers/dense_ffn.rs) | 11,867 | 17 files (`dense_ffn.rs` = 86 LOC + 16 submodules) | 1,471 |
+| [`crates/spark-server/src/scheduler/verify_qwen4_batched_step.rs`](../crates/spark-server/src/scheduler/verify_qwen4_batched_step.rs) | 8,504 | 12 files (`verify_qwen4_batched_step.rs` = 103 LOC + 11 submodules) | 1,026 |
+| [`crates/spark-model/src/layers/qwen4_mtp.rs`](../crates/spark-model/src/layers/qwen4_mtp.rs) | 7,632 | 11 files (`qwen4_mtp.rs` = 46 LOC + 10 submodules) | 1,457 |
+| [`crates/spark-model/src/layers/dflash_head/noise_pass.rs`](../crates/spark-model/src/layers/dflash_head/noise_pass.rs) | 7,172 | 9 files (`noise_pass.rs` = 60 LOC + 8 submodules) | 1,229 |
+
+All static `include_str!` contract tests, microgate provenance SHA checks, and `env_inventory.py --check` invariants were updated without weakening a single assertion.
+
+---
+
+## 7. Flash-Next CUDA Modularization & Shape Templatization (Track D)
+
+The four hottest Flash-Next Blackwell NVFP4 MoE and mHC kernels (**18,281 LOC** total) were factored into compile-time geometry traits and focused `.cuh` modules while keeping identical top-level `.cu` stems and `extern "C" __global__` entry symbols:
+
+- **Compile-Time Shape Traits ([`qwen4_geometry.cuh`](../kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4_geometry.cuh)):** Replaced hardcoded `2560`/`640`/`512`/`10`/`4`/`320` literals with `Qwen4MoeGeometry<Hidden, Inter, NumExperts, TopK, MhcStreams, MhcRank>` (with divisibility `static_assert` invariants and `Qwen4Ts4eLayout<N, K>`), instantiated for `Qwen4FlashNextShape = Qwen4MoeGeometry<2560, 640, 512, 10, 4, 320>` and compile-verified on alternate geometry `<3072, 768, 256, 8, 4, 384>`.
+- **Modular Header Decomposition:**
+  - `qwen4_moe_compact_t_k32_v28.cu`: **8,175 → 52 LOC** (`detail/moe_compact/`, 11 headers, max 1,398 LOC)
+  - `qwen4_hc_combine_gemm.cu`: **6,614 → 25 LOC** (`detail/hc_combine/`, 9 headers, max 1,203 LOC)
+  - `qwen4_moe_w4a4_v32.cu`: **1,815 → 272 LOC** (`detail/moe_w4a4/`, 2 headers, max 1,172 LOC)
+  - `qwen4_moe_thin_sk_v33.cu`: **1,677 → 222 LOC** (`detail/moe_thin_sk/`, 2 headers, max 1,161 LOC)
+  - Shared FP4/MMA/PDL primitives extracted to `detail/qwen4_nvfp4_common.cuh` (283 LOC).
+- **Exact Compiler & Live GB10 Verification:** Automated `ptxas -v` diffing across all **408** `(file, arch, entry)` rows (`sm_121a`, `sm_120a`, `sm_103a`) reported **0 missing, 0 extra, 0 diffs, 0 regressions**, with **0 B stack / 0 B spills** on SM121a/SM120a. Formal PTX+SASS verification (`verify_ptx_isa_contracts.py`) proved 21 kernels / 377 entries (`0` odd `desc[UR]`), and live NVIDIA GB10 GPU parity tests passed **4/4** (`cos = 1.000000`, `max = 0.000e0`).
+
+---
+
+## 8. Related Documentation
 
 - [ADR-0011: Fail-Closed Recipe Contract](adr/recipe-contract.md)
 - [Operator Guide](OPERATOR-GUIDE.md)
