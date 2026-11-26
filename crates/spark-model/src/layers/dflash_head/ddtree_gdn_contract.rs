@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! M5A milestone: tree-aware GDN/conv reference math — Atlas contract.
+//! Tree-aware GDN/conv reference math — DDTree I/O contract.
 //!
-//! The actual reference implementation lives in Python at
-//! `research/ddtree_port/ddtree_src/prototypes/ddtree_gdn_reference.py`
-//! and is the **bit-equality oracle** for the M8A CUDA kernel.
+//! Documents the exact tensor shapes, dtypes, and semantics expected by the
+//! tree-aware DDTree GDN CUDA kernel and its offline bit-equality differential
+//! verification tests.
 //!
-//! This module documents the I/O contract so that:
-//!   1. M8A's CUDA kernel knows the exact tensor shapes + semantics
-//!   2. Atlas's integration tests can dump (q, k, v, gate, beta, parent_ids,
-//!      initial_state) → run the Python reference → diff Atlas kernel output
-//!
-//! Rationale for not duplicating the math in Rust:
+//! Rationale for not duplicating the reference loop in Rust:
 //!   - Reference does state-shape [HV=32, V=128, K=128] = 524 K float ops/token
 //!   - All M8A consumers are CUDA kernels, not CPU code — the Python ref is
 //!     the right place for a once-per-test oracle, not pure-Rust math

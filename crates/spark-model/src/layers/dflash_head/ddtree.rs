@@ -50,8 +50,8 @@ impl DDTree {
     }
 
     /// Parent indices for non-root verifier nodes. `-1` (encoded as `i32`)
-    /// signals the root. Layout matches the GPU-side parent tensor that
-    /// later milestones (M6A/M8A) feed to the tree-aware GDN replay.
+    /// signals the root. Layout matches the GPU-side parent tensor fed to
+    /// the tree-aware GDN replay kernel.
     pub fn parent_indices_for_verifier(&self) -> Vec<i32> {
         self.non_root_nodes()
             .iter()
@@ -512,9 +512,9 @@ pub fn build_parent_conditioned_tree(
 // Parent metadata — port of ddtree_parent_metadata.py
 // ============================================================================
 //
-// Builds the [num_reqs, max_tree_tokens + 1] parent-id tensor that later
-// milestones (M6A/M8A) feed to the tree-aware GDN/Flash replay. Rows without
-// a tree payload are PADDING_PARENT-filled; lengths report 0 for those rows.
+// Builds the [num_reqs, max_tree_tokens + 1] parent-id tensor fed to the
+// tree-aware GDN/Flash replay kernels. Rows without a tree payload are
+// PADDING_PARENT-filled; lengths report 0 for those rows.
 
 /// Sentinel parent id meaning "root of the tree" (encodes -1 in the i32 tensor).
 pub const ROOT_PARENT: i32 = -1;

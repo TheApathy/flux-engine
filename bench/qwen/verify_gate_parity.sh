@@ -4,9 +4,9 @@
 #
 # Why this exists
 # ---------------
-# `local/serve-aeon-27b-dflash.sh` is the script that actually produced the
-# published numbers. `qwen_champion_env()` in env.sh is a second, hand-written
-# copy of the same configuration, kept separate so the bench harness can run
+# When validating `qwen_champion_env()` in `env.sh` against an external
+# reference launcher (`QWEN_LAUNCHER`), this script re-derives the gate set
+# from both and fails closed on any drift.
 # without the launcher's box-specific preflight. Two copies of one truth drift.
 #
 # They already did. An earlier version of env.sh was checked "21 gates, 0
@@ -29,9 +29,6 @@ set -uo pipefail
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO="$(cd "$BENCH_DIR/../.." && pwd)"
 LAUNCHER="${QWEN_LAUNCHER:-}"
-if [ -z "$LAUNCHER" ] && [ -f "$REPO/local/serve-aeon-27b-dflash.sh" ]; then
-  LAUNCHER="$REPO/local/serve-aeon-27b-dflash.sh"
-fi
 ENVSH="$BENCH_DIR/env.sh"
 
 # A configuration this small cannot legitimately shrink to a handful of gates.
@@ -42,7 +39,7 @@ MIN_GATES=25
 
 if [ -z "$LAUNCHER" ] || [ ! -f "$LAUNCHER" ]; then
   echo "FATAL: reference launcher not found (${LAUNCHER:-unset})." >&2
-  echo "  Set QWEN_LAUNCHER=/path/to/serve-aeon-27b-dflash.sh to compare bench/qwen/env.sh against an external reference launcher." >&2
+  echo "  Set QWEN_LAUNCHER=/path/to/reference-launcher.sh to compare bench/qwen/env.sh against an external reference launcher." >&2
   exit 2
 fi
 [ -f "$ENVSH" ]    || { echo "FATAL: env.sh not found: $ENVSH" >&2; exit 2; }

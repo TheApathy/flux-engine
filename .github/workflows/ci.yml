@@ -215,6 +215,13 @@ jobs:
           /* Errors */
           int cuGetErrorName(int code, const char **out) { (void)code; (void)out; return 100; }
           int cuGetErrorString(int code, const char **out) { (void)code; (void)out; return 100; }
+          /* Pointer / address range queries */
+          int cuPointerGetAttribute(void *data, int attr, unsigned long long ptr) {
+              (void)data; (void)attr; (void)ptr; return 100;
+          }
+          int cuMemGetAddressRange_v2(unsigned long long *pbase, unsigned long *psize, unsigned long long dptr) {
+              (void)pbase; (void)psize; (void)dptr; return 100;
+          }
           /* Streams */
           int cuStreamCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
           int cuStreamDestroy_v2(void *a) { (void)a; return 100; }

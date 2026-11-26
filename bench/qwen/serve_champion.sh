@@ -17,18 +17,15 @@ source "$(dirname "${BASH_SOURCE[0]:-$0}")/env.sh"
 qwen_require_model
 
 # --- GATE PARITY --------------------------------------------------------------
-# When an external reference launcher (QWEN_LAUNCHER or local/serve-aeon-27b-dflash.sh)
-# is present, re-derive its gate set and refuse to serve on any drift from
+# When an external reference launcher (QWEN_LAUNCHER) is present,
+# re-derive its gate set and refuse to serve on any drift from
 # qwen_champion_env() in env.sh. When running self-contained from this repo
-# without that untracked external launcher, qwen_champion_env() in bench/qwen/env.sh
+# without an external launcher, qwen_champion_env() in bench/qwen/env.sh
 # is the authoritative configuration.
 #
 # Runs BEFORE qwen_kill_serves below: a config error should not cost you a
 # running serve before it tells you what is wrong.
 LAUNCHER="${QWEN_LAUNCHER:-}"
-if [ -z "$LAUNCHER" ] && [ -f "$REPO/local/serve-aeon-27b-dflash.sh" ]; then
-  LAUNCHER="$REPO/local/serve-aeon-27b-dflash.sh"
-fi
 if [ -n "$LAUNCHER" ]; then
   QWEN_LAUNCHER="$LAUNCHER" bash "$BENCH_DIR/verify_gate_parity.sh" \
     || { echo "FATAL: refusing to serve a configuration that is not the champion." >&2; exit 7; }

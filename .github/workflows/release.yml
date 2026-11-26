@@ -358,6 +358,7 @@ jobs:
           )
 
           gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             "dist/${src_tar}" \
             "dist/${lic_tar}" \
             "dist/${sbom_json}" \

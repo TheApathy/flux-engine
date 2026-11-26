@@ -112,8 +112,8 @@ qwen_require_model
 # is a separate question, and it decides whether the absolute tok/s here may be
 # quoted alongside the published table. Check it when the launcher is present,
 # and say plainly which of the two claims is supported when it is not.
-LAUNCHER="${QWEN_LAUNCHER:-$REPO/local/serve-aeon-27b-dflash.sh}"
-if [ -f "$LAUNCHER" ]; then
+LAUNCHER="${QWEN_LAUNCHER:-}"
+if [ -n "$LAUNCHER" ] && [ -f "$LAUNCHER" ]; then
   bash "$BENCH/verify_gate_parity.sh" \
     || { echo "FATAL: gates differ from the champion launcher -- refusing to run." >&2; exit 7; }
 else

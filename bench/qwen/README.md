@@ -242,10 +242,10 @@ This launcher asserts its own invariants and refuses to report a healthy serve
 unless all of them hold. Every assert exists because its absence once produced a
 clean-looking but wrong measurement:
 
-1. **Gate parity (pre-launch).** `env.sh`'s `qwen_champion_env()` is a second copy
-   of the configuration in `local/serve-aeon-27b-dflash.sh`, the script the
-   published numbers were measured on. `verify_gate_parity.sh` re-derives the
-   gate set from that launcher on every run and refuses to serve on any
+1. **Gate parity (pre-launch).** When `QWEN_LAUNCHER` points to an external
+   reference launcher script, `verify_gate_parity.sh` re-derives the gate set
+   from that launcher on every run and refuses to serve on any drift from
+   `env.sh`'s `qwen_champion_env()`.
    difference. It runs *before* the preflight kill, so a config error does not
    cost you a running serve. This one is not hypothetical: eleven gates were
    missing from `env.sh` for a while, because the check that cleared it had been
@@ -381,7 +381,7 @@ event the refusal exists to prevent.
 | File | Purpose |
 |---|---|
 | `env.sh` | Every path, port, gate and geometry setting for the harness. |
-| `verify_gate_parity.sh` | Re-derives the gate set from `local/serve-aeon-27b-dflash.sh` and fails on drift. That launcher, not `env.sh`, is the source of truth. |
+| `verify_gate_parity.sh` | Re-derives the gate set from an external `$QWEN_LAUNCHER` script (when provided) and fails on drift from `env.sh`. |
 | `build_cutlass.sh` | Release build with the correct kernel target. |
 | `serve_champion.sh` | Self-verifying launcher (the six asserts above). |
 | `benchenv.py` | Log scraping. Owns the accept anchor: read it before editing a regex. |

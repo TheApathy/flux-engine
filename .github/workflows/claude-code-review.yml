@@ -139,6 +139,17 @@ jobs:
                  arrays only), unquoted variables, or silent import-time `pip install` /
                  network fetches.
 
+            6. **GitHub Actions, `.gitignore`, Docker & Supply-Chain Integrity**
+               - Flag any `.gitignore` pattern (e.g., `*token*`, `core.*`, `*.env`) that could
+                 silently drop tracked `.rs`, `.cu`, `.cuh`, or recipe files on fresh clones.
+               - Flag GitHub Actions defects: floating/unpinned action tags (only official
+                 `slsa-framework/slsa-github-generator` requires release tag `@v2.1.0`),
+                 `pull_request_target`, overly broad `permissions:`, missing `shell: bash`
+                 in `container:` steps using `pipefail`, or untrusted `${{ github.event.* }}`
+                 interpolation inside `run:`.
+               - Flag Dockerfile build/runtime mismatches (e.g., `FLASHINFER_HOME` absent at
+                 build time vs runtime env defaults) or missing AGPL-3.0 notice bundles.
+
             ## OUTPUT FORMAT
             - Use a concise, constructive, peer-respectful tone.
             - Post inline comments on specific lines for concrete bugs or security issues.

@@ -343,7 +343,7 @@ pub struct ForwardContext<'a> {
     /// True when inside CUDA graph capture (between begin_capture/end_capture).
     /// MoE layers use sync all_reduce (capturable) instead of async (event-based).
     pub graph_capture: bool,
-    /// M8A: DDTree parent_ids device tensor for tree-aware GDN dispatch.
+    /// DDTree `parent_ids` device tensor for tree-aware GDN dispatch.
     /// `Some(ptr)` when the K=γ verify path is processing a non-flat tree
     /// payload (verify_d.rs uploads it from `a.pending_tree_payload`).
     /// `None` for flat verify — GDN falls through to the fused wy_k path.
