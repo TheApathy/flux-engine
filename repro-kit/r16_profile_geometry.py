@@ -694,7 +694,7 @@ IMAGE_ENVIRONMENT = {
     "PYTHONUNBUFFERED": "1",
     # 753bc22b9 bundles FlashInfer into the image.
     "FLASHINFER_HOME": "/opt/flux/fi_home",
-    "FLUX_ENGINE_VERSION": "1.0.2",
+    "FLUX_ENGINE_VERSION": "1.0.3",
     "FLUX_TARGET": "qwen3.8-flash-next",
     "FLUX_MODE": "auto",
     "FLUX_HOST": "0.0.0.0",

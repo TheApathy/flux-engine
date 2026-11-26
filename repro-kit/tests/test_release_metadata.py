@@ -15,7 +15,7 @@ from unittest import mock
 
 
 KIT_DIR = Path(__file__).resolve().parents[1]
-STABLE_VERSION = "1.0.2"
+STABLE_VERSION = "1.0.3"
 
 
 def _load_script(module_name: str, script_name: str):

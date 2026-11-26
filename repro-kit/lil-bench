@@ -67,7 +67,7 @@ LIL_ROOT = _resolve_lil_root()
 LIL_SCRIPT = LIL_ROOT / "llm_decode_bench.py"
 os.environ.setdefault("LLM_BENCH_NO_UPDATE_CHECK", "1")
 
-STABLE_ENGINE_VERSION = "1.0.2"
+STABLE_ENGINE_VERSION = "1.0.3"
 
 
 def engine_version() -> str:

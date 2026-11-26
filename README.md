@@ -270,7 +270,7 @@ python3 bench/qwen38-flash-next-gb10/estonia_bench.py \
   --output /tmp/estonia_136k.json --repetitions 5
 ```
 
-Measured the same way across all three execution paths on GB10 (`sm_121a`):
+Measured the same way across all three execution paths on GB10 (`sm_121a`, historical `v0.9.12-6k-stable` container-vs-source-vs-host parity receipt — `<= 0.12%` variance across build paths):
 
 | Path | 16K Prefill (`tok/s`) | `K=5` Decode (`tok/s`) | 136.5K Estonia |
 |---|---:|---:|---:|
@@ -346,7 +346,7 @@ compiles directly to `sm_121a` PTX/SASS with zero register spills (`-Xptxas -v -
 On `Qwen3.8-Flash-Next`, fusing the 4-stream hyper-connection bus (`mHC`),
 routing 512 experts through `cutlass_5222` (`v28q`/`v17q`) W4A8 grouped GEMMs,
 scoring QSA blocks with `ldmatrix.x4` at 5 CTAs/SM, and streaming 128 NVFP4 PLE
-shards over 4 DMA rings lifts single-Spark 16K prefill past **6,080 tok/s** and
+shards over 4 DMA rings lifts single-Spark 16K prefill to **6,501 tok/s** (and discrete Blackwell SM120 to **30,869–34,308 tok/s**) and
 keeps `K=5` speculative decode **100% lossless (`2,560 / 2,560` greedy tokens exact)**.
 
 ---

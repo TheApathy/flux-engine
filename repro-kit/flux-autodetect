@@ -27,7 +27,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-STABLE_ENGINE_VERSION = "1.0.2"
+STABLE_ENGINE_VERSION = "1.0.3"
 DEFAULT_MAX_SEQ_LEN_SENTINEL = 131072
 # Widest native Qwen4 decode/verify frame (spark_model::layers::QWEN4_NATIVE_MAX_ROWS).
 # Native batching is the server default across the logical C1..C128 admission
@@ -451,6 +451,8 @@ MODE_ALIASES = {
     "v1.0": "nextgen",
     "v1.0.0": "nextgen",
     "v1.0.1": "nextgen",
+    "v1.0.3": "nextgen",
+    "1.0.3": "nextgen",
     "v1.0.2": "nextgen",
     "1.0": "nextgen",
     "1.0.0": "nextgen",

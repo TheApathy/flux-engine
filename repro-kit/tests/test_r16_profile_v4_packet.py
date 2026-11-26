@@ -258,9 +258,9 @@ class HostBinding(unittest.TestCase):
         for line in block.replace("ENV ", "", 1).splitlines():
             key, value = line.strip().rstrip("\\").strip().split("=", 1)
             values[key] = value.strip('"')
-        values["FLUX_ENGINE_VERSION"] = "1.0.2"
+        values["FLUX_ENGINE_VERSION"] = "1.0.3"
         values.pop("LD_LIBRARY_PATH")
-        self.assertIn('ARG FLUX_ENGINE_VERSION="1.0.2"', text)
+        self.assertIn('ARG FLUX_ENGINE_VERSION="1.0.3"', text)
         self.assertEqual(values, G.IMAGE_ENVIRONMENT)
 
 
