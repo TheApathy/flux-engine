@@ -75,7 +75,7 @@ fn fixed_k_steps_record_once_per_trim_and_on_terminal_success() {
 
 #[test]
 fn batched_route_records_only_after_settlement() {
-    let source = include_str!("verify_qwen4_batched_step.rs");
+    let source = include_str!("verify_qwen4_batched_step/verify_exec.rs");
     assert_eq!(source.matches("record_settled_frame(").count(), 2);
     let trim = source
         .find(".context(\"batched verify trim proposer\")?;")
@@ -91,6 +91,12 @@ fn adaptive_depth_is_fed_only_through_the_settled_helper() {
     for source in [
         include_str!("verify_dflash_step.rs"),
         include_str!("verify_qwen4_batched_step.rs"),
+        include_str!("verify_qwen4_batched_step/depth_controller.rs"),
+        include_str!("verify_qwen4_batched_step/dflash_budget.rs"),
+        include_str!("verify_qwen4_batched_step/planning.rs"),
+        include_str!("verify_qwen4_batched_step/propose.rs"),
+        include_str!("verify_qwen4_batched_step/stochastic_staging.rs"),
+        include_str!("verify_qwen4_batched_step/verify_exec.rs"),
         include_str!("verify_k2_step.rs"),
         include_str!("verify_k3_step.rs"),
         include_str!("verify_k4_step.rs"),
@@ -125,8 +131,8 @@ fn short_frame_receipt_describes_a_c1_k4_frame() {
 
 #[test]
 fn adaptive_depth_cap_applies_before_the_batched_armed_check() {
-    let source = include_str!("verify_qwen4_batched_step.rs");
-    let body = body_of(source, "pub(super) fn effective_num_drafts(", "\n}\n");
+    let source = include_str!("verify_qwen4_batched_step/depth_controller.rs");
+    let body = body_of(source, "fn effective_num_drafts(", "\n}\n");
     assert!(
         !body.contains("return configured;"),
         "C=1 must not bypass the depth cap"
