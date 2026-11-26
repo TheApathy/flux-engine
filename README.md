@@ -1,134 +1,139 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Flux Inference Engine — Pure Rust + SM121a CUDA/PTX Runtime" width="880" />
+  <img src="assets/logo.svg" alt="Flux Inference Engine — Pure Rust + Blackwell CUDA/PTX Runtime" width="840" />
 </p>
+
+<h1 align="center">Flux Inference Engine</h1>
+
 <p align="center">
-  <h1 align="center">Flux Inference Engine</h1>
-  <p align="center">
-    <strong>Pure Rust + SM121a CUDA/PTX LLM Inference</strong><br>
-    <em>Hardware-Specific Inference at the GB10 Memory Bandwidth Ceiling</em>
-  </p>
-  <p align="center">
-    <img alt="NVIDIA Blackwell SM121a / SM120a" src="https://img.shields.io/badge/NVIDIA-Blackwell%20SM121a%20%2F%20SM120a-76B900?style=flat-square&logo=nvidia&logoColor=white">
-    <img alt="Apple Metal (Experimental)" src="https://img.shields.io/badge/Apple%20Metal-experimental-555555?style=flat-square&logo=apple&logoColor=white">
-    <a href="LICENSE"><img alt="License: AGPLv3" src="https://img.shields.io/badge/license-AGPLv3-yellow?style=flat-square"></a>
-    <a href="#serve-it-now"><img alt="Pure Rust" src="https://img.shields.io/badge/runtime-pure%20Rust-orange?style=flat-square"></a>
-    <a href="repro-kit/README.md"><img alt="GHCR" src="https://img.shields.io/badge/GHCR-theapathy%2Fflux--engine-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
-    <a href="https://theapathy.github.io/flux-engine/"><img alt="Docs Site" src="https://img.shields.io/badge/docs-theapathy.github.io-0EA5E9?style=flat-square&logo=mdbook&logoColor=white"></a>
-    <a href="https://github.com/TheApathy/flux-engine/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/TheApathy/flux-engine/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="https://github.com/TheApathy/flux-engine/actions/workflows/formal-verify.yml"><img alt="Formal Verification" src="https://github.com/TheApathy/flux-engine/actions/workflows/formal-verify.yml/badge.svg"></a>
-    <a href="https://github.com/TheApathy/flux-engine/actions/workflows/release.yml"><img alt="Release" src="https://github.com/TheApathy/flux-engine/actions/workflows/release.yml/badge.svg"></a>
-    <a href="https://scorecard.dev/viewer/?uri=github.com/TheApathy/flux-engine"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/TheApathy/flux-engine/badge"></a>
-  </p>
+  <strong>Self-contained Rust + custom Blackwell CUDA/PTX LLM inference server.</strong><br>
+  Zero Python runtime dependency · OpenAI, Anthropic &amp; Ollama-compatible API · Formally verified invariants
 </p>
 
 <p align="center">
-  <a href="https://theapathy.github.io/flux-engine/"><img alt="Documentation Site" src="https://img.shields.io/badge/%F0%9F%93%96%20Docs%20Site-0EA5E9?style=for-the-badge"></a>
-  <a href="https://theapathy.github.io/flux-engine/api-explorer/"><img alt="Interactive OpenAPI Explorer" src="https://img.shields.io/badge/%F0%9F%94%8C%20API%20Explorer-6366F1?style=for-the-badge"></a>
-  <a href="GETTING_STARTED.md"><img alt="Getting Started & Diagnostics Guide" src="https://img.shields.io/badge/%E2%9A%A1%20Getting%20Started-2EA44F?style=for-the-badge&logo=docker&logoColor=white"></a>
-  <a href="repro-kit/README.md"><img alt="Reproducibility Kit" src="https://img.shields.io/badge/%F0%9F%93%A6%20Repro%20Kit-F48C06?style=for-the-badge"></a>
-  <a href="docs/verification/BENCHMARK_VERIFICATION.md"><img alt="Benchmark Methodology & Verification" src="https://img.shields.io/badge/%F0%9F%9B%A1%EF%B8%8F%20Verification-38BDF8?style=for-the-badge"></a>
-</p>
-
-<p align="center">
-  <a href="https://theapathy.github.io/flux-engine/"><b>Docs</b></a> ·
-  <a href="https://theapathy.github.io/flux-engine/api-explorer/"><b>API Explorer</b></a> ·
-  <a href="GETTING_STARTED.md"><b>Getting Started</b></a> ·
-  <a href="#serve-it-now"><b>Serve It Now</b></a> ·
-  <a href="#why-the-defaults-are-baked-in"><b>Benchmarks</b></a> ·
-  <a href="docs/KERNEL-PROFILE.md"><b>Kernel Profile</b></a> ·
-  <a href="ARCHITECTURE.md"><b>Architecture</b></a> ·
-  <a href="AGENTS.md"><b>AGENTS.md</b></a> ·
-  <a href="SIGNING.md"><b>Signing</b></a>
+  <a href="https://theapathy.github.io/flux-engine/"><img alt="Docs" src="https://img.shields.io/badge/docs-theapathy.github.io-0EA5E9?style=flat-square"></a>
+  <a href="https://github.com/TheApathy/flux-engine/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/TheApathy/flux-engine/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/TheApathy/flux-engine/actions/workflows/formal-verify.yml"><img alt="Formal Verification" src="https://github.com/TheApathy/flux-engine/actions/workflows/formal-verify.yml/badge.svg"></a>
+  <a href="https://github.com/TheApathy/flux-engine/actions/workflows/release.yml"><img alt="Release" src="https://github.com/TheApathy/flux-engine/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/TheApathy/flux-engine"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/TheApathy/flux-engine/badge"></a>
+  <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-blue?style=flat-square"></a>
 </p>
 
 ---
 
-# This repository: Qwen3.8-Flash-Next & Multi-Model GB10 Inference
+## Overview
 
-> **`TheApathy/flux-engine`** (`v1.0.3`): an independently maintained Rust + CUDA/PTX
-> inference engine built on [`MonumentalSystems/atlas`](https://github.com/MonumentalSystems/atlas)
-> and [`Avarok-Cybersecurity/atlas`](https://github.com/Avarok-Cybersecurity/atlas)
-> via [`TheApathy/apathy-atlas`](https://github.com/TheApathy/apathy-atlas),
-> tuned for NVIDIA Grace Blackwell (`GB10`, `sm_121a`, 128 GB unified LPDDR5X @
-> ~273 GB/s).
->
-> - **`Qwen3.8-Flash-Next-NVFP4` (`125B + 51B` PLE, `6B` active) on a single GB10:**
->   - **Prefill (`w16384`):** **6,028–6,299 tok/s** (`8K–16K`), **5,906 tok/s** (`128K`), **5,525 tok/s** (`262K`); interactive `w4096` delivers **5,063–5,448 tok/s** with `11.9–12.7 GiB` free UMA headroom.
->   - **Lossless `K=5` Inferact MTP decode (`0` token divergence vs `K=1`):** **56.5–57.4 tok/s** sustained coding (**62.6–91.3 tok/s** on high-acceptance code/repetition prompts), **46.1 tok/s** at `128K`, **41.8 tok/s** at `262K`, and **580.7 tok/s** aggregate at `C=8` batched concurrency.
->   - **Verification & long-context accuracy:** **97.27%** (`1,283 / 1,319`) on GSM8K, **5/5 PASS** on `262,144`-token needle retrieval, and **5/5 PASS** (`5,400.4 tok/s` prefill / `48.2 tok/s` decode) on the `136,576`-token 6-hop Estonia needle benchmark.
-> - **`Qwen3.8-27B-NVFP4` (dense hybrid + DFlash):** **63.9 tok/s** on the 400-token MinHeap coding probe (`BF16-KV`, `γ=15`) and **58.012 tok/s** on the 1,500-token corrected-ABI control.
-> - **Multi-model `sm_121a` support:** first-class targets for **`DeepSeek-V4.1`**, **`GLM-5.3-Flash`**, **`Gemma-4`**, **`Qwen3.6-35B-A3B`**, **`Qwen3.5`**, **`Mistral-Small-4`**, **`MiniMax-M2.7`**, and **`Nemotron-3`**. See [`docs/compatibility/model-matrix.yaml`](docs/compatibility/model-matrix.yaml), [`CHANGELOG.md`](CHANGELOG.md), and [`CREDITS.md`](CREDITS.md).
+**Flux Engine** (`v1.0.3`, `AGPL-3.0-only`) is an independently maintained Rust + CUDA/PTX LLM inference engine built on [`MonumentalSystems/atlas`](https://github.com/MonumentalSystems/atlas) and [`Avarok-Cybersecurity/atlas`](https://github.com/Avarok-Cybersecurity/atlas) via [`TheApathy/apathy-atlas`](https://github.com/TheApathy/apathy-atlas).
+
+- **Native Rust + Blackwell CUDA/PTX:** Zero Python runtime dependency. Compiles target-specific kernels with static dispatch for **GB10 (`sm_121a`, 128 GB UMA)**, discrete **SM120** (RTX 50-series / RTX PRO 5000 & 6000), **SM103**, and experimental Apple Silicon **Metal**.
+- **Drop-In Serving & Operations:** OpenAI (`/v1/chat/completions`, `/v1/responses`), Anthropic (`/v1/messages`), and Ollama endpoints with SSE streaming, continuous batching, lossless speculative decoding (`MTP` / `DFlash2`), radix prefix caching, structured JSON/EBNF output (`xgrammar`), Prometheus `/metrics`, Ratatui TUI, and Web UI.
+- **Multi-Model Coverage:** `Qwen3.8-Flash-Next`, `Qwen3.8-27B`, `DeepSeek-V4.1`, `GLM-5.3-Flash`, `Gemma-4`, `Qwen3.6-35B-A3B`, `Qwen3.5`, `Mistral-Small-4`, `MiniMax-M2.7`, and `Nemotron-3` ([`docs/compatibility/model-matrix.yaml`](docs/compatibility/model-matrix.yaml)).
+- **Formally Verified & Signed Supply Chain:** 19 Z3 SMT UNSAT theorems, a 99,596-state TLA+ BFS scheduler model, a zero-spill PTX/SASS CI gate, SSH-signed commits/tags, SLSA Build L3 provenance, Cosign + Rekor signatures, and SPDX 2.3 SBOMs ([`SIGNING.md`](SIGNING.md)).
+
+## Documentation & Navigation
+
+| Area | Links |
+|---|---|
+| **Docs & API** | [Documentation Site](https://theapathy.github.io/flux-engine/) · [OpenAPI Explorer](https://theapathy.github.io/flux-engine/api-explorer/) · [`GETTING_STARTED.md`](GETTING_STARTED.md) · [`FLAGS.md`](FLAGS.md) · [`docs/API.md`](docs/API.md) |
+| **Serve & Deploy** | [Quick Start](#serve-it-now) · [Build from Source](#or-build-from-source) · [`deploy/` (systemd, K8s, Grafana)](deploy/README.md) · [`docs/clients/` (Claude Code, Codex, OpenCode)](docs/clients/README.md) |
+| **Benchmarks & Specs** | [Profile Tables](#why-the-defaults-are-baked-in) · [`repro-kit/`](repro-kit/README.md) · [`BENCHMARK_VERIFICATION.md`](docs/verification/BENCHMARK_VERIFICATION.md) · [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/KERNEL-PROFILE.md`](docs/KERNEL-PROFILE.md) |
+| **Engineering & Security** | [`AGENTS.md`](AGENTS.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`SIGNING.md`](SIGNING.md) · [`.github/SECURITY.md`](.github/SECURITY.md) · [`CHANGELOG.md`](CHANGELOG.md) · [`CREDITS.md`](CREDITS.md) |
+
+## Qualified Performance (`GB10` / `sm_121a`)
+
+| Model / Workload | Measured Result | Verification |
+|---|---|---|
+| **`Qwen3.8-Flash-Next-NVFP4`** (`125B + 51B` PLE, `6B` active) — Prefill | **6,028–6,299 tok/s** (`8K–16K`) · **5,906 tok/s** (`128K`) · **5,525 tok/s** (`262K`) | `w16384` default; interactive `w4096` delivers **5,063–5,448 tok/s** (`11.9–12.7 GiB` free UMA) |
+| **`Qwen3.8-Flash-Next-NVFP4`** — Lossless `K=5` MTP Decode | **56.5–57.4 tok/s** coding (**62.6–91.3 tok/s** high-accept) · **46.1 tok/s** (`128K`) · **41.8 tok/s** (`262K`) · **580.7 tok/s** (`C=8`) | `0` token divergence vs `K=1`; **97.27%** GSM8K (`1,283/1,319`); **5/5 PASS** `262K` & `136.5K` 6-hop needle |
+| **`Qwen3.8-27B-NVFP4`** (dense hybrid + `DFlash`) | **63.9 tok/s** (`400`-tok coding probe, `BF16-KV`, `γ=15`) · **58.012 tok/s** (`1,500`-tok control) | Reproducible via [`repro-kit/`](repro-kit/README.md) · [full profile tables](#why-the-defaults-are-baked-in) |
 
 <a id="serve-it-now"></a>
 
-## Serve it now
+## Quick Start (Serve It Now)
 
-### 1. Universal local-model container (`ghcr.io/theapathy/flux-engine:v1.0.3` / `:v1.0` / `:gb10` / `:latest`)
+### 1. Run with Docker (GHCR)
 
-Mount your local models directory at `/models` and point `flux serve` at **any**
-checkpoint directory. The container entrypoint inspects `config.json`,
-`hf_quant_config.json`, `ple/` shards, vision towers, and companion speculative
-drafters (`DFlash2` or `Inferact-MTP`), then selects the right `--kernel-target`,
-operating recipe (`FLUX_MODE=auto` -> `flux-nextgen-max-prefill-decode.env`),
-PLE DMA ring configuration, and draft width (`gamma`) automatically *(release
-line `v1.0.x`: tags `v1.0.3`, `v1.0`, `gb10`, `latest`; prior `v0.9.x` tags
-remain available for historical comparison)*:
+Mount your local models directory at `/models` — the entrypoint auto-detects the checkpoint architecture, quantization config, PLE shards, vision towers, and companion `DFlash2`/`MTP` drafters. Official signed images are published for **GB10 (`linux/arm64`)** (`:v1.0.3-gb10` / `:gb10`) and **SM120 (`linux/amd64`)** (`:v1.0.3-sm120` / `:sm120`).
 
 ```bash
-# Serve Qwen3.8-Flash-Next-NVFP4 out of the box (~33s cold boot, 6,231–6,381 tok/s @ 16K prefill,
-# 82.4 tok/s C=1 greedy / 66.9..298.8 tok/s C=1..16 Prose with auto-attached DFlash2)
+# NVIDIA GB10 / DGX Spark (linux/arm64) — auto-detects model & recipe under /models
 docker run --rm --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
-  -p 8899:8899 \
+  -p 127.0.0.1:8899:8899 \
   -v "$MODELS_ROOT:/models:ro" \
-  ghcr.io/theapathy/flux-engine:v1.0.3
+  ghcr.io/theapathy/flux-engine:v1.0.3-gb10
 
-# High-concurrency C=16 serving (zero-flag OOB, auto-attaches companion DFlash2 if mounted under /models)
+# Discrete Blackwell SM120 (RTX 5090 / RTX PRO 6000, linux/amd64)
 docker run --rm --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
-  -p 8899:8899 \
+  -p 127.0.0.1:8899:8899 \
+  -v "$MODELS_ROOT:/models:ro" \
+  ghcr.io/theapathy/flux-engine:v1.0.3-sm120
+```
+
+Verify the running server:
+
+```bash
+curl -sf http://127.0.0.1:8899/health
+curl -sf http://127.0.0.1:8899/v1/models
+```
+
+<details>
+<summary><b>More Docker examples</b> (high concurrency, selecting a checkpoint, <code>list-models</code>, optional <code>io_uring</code>)</summary>
+
+```bash
+# High-concurrency C=16 serving (auto-attaches companion DFlash2 if present under /models)
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -p 127.0.0.1:8899:8899 \
   -v "$MODELS_ROOT:/models:ro" \
   -e FLUX_CONCURRENCY=16 \
-  ghcr.io/theapathy/flux-engine:v1.0.3
+  ghcr.io/theapathy/flux-engine:v1.0.3-gb10
 
-# Serve any other local checkpoint (e.g. Qwen3.8-27B + DFlash, Qwen3.6-35B-A3B, DeepSeek-V4.1, Gemma-4)
+# Serve a specific checkpoint with an explicit companion drafter
 docker run --rm --gpus all --ipc=host \
   --ulimit memlock=-1 \
-  -p 8899:8899 \
+  -p 127.0.0.1:8899:8899 \
   -v "$MODELS_ROOT:/models:ro" \
   -e FLUX_MODEL=/models/Qwen3.8-27B-NVFP4 \
   -e FLUX_DRAFT_MODEL=/models/Qwen3.8-27B-DFlash2 \
   -e FLUX_MODE=auto \
   ghcr.io/theapathy/flux-engine:gb10
 
-# Inspect a model directory or scan all checkpoints under /models without launching a server
+# Scan all local checkpoints under /models without launching a server
 docker run --rm --gpus all -v "$MODELS_ROOT:/models:ro" \
   ghcr.io/theapathy/flux-engine:gb10 list-models /models
 ```
 
-> **Optional `io_uring` flag for NVMe PLE offload:** Docker's default seccomp profile works out of the box (`ple_offload.rs` automatically falls back to `pread64`). If you want kernel `io_uring` async DMA for `Qwen3.8-Flash-Next` NVMe PLE shards, optionally add `--security-opt seccomp=unconfined` (or a custom seccomp profile allowing `io_uring_setup`/`io_uring_enter`).
+> **Optional `io_uring` for NVMe PLE offload:** Docker's default seccomp profile works out of the box (`ple_offload.rs` falls back to `pread64`). To enable kernel `io_uring` async DMA for `Qwen3.8-Flash-Next` NVMe PLE shards, pass `--security-opt seccomp=unconfined` or a custom seccomp profile allowing `io_uring_setup` / `io_uring_enter`.
+
+</details>
+
+<details>
+<summary><b>Container environment variables</b> (<code>FLUX_*</code> reference — 15 options)</summary>
 
 | Environment Variable | Default | Purpose |
 |---|---|---|
-| `FLUX_MODEL` | *(auto-discovered in `/models` or positional arg)* | Path to local model checkpoint directory inside the container |
+| `FLUX_MODEL` | *(auto-discovered in `/models`)* | Path to local model checkpoint directory inside the container |
 | `FLUX_MODE` | `auto` | Operating profile: `auto`, `max-prefill` (`w16384`), `interactive` (`w4096`), `fast-prefill` (`fast`), `decode` (`lossless-decode`), `long-context` (`136k`), `exact` (`exact-reference`) |
-| `FLUX_PORT` | `8899` | HTTP listening port for the OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/health`) |
-| `FLUX_MAX_SEQ_LEN` | Mode-dependent (`40960` / `65536` / `135168` / `143360`) | Maximum context length in tokens (`--max-seq-len`) |
+| `FLUX_PORT` | `8899` | HTTP listening port (`/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/health`) |
+| `FLUX_MAX_SEQ_LEN` | Mode-dependent (`40960`–`143360`) | Maximum context length in tokens (`--max-seq-len`) |
 | `FLUX_KV_CACHE_DTYPE` | `auto` (`bf16` / `fp8` / `turboquant`) | KV cache precision (`bf16` required for lossless speculative decode recipes) |
-| `FLUX_GPU_MEMORY_UTILIZATION` | `0.55` (GB10 UMA) / `0.90` (discrete) | Safe GPU/UMA memory fraction (`--gpu-memory-utilization`) |
-| `FLUX_DRAFT_MODEL` | *(optional; `Qwen3.8-Flash-Next` uses built-in `mtp.*` by default)* | Path to companion `DFlash` or external `MTP` drafter directory (auto-reads `block_size`) |
+| `FLUX_GPU_MEMORY_UTILIZATION` | `0.55` (GB10) / `0.90` (discrete) | Safe GPU/UMA memory fraction (`--gpu-memory-utilization`) |
+| `FLUX_DRAFT_MODEL` | *(optional; built-in `mtp.*` used by default)* | Path to companion `DFlash` or external `MTP` drafter directory |
 | `FLUX_GAMMA` | `auto` (`4` for MTP `K=5`, `block_size - 1` for DFlash) | Speculative draft tokens per step (`gamma`) |
-| `FLUX_DFLASH_LOOKUP` | `off` | Opt-in lossless context-lookup drafting on top of DFlash (27B): `sam` or `retrieval` (+33% / +37% on edit-heavy prompts; `retrieval` can cost ~3.7 ms/step on a miss at 262K) |
-| `FLUX_DISABLE_SPECULATION` | `0` *(unset)* | Set to `1` to disable all speculative decoding (equivalent to `--no-speculative` / `ATLAS_DISABLE_SPECULATION=1`; use `FLUX_DRAFT_MODEL=none` to disable external DFlash/MTP sidecars) |
-| `FLUX_THINKING` | unset (`MODEL.toml` `thinking_default` applies) | Default `<think>` reasoning traces (`on`, `off`, or unset for model default; `off` forces `--disable-thinking`) |
-| `FLUX_THINKING_BUDGET` | MODEL profile (`262144` in `MODEL.toml` for Qwen3.8-Flash-Next) | Optional server-ceiling override; request budgets may select a lower value |
-| `FLUX_CPU_AFFINITY` | `5-9,15-19` (GB10 20-core ARM64) | CPU core pinning mask passed to `taskset -c` (10 Cortex-X925 performance cores) |
-| `FLUX_PLE_RAM_STAGE` | `0` *(opt-in via `1` or `--ple-ram`)* | Stage `ple-offload/` shards into `/dev/shm` `tmpfs` (`ATLAS_PLE_OFFLOAD_DIR`, read-only `/models:ro` safe) with `128K` mixed `NVFP4` KV (`4/12` `BF16` boundary layers) and `FP8_WEIGHT_CACHE=0` — eliminates slow cloud/loopback storage IOPS caps (`--shm-size=32g` required) |
-| `FLUX_PLE_RAM_DIR` | `/dev/shm/flux-ple-offload` | Base `tmpfs` directory for `--ple-ram` / `FLUX_PLE_RAM_STAGE=1` (also accepts `--ple-ram-dir`) |
+| `FLUX_DFLASH_LOOKUP` | `off` | Opt-in lossless context-lookup drafting on top of DFlash (27B): `sam` or `retrieval` |
+| `FLUX_DISABLE_SPECULATION` | `0` *(unset)* | Set to `1` to disable all speculative decoding (`FLUX_DRAFT_MODEL=none` disables external sidecars) |
+| `FLUX_THINKING` | unset (`MODEL.toml` default) | Default `<think>` reasoning traces (`on`, `off`, or unset) |
+| `FLUX_THINKING_BUDGET` | `MODEL.toml` profile (`262144`) | Optional server-ceiling override for reasoning tokens |
+| `FLUX_CPU_AFFINITY` | `5-9,15-19` (GB10 ARM64) | CPU core pinning mask passed to `taskset -c` |
+| `FLUX_PLE_RAM_STAGE` | `0` *(opt-in)* | Stage `ple-offload/` shards into `/dev/shm` `tmpfs` (`--shm-size=32g` required) |
+| `FLUX_PLE_RAM_DIR` | `/dev/shm/flux-ple-offload` | Base `tmpfs` directory for `--ple-ram` / `FLUX_PLE_RAM_STAGE=1` |
 
-See [`FLAGS.md`](FLAGS.md), [`docs/CONTAINER_GUIDE.md`](docs/CONTAINER_GUIDE.md), and [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md) for the complete variable and CLI flag reference.
+See [`FLAGS.md`](FLAGS.md), [`docs/CONTAINER_GUIDE.md`](docs/CONTAINER_GUIDE.md), and [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md) for the complete CLI and environment reference.
 
-### 2. Measure it
+</details>
+
+### 2. Verify Throughput & Determinism
 
 ```bash
 git clone https://github.com/TheApathy/flux-engine.git
@@ -137,14 +142,14 @@ python3 flux-engine/bench/qwen38-flash-next-gb10/lil_decode_bench.py \
   --output /tmp/flash_next_probe.json --repetitions 3 --max-tokens 256
 ```
 
-Expect single-stream `K=5` decode of **91.26 tok/s** on `tf_streams_code_256` (`87.72 tok/s` on `sparkdash_code_400`, `86.86 tok/s` on `rep0`, `66.20 tok/s` on `sparkdash_prose_400`, `63.98 tok/s` on `chat0`, `62.59 tok/s` on `code0`, `50.58 tok/s` on `prose0`, `55.27 tok/s` at 8K, `53.72 tok/s` at 32K, `53.03 tok/s` at 64K, `46.1 tok/s` / `43.79 tok/s` at 128K, and `41.8 tok/s` at 255K/262K), `deterministic: true` (`3x256` bit-identical raw logits), and an identical `stable_output_sha256` across all repetitions. For the full 8K..128K prefill + lossless `K=5` verification sweep:
+On a single GB10 (`sm_121a`), single-stream `K=5` decode reaches **62.6–91.3 tok/s** on code/repetition prompts, **50.6–66.2 tok/s** on prose/chat, **53.0–55.3 tok/s** at `8K–64K`, **46.1 tok/s** at `128K`, and **41.8 tok/s** at `255K–262K` — with `deterministic: true` (`3×256` bit-identical raw logits) and identical `stable_output_sha256` across repetitions. For the full `8K–128K` prefill and lossless `K=5` sweep:
 
 ```bash
 docker run --rm --gpus all --ipc=host \
   --ulimit memlock=-1 \
   -v "$PWD/results:/results" \
   -v "$MODELS_ROOT:/models:ro" \
-  ghcr.io/theapathy/flux-engine:v1.0.3 \
+  ghcr.io/theapathy/flux-engine:v1.0.3-gb10 \
   bench run \
     --config /opt/flux/repro-kit/benchmark-config.yaml \
     --output /results/results.json
@@ -318,22 +323,6 @@ block-scaled Tensor Core throughput (`NVFP4` x `MXFP8` `mma.sync...f8f6f4.block_
 and L2 residency. Discrete Blackwell (`SM120` RTX PRO 6000) and Hopper (`SM90a`) `.env` profiles
 are also provided in [`repro-kit/recipes/`](repro-kit/recipes/), while datacenter
 Blackwell (`SM100a` B200) is supported via runtime dispatch.
-
----
-
-## 📑 Table of Contents
-
-- [🧭 Philosophy](#philosophy)
-- [🏛️ Architecture](#architecture)
-- [📦 What We Ship Today](#models)
-- [⚡ Performance](#performance)
-- [🗜️ KV Cache Quantization](#kv-cache)
-- [🚀 Quick Start](#quick-start)
-- [🔬 Kernel Debugging](#debugging)
-- [🔌 Adding a New Hardware Target](#new-hardware)
-- [🧬 Adding a New Model](#new-model)
-- [📚 Citations](#citations)
-- [⚖️ License and Attribution](#license)
 
 ---
 
