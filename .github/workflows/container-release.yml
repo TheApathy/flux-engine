@@ -264,18 +264,34 @@ jobs:
 
       - name: Build and push SM120 image
         id: build
+        if: needs.preflight.outputs.dry_run != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/sm120/Dockerfile
           platforms: linux/amd64
-          push: ${{ needs.preflight.outputs.dry_run != 'true' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
           sbom: true
           provenance: mode=max
+          cache-from: type=gha,scope=flux-sm120
+          cache-to: type=gha,scope=flux-sm120,mode=max
+
+      - name: Build SM120 image (dry-run)
+        if: needs.preflight.outputs.dry_run == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/sm120/Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
           cache-from: type=gha,scope=flux-sm120
           cache-to: type=gha,scope=flux-sm120,mode=max
 
@@ -383,16 +399,30 @@ jobs:
 
       - name: Build and push GB10 image
         id: build
+        if: needs.preflight.outputs.dry_run != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/gb10/Dockerfile
           platforms: linux/arm64
-          push: ${{ needs.preflight.outputs.dry_run != 'true' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: mode=max
+          cache-from: type=gha,scope=flux-gb10
+          cache-to: type=gha,scope=flux-gb10,mode=max
+
+      - name: Build GB10 image (dry-run)
+        if: needs.preflight.outputs.dry_run == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/gb10/Dockerfile
+          platforms: linux/arm64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=flux-gb10
           cache-to: type=gha,scope=flux-gb10,mode=max
 

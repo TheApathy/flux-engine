@@ -143,8 +143,9 @@ echo "OK chat template: native laguna ($(grep -oE "Using model's bundled chat te
 # against a moving target and a "divergence" means nothing.
 req='{"model":"laguna","messages":[{"role":"user","content":"Write a Python function gcd(a,b) using Euclid. Output only code."}],"max_tokens":80,"temperature":0.0,"chat_template_kwargs":{"enable_thinking":false}}'
 hash_once() {
-  curl -s -m 60 "$BASE_URL/v1/chat/completions" -H 'Content-Type: application/json' -d "$req" \
-    | python3 -c "import sys,json,hashlib;print(hashlib.sha256(json.load(sys.stdin)['choices'][0]['message']['content'].encode()).hexdigest()[:16])" 2>/dev/null
+  local resp
+  resp="$(curl -s -m 60 "$BASE_URL/v1/chat/completions" -H 'Content-Type: application/json' -d "$req")"
+  python3 -c "import sys,json,hashlib;print(hashlib.sha256(json.load(sys.stdin)['choices'][0]['message']['content'].encode()).hexdigest()[:16])" <<<"$resp" 2>/dev/null
 }
 h1=$(hash_once); h2=$(hash_once)
 if [ -n "$h1" ] && [ "$h1" = "$h2" ]; then

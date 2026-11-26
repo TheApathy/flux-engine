@@ -200,7 +200,7 @@ jobs:
       - name: Run offline Python & shell test suites
         run: |
           set -euo pipefail
-          python3 -m pip install --disable-pip-version-check --quiet pytest pyyaml httpx rich requests psutil z3-solver
+          python3 -m pip install --disable-pip-version-check --quiet --require-hashes -r .github/requirements-ci.txt
           PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q \
             repro-kit/tests \
             repro/tests \

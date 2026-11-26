@@ -56,9 +56,7 @@ if command -v jq >/dev/null 2>&1; then
       fi
     done
 else
-  curl -sS -N -X POST "$FLUX_URL/v1/chat/completions" \
-    "${CURL_HEADERS[@]}" \
-    -d "$PAYLOAD" | python3 -u -c '
+  python3 -u -c '
 import json, sys
 for raw in sys.stdin:
     line = raw.rstrip("\r\n")
@@ -73,5 +71,5 @@ for raw in sys.stdin:
         if content:
             sys.stdout.write(content)
             sys.stdout.flush()
-'
+' < <(curl -sS -N -X POST "$FLUX_URL/v1/chat/completions" "${CURL_HEADERS[@]}" -d "$PAYLOAD")
 fi

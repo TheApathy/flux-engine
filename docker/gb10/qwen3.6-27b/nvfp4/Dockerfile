@@ -22,8 +22,11 @@ RUN apt-get update -qq && \
     apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev && \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+COPY --from=rust:1.93.1-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 /usr/local/cargo /usr/local/cargo
+COPY --from=rust:1.93.1-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 /usr/local/rustup /usr/local/rustup
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
 ENV CUDA_HOME=/usr/local/cuda
 # nvcc must be ON PATH, not merely findable via CUDA_HOME: cudarc 0.19.2's
 # build.rs:115 shells out to a bare `nvcc --version` and panics if it is not
