@@ -34,7 +34,7 @@ jobs:
       github.event.sender.type == 'User' &&
       (github.event.pull_request.author_association == 'OWNER' ||
        github.event.pull_request.author_association == 'MEMBER')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -145,8 +145,8 @@ jobs:
                - Flag GitHub Actions defects: floating/unpinned action tags (only official
                  `slsa-framework/slsa-github-generator` requires release tag `@v2.1.0`),
                  `pull_request_target`, overly broad `permissions:`, missing `shell: bash`
-                 in `container:` steps using `pipefail`, or untrusted `${{ github.event.* }}`
-                 interpolation inside `run:`.
+                 in `container:` steps using `pipefail`, or untrusted `github.event.*`
+                 expression interpolation inside `run:`.
                - Flag Dockerfile build/runtime mismatches (e.g., `FLASHINFER_HOME` absent at
                  build time vs runtime env defaults) or missing AGPL-3.0 notice bundles.
 

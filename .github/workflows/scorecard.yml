@@ -25,7 +25,7 @@ concurrency:
 jobs:
   analysis:
     name: Scorecard Analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       # Needed to upload SARIF results to GitHub Code Scanning.

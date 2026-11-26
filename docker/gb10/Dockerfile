@@ -42,6 +42,15 @@ ENV ATLAS_TARGET_HW=gb10
 ENV ATLAS_TARGET_MODEL=*
 ENV ATLAS_TARGET_QUANT=*
 
+# Pinned MIT ExLlamaV3 source required by crates/atlas-kernels/build.rs when
+# building universal (`ATLAS_TARGET_MODEL=*`) images including GLM-5.3-Flash EXL3.
+ARG EXLLAMAV3_REV=e648f1a131365aae15920073e761a3fa5a527654
+RUN git init -q /tmp/exllamav3 && \
+    git -C /tmp/exllamav3 remote add origin https://github.com/turboderp-org/exllamav3.git && \
+    git -C /tmp/exllamav3 fetch --depth 1 origin "${EXLLAMAV3_REV}" && \
+    git -C /tmp/exllamav3 checkout -q FETCH_HEAD
+ENV ATLAS_EXLLAMAV3_SOURCE=/tmp/exllamav3
+
 RUN cargo build --release -p spark-server
 
 # ── Runtime stage ────────────────────────────────────────────────

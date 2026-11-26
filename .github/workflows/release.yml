@@ -32,7 +32,7 @@ concurrency:
 jobs:
   preflight:
     name: Release Preflight, Signed-Tag & Compliance Gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -184,7 +184,7 @@ jobs:
   build-artifacts:
     name: Build Deterministic AGPL Tarballs, SPDX 2.3 SBOM & Cosign Bundle
     needs: preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -297,7 +297,7 @@ jobs:
     name: Publish GitHub Release
     needs: [preflight, build-artifacts, slsa-provenance]
     if: needs.preflight.outputs.dry_run != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write

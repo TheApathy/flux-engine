@@ -5,39 +5,54 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'docs/**'
+      - 'assets/**'
+      - 'README.md'
+      - 'GETTING_STARTED.md'
+      - 'ARCHITECTURE.md'
+      - 'FLAGS.md'
+      - 'SIGNING.md'
+      - 'REPRODUCING.md'
+      - 'CONTRIBUTING.md'
+      - 'CHANGELOG.md'
+      - 'CREDITS.md'
+      - 'TRADEMARKS.md'
+      - 'llms.txt'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/build_docs_site.py'
       - '.github/workflows/docs.yml'
   pull_request:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'docs/**'
+      - 'README.md'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/build_docs_site.py'
       - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions: {}
 
 concurrency:
-  group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
 
 env:
-  # Skip CUDA/nvcc in build.rs so rustdoc can run on hosts without a GPU.
-  # - ATLAS_SKIP_BUILD=1: atlas-kernels emits a stub target_ptx.rs
-  # - CUDARC_CUDA_VERSION=13000: short-circuits cudarc's `nvcc --version`
-  #   probe. Format is {major}0{minor}0 — 13000 == CUDA 13.0.
   ATLAS_SKIP_BUILD: "1"
   CUDARC_CUDA_VERSION: "13000"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-permissions:
-  contents: read
-
 jobs:
   build:
-    name: Build rustdoc
-    runs-on: ubuntu-latest
+    name: Build Docs Site (mdBook + Rustdoc + API Explorer)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -45,36 +60,67 @@ jobs:
 
       - name: Install native build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cmake clang libclang-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "1.93.1"
 
+      - name: Install mdBook
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2
+        with:
+          tool: mdbook
+
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Build rustdoc
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
 
       - name: Add rustdoc index redirect
         run: |
           cat > target/doc/index.html <<'EOF'
           <!DOCTYPE html>
           <html><head><meta charset="utf-8">
-          <title>Flux Engine API Reference</title>
+          <title>Flux Engine Rustdoc API</title>
           <meta http-equiv="refresh" content="0; url=atlas_core/index.html">
           </head><body>
           <p>Redirecting to <a href="atlas_core/index.html">atlas_core</a>…</p>
           </body></html>
           EOF
 
-      - name: Upload rustdoc artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - name: Build combined GitHub Pages site (mdBook + Rustdoc + Scalar API Explorer)
+        run: |
+          python3 -B scripts/build_docs_site.py \
+            --repo-root . \
+            --output _site \
+            --rustdoc target/doc
+
+      - name: Configure GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Upload GitHub Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
-          name: rustdoc-api
-          path: target/doc
-          retention-days: 7
-          if-no-files-found: error
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

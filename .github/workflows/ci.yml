@@ -23,9 +23,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    name: cargo fmt --check
-    runs-on: ubuntu-latest
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'kernels/**'
+              - 'build-support/**'
+              - 'jinja-templates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+
+  lint:
+    name: Fast Lint (rustfmt, SPDX headers, typos)
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -35,11 +60,21 @@ jobs:
         with:
           toolchain: "1.93.1"
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Verify SPDX license headers
+        uses: apache/skywalking-eyes/header@a196742f472feaffafea537ce5a2a4c3c53a8de4 # v0.9.0
+        with:
+          config: .licenserc.yaml
+          mode: check
+      - name: Check spelling (typos)
+        uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
 
   clippy:
     name: cargo clippy --tests
-    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -58,32 +93,9 @@ jobs:
       # ergonomic local iteration; CI denies all warnings via `-D warnings`.
       - run: cargo clippy --workspace --tests -- -D warnings
 
-  license-headers:
-    name: SPDX license headers
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: apache/skywalking-eyes/header@a196742f472feaffafea537ce5a2a4c3c53a8de4 # v0.9.0
-        with:
-          config: .licenserc.yaml
-          mode: check
-
-  typos:
-    name: typos
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
-
   hygiene:
     name: Privacy, secrets, workflow lint & offline Python tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -175,8 +187,10 @@ jobs:
           bash tools/recipe_bench/trap_test.sh
 
   test:
-    name: cargo test --workspace
-    runs-on: ubuntu-latest
+    name: cargo nextest --workspace
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -472,7 +486,7 @@ jobs:
            * links against. Each returns ncclSystemError (2) so any
            * caller fails-fast; never invoked at runtime in default
            * `cargo test` because every NCCL test is `#[ignore]`-gated. */
-          int ncclGetVersion(int *version) { (void)version; return 2; }
+          int ncclGetVersion(int *version) { if (version) *version = 22900; return 0; }
           int ncclGetUniqueId(void *uid) { (void)uid; return 2; }
           const char *ncclGetErrorString(int code) { (void)code; return "no GPU (CI stub)"; }
           int ncclCommInitRank(void **comm, int n, void *uid, int rank) {
@@ -517,16 +531,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "1.93.1"
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      # Default `cargo test` skips `#[ignore]`-gated tests, which is
-      # exactly what we want — every test that requires a real GPU
-      # (spark-runtime, spark-storage, atlas-kernels, atlas-spark-bench
-      # correctness, spark-server integration) carries `#[ignore]` and
-      # is run locally on GPU hardware via `-- --ignored`.
-      - run: cargo test --workspace --locked
+      # Process-per-test isolation via cargo-nextest prevents parallel env-var
+      # races while skipping `#[ignore]`-gated GPU tests on no-GPU runners.
+      - run: cargo nextest run --workspace --locked --no-fail-fast
 
   test-macos-metal:
     name: cargo test --features metal (macOS aarch64)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
     runs-on: macos-14
     timeout-minutes: 30
     steps:

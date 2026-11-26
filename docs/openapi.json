@@ -1,0 +1,201 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Flux Engine Inference API",
+    "version": "1.0.3",
+    "summary": "OpenAI-, Anthropic-, and Ollama-compatible HTTP API for Flux Engine (Pure Rust + Blackwell CUDA/PTX).",
+    "description": "Verified HTTP endpoint specification for Flux Engine (`spark-server`). Supports streaming SSE completions, tool calling, structured outputs (`xgrammar`), reasoning streams, vision inputs, and health/Prometheus telemetry.",
+    "license": {
+      "name": "AGPL-3.0-only",
+      "url": "https://github.com/TheApathy/flux-engine/blob/main/LICENSE"
+    },
+    "contact": {
+      "name": "Flux Engine Maintainers",
+      "url": "https://github.com/TheApathy/flux-engine"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8888",
+      "description": "Local native `flux serve` default (loopback)"
+    },
+    {
+      "url": "http://127.0.0.1:8899",
+      "description": "Local container (`flux-autodetect`) default (loopback)"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Required when `--api-key` is configured (OpenAI-compatible clients)."
+      },
+      "AnthropicApiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "Required when `--api-key` is configured (Anthropic SDK / Claude Code clients)."
+      }
+    },
+    "schemas": {
+      "ChatMessage": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": { "type": "string", "enum": ["system", "developer", "user", "assistant", "tool"] },
+          "content": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] }
+        }
+      },
+      "ChatCompletionRequest": {
+        "type": "object",
+        "required": ["model", "messages"],
+        "properties": {
+          "model": { "type": "string", "example": "qwen3.8-flash-next" },
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/ChatMessage" } },
+          "max_tokens": { "type": "integer", "minimum": 1, "example": 512 },
+          "temperature": { "type": "number", "minimum": 0, "maximum": 2, "example": 0.7 },
+          "top_p": { "type": "number", "minimum": 0, "maximum": 1, "example": 0.95 },
+          "stream": { "type": "boolean", "default": false },
+          "tools": { "type": "array", "items": { "type": "object" } },
+          "response_format": { "type": "object", "description": "Optional JSON schema enforced via `xgrammar`." }
+        }
+      },
+      "AnthropicMessageRequest": {
+        "type": "object",
+        "required": ["model", "max_tokens", "messages"],
+        "properties": {
+          "model": { "type": "string", "example": "qwen3.8-flash-next" },
+          "max_tokens": { "type": "integer", "minimum": 1, "example": 1024 },
+          "system": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] },
+          "messages": { "type": "array", "items": { "type": "object" } },
+          "stream": { "type": "boolean", "default": false },
+          "tools": { "type": "array", "items": { "type": "object" } },
+          "thinking": { "type": "object", "description": "Optional extended-thinking configuration." }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "example": "ok" }
+        }
+      }
+    }
+  },
+  "security": [{ "BearerAuth": [] }, { "AnthropicApiKey": [] }],
+  "paths": {
+    "/v1/chat/completions": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Create chat completion",
+        "description": "OpenAI-compatible chat completions endpoint with SSE streaming, tool calls, reasoning streams, vision inputs, and `xgrammar` structured outputs.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Chat completion JSON response or `text/event-stream` SSE stream." },
+          "400": { "description": "Invalid request payload or context budget exceeded." },
+          "401": { "description": "Missing or invalid API key." }
+        }
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Create raw text completion",
+        "description": "OpenAI-compatible legacy text completions endpoint.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["model", "prompt"] } } }
+        },
+        "responses": { "200": { "description": "Completion JSON or SSE stream." } }
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Create OpenAI Responses API response",
+        "description": "Supports OpenAI Responses API input items, streaming events, reasoning, and tool calling.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["model", "input"] } } }
+        },
+        "responses": { "200": { "description": "Response object or SSE event stream." } }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": ["OpenAI"],
+        "summary": "List loaded models",
+        "responses": { "200": { "description": "List of available model descriptors." } }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": ["Anthropic"],
+        "summary": "Create Anthropic message (Claude Code compatible)",
+        "description": "Native Anthropic Messages API translator supporting `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop` SSE events, tool use, and thinking blocks.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AnthropicMessageRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Anthropic Message JSON or `text/event-stream` SSE stream." },
+          "400": { "description": "Invalid Anthropic request payload." },
+          "401": { "description": "Missing or invalid `x-api-key`." }
+        }
+      }
+    },
+    "/v1/messages/count_tokens": {
+      "post": {
+        "tags": ["Anthropic"],
+        "summary": "Count prompt tokens for Anthropic Messages request",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["model", "messages"] } } }
+        },
+        "responses": { "200": { "description": "Exact input token count." } }
+      }
+    },
+    "/api/tags": {
+      "get": {
+        "tags": ["Ollama"],
+        "summary": "List local models (Ollama discovery)",
+        "responses": { "200": { "description": "Ollama-compatible model list." } }
+      }
+    },
+    "/api/show": {
+      "post": {
+        "tags": ["Ollama"],
+        "summary": "Inspect model metadata (Ollama discovery)",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["name"] } } }
+        },
+        "responses": { "200": { "description": "Ollama-compatible model metadata." } }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Server readiness & health probe",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Server is ready to accept inference requests.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Prometheus telemetry scrape endpoint",
+        "security": [],
+        "responses": { "200": { "description": "Prometheus text exposition format metrics." } }
+      }
+    }
+  }
+}
