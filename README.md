@@ -107,6 +107,13 @@ docker run --rm --gpus all -v "$MODELS_ROOT:/models:ro" \
 ```
 
 > **Optional `io_uring` for NVMe PLE offload:** Docker's default seccomp profile works out of the box (`ple_offload.rs` falls back to `pread64`). To enable kernel `io_uring` async DMA for `Qwen3.8-Flash-Next` NVMe PLE shards, pass `--security-opt seccomp=unconfined` or a custom seccomp profile allowing `io_uring_setup` / `io_uring_enter`.
+>
+> **One-time PLE offload preparation for `JMNI-Labs/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid`:** Upstream Flash-Next checkpoints ship with resident `ple_embed_tokens` (`~99 GB` total). On single `96 GB` SM120 or `128 GB` GB10 hosts, materialize the `ple-offload/` NVFP4 passthrough shards in `<45 s` once before first serve:
+> ```bash
+> docker run --rm -v "$MODELS_ROOT:/models" --entrypoint /usr/local/bin/repack-ple \
+>   ghcr.io/theapathy/flux-engine:latest --mode offload --src /models/Qwen3.8-Flash-Next-NVFP4
+> ```
+> To eliminate cloud/loopback disk IOPS during prefill on discrete SM120 hosts, pass `--shm-size=32g -e FLUX_PLE_RAM_STAGE=1` to stage `ple-offload/` into `/dev/shm`.
 
 </details>
 
@@ -468,7 +475,7 @@ Every model below runs on NVIDIA GB10 (`sm_121a`) with hand-tuned
 | Family | Model | Checkpoint / HuggingFace ID | Params / Active | Architecture |
 |---|---|---|---:|---|
 | **Qwen3.8-Flash-Next** | **Qwen3.8-Flash-Next-NVFP4** | `JMNI-Labs/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid` / `Blackfrost-AI/CYBER-FROST-3.8-NVFP4-V2` / `nvidia/Qwen3.8-Flash-Next-NVFP4` *(+ `ple-offload/`)* | 125B+51B PLE / 6B | 36 GDN + 12 QSA + 512+1 MoE top-10 + 4-stream mHC + built-in `K=5` MTP |
-| **Qwen3.8** | **Qwen3.8-27B-NVFP4** | `unsloth/Qwen3.8-27B-NVFP4` *(+ DFlash drafter v2/v3)* | 27B dense | 48 GDN + 16 GQA, dense FFN, MRoPE, `gamma=15` DFlash speculative decode |
+| **Qwen3.8** | **Qwen3.8-27B-NVFP4** | `nvidia/Qwen3.8-27B-NVFP4` *(+ `z-lab/Qwen3.8-27B-DFlash2`)* | 27B dense | 48 GDN + 16 GQA, dense FFN, MRoPE, `DFlash` / `DFlash2` speculative decode |
 | **DeepSeek-V4.1** | **DeepSeek-V4.1-Flash-Next** | `deepseek-ai/DeepSeek-V4.1-Flash-Next` (`deepseek_v41`) | 284B CB3 MoE / MLA | Multi-Head Latent Attention (`head_dim=512`, `qk_rope_head_dim=64`, `q_lora_rank=1280`, MQA `kv_heads=1`) + 384-expert CB3 MoE + Engram + DSpark |
 | **GLM-5.3** | **GLM-5.3-Flash EXL3 2.05 bpw** | `GLM-5.3-Flash` (`glm5.3-flash`) | 320B / 18B | KDA linear attention + NoPE DSA + 4-stream mHC + routed MoE; target-only (no speculation) |
 | **SuperGemma4** | **SuperGemma4-26B-A4B / 31B** | `bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16` / `nvidia/Gemma-4-31B-IT-NVFP4` | 26B / 4B & 31B dense | Alternating sliding + full GQA attention, GeGLU MoE / dense FFN |

@@ -833,6 +833,22 @@ class ContainerTagAndDiagnosticsTests(TestCase):
         self.assertEqual(plan_c64["env"]["ATLAS_QWEN4_VERIFY_GRAPH"], "1")
         self.assertEqual(plan_c64["env"]["ATLAS_MULTISEQ_GRAPHS"], "1")
 
+        # C=1 + --ple-ram on discrete 96 GB keeps FAST_PROJ_FP8_WEIGHT_CACHE=1 (PLE lives in host /dev/shm)
+        plan_c1_ram = _plan_on_hw(
+            _flash_next_model(with_dflash=True),
+            hw_96,
+            env={"FLUX_CONCURRENCY": "1", "FLUX_PLE_RAM_STAGE": "1"},
+        )
+        self.assertEqual(plan_c1_ram["env"]["ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE"], "1")
+
+        # C=16 + --ple-ram BF16 on discrete 96 GB must stay <= 393,216 tokens (below ~432K live ceiling)
+        plan_c16_ram = _plan_on_hw(
+            _flash_next_model(with_dflash=True),
+            hw_96,
+            env={"FLUX_CONCURRENCY": "16", "FLUX_PLE_RAM_STAGE": "1"},
+        )
+        self.assertLessEqual(int(_arg_value(plan_c16_ram["command"], "--kv-pool-tokens")), 393216)
+
     def test_1x_96gb_sm120_1m_nvfp4_hits_1p5m_plus_pool_and_fixes_all_blockers(self):
         hw_96 = _make_hw_via_smi(
             "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887, 12.0\n",
@@ -994,6 +1010,35 @@ class ContainerTagAndDiagnosticsTests(TestCase):
             fa.detect_quantization(Path("/models/custom-fp8-model"), cfg_fp8, "custom-fp8-model"),
             "FP8",
         )
+
+    def test_1x_96gb_sm120_qwen27b_c1_and_c8_dflash2_kv_pool_and_no_spurious_sm121_warn(self):
+        hw_96 = _make_hw_via_smi("NVIDIA RTX PRO 6000 Blackwell, 97887, 12.0\n", host_ram_gib=384.0)
+        self.assertEqual(fa._qwen27b_kv_kib_per_tok("nvfp4", "8"), 64.0)
+        self.assertEqual(fa._qwen27b_kv_kib_per_tok("nvfp4", "auto"), 29.5)
+        self.assertEqual(fa._qwen27b_kv_kib_per_tok("bf16", "auto"), 64.0)
+
+        plan_c1 = _plan_on_hw(
+            _qwen27b_model(with_dflash=True),
+            hw_96,
+            env={"FLUX_CONCURRENCY": "1", "FLUX_KV_CACHE_DTYPE": "bf16"},
+        )
+        self.assertLessEqual(plan_c1["vram_budget"]["recommended_kv_pool_tokens"], 524288)
+        self.assertFalse(any("libatlas_fi_fp4_sm121.so" in w for w in plan_c1.get("warnings", [])))
+
+        plan_c8 = _plan_on_hw(
+            _qwen27b_model(with_dflash=True),
+            hw_96,
+            env={"FLUX_CONCURRENCY": "8", "FLUX_KV_CACHE_DTYPE": "bf16", "FLUX_MAX_SEQ_LEN": "32768"},
+        )
+        self.assertEqual(plan_c8["concurrency"], 8)
+        self.assertLessEqual(int(_arg_value(plan_c8["command"], "--kv-pool-tokens")), 393216)
+
+        with self.assertRaisesRegex(ValueError, r"qualified through C8"):
+            _plan_on_hw(
+                _qwen27b_model(with_dflash=True),
+                hw_96,
+                env={"FLUX_CONCURRENCY": "9"},
+            )
 
 
 

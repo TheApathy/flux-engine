@@ -190,7 +190,7 @@ All other supported architectures fit directly in unified memory without a PLE o
 
 | Model Family | Base Checkpoint (Hugging Face Link) | Companion Speculative Drafter (Hugging Face Link) | `block_size` / `gamma` | Auto-Detected `--kernel-target` |
 | :--- | :--- | :--- | :--- | :--- |
-| **Qwen3.8-27B Dense Hybrid** *(63.9+ tok/s)* | [`unsloth/Qwen3.8-27B-NVFP4`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) *(or [`Hotshot2000/Qwen3.8-27B-NVFP4`](https://huggingface.co/Hotshot2000/Qwen3.8-27B-NVFP4))* | • **Recommended (`63.9 tok/s`):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2)<br>• **V3 Control (`58.0–59.5 tok/s`):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3)<br>• **Public DFlash2 (`58.0 tok/s`):** [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) *(or [`incoai/Qwen3.5-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.5-27B-DFlash2))*<br>• **Public 8-tok DFlash2 (`43.9 tok/s`):** [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | `block_size=16` -> `gamma=15` *(for `Apathy-v2/v3` & `z-lab`)*<br>`block_size=8` -> `gamma=7` *(for `incoai/Qwen3.8-27B-DFlash2`)* | `qwen3.8-27b` |
+| **Qwen3.8-27B Dense Hybrid** *(63.9+ tok/s)* | [`nvidia/Qwen3.8-27B-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) *(canonical public ModelOpt NVFP4)* | • **Recommended (`63.9 tok/s`):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2)<br>• **V3 Control (`58.0–59.5 tok/s`):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3)<br>• **Public DFlash2 (`58.0–81.1 tok/s` GB10 / `487.2 tok/s` SM120):** [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) *(or [`incoai/Qwen3.5-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.5-27B-DFlash2))*<br>• **Public 8-tok DFlash2 (`43.9 tok/s`):** [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | `block_size=16` -> `gamma=15` *(for `Apathy-v2/v3`)*<br>`block_size=8` -> `gamma=7` *(for `z-lab/Qwen3.8-27B-DFlash2` & `incoai`)* | `qwen3.8-27b` |
 | **Qwen3.6-27B / AEON-27B** | [`RedHatAI/Qwen3.6-27B-NVFP4`](https://huggingface.co/RedHatAI/Qwen3.6-27B-NVFP4) | [`z-lab/Qwen3.6-27B-DFlash`](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) | `block_size=16` -> `gamma=15` | `qwen3.6-27b` |
 | **Qwen3.6 / 3.5 35B-A3B MoE** | [`Qwen/Qwen3.5-35B-A3B-FP8`](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8) | Built-in MTP or [`z-lab/Qwen3.5-35B-A3B-DFlash`](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | `gamma=4` (MTP) / `15` (DFlash) | `qwen3.6-35b-a3b` / `qwen3.5-35b-a3b` |
 | **DeepSeek-V4.1 Flash MoE** | `DeepSeek-V4.1-Flash-Next-DGX-Spark-512K` | In-checkpoint 3-layer MTP | `gamma=3` | `deepseek-v4-flash` |
@@ -201,9 +201,8 @@ All other supported architectures fit directly in unified memory without a PLE o
 ```bash
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-# 1. Download the Qwen3.8-27B-NVFP4 target checkpoint (pin revision 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108):
-hf download unsloth/Qwen3.8-27B-NVFP4 \
-  --revision 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108 \
+# 1. Download the canonical ModelOpt Qwen3.8-27B-NVFP4 target checkpoint:
+hf download nvidia/Qwen3.8-27B-NVFP4 \
   --local-dir "$MODELS_DIR/Qwen3.8-27B-NVFP4"
 
 # 2a. Download our gamma=15 DFlash v2 drafter (63.9 tok/s, block_size=16):

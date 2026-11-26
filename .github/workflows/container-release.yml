@@ -29,6 +29,11 @@ on:
         required: false
         default: true
         type: boolean
+      target_model:
+        description: "FLUX_TARGET_MODEL build arg (default '*' for universal; e.g. 'qwen3.8-flash-next,qwen3.8-27b' for faster dev builds)"
+        required: false
+        default: "*"
+        type: string
 
 permissions: {}
 
@@ -277,6 +282,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
+            FLUX_TARGET_MODEL=${{ github.event_name == 'workflow_dispatch' && inputs.target_model || '*' }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=flux-sm120
@@ -294,6 +300,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
+            FLUX_TARGET_MODEL=${{ github.event_name == 'workflow_dispatch' && inputs.target_model || '*' }}
           cache-from: type=gha,scope=flux-sm120
           cache-to: type=gha,scope=flux-sm120,mode=max
 
@@ -414,6 +421,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
+            FLUX_TARGET_MODEL=${{ github.event_name == 'workflow_dispatch' && inputs.target_model || '*' }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=flux-gb10
@@ -431,6 +439,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
+            FLUX_TARGET_MODEL=${{ github.event_name == 'workflow_dispatch' && inputs.target_model || '*' }}
           cache-from: type=gha,scope=flux-gb10
           cache-to: type=gha,scope=flux-gb10,mode=max
 

@@ -48,23 +48,9 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 
 WORKDIR /build
 
-# Strict allowlist COPY: only build inputs are copied into the builder context.
-# Local workspace notes, git history, and temporary build artifacts are never copied.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY build-support/ build-support/
-COPY crates/ crates/
-COPY kernels/ kernels/
-COPY jinja-templates/ jinja-templates/
-
-ENV FLUX_TARGET_HW=${FLUX_TARGET_HW} \
-    FLUX_TARGET_MODEL=${FLUX_TARGET_MODEL} \
-    FLUX_TARGET_QUANT=${FLUX_TARGET_QUANT} \
-    ATLAS_TARGET_HW=${FLUX_TARGET_HW} \
-    ATLAS_TARGET_MODEL=${FLUX_TARGET_MODEL} \
-    ATLAS_TARGET_QUANT=${FLUX_TARGET_QUANT}
-
 # Pinned Apache-2.0 FlashInfer + 3rdparty/cccl headers for build-time static
 # compilation of `qwen4_fi_attn.cu` (`ATLAS_QWEN4_PREFILL_ATTN_FI=1`).
+# Fetched before workspace COPY so source edits hit BuildKit layer cache.
 # Statically linked into `spark`; zero runtime stage bloat.
 ARG FLASHINFER_REV=74fb3fb8a64cd36b8f4452a5ef1a7f865eef013e
 RUN git init -q /opt/fi_src && \
@@ -83,7 +69,27 @@ RUN git init -q /tmp/exllamav3 && \
     git -C /tmp/exllamav3 checkout -q FETCH_HEAD
 ENV ATLAS_EXLLAMAV3_SOURCE=/tmp/exllamav3
 
-RUN cargo build --release --locked -p spark-server
+# Strict allowlist COPY: only build inputs are copied into the builder context.
+# Local workspace notes, git history, and temporary build artifacts are never copied.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY build-support/ build-support/
+COPY crates/ crates/
+COPY kernels/ kernels/
+COPY jinja-templates/ jinja-templates/
+
+ENV FLUX_TARGET_HW=${FLUX_TARGET_HW} \
+    FLUX_TARGET_MODEL=${FLUX_TARGET_MODEL} \
+    FLUX_TARGET_QUANT=${FLUX_TARGET_QUANT} \
+    ATLAS_TARGET_HW=${FLUX_TARGET_HW} \
+    ATLAS_TARGET_MODEL=${FLUX_TARGET_MODEL} \
+    ATLAS_TARGET_QUANT=${FLUX_TARGET_QUANT}
+
+RUN --mount=type=cache,id=flux-cargo-registry-amd64,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=flux-cargo-git-amd64,target=/usr/local/cargo/git \
+    --mount=type=cache,id=flux-cargo-target-sm120,target=/build/target \
+    cargo build --release --locked -p spark-server && \
+    mkdir -p /out && \
+    cp /build/target/release/spark /out/spark
 
 # ── Runtime stage (linux/amd64, CUDA 13.0 runtime) ───────────────
 FROM --platform=linux/amd64 nvidia/cuda:13.0.0-runtime-ubuntu24.04@sha256:95318efecfd68ab3d109da5277863257b06137c84f34a87f38de970d5cd035d3
@@ -168,7 +174,7 @@ RUN apt-mark unhold libcublas-13-0 libnccl2 2>/dev/null || true && \
     chmod 1777 /results
 
 # Explicit allowlist COPY into runtime stage — never copies local workspace notes.
-COPY --from=builder /build/target/release/spark /opt/flux/bin/flux-server-real
+COPY --from=builder /out/spark /opt/flux/bin/flux-server-real
 COPY --from=builder /build/jinja-templates/ /jinja-templates/
 COPY repro-kit/flux-autodetect /usr/local/bin/flux
 COPY repro-kit/flux-bench /usr/local/bin/flux-bench

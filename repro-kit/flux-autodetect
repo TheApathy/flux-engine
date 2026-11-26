@@ -116,8 +116,8 @@ MULTI_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "gpu_memory_utilization": "0.55",
         "tool_call_parser": "qwen3_coder",
         "speculation": "dflash2",
-        # The DFlash2 profile is qualified at one sequence; plain target-only may go wider.
-        "max_concurrency_speculative": 1,
+        # Hoisted batched DFlash2 is qualified through C=8; plain target-only may go wider.
+        "max_concurrency_speculative": 8,
         "flags": ["--disable-confidence-early-stop"],
         "label": "Qwen3.8-27B",
         "dflash_flags": [
@@ -1640,6 +1640,29 @@ def _qwen4_kv_kib_per_tok(kv_cache_dtype: str, kv_high_precision_layers: str = "
     return 25.61
 
 
+def _qwen27b_kv_kib_per_tok(kv_cache_dtype: str, kv_high_precision_layers: str = "auto") -> float:
+    """Exact Qwen3.8/3.6/3.5-27B KV KiB/token (16 full-attn layers, 4 KV heads, head_dim=256)."""
+    dt = (kv_cache_dtype or "bf16").strip().lower()
+    if dt == "bf16":
+        return 64.0
+    hp_raw = str(kv_high_precision_layers or "auto").strip().lower()
+    if hp_raw in ("max", "all"):
+        bf16_layers = 16
+    elif hp_raw == "auto":
+        bf16_layers = 4
+    else:
+        try:
+            bf16_layers = min(16, max(0, int(hp_raw)) * 2)
+        except ValueError:
+            bf16_layers = 4
+    quant_layers = 16 - bf16_layers
+    if dt == "nvfp4":
+        return round(bf16_layers * 4.0 + quant_layers * 1.125, 2)
+    if dt == "fp8":
+        return round(bf16_layers * 4.0 + quant_layers * 2.0, 2)
+    return 64.0
+
+
 def calculate_discrete_vram_budget(
     model_info: Dict[str, Any],
     hw: Dict[str, Any],
@@ -1709,7 +1732,11 @@ def calculate_discrete_vram_budget(
             # - QSA side-cache reserve scales with concurrency * min(max_seq_len, 262144), sharded by KV heads * PP
             extra_slots = min(max(1, int(concurrency)), 64) - 1
             ssm_per_slot = 0.11 / ssm_shard_div
-            spec_per_slot = (0.16 / float(max(1, pp_size))) if speculative_enabled else 0.0
+            spec_per_slot = (
+                (0.18 / float(max(1, pp_size))) + (0.05 / ssm_shard_div)
+                if speculative_enabled
+                else 0.0
+            )
             seq_factor = min(max(4096, int(max_seq_len)), 262144) / 262144.0
             qsa_per_slot = (0.16 * seq_factor) / kv_shard_div
             scratch_gib += float(extra_slots) * (ssm_per_slot + spec_per_slot + qsa_per_slot)
@@ -1719,6 +1746,20 @@ def calculate_discrete_vram_budget(
         if qsa_fp8_active and (kv_cache_dtype or "bf16").lower() == "bf16":
             # Lean Shared-V8 QSA E4M3 prefill shadows (~1.65 GiB / (min(tp, kv_heads) * pp)).
             scratch_gib += 1.65 / kv_shard_div
+    elif kt_l in ("qwen3.8-27b", "qwen3.6-27b", "qwen3.5-27b"):
+        ssm_shard_div = float(max(1, tp_size) * max(1, pp_size))
+        if per_gpu_vram_gib >= 80.0:
+            # On >=80 GiB discrete GPUs, 27B materializes dense FFN/SSM transposed
+            # prefill/decode weights (~19.9 GiB) + BF16 lm_head/scales (~4.5 GiB).
+            scratch_gib += 24.4 / ssm_shard_div
+        if concurrency > 1:
+            # 48-layer SSM state + rollback snapshot pools (~2.4 GiB/slot sharded by TP*PP)
+            # plus batched DFlash2 proposer state (~1.6 GiB).
+            scratch_gib += float(min(max(1, int(concurrency)), 64)) * (2.4 / ssm_shard_div)
+            if speculative_enabled:
+                scratch_gib += 1.6 / float(max(1, pp_size))
+        elif per_gpu_vram_gib >= 80.0:
+            scratch_gib += 2.4 / ssm_shard_div
 
     # Mirror Step-5 runtime KV sizing (`build.rs`): subtract fixed CUDA context/graph
     # headroom directly from per-GPU VRAM, then apply a single clean allocator ratio
@@ -1734,6 +1775,8 @@ def calculate_discrete_vram_budget(
     kv_dtype_l = (kv_cache_dtype or "bf16").lower()
     if kt_l == "qwen3.8-flash-next":
         base_kv_kib = _qwen4_kv_kib_per_tok(kv_dtype_l, kv_high_precision_layers)
+    elif kt_l in ("qwen3.8-27b", "qwen3.6-27b", "qwen3.5-27b"):
+        base_kv_kib = _qwen27b_kv_kib_per_tok(kv_dtype_l, kv_high_precision_layers)
     elif kv_dtype_l == "nvfp4":
         base_kv_kib = float(spec["kv_kib_per_tok_nvfp4"])
     elif kv_dtype_l == "fp8":
@@ -3032,7 +3075,9 @@ def _resolve_27b_flashinfer(env_vars: Dict[str, str], model_info: Dict[str, Any]
         env_vars["ATLAS_PREFILL_FFN_FLASHINFER"] = "0"
         if "ATLAS_CUBLASLT_NVFP4" not in os.environ and "ATLAS_CUBLASLT_NVFP4" not in env_vars:
             env_vars["ATLAS_CUBLASLT_NVFP4"] = "1"
-        warnings.append(f"{reason}; ATLAS_PREFILL_FFN_FLASHINFER=0 (27B prefill takes the slower route)")
+            warnings.append(f"{reason}; ATLAS_PREFILL_FFN_FLASHINFER=0 (27B prefill takes the slower route)")
+        elif str(env_vars.get("ATLAS_CUBLASLT_NVFP4", "")).strip() != "1":
+            warnings.append(f"{reason}; ATLAS_PREFILL_FFN_FLASHINFER=0 (27B prefill takes the slower route)")
 
 
 # FLUX_DFLASH_LOOKUP: reviewed opt-in for the DFlash context-lookup drafters
@@ -3509,6 +3554,15 @@ def build_launch_plan(
             _cli_hp_layers = extra_args[_idx + 1].strip()
             break
     default_hp_layers = profile.get("kv_high_precision_layers", "auto") if profile is not None else "auto"
+    if (
+        is_discrete_vram_known
+        and kt == "qwen3.8-27b"
+        and default_hp_layers == "8"
+    ):
+        # On GB10 UMA, hp=8 keeps all 16/16 attention layers in BF16 (64 KiB/tok).
+        # On discrete GPUs, default to hp=auto (4/16 BF16 + 12/16 NVFP4 = 29.5 KiB/tok)
+        # so NVFP4 KV actually saves VRAM unless the operator explicitly overrides it.
+        default_hp_layers = "auto"
     kv_hp_layers_for_budget = (
         _cli_hp_layers
         or public_selector("FLUX_KV_HIGH_PRECISION_LAYERS", default_hp_layers).strip()
@@ -3693,7 +3747,7 @@ def build_launch_plan(
             and str(env_vars.get("ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE", "0")).strip() == "1"
             and concurrency <= 16
             and not discrete_1x96_1m_disable_fast_proj
-            and ple_ram_plan is None
+            and (ple_ram_plan is None or is_discrete_vram_known)
         )
         qsa_fp8_for_budget = bool(
             requires_qsa
@@ -4477,9 +4531,10 @@ def build_launch_plan(
         and spec.get("mode", "none") != "none"
         and concurrency > int(profile.get("max_concurrency_speculative", 128))
     ):
+        max_spec = int(profile.get("max_concurrency_speculative", 128))
         raise ValueError(
-            f"{kt} speculation is qualified at C1 only; set FLUX_CONCURRENCY=1, "
-            "or FLUX_SPEC_MODE=none for unqualified plain C>1"
+            f"{kt} speculation is qualified through C{max_spec}; set FLUX_CONCURRENCY<={max_spec}, "
+            "or FLUX_SPEC_MODE=none for unqualified plain concurrency"
         )
     if qsa_concurrency:
         if not disable_spec and spec.get("mode") in ("native-mtp", "dflash"):
@@ -4620,7 +4675,7 @@ def build_launch_plan(
             ):
                 env_vars["ATLAS_PLE_PARKED_CACHE_MB"] = "0"
                 env_vars["FLUX_PLE_PARKED_CACHE_MB"] = "0"
-            if not any(
+            if not is_discrete_vram_known and not any(
                 k in os.environ or (custom_env and k in custom_env)
                 for k in (
                     "ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE",

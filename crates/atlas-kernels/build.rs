@@ -317,8 +317,17 @@ fn main() {
             &signature_file,
         );
 
-        let mut errors = Vec::new();
-        let mut compiled = 0usize;
+        struct CompileJob<'a> {
+            index: usize,
+            cu_file: &'a std::path::Path,
+            out_file: PathBuf,
+            deps_file: PathBuf,
+            deps_manifest: Option<String>,
+            size_hint: u64,
+        }
+
+        let mut errors: Vec<(usize, String)> = Vec::new();
+        let mut pending: Vec<CompileJob<'_>> = Vec::new();
         let mut cached = 0usize;
         // Files each `.cu` reaches through quoted #includes (wrappers around
         // another target's source or inherited headers): they gate the cache
@@ -333,7 +342,7 @@ fn main() {
                 }
             })
             .collect();
-        for (cu_file, deps) in cu_files.iter().zip(&include_deps) {
+        for (job_idx, (cu_file, deps)) in cu_files.iter().zip(&include_deps).enumerate() {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap().to_string();
             let out_file = ptx_dir.join(format!("t{idx}__{stem}.{output_ext}"));
             let deps_file = ptx_dir.join(format!("t{idx}__{stem}.{output_ext}.deps"));
@@ -377,27 +386,124 @@ fn main() {
             if let Err(error) = std::fs::remove_file(&deps_file)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                errors.push(format!(
-                    "Failed to invalidate {}: {error}",
-                    deps_file.display()
+                errors.push((
+                    job_idx,
+                    format!("Failed to invalidate {}: {error}", deps_file.display()),
                 ));
                 continue;
             }
-            if let Err(e) =
-                compute_target.compile(cu_file, &out_file, &target.arch, &target.extra_flags)
-            {
-                errors.push(e);
-            } else {
-                compiled += 1;
-                if let Some(manifest) = deps_manifest
-                    && let Err(error) = std::fs::write(&deps_file, manifest)
-                {
-                    errors.push(format!("Failed to write {}: {error}", deps_file.display()));
+            let size_hint = std::fs::metadata(cu_file).map(|m| m.len()).unwrap_or(0);
+            pending.push(CompileJob {
+                index: job_idx,
+                cu_file,
+                out_file,
+                deps_file,
+                deps_manifest,
+                size_hint,
+            });
+        }
+
+        // Longest-processing-time (LPT) first: kick off large `.cu` modules at t=0.
+        pending.sort_by(|a, b| {
+            b.size_hint
+                .cmp(&a.size_hint)
+                .then_with(|| a.index.cmp(&b.index))
+        });
+
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let max_jobs = env::var("ATLAS_NVCC_JOBS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| available.clamp(1, 16));
+        let worker_count = pending.len().min(max_jobs);
+        let next_job = std::sync::atomic::AtomicUsize::new(0);
+        let compute_target_ref = compute_target.as_ref();
+        let arch_ref = target.arch.as_str();
+        let extra_flags_ref = target.extra_flags.as_slice();
+
+        let (compiled, worker_errors) = if worker_count <= 1 {
+            let mut ok_count = 0usize;
+            let mut errs = Vec::new();
+            for job in &pending {
+                match compute_target_ref.compile(
+                    job.cu_file,
+                    &job.out_file,
+                    arch_ref,
+                    extra_flags_ref,
+                ) {
+                    Ok(()) => {
+                        ok_count += 1;
+                        if let Some(manifest) = &job.deps_manifest
+                            && let Err(error) = std::fs::write(&job.deps_file, manifest)
+                        {
+                            errs.push((
+                                job.index,
+                                format!("Failed to write {}: {error}", job.deps_file.display()),
+                            ));
+                        }
+                    }
+                    Err(e) => errs.push((job.index, e)),
                 }
             }
-        }
+            (ok_count, errs)
+        } else {
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(worker_count);
+                for _ in 0..worker_count {
+                    let pending_ref = &pending;
+                    let next_ref = &next_job;
+                    handles.push(scope.spawn(move || {
+                        let mut local_ok = 0usize;
+                        let mut local_errs = Vec::new();
+                        loop {
+                            let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(job) = pending_ref.get(i) else {
+                                break;
+                            };
+                            match compute_target_ref.compile(
+                                job.cu_file,
+                                &job.out_file,
+                                arch_ref,
+                                extra_flags_ref,
+                            ) {
+                                Ok(()) => {
+                                    local_ok += 1;
+                                    if let Some(manifest) = &job.deps_manifest
+                                        && let Err(error) = std::fs::write(&job.deps_file, manifest)
+                                    {
+                                        local_errs.push((
+                                            job.index,
+                                            format!(
+                                                "Failed to write {}: {error}",
+                                                job.deps_file.display()
+                                            ),
+                                        ));
+                                    }
+                                }
+                                Err(e) => local_errs.push((job.index, e)),
+                            }
+                        }
+                        (local_ok, local_errs)
+                    }));
+                }
+                let mut total_ok = 0usize;
+                let mut all_errs = Vec::new();
+                for handle in handles {
+                    let (ok, errs) = handle.join().expect("kernel compiler worker panicked");
+                    total_ok += ok;
+                    all_errs.extend(errs);
+                }
+                (total_ok, all_errs)
+            })
+        };
+        errors.extend(worker_errors);
+        errors.sort_by_key(|(idx, _)| *idx);
         if !errors.is_empty() {
-            panic!("Kernel compilation failed:\n{}", errors.join("\n"));
+            let messages: Vec<&str> = errors.iter().map(|(_, msg)| msg.as_str()).collect();
+            panic!("Kernel compilation failed:\n{}", messages.join("\n"));
         }
         if cached > 0 {
             println!(

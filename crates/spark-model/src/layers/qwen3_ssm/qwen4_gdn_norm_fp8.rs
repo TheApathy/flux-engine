@@ -242,25 +242,38 @@ pub(super) fn mode() -> Result<Option<Mode>> {
     if mode.is_some() {
         let _ = v2_selected()?;
         let _ = l2_discard_policy()?;
-        ensure!(
-            super::qwen4_gdn_fi::selected(),
-            "{SELECTOR} requires {}",
-            super::qwen4_gdn_fi::SELECTOR
-        );
-        ensure!(
-            qwen4_fast_proj::selection()?.ssm
-                && qwen4_fast_proj::fp8_selection()?.ssm
-                && qwen4_fast_proj::fp8_tensor_scales(),
-            "{SELECTOR} requires {}=ssm, {}=ssm and ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_SCALE=tensor",
-            qwen4_fast_proj::SELECTOR,
-            qwen4_fast_proj::FP8_SELECTOR
-        );
-        if mode == Some(Mode::FiStatic) {
+        #[cfg(not(atlas_fi_gdn))]
+        {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "{SELECTOR} requested, but this build was compiled without FlashInfer GDN AOT objects (cfg(atlas_fi_gdn) disabled); falling back to native CUDA GDN norm path"
+                );
+            });
+            return Ok(None);
+        }
+        #[cfg(atlas_fi_gdn)]
+        {
             ensure!(
-                super::qwen4_gdn_fi::dtype() == Some(FiDtype::F16),
-                "{SELECTOR}=3 requires {}=2 (the FP16 export)",
+                super::qwen4_gdn_fi::selected(),
+                "{SELECTOR} requires {}",
                 super::qwen4_gdn_fi::SELECTOR
             );
+            ensure!(
+                qwen4_fast_proj::selection()?.ssm
+                    && qwen4_fast_proj::fp8_selection()?.ssm
+                    && qwen4_fast_proj::fp8_tensor_scales(),
+                "{SELECTOR} requires {}=ssm, {}=ssm and ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_SCALE=tensor",
+                qwen4_fast_proj::SELECTOR,
+                qwen4_fast_proj::FP8_SELECTOR
+            );
+            if mode == Some(Mode::FiStatic) {
+                ensure!(
+                    super::qwen4_gdn_fi::dtype() == Some(FiDtype::F16),
+                    "{SELECTOR}=3 requires {}=2 (the FP16 export)",
+                    super::qwen4_gdn_fi::SELECTOR
+                );
+            }
         }
     }
     Ok(mode)
@@ -889,5 +902,17 @@ mod tests {
         assert_eq!(qkv_total_bytes, 12_079_595_520);
         assert_eq!(qkv_last_strip_bytes, 377_487_360);
         assert_eq!(gdn_out_total_bytes, 7_247_757_312);
+    }
+
+    #[cfg(not(atlas_fi_gdn))]
+    #[test]
+    fn mode_without_aot_falls_back_cleanly() {
+        // Without FlashInfer GDN AOT objects (`cfg(not(atlas_fi_gdn))`), recipes
+        // that request `ATLAS_QWEN4_PREFILL_GDN_NORM_FP8=1|2|3` must gracefully
+        // fall back to `Ok(None)` rather than failing every prefill request.
+        assert_eq!(
+            mode().expect("cfg(not(atlas_fi_gdn)) mode() must not hard-error"),
+            None
+        );
     }
 }

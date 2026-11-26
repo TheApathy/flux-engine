@@ -2483,6 +2483,12 @@ pub(super) fn try_dense_gdn_fi_prefill(
     #[cfg(not(atlas_fi_gdn))]
     {
         let _ = (qkv, gate_beta, output, stream);
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "{DENSE_GDN_FI_SELECTOR} requested, but this build was compiled without FlashInfer GDN AOT objects (cfg(atlas_fi_gdn) disabled); falling back to native CUDA WY32 GDN prefill"
+            );
+        });
         Ok(false)
     }
 }
