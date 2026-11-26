@@ -65,7 +65,7 @@ tokio = { version = "1", features = ["full", "parking_lot"] }
 # ── Atlas TUI (crates/spark-server/src/tui/) ──
 # ratatui pins its own crossterm; the version here MUST match ratatui 0.29's
 # (crossterm 0.28) or two raw-mode stacks fight over the terminal.
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 # Single/multi-line inputs (log filter, library search, REPL, chat). MIT.
 tui-textarea = "0.7"
