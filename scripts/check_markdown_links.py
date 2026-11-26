@@ -21,9 +21,8 @@ MD_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 HTML_LINK_RE = re.compile(r"""(?:href|src)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 EXTERNAL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
-# Root `AGENTS.md` is intentionally gitignored for private local notes and
-# must never be scanned or required as a tracked public doc.
-EXCLUDED_ROOT_FILES = {"AGENTS.md"}
+# Local private agent notes are gitignored; public AGENTS.md and CLAUDE.md are checked.
+EXCLUDED_ROOT_FILES = {"AGENTS.local.md", "CLAUDE.local.md"}
 
 
 def iter_target_markdown_files(root: Path) -> list[Path]:

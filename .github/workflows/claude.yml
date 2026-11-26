@@ -42,24 +42,6 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - name: Harden runner (eBPF egress block — Anthropic + GitHub + Ubuntu apt only)
-        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
-        with:
-          egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            api.github.com:443
-            release-assets.githubusercontent.com:443
-            objects.githubusercontent.com:443
-            registry.npmjs.org:443
-            api.anthropic.com:443
-            claude.ai:443
-            downloads.claude.ai:443
-            azure.archive.ubuntu.com:80
-            azure.archive.ubuntu.com:443
-            security.ubuntu.com:80
-            security.ubuntu.com:443
-
       - name: Check Anthropic credentials configured
         id: auth
         env:
@@ -73,18 +55,34 @@ jobs:
             echo "::notice::Skipping Claude Code: configure ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in repository secrets to enable."
           fi
 
+      - name: Install bubblewrap for Claude subprocess sandbox & env scrubbing
+        if: steps.auth.outputs.configured == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends bubblewrap
+
+      - name: Harden runner (eBPF egress block + disable sudo/containers)
+        if: steps.auth.outputs.configured == 'true'
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            release-assets.githubusercontent.com:443
+            objects.githubusercontent.com:443
+            registry.npmjs.org:443
+            api.anthropic.com:443
+            claude.ai:443
+            downloads.claude.ai:443
+
       - name: Checkout repository
         if: steps.auth.outputs.configured == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Install bubblewrap for Claude subprocess sandbox & env scrubbing
-        if: steps.auth.outputs.configured == 'true'
-        run: |
-          sudo apt-get update -qq -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
-          sudo apt-get install -y -qq --no-install-recommends bubblewrap
 
       - name: Run Claude Code (Read-Only Opus Audit)
         if: steps.auth.outputs.configured == 'true'

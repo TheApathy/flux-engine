@@ -13,27 +13,32 @@
     <a href="LICENSE"><img alt="License: AGPLv3" src="https://img.shields.io/badge/license-AGPLv3-yellow?style=flat-square"></a>
     <a href="#serve-it-now"><img alt="Pure Rust" src="https://img.shields.io/badge/runtime-pure%20Rust-orange?style=flat-square"></a>
     <a href="repro-kit/README.md"><img alt="GHCR" src="https://img.shields.io/badge/GHCR-theapathy%2Fflux--engine-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
+    <a href="https://theapathy.github.io/flux-engine/"><img alt="Docs Site" src="https://img.shields.io/badge/docs-theapathy.github.io-0EA5E9?style=flat-square&logo=mdbook&logoColor=white"></a>
     <a href="https://github.com/TheApathy/flux-engine/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/TheApathy/flux-engine/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="https://github.com/TheApathy/flux-engine/actions/workflows/formal-verify.yml"><img alt="Formal Verification" src="https://github.com/TheApathy/flux-engine/actions/workflows/formal-verify.yml/badge.svg"></a>
     <a href="https://github.com/TheApathy/flux-engine/actions/workflows/release.yml"><img alt="Release" src="https://github.com/TheApathy/flux-engine/actions/workflows/release.yml/badge.svg"></a>
     <a href="https://scorecard.dev/viewer/?uri=github.com/TheApathy/flux-engine"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/TheApathy/flux-engine/badge"></a>
   </p>
 </p>
 
 <p align="center">
-  <a href="GETTING_STARTED.md"><img alt="Getting Started & Diagnostics Guide" src="https://img.shields.io/badge/%E2%9A%A1%20Getting%20Started%20%26%20Gotchas-2EA44F?style=for-the-badge&logo=docker&logoColor=white"></a>
+  <a href="https://theapathy.github.io/flux-engine/"><img alt="Documentation Site" src="https://img.shields.io/badge/%F0%9F%93%96%20Docs%20Site-0EA5E9?style=for-the-badge"></a>
+  <a href="https://theapathy.github.io/flux-engine/api-explorer/"><img alt="Interactive OpenAPI Explorer" src="https://img.shields.io/badge/%F0%9F%94%8C%20API%20Explorer-6366F1?style=for-the-badge"></a>
+  <a href="GETTING_STARTED.md"><img alt="Getting Started & Diagnostics Guide" src="https://img.shields.io/badge/%E2%9A%A1%20Getting%20Started-2EA44F?style=for-the-badge&logo=docker&logoColor=white"></a>
   <a href="repro-kit/README.md"><img alt="Reproducibility Kit" src="https://img.shields.io/badge/%F0%9F%93%A6%20Repro%20Kit-F48C06?style=for-the-badge"></a>
-  <a href="docs/verification/BENCHMARK_VERIFICATION.md"><img alt="Benchmark Methodology & Verification" src="https://img.shields.io/badge/%F0%9F%9B%A1%EF%B8%8F%20Benchmark%20Verification-38BDF8?style=for-the-badge"></a>
-  <a href="ARCHITECTURE.md"><img alt="SM121a Architecture" src="https://img.shields.io/badge/%F0%9F%8F%9B%EF%B8%8F%20SM121a%20Architecture-1E6091?style=for-the-badge"></a>
+  <a href="docs/verification/BENCHMARK_VERIFICATION.md"><img alt="Benchmark Methodology & Verification" src="https://img.shields.io/badge/%F0%9F%9B%A1%EF%B8%8F%20Verification-38BDF8?style=for-the-badge"></a>
 </p>
 
 <p align="center">
-  <a href="GETTING_STARTED.md"><b>Getting Started & Gotchas</b></a> ·
+  <a href="https://theapathy.github.io/flux-engine/"><b>Docs</b></a> ·
+  <a href="https://theapathy.github.io/flux-engine/api-explorer/"><b>API Explorer</b></a> ·
+  <a href="GETTING_STARTED.md"><b>Getting Started</b></a> ·
   <a href="#serve-it-now"><b>Serve It Now</b></a> ·
   <a href="#why-the-defaults-are-baked-in"><b>Benchmarks</b></a> ·
-  <a href="docs/verification/BENCHMARK_VERIFICATION.md"><b>Benchmark Verification</b></a> ·
   <a href="docs/KERNEL-PROFILE.md"><b>Kernel Profile</b></a> ·
   <a href="ARCHITECTURE.md"><b>Architecture</b></a> ·
-  <a href="#where-things-are"><b>Directory Map</b></a>
+  <a href="AGENTS.md"><b>AGENTS.md</b></a> ·
+  <a href="SIGNING.md"><b>Signing</b></a>
 </p>
 
 ---

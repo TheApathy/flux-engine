@@ -57,9 +57,10 @@ known_hosts
 !/kernels/gb10/glm5.3-flash/iq3/ggml_q6_token_embedding.cu
 
 # --- Local Agent / IDE / Host Lock & Telemetry Guardrails ---
-# AGENTS.md stays strictly gitignored for private local notes; public
-# contributor/agent guidance lives in tracked CLAUDE.md.
-AGENTS.md
+# Local private agent notes stay strictly gitignored; public
+# contributor/agent guidance lives in tracked AGENTS.md and CLAUDE.md.
+AGENTS.local.md
+CLAUDE.local.md
 .claude/
 .codex/
 .cursor/

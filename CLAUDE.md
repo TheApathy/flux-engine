@@ -2,6 +2,10 @@
 
 # Flux Engine — Contributor & Coding Agent Guide (`CLAUDE.md`)
 
+> See [`AGENTS.md`](AGENTS.md) for the full production engineering contract,
+> formal verification requirements (Z3 SMT, TLA+ BFS, CUDA PTX zero-spill),
+> 4-part PR template, and anti-slop rejection criteria.
+
 **Flux Engine** (`TheApathy/flux-engine`) is a pure-Rust + custom CUDA/PTX
 large language model inference engine licensed under **`AGPL-3.0-only`**. It
 targets NVIDIA Grace Blackwell (`GB10`, `sm_121a` / `sm_121f`), discrete
