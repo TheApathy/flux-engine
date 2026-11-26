@@ -3,7 +3,7 @@
 use super::{LmHeadPath, resolve_lm_head_path};
 
 const CONSTRUCTOR_SOURCE: &str = include_str!("from_weights.rs");
-const NOISE_PASS_SOURCE: &str = include_str!("noise_pass.rs");
+const NOISE_PASS_SOURCE: &str = include_str!("noise_pass/eager.rs");
 
 fn compact(source: &str) -> String {
     source.chars().filter(|ch| !ch.is_whitespace()).collect()

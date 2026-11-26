@@ -9,7 +9,7 @@ use super::{
 
 const CUDA_SOURCE: &str = include_str!("../../../../../kernels/gb10/common/argmax_bf16.cu");
 const FORWARD_SOURCE: &str = include_str!("forward_block.rs");
-const NOISE_SOURCE: &str = include_str!("noise_pass.rs");
+const NOISE_SOURCE: &str = include_str!("noise_pass/eager.rs");
 const PROPOSE_SOURCE: &str = include_str!("propose.rs");
 const ASYNC_SOURCE: &str = include_str!("async_propose.rs");
 

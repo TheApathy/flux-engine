@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-const NOISE_PASS: &str = include_str!("../src/layers/dflash_head/noise_pass.rs");
+const NOISE_PASS: &str = include_str!("../src/layers/dflash_head/noise_pass/eager.rs");
 const FORWARD_BLOCK_LAYER: &str = include_str!("../src/layers/dflash_head/forward_block_layer.rs");
 
 fn successful_call_end<'a>(source: &'a str, call: &str) -> (&'a str, usize) {
