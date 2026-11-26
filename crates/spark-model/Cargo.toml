@@ -65,7 +65,7 @@ tokenizers = { version = "0.23", optional = true, default-features = false, feat
 # Used by the `metal_qwen35_inference` example only — gated by
 # `required-features = ["metal-example"]` on the `[[example]]` block below so
 # default Linux `cuda` builds don't pull it in.
-safetensors = { version = "0.7", optional = true }
+safetensors = { version = "0.8", optional = true }
 
 # End-to-end Qwen3.5-4B-MLX-8bit decode driver. Loads weights via
 # `MlxInt8Weight`, kernel handles via `Qwen35Kernels::resolve`, and
