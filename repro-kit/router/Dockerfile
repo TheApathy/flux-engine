@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM haproxy:2.8
+FROM haproxy:3.1
 
 ARG FLUX_ENGINE_VERSION="1.0.2"
 ARG FLUX_SOURCE_REVISION="unknown"

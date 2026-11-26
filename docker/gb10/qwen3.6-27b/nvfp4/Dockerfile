@@ -16,7 +16,7 @@
 #       --dflash --draft-model z-lab/Qwen3.6-27B-DFlash --max-seq-len 16384
 
 # ── Build stage ──────────────────────────────────────────────────
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:13.5.0-devel-ubuntu24.04 AS builder
 
 RUN apt-get update -qq && \
     apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev && \
@@ -48,7 +48,7 @@ ENV ATLAS_TARGET_QUANT=nvfp4
 RUN cargo build --release -p spark-server
 
 # ── Runtime stage ────────────────────────────────────────────────
-FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+FROM nvidia/cuda:13.5.0-runtime-ubuntu24.04
 
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.source="https://github.com/TheApathy/flux-engine"
