@@ -17,7 +17,7 @@ pub(super) const DOWN_CUDA_SHA: &str =
 pub(super) const WRAPPER_SHA: &str =
     "d0082ca50bfb1ad6d77fd2d9b4370b5378dfcaf9c69662f0a88b8f2b4745d920";
 pub(super) const ROUTE_SHA: &str =
-    "26a30cfcccad0ecead5cdcfe55b4745ea8208e933e6394ec007de60fc94ea90a";
+    "5f4aba7a9da028076ef5a887b9d13c5195506edb9912cf811f2b282bad9a6a37";
 pub(super) const MANIFEST_SHA: &str =
     "e15f5c2fc6741ae14229812f6de1b2ffaed08b0030d659a442c0daf5cbcb1e17";
 pub(super) const DIRECT_MODULES: [&str; 3] = [

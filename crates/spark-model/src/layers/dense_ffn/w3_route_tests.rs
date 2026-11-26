@@ -16,7 +16,7 @@ fn w3_route_requires_small_batched_silu_and_complete_preparation() {
 
 #[test]
 fn w3_dispatch_is_complete_ordered_and_precedes_w4_routes() {
-    let source = include_str!("../dense_ffn.rs");
+    let source = include_str!("kgamma.rs");
     let start = source.find("pub fn forward_kgamma(").unwrap();
     let w3_start = source[start..]
         .find("if w3_kgamma_applicable(")
@@ -46,7 +46,7 @@ fn w3_dispatch_is_complete_ordered_and_precedes_w4_routes() {
 
 #[test]
 fn w3_preparation_requires_weight_handle_and_silu() {
-    let source = include_str!("../dense_ffn.rs");
+    let source = include_str!("layer.rs");
     let start = source.find("fn has_w3_gemm(&self)").unwrap();
     let end = source[start..]
         .find("/// Whether ANY W3 routing")

@@ -214,7 +214,10 @@ mod tests {
 
     #[test]
     fn dense_ffn_integration_is_env_gated_and_falls_through_existing_split_m8() {
-        let source = include_str!("../dense_ffn.rs");
+        let source = concat!(
+            include_str!("../dense_ffn/policy.rs"),
+            include_str!("../dense_ffn/kgamma.rs"),
+        );
         assert!(source.contains("ATLAS_EXACT_FFN_LOWREG_GATE_UP_M16"));
         assert!(source.contains("exact_ffn_lowreg_m16_route("));
         assert!(source.contains("w4a16_gemv_gate_exact_m16_lowreg("));

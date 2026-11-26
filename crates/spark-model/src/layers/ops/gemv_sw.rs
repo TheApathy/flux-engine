@@ -403,15 +403,32 @@ mod tests {
     /// PROVEN BY: restoring either pre-port call site turns this red.
     #[test]
     fn dense_ffn_decode_does_not_call_base_dual_or_silu_input() {
-        let src = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/layers/dense_ffn.rs"),
-        )
-        .unwrap();
-        for banned in ["ops::w4a16_gemv_dual(", "ops::w4a16_gemv_silu_input("] {
-            assert!(
-                !src.contains(banned),
-                "dense_ffn.rs: use the w4a16_decode_gemv_* dispatchers, not {banned}"
-            );
+        let layers_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/layers");
+        let mut files = vec![layers_dir.join("dense_ffn.rs")];
+        for entry in fs::read_dir(layers_dir.join("dense_ffn")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("_tests.rs"))
+            {
+                files.push(path);
+            }
+        }
+        assert!(
+            files.len() > 1,
+            "expected split dense_ffn production submodules"
+        );
+        for path in files {
+            let src = fs::read_to_string(&path).unwrap();
+            for banned in ["ops::w4a16_gemv_dual(", "ops::w4a16_gemv_silu_input("] {
+                assert!(
+                    !src.contains(banned),
+                    "{}: use the w4a16_decode_gemv_* dispatchers, not {banned}",
+                    path.display()
+                );
+            }
         }
     }
 }

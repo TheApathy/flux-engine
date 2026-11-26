@@ -8,7 +8,10 @@
 const LAYERS: &str = include_str!("../src/layers/mod.rs");
 const SSM_VERIFY: &str = include_str!("../src/layers/qwen3_ssm/trait_decode_batched.rs");
 const SSM_DECODE: &str = include_str!("../src/layers/qwen3_ssm/ssm_forward.rs");
-const FFN: &str = include_str!("../src/layers/dense_ffn.rs");
+const FFN: &str = concat!(
+    include_str!("../src/layers/dense_ffn/kgamma.rs"),
+    include_str!("../src/layers/dense_ffn/policy.rs"),
+);
 const ATTN_FFN: &str = include_str!("../src/layers/qwen3_attention/trait_impl/multi_seq/ffn.rs");
 const DRAFTER_LOAD: &str =
     include_str!("../../spark-server/src/main_modules/serve_phases/weights.rs");
