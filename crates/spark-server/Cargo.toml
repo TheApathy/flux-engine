@@ -97,7 +97,7 @@ xgrammar = { path = "../xgrammar" }
 rest-store = { path = "../rest-store" }
 prometheus = { version = "0.13", default-features = false }
 lazy_static = "1"
-tower-http = { version = "0.6", features = ["catch-panic", "cors"] }
+tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 # Blocking HTTP client for the TUI Library recipe fetcher and issue reporter,
 # plus base64 credential/image encoding.
 ureq = { version = "3", features = ["json"] }
