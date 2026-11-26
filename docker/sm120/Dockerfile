@@ -26,7 +26,7 @@
 #     ghcr.io/theapathy/flux-engine:sm120 inspect
 
 # ── Build stage (linux/amd64, CUDA 13.0 devel) ───────────────────
-FROM --platform=linux/amd64 nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder
+FROM --platform=linux/amd64 nvidia/cuda:13.0.0-devel-ubuntu24.04@sha256:1e8ac7a54c184a1af8ef2167f28fa98281892a835c981ebcddb1fad04bdd452d AS builder
 
 ARG FLUX_TARGET_HW=rtx6000
 ARG FLUX_TARGET_MODEL=*
@@ -71,7 +71,7 @@ ENV ATLAS_EXLLAMAV3_SOURCE=/tmp/exllamav3
 RUN cargo build --release -p spark-server
 
 # ── Runtime stage (linux/amd64, CUDA 13.0 runtime) ───────────────
-FROM --platform=linux/amd64 nvidia/cuda:13.0.0-runtime-ubuntu24.04
+FROM --platform=linux/amd64 nvidia/cuda:13.0.0-runtime-ubuntu24.04@sha256:95318efecfd68ab3d109da5277863257b06137c84f34a87f38de970d5cd035d3
 
 ARG FLUX_TARGET_HW=rtx6000
 ARG FLUX_ENGINE_VERSION=1.0.3

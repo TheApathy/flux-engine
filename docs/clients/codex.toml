@@ -1,0 +1,9 @@
+# Flux Engine local OpenAI-compatible provider for Codex CLI (~/.codex/config.toml)
+model = "qwen3.8-flash-next"
+model_provider = "flux"
+
+[model_providers.flux]
+name = "Flux Engine (Local)"
+base_url = "http://127.0.0.1:8888/v1"
+env_key = "FLUX_API_KEY"
+wire_api = "responses"

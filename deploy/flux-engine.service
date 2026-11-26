@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Hardened systemd unit for Flux Engine (loopback-by-default).
+# Install:
+#   sudo cp deploy/flux-engine.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now flux-engine
+
+[Unit]
+Description=Flux Engine LLM Inference Server
+Documentation=https://theapathy.github.io/flux-engine/
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flux
+Group=flux
+SupplementaryGroups=video render
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/flux-engine/flux-engine.env
+ExecStart=/usr/local/bin/spark serve /srv/models/model --bind 127.0.0.1 --port 8888
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=300s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Sandboxing (CUDA requires JIT/mapped device memory, so MemoryDenyWriteExecute stays off)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/srv/models
+
+[Install]
+WantedBy=multi-user.target

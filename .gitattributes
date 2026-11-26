@@ -1,0 +1,27 @@
+# Consistent LF line endings across Linux, macOS, and Windows contributors.
+* text=auto eol=lf
+
+*.rs text eol=lf
+*.cu text eol=lf
+*.cuh text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.env text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.svg text eol=lf
+Dockerfile text eol=lf
+Makefile text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.gz binary
+*.tgz binary

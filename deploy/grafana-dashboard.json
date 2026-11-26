@@ -1,0 +1,64 @@
+{
+  "title": "Flux Engine — Inference & KV Cache Telemetry",
+  "uid": "flux-engine-prod-v1",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "tags": ["flux-engine", "llm", "cuda", "blackwell"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Active Requests & Queue Depth",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "flux_active_requests", "legendFormat": "active ({{instance}})" },
+        { "expr": "flux_queued_requests", "legendFormat": "queued ({{instance}})" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Token Throughput (Prompt & Generation tok/s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(flux_generation_tokens_total[1m])", "legendFormat": "decode tok/s ({{instance}})" },
+        { "expr": "rate(flux_prompt_tokens_total[1m])", "legendFormat": "prefill tok/s ({{instance}})" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "gauge",
+      "title": "KV Cache Pool Utilization",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 7 },
+      "targets": [
+        { "expr": "flux_kv_cache_utilization_ratio", "legendFormat": "KV util" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Request Latency & Time-to-First-Token (p50 / p95 / p99)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 8, "y": 8, "w": 16, "h": 7 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(flux_ttft_seconds_bucket[5m])) by (le))", "legendFormat": "TTFT p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(flux_ttft_seconds_bucket[5m])) by (le))", "legendFormat": "TTFT p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(flux_ttft_seconds_bucket[5m])) by (le))", "legendFormat": "TTFT p99" }
+      ]
+    }
+  ]
+}

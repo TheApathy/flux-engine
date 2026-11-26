@@ -1,0 +1,60 @@
+name: Formal Verification (Z3 & Scheduler Model)
+
+# Runs formal SMT theorem proofs (Z3) and scheduler TLA-style state-machine
+# verification on every PR touching scheduler, KV-cache, speculative-decoding,
+# or formal proof files.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/spark-server/src/scheduler/**'
+      - 'crates/spark-runtime/src/kv_cache/**'
+      - 'crates/spark-model/src/model/**'
+      - 'repro-kit/formal/**'
+      - '.github/workflows/formal-verify.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/spark-server/src/scheduler/**'
+      - 'crates/spark-runtime/src/kv_cache/**'
+      - 'crates/spark-model/src/model/**'
+      - 'repro-kit/formal/**'
+      - '.github/workflows/formal-verify.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: formal-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  z3-and-scheduler-model:
+    name: Z3 Theorems & Scheduler State-Machine Proofs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (eBPF egress audit, disable sudo/containers)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+          disable-sudo-and-containers: true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Z3 solver
+        run: python3 -m pip install --disable-pip-version-check --quiet z3-solver
+
+      - name: Prove NextGen invariants (Z3 SMT)
+        run: python3 -B repro-kit/formal/verify_nextgen_invariants.py
+
+      - name: Verify scheduler TLA-style state machine
+        run: python3 -B repro-kit/formal/verify_scheduler_tla_model.py

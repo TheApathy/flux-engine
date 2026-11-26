@@ -30,6 +30,12 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
+      - name: Harden runner (eBPF egress audit, disable sudo/containers)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+          disable-sudo-and-containers: true
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -53,6 +59,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Harden runner (eBPF egress audit, disable sudo/containers)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+          disable-sudo-and-containers: true
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -77,6 +89,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
+      - name: Harden runner (eBPF egress audit)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -98,6 +115,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Harden runner (eBPF egress audit, disable sudo/containers)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+          disable-sudo-and-containers: true
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -177,7 +200,7 @@ jobs:
       - name: Run offline Python & shell test suites
         run: |
           set -euo pipefail
-          python3 -m pip install --disable-pip-version-check --quiet pytest pyyaml
+          python3 -m pip install --disable-pip-version-check --quiet pytest pyyaml httpx z3-solver
           PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q \
             repro-kit/tests \
             repro/tests \
@@ -193,6 +216,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
+      - name: Harden runner (eBPF egress audit)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -538,12 +566,21 @@ jobs:
       # Process-per-test isolation via cargo-nextest prevents parallel env-var
       # races while skipping `#[ignore]`-gated GPU tests on no-GPU runners.
       - run: cargo nextest run --workspace --locked --no-fail-fast
+      - name: Compiled-binary CLI smoke check (--version & --help)
+        run: |
+          set -euo pipefail
+          cargo build --locked -p spark-server --bin spark
+          ver="$(./target/debug/spark --version)"
+          echo "Compiled binary version: $ver"
+          echo "$ver" | grep -q "1.0.3"
+          ./target/debug/spark --help >/dev/null
+          ./target/debug/spark serve --help >/dev/null
 
   test-macos-metal:
     name: cargo test --features metal (macOS aarch64)
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -557,7 +594,7 @@ jobs:
       # feature opts out of cudarc workspace-wide and into the Metal
       # runtime backend (objc2-metal). xcrun + metallib are part of
       # macOS's built-in Xcode Command Line Tools and don't need a
-      # separate install on macos-14 runners.
+      # separate install on macos-15 runners.
       - name: cargo check spark-server --features metal
         run: cargo check -p spark-server --no-default-features --features metal
       - name: cargo check spark-runtime --features metal

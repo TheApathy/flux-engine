@@ -52,6 +52,15 @@ jobs:
       build_sm120: ${{ steps.context.outputs.build_sm120 }}
       build_gb10: ${{ steps.context.outputs.build_gb10 }}
     steps:
+      - name: Harden runner (eBPF egress block, disable sudo/containers)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+          disable-sudo-and-containers: true
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -215,6 +224,11 @@ jobs:
       attestations: write
       security-events: write
     steps:
+      - name: Harden runner (eBPF egress audit)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -280,6 +294,11 @@ jobs:
             exit 1
           fi
           cosign sign --yes "ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}"
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\.com/TheApathy/flux-engine/\.github/workflows/container-release\.yml@.*$" \
+            "ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}" >/dev/null
+          echo "Verified Cosign keyless OCI signature on ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}"
 
       - name: Attest SM120 image build provenance (GitHub Artifact Attestations)
         if: needs.preflight.outputs.dry_run != 'true'
@@ -324,6 +343,11 @@ jobs:
       attestations: write
       security-events: write
     steps:
+      - name: Harden runner (eBPF egress audit)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -387,6 +411,11 @@ jobs:
             exit 1
           fi
           cosign sign --yes "ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}"
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\.com/TheApathy/flux-engine/\.github/workflows/container-release\.yml@.*$" \
+            "ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}" >/dev/null
+          echo "Verified Cosign keyless OCI signature on ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}"
 
       - name: Attest GB10 image build provenance (GitHub Artifact Attestations)
         if: needs.preflight.outputs.dry_run != 'true'

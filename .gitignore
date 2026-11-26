@@ -52,6 +52,9 @@ known_hosts
 !kernels/**/*.cuh
 !crates/spark-server/src/tokenizer/
 !/crates/xgrammar/src/tokenizer/
+!/crates/atlas-embed/src/token.rs
+!/kernels/gb10/glm5.3-flash/exl3/ggml_q6_token_embedding.cu
+!/kernels/gb10/glm5.3-flash/iq3/ggml_q6_token_embedding.cu
 
 # --- Local Agent / IDE / Host Lock & Telemetry Guardrails ---
 # AGENTS.md stays strictly gitignored for private local notes; public

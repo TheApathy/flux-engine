@@ -27,7 +27,6 @@ src = "src"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/TheApathy/flux-engine"
-git-repository-icon = "fa-github"
 edit-url-template = "https://github.com/TheApathy/flux-engine/edit/main/{path}"
 no-section-label = true
 """

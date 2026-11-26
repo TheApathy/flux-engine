@@ -1,0 +1,8 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8888",
+    "ANTHROPIC_API_KEY": "${FLUX_API_KEY}",
+    "ANTHROPIC_MODEL": "qwen3.8-flash-next",
+    "ANTHROPIC_SMALL_FAST_MODEL": "qwen3.8-flash-next"
+  }
+}
