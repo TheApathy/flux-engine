@@ -166,7 +166,7 @@ ATLAS_QWEN4_VERIFY_GRAPH=1 \
     --port 8000 --bind 127.0.0.1
 ```
 
-For opt-in ultra-fast Flash-Next prefill (`W4A4` NVFP4×NVFP4 MoE + `mHC` NVFP4 2-CTA), pass `ATLAS_QWEN4_PREFILL_MOE_W4A4=all ATLAS_QWEN4_PREFILL_MHC_NVFP4=1` (experimental opt-in; default recipe stays 100% lossless `W4A8` `V31_WS` with `10/10` needle exactness).
+For opt-in ultra-fast Flash-Next prefill (`W4A4` NVFP4×NVFP4 MoE + `mHC` NVFP4 2-CTA), pass `ATLAS_QWEN4_PREFILL_MOE_W4A4=all ATLAS_QWEN4_PREFILL_MHC_NVFP4=1` (experimental opt-in; default recipe stays calibrated exact-route `W4A8` `V31_WS` prefill — `5/5` needles verified in §6.1 — with lossless greedy speculative verification).
 
 For plain target-only exact decode (disabling speculation):
 
@@ -232,7 +232,7 @@ Most of these auto-engage when `active_sm_count() > 64` or `CC == (10, 3)`:
 | `ATLAS_GDN_PREFILL_FI` | Auto-ON (`rows > 32`, `sm_count > 64`) | FlashInfer CuTe-DSL BF16 chunked GDN prefill for `Qwen3.8-27B` (`48` SSM layers, `2.45x` faster 8K prefill). |
 | `ATLAS_GATEUP_N32=0` + coalesced `M<=16` | Auto-ON (`sm_count > 64`) | Single-launch BF16×BF16 MMA intra-CTA warp-split-K fused `gate+up+silu` (`v2_n16_sk4_m16_gateup_silu`, 1,088 CTAs) + `down`/`QKV`/`SSM`/`lm_head` (`M<=16`), plus 3-CTA/SM streaming (`__ldcs`/`__stcs`) multi-seq GDN (`-3.04 ms/step` on `27B C=1` DFlash2, `+50–103 tok/s` across `27B C=8..64`). |
 | `ATLAS_WY17_LAZY_COMMIT` | `1` in `nvidia-blackwell-sm120.env` | Deferred WY17 GDN commit on `Qwen3.8-27B` DFlash2 (`+22–66 tok/s` on `C=1`). |
-| `ATLAS_DFLASH_BATCHED_VERIFY` | Opt-in (`0`/`1`) | Cross-sequence batched flat DFlash2 verify (`C=2..16`, up to `128` rows/pass) with per-slot `gdn_lazy_retain` lanes, hoisted 48L SSM (`gdn_f32_sequence_lazyfinal_multi` at `C>=4` / Split-V=4 at `C<4`), hoisted 16L Attn QKV/O/FFN, `cuBLASLt NVFP4` `lm_head_batched` (`LM_CHUNK=128`, 1-launch `argmax_bf16_rows`), 1-launch `batched_embed`, and post-thinking (`--disable-thinking` / post-`</think>`) masked-argmax support. |
+| `ATLAS_DFLASH_BATCHED_VERIFY` | Auto-ON via `flux-autodetect` for `27B C>=2` (opt-in `=1` on raw `flux-server`) | Cross-sequence batched flat DFlash2 verify (`C=2..16`, up to `128` rows/pass) with per-slot `gdn_lazy_retain` lanes, hoisted 48L SSM (`gdn_f32_sequence_lazyfinal_multi` at `C>=4` / Split-V=4 at `C<4`), hoisted 16L Attn QKV/O/FFN, `cuBLASLt NVFP4` `lm_head_batched` (`LM_CHUNK=128`, 1-launch `argmax_bf16_rows`), 1-launch `batched_embed`, and post-thinking (`--disable-thinking` / post-`</think>`) masked-argmax support. |
 | `ATLAS_DFLASH_BATCHED_VERIFY_GRAPH` | Auto-ON (`sm_count > 64`), OFF on GB10 | Full-step CUDA graph capture of `decode_verify_dflash_batched` (embedding + 64 layers + final norm + `lm_head_batched` + `argmax_bf16_rows`) over a fixed-address pre-staged metadata slab. |
 | `ATLAS_QWEN4_PLE_UNIFIED_GRAPH` | Default ON (`1`) | Unified 48-layer `Qwen3.8-Flash-Next` verify CUDA graph overlapping `mmap` PLE `dequant + key_proj + value_proj` on the secondary stream with Layer 0, combined with `sk_dn=1` + fused `shared_gate` in `qwen4_moe_thin_sk_v33`, high-SM `N8Sk8M32V2` mHC routing, `N=512` Split-K router, inter-layer `mlp_hyper` deferral, and fused `scatter + deinterleave_qg`. |
 | `ATLAS_DFLASH_STAGE1_GRAPH` | Default ON (`1`) | Bucketed `1..=8`-row Stage-1 KV CUDA graphs, coalesced context-capture D2D runs, suffix-only position upload, and single `216 B` Stage-2 bundle H2D in `dflash_head`. |
@@ -245,7 +245,9 @@ Most of these auto-engage when `active_sm_count() > 64` or `CC == (10, 3)`:
 
 Measured on `1x NVIDIA RTX PRO 6000 Blackwell Workstation Edition` (`SM12.0`, `188 SMs`, `3,090 MHz` boost, `96 GB GDDR7` @ `14,001 MHz` / `1,792 GB/s`, `96 MiB L2`, `600 W` TDP, PCIe Gen5 x16, CUDA `13.0`, Ubuntu `24.04 x86_64`).
 
-> **Workstation vs. Server Edition Note:** Passive-cooled `RTX PRO 6000 Blackwell Server Edition` SKUs cap core clocks at `2,430 MHz` and GDDR7 at `12,481 MHz` (`1,600 GB/s`), running ~8–12% lower on decode while achieving `15,151 tok/s` (`532.5 ms`) 8K `27B` prefill and `32,674 tok/s` (`495.9 ms`) 16K Flash-Next `W4A4` prefill.
+> **Build & Edition Notes:**
+> - **Peak Prefill (`fi_gdn` AOT):** The headline cold-prefill tables below (§6.1 and §6.3) were measured with locally source-built FlashInfer CuTe-DSL `fi_gdn` AOT objects (`rebuild-aot.sh`) + `FLASHINFER_HOME` enabled — the exact configuration built into the published `ghcr.io/theapathy/flux-engine:sm120` (`:v1.0.3` `linux/amd64`) container image. Pure-source builds without `fi_gdn` AOT compile and run cleanly via the native CUDA GDN fallback at lower prefill speed.
+> - **Workstation vs. Server Edition:** Passive-cooled `RTX PRO 6000 Blackwell Server Edition` SKUs cap core clocks at `2,430 MHz` and GDDR7 at `12,481 MHz` (`1,600 GB/s`), running ~8–12% lower on decode while achieving `15,151 tok/s` (`532.5 ms`) 8K `27B` prefill and `32,674 tok/s` (`495.9 ms`) 16K Flash-Next `W4A4` prefill.
 
 ### 6.1 `Qwen3.8-Flash-Next-NVFP4` — Cold Prefill (`1x RTX PRO 6000 WS`, `600 W`, BF16 KV, `mmap` PLE)
 
@@ -264,8 +266,8 @@ Measured on `1x NVIDIA RTX PRO 6000 Blackwell Workstation Edition` (`SM12.0`, `1
 | **`C=1` (opt-in `NVFP4` `lm_head`)** | **DFlash2 (`W=8`, `ATLAS_QWEN4_TARGET_LMHEAD_MODE=nvfp4`, `11.29–11.40 ms/round`)** | **`678.3` / `550.5` / `358.8` / `316.2` / `208.4 tok/s`** | `678.3` / `550.5` / `358.8` / `316.2` / `208.4 tok/s` | `606.2` / `505.4` / `343.9` / `302.6` / `204.0 tok/s` | — |
 | **`C=2`** | DFlash2 (`W=8`, `256`-row graph) | **`432.7 tok/s`** | `216.4 tok/s` | `355.5 tok/s` | `396.0 W` |
 | **`C=4`** | DFlash2 (`W=8`, `256`-row graph) | **`672.0 tok/s`** | `168.0 tok/s` | `475.9 tok/s` | `434.8 W` |
-| **`C=8`** | **DFlash2 (`W=8`, `256`-row graph, `GQA12_RAGGED` gated)** | **`1,133.6 tok/s`** (mixed) / **`2,357.0 tok/s`** (arith wall) | `141.7 tok/s` (mixed) / `294.6 tok/s` (arith) | **`712.5 tok/s`** (mixed) / **`2,357.0 tok/s`** (arith) | `525.2 W` |
-| **`C=16`** | **DFlash2 (`W=8`, `256`-row graph, `GQA12_RAGGED` gated)** | **`1,886.0 tok/s`** (mixed) / **`3,687.1 tok/s`** (arith wall) | `117.9 tok/s` (mixed) / `230.4 tok/s` (arith) | **`1,399.2 tok/s`** (mixed) / **`3,687.1 tok/s`** (arith) | `507.8 W` |
+| **`C=8`** | **DFlash2 (`W=8`, `256`-row graph, `GQA12_RAGGED` gated)** | **`1,133.6 tok/s`** (mixed) | `141.7 tok/s` (mixed) | **`712.5 tok/s`** (mixed) / **`2,357.0 tok/s`** (arith wall, `294.6/req`) | `525.2 W` |
+| **`C=16`** | **DFlash2 (`W=8`, `256`-row graph, `GQA12_RAGGED` gated)** | **`1,886.0 tok/s`** (mixed) | `117.9 tok/s` (mixed) | **`1,399.2 tok/s`** (mixed) / **`3,687.1 tok/s`** (arith wall, `230.4/req`) | `507.8 W` |
 | **`C=24`** | DFlash2 (`W=8`, `256`-row graph) | **`2,356.0 tok/s`** | `98.2 tok/s` | `1,693.2 tok/s` | `527.2 W` |
 | **`C=32`** | DFlash2 (`W=8`, `256`-row graph) | **`2,765.3 tok/s`** | `86.4 tok/s` | `1,882.0 tok/s` | `552.6 W` |
 | **`C=48`** | **DFlash2 (`K=5`, `win=1024`, `rows=240`)** | **`3,068.6 tok/s`** | **`63.9 tok/s`** | `1,686.7 tok/s` | `544.3 W` |
@@ -282,14 +284,16 @@ Measured on `1x NVIDIA RTX PRO 6000 Blackwell Workstation Edition` (`SM12.0`, `1
 | Concurrency | Best Mode | Steady-State Aggregate | Per-Request Steady | End-to-End Wall Aggregate | Peak Power |
 |---:|---|---:|---:|---:|---:|
 | **`C=1`** (`arith` / `code_edit` / `code` / `prose`) | **DFlash2 (`W=8`, coalesced `v2_n16_sk4` + `WY17`)** | **`497.1` / `312.3` / `300.0` / `266.0 tok/s`** | `497.1` / `312.3` / `300.0` / `266.0 tok/s` | `461.3` / `299.7` / `286.9` / `258.7 tok/s` | — |
-| **`C=2`** | **Hoisted Batched DFlash2 (`W=8`, `forward=15.97 ms`, `20.1 ms/round`, graphed)** | **`~796 tok/s`** (arith) | **`~398 tok/s`** | **`590.1 tok/s`** (arith) / **`575.5 tok/s`** (mixed) | `568.0 W` |
-| **`C=4`** | **Hoisted Batched DFlash2 (`W=8`, `forward=18.47 ms`, `23.5 ms/round`, graphed)** | **`~1,362 tok/s`** (arith) | **`~340 tok/s`** | **`600.1 tok/s`** (arith) / **`514.3 tok/s`** (mixed) | `568.0 W` |
-| **`C=8`** | **Hoisted Batched DFlash2 (`W=8`, `forward=21.09 ms`, `27.5 ms/round`, graphed)** | **`~2,327 tok/s`** (arith; plain `561.5`) | **`~291 tok/s`** | **`1,073.8 tok/s`** (arith) / **`711.4 tok/s`** (mixed) | `568.0 W` |
+| **`C=2`** | **Hoisted Batched DFlash2 (`W=8`, `forward=15.97 ms`, `20.1 ms/round`, graphed)** | — *(see wall)* | — | **`590.1 tok/s`** (arith) / **`575.5 tok/s`** (mixed) | `568.0 W` |
+| **`C=4`** | **Hoisted Batched DFlash2 (`W=8`, `forward=18.47 ms`, `23.5 ms/round`, graphed)** | — *(see wall)* | — | **`600.1 tok/s`** (arith) / **`514.3 tok/s`** (mixed) | `568.0 W` |
+| **`C=8`** | **Hoisted Batched DFlash2 (`W=8`, `forward=21.09 ms`, `27.5 ms/round`, graphed)** | **`1,118.9 tok/s`** (mixed; plain `561.5`) | **`139.9 tok/s`** | **`1,073.8 tok/s`** (arith) / **`711.4 tok/s`** (mixed) | `568.0 W` |
 | **`C=16`** | Plain Multi-Seq (`GRAPHS=1`, coalesced `M<=16` + 3-CTA GDN) | **`932.5 tok/s`** | **`58.3 tok/s`** | `802.3 tok/s` | **`605.5 W`** |
 | **`C=24`** | Plain Multi-Seq (`GRAPHS=1`, `cuBLASLt NVFP4` `M>=24` + PTX absmax + 3-CTA GDN) | **`1,161.6 tok/s`** | **`48.4 tok/s`** | `957.0 tok/s` | `431.3 W` |
 | **`C=32`** | Plain Multi-Seq (`GRAPHS=1`, `cuBLASLt NVFP4` `M>=24` + PTX absmax + 3-CTA GDN) | **`1,394.4 tok/s`** | **`43.6 tok/s`** | `1,102.6 tok/s` | `437.1 W` |
 | **`C=48`** | Plain Multi-Seq (`GRAPHS=1`, `cuBLASLt NVFP4` `M>=24` + PTX absmax + 3-CTA GDN) | **`1,724.8 tok/s`** | **`35.9 tok/s`** | `1,300.9 tok/s` | `452.9 W` |
-| **`C=64`** | Plain Multi-Seq (`GRAPHS=1`, `cuBLASLt NVFP4` `M>=24` + PTX absmax + 3-CTA GDN) | **`1,974.8 tok/s`** (`97.3%` GDDR7 BW!) | **`30.9 tok/s`** | **`1,479.8 tok/s`** | `454.3 W` |
+| **`C=64`** | Plain Multi-Seq (`GRAPHS=1`, `cuBLASLt NVFP4` `M>=24` + PTX absmax + 3-CTA GDN) | **`1,974.8 tok/s`** | **`30.9 tok/s`** | **`1,479.8 tok/s`** | `454.3 W` |
+
+*(Note: For `C=2`/`C=4` batched DFlash2, `C×8 / round_ms` gives a 100%-acceptance upper bound only; the table reports strictly measured wall-clock throughput and measured mixed steady-state `1,118.9 tok/s` at `C=8`.)*
 
 ### 6.4 `Qwen3.8-Flash-Next-NVFP4` — `1M` YaRN4 Long-Context Recall & `1x`–`8x` Pooled NVFP4 KV Capacity (`600 W` SM120)
 
@@ -297,10 +301,10 @@ Measured on `1x NVIDIA RTX PRO 6000 Blackwell Workstation Edition` (`SM12.0`, `1
   - Depth `0.1`: `1,011,019` prompt tokens · **`82.07 s` TTFT (`12,318.8 tok/s`)** · exact needle recall (**PASS**)
   - Depth `0.5`: `1,011,019` prompt tokens · **`82.12 s` TTFT (`12,312.0 tok/s`)** · exact needle recall (**PASS**)
   - Depth `0.9`: `1,011,019` prompt tokens · **`82.18 s` TTFT (`12,302.8 tok/s`)** · exact needle recall (**PASS**)
-- **Certified Resident KV Pool Capacity (`1x 96 GB` live-verified + `2x`/`4x`/`8x` discrete pooling):**
-  - `1x 96 GB` (`hp=auto`, `4xBF16 + 8xNVFP4`): **`1,458,544` (`1.46M`) max KV tokens** (`budget_blocks=91,159`, `14.11 KiB/tok`)
-  - `1x 96 GB` (`hp=0`, `12xNVFP4`, `C=4`): **`2,304,528` (`2.30M`) max KV tokens** (`budget_blocks=144,033`, `8.36 KiB/tok`; `2,097,232` = `2.0M` allocated in `13.50 GiB`)
-  - `2x / 4x / 8x 96 GB` (`TP/EP/PP` auto-pooled via `flux-autodetect`): **`6.3M` (`2x TP2+EP2`) -> `8.4M` (`4x TP4+EP4`) -> `16.8M` (`4x/8x PP`)** pooled NVFP4 KV tokens.
+- **Resident KV Pool Capacity (`1x 96 GB` live-verified; `2x`/`4x`/`8x` planner-calculated):**
+  - `1x 96 GB` live-verified (`hp=auto`, `4xBF16 + 8xNVFP4`): **`1,458,544` (`1.46M`) max KV tokens** (`budget_blocks=91,159`, `14.11 KiB/tok` total incl. QSA indexer)
+  - `1x 96 GB` live-verified (`hp=0`, `12xNVFP4`, `C=4`): **`2,304,528` (`2.30M`) max KV tokens** (`budget_blocks=144,033`; `2,097,232` = `2.0M` tokens allocate **`13.50 GiB` raw NVFP4 KV** @ `6.75 KiB/tok` or **`16.72 GiB` total incl. QSA indexer** @ `8.36 KiB/tok`)
+  - `2x / 4x / 8x 96 GB` **planner-calculated** via `flux-autodetect` (not yet live-benchmarked on multi-GPU SM120 hardware): **`6.3M` (`2x TP2+EP2`) -> `8.4M` (`4x TP4+EP4`) -> `16.8M` (`4x/8x PP`)** pooled NVFP4 KV tokens.
 
 ---
 

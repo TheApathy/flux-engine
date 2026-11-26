@@ -50,7 +50,7 @@ Wait ~30–60 s for `/health` to return `200 OK`:
 
 ```bash
 curl -s http://127.0.0.1:8899/health
-# {"status":"ok"}
+# {"status":"ready","model":"..."}
 ```
 
 ---
@@ -61,7 +61,7 @@ curl -s http://127.0.0.1:8899/health
 |---|---|---:|---|
 | **Flash-Next Target** | `/models/Qwen3.8-Flash-Next-NVFP4-Offload` | `~70 GiB` | 48-layer hybrid (`36` GDN + `12` QSA), 512 routed + 1 shared MoE experts (`NVFP4`), 4-stream mHC, 128 sector-aligned NVFP4 `ple/` shards (`548` files total) |
 | **Flash-Next MTP Drafter** | `/models/Qwen3.8-Flash-Next-Inferact-MTP` | `~4.2 GiB` | Native 1-layer full-attention MoE Multi-Token Prediction head (`num_drafts=4`, `K=5` lossless verify) |
-| **Dense 27B Target** | `/models/Qwen3.8-27B-NVFP4` | `21.8 GiB` | `unsloth/Qwen3.8-27B-NVFP4` (`64` layers: `48` GDN + `16` GQA, dense FFN) |
+| **Dense 27B Target** | `/models/Qwen3.8-27B-NVFP4` | `21.8 GiB` | `nvidia/Qwen3.8-27B-NVFP4` (or compatible NVFP4 checkpoint; `64` layers: `48` GDN + `16` GQA, dense FFN) |
 | **Dense 27B Drafter (v1 B16)** | `/models/Qwen3.8-27B-DFlash-v2` | `3.96 GiB` | 8-layer BF16 block-diffusion drafter (`block_size=16`, proposes `gamma=15` tokens/step, `63.9–64.0 tok/s` on 400-tok coding probe) |
 | **Dense 27B Drafter (DFlash2 B8)** | `/models/Qwen3.8-27B-DFlash2` | `~2.5 GiB` | 5-layer qualified default `z-lab/Qwen3.8-27B-DFlash2` (`block_size=8`, `gamma=7`) or `incoai/Qwen3.5-27B-DFlash2` (`block_size=16`, `58.01 tok/s`) |
 
@@ -115,20 +115,20 @@ All `FLUX_*` variables can be passed via `docker run -e FLUX_...=...` or exporte
 | `FLUX_PORT` | `8899` | HTTP listening port for the OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/health`). |
 | `FLUX_HOST` | `127.0.0.1` (host) / `0.0.0.0` (container) | Bind address passed to `--bind` (`--host`). |
 | `FLUX_MAX_SEQ_LEN` | Mode-dependent (`40960` / `135168` / `143360`) | Maximum context length in tokens (`--max-seq-len`). |
-| `FLUX_KV_CACHE_DTYPE` | `bf16` (or `fp8` / `turboquant`) | KV cache precision (`bf16` required for lossless Qwen3.8-Flash-Next and Qwen3.8-27B recipes). |
-| `FLUX_GPU_MEMORY_UTILIZATION` | `0.55` (GB10 UMA) / `0.90` (discrete) | Fraction of memory budget for runtime arenas (keep `<= 0.55` on GB10 UMA to preserve OS and runtime headroom). |
+| `FLUX_KV_CACHE_DTYPE` | `auto` (`bf16` / `fp8` / `nvfp4` / `turbo3` / `turbo4`) | KV cache precision (`bf16` required for lossless Qwen3.8-Flash-Next and Qwen3.8-27B recipes; `nvfp4` for 1M context on 1× GB10). |
+| `FLUX_GPU_MEMORY_UTILIZATION` | `auto` (`0.85` GB10 default, `0.78` on large MoE, `0.55` on tight `w16384` recipes; `0.90` discrete) | Fraction of memory budget for runtime arenas (`--gpu-memory-utilization`). Keep `<= 0.55` on tight 16K-chunk GB10 UMA recipes to preserve OS and runtime headroom. |
 | `FLUX_DRAFT_MODEL` | *(auto-detected if present)* | Path to companion speculative drafter (`Inferact-MTP` or `DFlash`). |
-| `FLUX_GAMMA` | `4` (MTP `K=5`) / `15` (DFlash `K=16`) | Number of speculative draft tokens proposed per step (`gamma`). |
+| `FLUX_GAMMA` | `4` (MTP `K=5`) / `block_size - 1` (DFlash: `7` for `B8`, `15` for `B16`) | Number of speculative draft tokens proposed per step (`gamma`). |
 | `FLUX_DISABLE_SPECULATION` | `0` *(unset)* | Set to `1` to disable all speculative decoding (equivalent to `--no-speculative` / `ATLAS_DISABLE_SPECULATION=1`; use `FLUX_DRAFT_MODEL=none` to disable external DFlash/MTP sidecars). |
 | `FLUX_THINKING` | unset (`MODEL.toml` `thinking_default` applies) | Default `<think>` behavior (`on`, `off`, or unset for model default). Can also be toggled per-request via `chat_template_kwargs`. |
 | `FLUX_THINKING_BUDGET` | MODEL profile (`262144` in `MODEL.toml` for Qwen3.8-Flash-Next & Qwen3.8-27B) | Optional `--max-thinking-budget` server-ceiling override. A request may select a lower budget; when unset, the selected `MODEL.toml` profile remains authoritative. |
-| `FLUX_CPU_AFFINITY` | `5-9,15-19` (GB10 ARM64) | CPU core mask passed to `taskset -c` (pins server + PLE DMA to the 10 Cortex-X925 performance cores). |
-| `FLUX_CONCURRENCY` | `1` | Max concurrent sequences (`--max-num-seqs` / `--max-batch-size`). Qwen3.8-Flash-Next batches `2..32` natively by default (`ATLAS_QWEN4_NATIVE_BATCH` unset; `v1.0.x` supports `FLUX_CONCURRENCY=16` with lazy-H SSM pool); `33..128` requires `ATLAS_QWEN4_NATIVE_BATCH=0` and decodes C1 once per row. Startup memory admission still applies. |
+| `FLUX_CPU_AFFINITY` | `auto` (`5-9,15-19` on 20-core GB10 ARM64; unset on x86_64) | CPU core mask passed to `taskset -c` (pins server + PLE DMA to the 10 Cortex-X925 performance cores on GB10). |
+| `FLUX_CONCURRENCY` | `1` | Max concurrent sequences (`--max-num-seqs` / `--max-batch-size`). Qwen3.8-Flash-Next batches `2..128` natively via `flux-autodetect` (`QWEN4_NATIVE_MAX_ROWS=128`; Rust engine ceiling `256`); `ATLAS_QWEN4_NATIVE_BATCH=0` forces serial C1 per row. Startup memory admission still applies. |
 | `FLUX_KERNEL_TARGET` | `auto` | Explicit `--kernel-target` override matching a directory under `kernels/gb10/` (e.g. `qwen3.8-flash-next`, `qwen3.8-27b`, `qwen3.6-27b`, `deepseek-v4.1`, `glm5.3-flash`, `gemma-4-26b-a4b`, `gemma-4-31b`). |
-| `FLUX_WEIGHT_CACHE_DIR` | `/var/cache/flux-weight-cache` | Directory for persistent post-transform weight cache shards. |
+| `FLUX_WEIGHT_CACHE_DIR` | `~/.cache/atlas-weight-cache` (host) / `/var/cache/flux-weight-cache` (container) | Directory for persistent post-transform weight cache shards. |
 | `FLUX_QWEN4_PREFILL_WIDE` | `16384` (`max-prefill`) / `4096` (`interactive`) | Prefill chunk token width (`4096`, `8192`, `16384`). Must match `--max-prefill-tokens`. |
-| `ATLAS_QWEN4_NATIVE_BATCH` | unset (native) | Qwen4 C2+ decode route. Unset: native one-forward batching for C2-C32, with every serialized frame logged and counted by reason (`atlas_qwen4_decode_frames_total`). `1`: native or refuse to start. `0`: serial C1 per row. |
-| `FLUX_QWEN4_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB` | `7` (`128K`) / `10` (`136K+`) | Free unified memory floor (in GiB) below which FP8 fast-projection weight caching stops allocating. |
+| `ATLAS_QWEN4_NATIVE_BATCH` | unset (native) | Qwen4 C2+ decode route. Unset: native one-forward batching for `C2..C128` (engine hard ceiling `256`), with every serialized frame logged and counted by reason (`atlas_qwen4_decode_frames_total`). `1`: native or refuse to start. `0`: serial C1 per row. |
+| `FLUX_QWEN4_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB` | `6` (nextgen) / `7` (`128K`) / `10` (`136K+`) | Free unified memory floor (in GiB) below which FP8 fast-projection weight caching stops allocating. |
 
 ---
 
@@ -140,7 +140,7 @@ All `FLUX_*` variables can be passed via `docker run -e FLUX_...=...` or exporte
 curl -s http://127.0.0.1:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen38-native-mtp-frontier-v1",
+    "model": "Qwen3.8-Flash-Next-NVFP4-Offload",
     "messages": [
       {"role": "user", "content": "Write a lock-free ring buffer in Rust with atomic acquire/release indices."}
     ],
@@ -164,7 +164,7 @@ launcher reports the ceiling and its source without replacing the model profile.
 curl -s http://127.0.0.1:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen38-native-mtp-frontier-v1",
+    "model": "Qwen3.8-Flash-Next-NVFP4-Offload",
     "messages": [{"role": "user", "content": "Find all integer solutions to x^3 + y^3 = 1729."}],
     "chat_template_kwargs": {"enable_thinking": true},
     "max_tokens": 2048,
@@ -178,8 +178,8 @@ curl -s http://127.0.0.1:8899/v1/chat/completions \
 curl -s http://127.0.0.1:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen38-native-mtp-frontier-v1",
-    "messages": [{"role": "user", "content": "Check the current free memory floor on node spark-01."}],
+    "model": "Qwen3.8-Flash-Next-NVFP4-Offload",
+    "messages": [{"role": "user", "content": "Check the current free memory floor on node node-01."}],
     "tools": [{
       "type": "function",
       "function": {
@@ -244,10 +244,10 @@ the speculative path is unvalidated.
    The GB10 hardware watchdog resets the node if free unified memory hits `6,144 MiB` (`6.0 GiB`). All Flux recipes enforce `MEASURED_FLOOR_MB >= 6,656 MiB` via `FLUX_QWEN4_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB=7` (or `10` at 136K+ context).
 3. **Never pass `"reasoning_effort"` to Qwen3.8 chat templates.**
    Qwen3.8's Jinja template explicitly calls `raise_exception` if `reasoning_effort` is present, causing an HTTP `400`. Use `"chat_template_kwargs": {"enable_thinking": true|false}` instead.
-4. **Do not raise `--gpu-memory-utilization` above `0.55` on GB10.**
-   On unified memory, raising `--gpu-memory-utilization` from `0.55` to `0.68` shrinks allocatable headroom (`16.6 GiB` -> `5.7 GiB`) and risks an OS OOM during wide prefill chunks.
+4. **Respect the per-recipe `--gpu-memory-utilization` cap on GB10 UMA.**
+   `flux-autodetect` defaults to `0.85` on small/medium models and `0.78` on large MoE models, while tight `w16384` Flash-Next recipes clamp to `0.55`. On `w16384` Flash-Next (`~70 GiB` weights + wide prefill buffers), raising `--gpu-memory-utilization` from `0.55` to `0.68` shrinks allocatable headroom (`16.6 GiB` -> `5.7 GiB`) and risks an OS OOM during wide prefill chunks.
 5. **Size concurrency (`FLUX_CONCURRENCY` / `--max-num-seqs`) carefully on GB10 UMA.**
-   Each active sequence in a hybrid GDN model owns an FP32 recurrent state slot across 36–48 layers. Under legacy eager state pools, keep `--max-num-seqs <= 8` on long contexts; in `v1.0.x` with the lazy-H SSM pool and startup memory admission, `FLUX_CONCURRENCY=16` (up to `32` native batched) is supported when free UMA headroom allows.
+   Each active sequence in a hybrid GDN model owns an FP32 recurrent state slot across 36–48 layers. Under legacy eager state pools, keep `--max-num-seqs <= 8` on long contexts; in `v1.0.x` with the lazy-H SSM pool and startup memory admission, `FLUX_CONCURRENCY` scales up to `128` (`FLUX_MODE=c128`, native batching ceiling `128` via launcher / `256` in Rust) when free UMA headroom allows.
 
 ---
 

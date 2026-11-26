@@ -86,17 +86,22 @@ variant, etc.), you'll also need to:
 
 ## Adding a new hardware target
 
-Flux Engine currently ships CUDA kernel targets for **GB10 (Grace Blackwell, `sm_121a`)**
-and **discrete Blackwell (`sm_120a` / RTX PRO 6000; see [`SM120_SM103_BRINGUP.md`](SM120_SM103_BRINGUP.md))**,
+Flux Engine currently ships CUDA kernel targets for **GB10 (Grace Blackwell, `sm_121a`)**,
+**discrete Blackwell (`sm_120a` / RTX 50-series & RTX PRO 5000/6000)**, and **Phase-A Blackwell Ultra (`sm_103a` / GB300; see [`SM120_SM103_BRINGUP.md`](SM120_SM103_BRINGUP.md))**,
 plus an experimental **Apple Metal** backend ([`METAL_BACKEND.md`](METAL_BACKEND.md)). Adding another
 CUDA target (for example `sm_100` for Blackwell B200, or `sm_90` for Hopper H100/H200) requires:
 
-1. **`kernels/<new-hw>/HARDWARE.toml`**:
+1. **`kernels/<new-hw>/HARDWARE.toml`** (matching the schema in `kernels/gb10/HARDWARE.toml` and `kernels/rtx6000/HARDWARE.toml`):
    ```toml
    [hardware]
-   arch = "blackwell"              # or "hopper", "ampere", etc.
-   sm = 100                        # compute capability
-   use_fp32_residual = false       # GB10 quirk; usually false
+   name = "rtx6000"
+   vendor = "nvidia"
+   arch = "sm_120a"
+   extends = "gb10"
+   compute_capability = [12, 0]
+   memory_bandwidth_gbps = 1792
+   memory_type = "gddr7"
+   memory_gb = 96
    ```
 
 2. **Per-quant kernel directory**: `kernels/<new-hw>/nvfp4/`,
@@ -139,21 +144,23 @@ To add a new scheme (e.g., MX4, INT4):
 Once compiled:
 
 ```bash
-# Smoke test
-docker run --gpus all --ipc=host -p 8888:8888 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+# Smoke test (container listens on 8899 by default; mount local checkpoints at /models)
+docker run --rm --gpus all --ipc=host -p 127.0.0.1:8899:8899 \
+  -v "$MODELS_ROOT:/models:ro" \
   ghcr.io/theapathy/flux-engine:v1.0.3 \
-  serve <new-model-hf-id> --max-seq-len 4096 --max-batch-size 1
+  serve --model /models/<new-model-dir> --max-seq-len 4096
 
-curl http://localhost:8888/v1/chat/completions -d '{"model":"...","messages":[{"role":"user","content":"hi"}]}'
+curl http://127.0.0.1:8899/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","messages":[{"role":"user","content":"hi"}]}'
 
 # OpenAI compatibility & session isolation tests
-python3 tests/test_openai_compat_v2.py --url http://localhost:8888
-python3 tests/test_session_isolation.py --url http://localhost:8888
+python3 tests/test_openai_compat_v2.py --url http://127.0.0.1:8899
+python3 tests/test_session_isolation.py --url http://127.0.0.1:8899
 
 # CPU-only contract & unit suite
-ATLAS_SKIP_BUILD=1 cargo test --workspace --lib
-pytest repro-kit/tests/
+ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 cargo test --workspace --lib
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest repro-kit/tests/
 ```
 
 ## Reference implementations

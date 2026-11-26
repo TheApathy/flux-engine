@@ -90,7 +90,7 @@ cosign verify-blob \
 
 # 4. Verify GitHub build & SBOM attestations (requires GitHub CLI `gh`):
 gh attestation verify "flux-engine-${TAG}-src.tar.gz" --repo TheApathy/flux-engine
-gh attestation verify "flux-engine-${TAG}.spdx.json" --repo TheApathy/flux-engine
+gh attestation verify "flux-engine-${TAG}-src.tar.gz" --predicate-type https://spdx.dev/Document --repo TheApathy/flux-engine
 ```
 
 ### 2.4 Verifying Signed GHCR Container Images (`ghcr.io/theapathy/flux-engine`)

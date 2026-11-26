@@ -59,13 +59,13 @@
   <g transform="translate(308, 66)">
     <!-- Status Pills Row -->
     <rect x="0" y="0" width="150" height="32" rx="16" fill="#122d1f" stroke="#10B981" stroke-width="1.5"/>
-    <text x="75" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#34D399" text-anchor="middle">PURE RUST</text>
+    <text x="75" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#34D399" text-anchor="middle">NATIVE RUST</text>
 
     <rect x="164" y="0" width="212" height="32" rx="16" fill="#111d2e" stroke="#38BDF8" stroke-width="1.5"/>
     <text x="270" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#38BDF8" text-anchor="middle">CUDA / PTX KERNELS</text>
 
     <rect x="390" y="0" width="194" height="32" rx="16" fill="#211433" stroke="#A855F7" stroke-width="1.5"/>
-    <text x="487" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#C084FC" text-anchor="middle">SLSA L3 · SIGNED</text>
+    <text x="487" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#C084FC" text-anchor="middle">COSIGN · SLSA L3</text>
 
     <rect x="598" y="0" width="166" height="32" rx="16" fill="#271c0c" stroke="#F59E0B" stroke-width="1.5"/>
     <text x="681" y="21" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13.5" font-weight="700" fill="#FBBF24" text-anchor="middle">AGPL-3.0-only</text>
@@ -93,18 +93,18 @@
     <text x="24" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="25" font-weight="800" fill="#34D399">SM121a · SM120a</text>
     <line x1="24" y1="112" x2="254" y2="112" stroke="#262c36" stroke-width="1.2"/>
     <text x="24" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Custom NVFP4, MXFP8 &amp; W4A8</text>
-    <text x="24" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">PTX / SASS kernels with formal</text>
-    <text x="24" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">zero-register-spill verification</text>
+    <text x="24" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">PTX / SASS kernels with CI</text>
+    <text x="24" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">zero-spill hot-path verification</text>
 
-    <!-- Card 2: Pure Rust Runtime -->
+    <!-- Card 2: Native Rust Runtime -->
     <rect x="297" y="0" width="278" height="194" rx="16" fill="#161b22" stroke="#38BDF8" stroke-width="1.8"/>
     <circle cx="321" cy="30" r="6" fill="#38BDF8"/>
     <text x="337" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">ZERO-OVERHEAD CORE</text>
-    <text x="321" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="27" font-weight="800" fill="#38BDF8">Pure Rust</text>
+    <text x="321" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="25" font-weight="800" fill="#38BDF8">Native Rust</text>
     <line x1="321" y1="112" x2="551" y2="112" stroke="#262c36" stroke-width="1.2"/>
-    <text x="321" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Single native binary with zero</text>
-    <text x="321" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Python runtime, CUDA graphs,</text>
-    <text x="321" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">multi-GPU KV &amp; Metal support</text>
+    <text x="321" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">Single native server binary,</text>
+    <text x="321" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">zero Python in hot path, CUDA</text>
+    <text x="321" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">graphs &amp; pooled multi-GPU KV</text>
 
     <!-- Card 3: Speculative & Long Context -->
     <rect x="594" y="0" width="278" height="194" rx="16" fill="#161b22" stroke="#A855F7" stroke-width="1.8"/>
@@ -120,11 +120,11 @@
     <rect x="891" y="0" width="278" height="194" rx="16" fill="#161b22" stroke="#F59E0B" stroke-width="1.8"/>
     <circle cx="915" cy="30" r="6" fill="#F59E0B"/>
     <text x="931" y="35" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9CA3AF">DROP-IN &amp; VERIFIED</text>
-    <text x="915" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="25" font-weight="800" fill="#FBBF24">OpenAI · Claude</text>
+    <text x="915" y="88" font-family="'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="21.5" font-weight="800" fill="#FBBF24">OpenAI · Anthropic</text>
     <line x1="915" y1="112" x2="1145" y2="112" stroke="#262c36" stroke-width="1.2"/>
-    <text x="915" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">OpenAI, Anthropic &amp; Ollama</text>
-    <text x="915" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">endpoints, tool calling, xgrammar,</text>
-    <text x="915" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">Cosign &amp; SLSA L3 provenance</text>
+    <text x="915" y="140" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">OpenAI &amp; Anthropic APIs,</text>
+    <text x="915" y="162" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#D1D5DB">tool calling, xgrammar,</text>
+    <text x="915" y="181" font-family="'DejaVu Sans', 'Liberation Sans', sans-serif" font-size="14" fill="#8B949E">Cosign OCI &amp; source SLSA L3</text>
   </g>
 
   <!-- Bottom Footer Strip -->

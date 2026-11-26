@@ -1,6 +1,6 @@
 # Flux Engine
 
-> Pure-Rust + custom CUDA/PTX LLM inference engine (`AGPL-3.0-only`, v1.0.3) optimized for NVIDIA Grace Blackwell (`GB10`, `sm_121a`), discrete Blackwell (`SM120` / `sm_120a`, `SM103` / `sm_103a`), and experimental Apple Silicon (`Metal`).
+> Native Rust + custom CUDA/PTX LLM inference engine (`AGPL-3.0-only`, v1.0.3) optimized for NVIDIA Grace Blackwell (`GB10`, `sm_121a`), discrete Blackwell (`SM120` / `sm_120a`, Phase-A `SM103` / `sm_103a`), and experimental Apple Silicon (`Metal`).
 
 ## Getting Started & Operations
 
@@ -22,7 +22,7 @@
 - [crates/README.md](crates/README.md): Crate-by-crate breakdown (11 active crates + 5 reserved interface stubs).
 - [docs/FLUX_KERNELS.md](docs/FLUX_KERNELS.md): Custom `sm_121a` CUDA/PTX kernel registry and zero-spill compilation gates.
 - [docs/KERNEL-PROFILE.md](docs/KERNEL-PROFILE.md): Per-stage prefill (`1,348 ms / 8K`) and speculative verify timing breakdown.
-- [docs/turboquant-plus.md](docs/turboquant-plus.md): TurboQuant+ KV-cache quantization (`turbo2`/`3`/`4`/`8`, asymmetric `fp8k_turbo4v`, `bf16k_turbo4v`, `turbo4k_turbo3v`).
+- [docs/turboquant-plus.md](docs/turboquant-plus.md): TurboQuant+ KV-cache quantization (`turbo3`/`4`/`8`, asymmetric `fp8k_turbo4v`, `bf16k_turbo4v`, `turbo4k_turbo3v`).
 - [docs/compatibility/model-matrix.yaml](docs/compatibility/model-matrix.yaml): Machine-readable compatibility matrix across 19 model entries.
 - [docs/compatibility/hardware-matrix.yaml](docs/compatibility/hardware-matrix.yaml): Hardware target capabilities across GB10, RTX PRO 6000, B200, H100, and Apple Metal.
 - [ENGINE-CARD.md](docs/ENGINE-CARD.md): Engine architecture and model auto-detection summary card.

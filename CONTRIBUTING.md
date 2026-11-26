@@ -67,16 +67,16 @@ flowchart TD
 - [ ] **Clean Build, Clippy & Formatting:**
   ```bash
   cargo fmt --all -- --check
-  ATLAS_TARGET_HW=gb10 cargo clippy --workspace --all-targets -- -D warnings
-  ATLAS_TARGET_HW=rtx6000 cargo check --workspace --all-targets
+  ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 ATLAS_TARGET_HW=gb10 cargo clippy --workspace --all-targets -- -D warnings
+  ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 ATLAS_TARGET_HW=rtx6000 cargo check --workspace --all-targets
   ```
 - [ ] **CPU Unit & Harness Tests:**
   ```bash
   cargo test --workspace --lib
-  pytest repro-kit/tests
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests repro-kit/tests
   ```
 - [ ] **Prefill & Lossless Decode Verification (when modifying GPU kernels/runtime):**
-  - `Qwen3.8-Flash-Next`: `8K..128K` prefill deterministic (`20/20` identical hashes), `LOSSLESS 10/10` (`2,560 / 2,560` greedy tokens match `--no-speculative`), `5/5 PASS` on 136.5K Estonia (`bench/qwen38-flash-next-gb10/estonia_bench.py`), and `MemAvailable >= 6,656 MiB` (`0` watchdog kills).
-  - `Qwen3.8-27B`: 400-token MinHeap probe (`bench/qwen38-gb10/weschera_minheap_repro.py`) deterministic across repeated runs.
+  - `Qwen3.8-Flash-Next`: `8K..128K` prefill deterministic (`20/20` identical hashes), greedy `K=5` token parity (`2,560 / 2,560` tokens match `flux serve --no-speculative`), `5/5 PASS` on 136.5K Estonia (`bench/qwen38-flash-next-gb10/estonia_bench.py`), and `MemAvailable >= 6,656 MiB` (`0` watchdog kills).
+  - `Qwen3.8-27B`: 400-token coding probe deterministic across repeated runs (`bench/qwen38-gb10/`).
 - [ ] **Zero-Leak & Path Sanitization:** No machine-local user directory paths, internal hostnames, private IPs, or credentials in any tracked file.
 - [ ] **License & Attribution Integrity:** `AGPL-3.0-only` SPDX headers, `deny.toml` compliance, and upstream attributions in [`CREDITS.md`](CREDITS.md), [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), and [`SOURCE_AND_LICENSES.md`](SOURCE_AND_LICENSES.md) remain intact.

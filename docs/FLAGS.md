@@ -11,12 +11,12 @@ When launching `ghcr.io/theapathy/flux-engine:gb10` (or invoking `flux serve` / 
 | Variable | Default | Description |
 |---|---|---|
 | `FLUX_MODEL` | *(auto-discovered under `/models` or positional arg)* | Path to local model checkpoint directory (e.g. `/models/Qwen3.8-Flash-Next-NVFP4-Offload` or `/models/Qwen3.8-27B-NVFP4`). |
-| `FLUX_MODE` | `auto` | Operating profile: `auto`, `max-prefill` (`v9` / `w16384`), `interactive` (`interactive-w4096` / `w4096`), `fast-prefill` (`fast`), `decode` (`lossless-decode` / `k5-decode`), `long-context` (`long-context-136k` / `136k`), `exact` (`exact-reference`). |
+| `FLUX_MODE` | `auto` | Operating profile: `auto`, `nextgen`, `agent`, `max-prefill` (`v9` / `w16384`), `interactive` (`interactive-w4096` / `w4096`), `fast-prefill` (`fast`), `decode` (`lossless-decode` / `k5-decode`), `long-context` (`long-context-136k` / `136k`), `256k`, `1m-nvfp4`, `c128`, `high-kv`, `2x-spark`, `2x-spark-1m`, `3x-spark`, `4x-spark`, `512k` / `1m` (non-QSA models), `exact` (`exact-reference`). |
 | `FLUX_PORT` | `8899` | HTTP listening port for the OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/health`). |
 | `FLUX_HOST` | `127.0.0.1` (host) / `0.0.0.0` (container) | Bind address passed to `--bind` (`--host`). Use `--api-key` when exposing beyond loopback. |
-| `FLUX_MAX_SEQ_LEN` | Mode-dependent (`40960` / `65536` / `135168` / `143360`) | Maximum context length in tokens (`--max-seq-len`). |
-| `FLUX_KV_CACHE_DTYPE` | `auto` (`bf16` / `fp8` / `turboquant`) | KV cache precision (`bf16` required for lossless Qwen3.8-Flash-Next and Qwen3.8-27B recipes). |
-| `FLUX_GPU_MEMORY_UTILIZATION` | `0.55` (GB10 UMA) / `0.90` (discrete) | Safe GPU/UMA memory fraction (`--gpu-memory-utilization`, keep `<= 0.55` on 128 GB GB10 UMA to protect OS page cache and CUDA runtime headroom). |
+| `FLUX_MAX_SEQ_LEN` | Mode-dependent (`40960` / `65536` / `135168` / `143360` / `262144` / `1048576`) | Maximum context length in tokens (`--max-seq-len`). |
+| `FLUX_KV_CACHE_DTYPE` | `auto` (`bf16` / `fp8` / `nvfp4` / `turbo3` / `turbo4`) | KV cache precision (`bf16` required for lossless Qwen3.8-Flash-Next and Qwen3.8-27B recipes; `nvfp4` for 1M single-GPU context). |
+| `FLUX_GPU_MEMORY_UTILIZATION` | `auto` (`0.85` GB10 default, `0.78` large MoE, `0.55` tight `w16384` recipes; `0.90` discrete) | Safe GPU/UMA memory fraction (`--gpu-memory-utilization`). Keep `<= 0.55` on tight 16K-chunk GB10 UMA recipes to protect OS page cache and CUDA runtime headroom. |
 | `FLUX_DRAFT_MODEL` | *(auto-detected if companion drafter present)* | Path to companion speculative drafter directory (`Inferact-MTP` or `DFlash`). Automatically reads `block_size` from drafter `config.json`. |
 | `FLUX_MTP_SOURCE` | `auto` | Qwen3.8-Flash-Next MTP routed-expert source when both the checkpoint and an `--mtp-from-path` / `FLUX_DRAFT_MODEL` sidecar provide one: `auto` (checkpoint bank wins; the sidecar fills in only for checkpoints without `mtp.layers.0.mlp.experts.*`, such as the Offload), `checkpoint` (never load a sidecar), `sidecar` (replace the checkpoint bank with the sidecar's). Only routed experts come from the sidecar. The server logs one `QWEN4_MTP_SOURCE source=...` line. |
 | `FLUX_GAMMA` | `auto` (`4` for MTP `K=5`, `block_size - 1` for DFlash) | Number of speculative draft tokens per step (`gamma`). For DFlash, automatically sets `ATLAS_DFLASH_DRAFT_CAP=gamma` and `ATLAS_DDTREE_MAX_NODES=gamma+1`. |
@@ -26,11 +26,11 @@ When launching `ghcr.io/theapathy/flux-engine:gb10` (or invoking `flux serve` / 
 | `FLUX_THINK_NUDGE` | `off` | Thinking nudge (Qwen3.8-Flash-Next and Qwen3.8-27B only; ignored with a warning elsewhere). `on` writes one first-person "commit to an approach" sentence into the open think block when thinking goes in circles (25% of the last 1024 thinking tokens are self-repeated 8-grams, after 3072 tokens; at most twice per turn). It never closes thinking and never stops generation. Fenced code is not read. Responses report `usage.completion_tokens_details.think_nudges` (omitted when 0). Also read as `ATLAS_THINK_NUDGE`. |
 | `FLUX_THINK_NUDGE_RATE` / `_MIN_TOKENS` / `_MAX` | `0.25` / `3072` / `2` | Nudge trigger rate in (0, 1], minimum thinking tokens, and nudges per turn (0-2). Parsed strictly while the nudge is on (a bad value fails startup); ignored while it is off. |
 | `FLUX_SETTINGS_FILE` | `off` | Save live setting changes (`flux set`, `PATCH /v1/flux/settings`) and reapply them when the same model starts again. `on` = `/results/flux-runtime-settings.json`, or give a path. Written atomically, mode `0600`; a file for another model is ignored; an invalid file fails startup. Also read as `ATLAS_SETTINGS_FILE`. |
-| `FLUX_CPU_AFFINITY` | `5-9,15-19` (on GB10 20-core ARM64) | CPU core pinning mask passed to `taskset -c` (pins runtime and PLE DMA rings to the 10 Cortex-X925 performance cores). |
-| `FLUX_CONCURRENCY` | `1` | Max concurrent sequences (`--max-num-seqs` / `--max-batch-size`). Qwen3.8-Flash-Next batches `2..32` natively by default (`ATLAS_QWEN4_NATIVE_BATCH` unset); `33..128` requires `ATLAS_QWEN4_NATIVE_BATCH=0` and decodes C1 once per row. Startup memory admission still applies. |
+| `FLUX_CPU_AFFINITY` | `auto` (`5-9,15-19` on 20-core GB10 ARM64; unset on x86_64) | CPU core pinning mask passed to `taskset -c` (pins runtime and PLE DMA rings to the 10 Cortex-X925 performance cores on GB10). |
+| `FLUX_CONCURRENCY` | `1` | Max concurrent sequences (`--max-num-seqs` / `--max-batch-size`). Qwen3.8-Flash-Next batches `2..128` natively via `flux-autodetect` (`QWEN4_NATIVE_MAX_ROWS=128`; Rust engine ceiling `256`); `ATLAS_QWEN4_NATIVE_BATCH=0` forces serial C1 per row. Startup memory admission still applies. |
 | `FLUX_KERNEL_TARGET` | `auto` | Explicit `--kernel-target` override matching a directory under `kernels/gb10/` (e.g. `qwen3.8-flash-next`, `qwen3.8-27b`, `qwen3.6-27b`, `deepseek-v4.1`, `glm5.3-flash`, `gemma-4-26b-a4b`, `gemma-4-31b`). |
 | `FLUX_TOPOLOGY` | `auto` | Hardware topology (`auto`, `1x-spark`, `2x-spark`, `4x-spark`, `generic-gpu`). |
-| `FLUX_WEIGHT_CACHE_DIR` | `/var/cache/flux-weight-cache` | Directory for persistent post-transform weight cache files (`ATLAS_WEIGHT_CACHE_DIR`). |
+| `FLUX_WEIGHT_CACHE_DIR` | `~/.cache/atlas-weight-cache` (host) / `/var/cache/flux-weight-cache` (container) | Directory for persistent post-transform weight cache files (`ATLAS_WEIGHT_CACHE_DIR`). |
 
 ---
 
@@ -39,15 +39,15 @@ When launching `ghcr.io/theapathy/flux-engine:gb10` (or invoking `flux serve` / 
 | CLI Flag | Flagship Value (`Qwen3.8-Flash-Next`) | Flagship Value (`Qwen3.8-27B`) | Purpose |
 |---|---|---|---|
 | `--model-from-path` | `/path/to/models/Qwen3.8-Flash-Next-NVFP4-Offload` | `/path/to/models/Qwen3.8-27B-NVFP4` | Target model checkpoint directory. |
-| `--served-model-name` | `qwen38-native-mtp-frontier-v1` | `Qwen3.8-27B` | OpenAI `/v1/models` and `/v1/chat/completions` model identifier. |
-| `--kernel-target` | `qwen3.8-flash-next` | `qwen3.8-27b` | Selects the embedded `sm_121a` PTX dispatch table. |
-| `--speculative` | Enabled (`--num-drafts 4`) | Enabled (`--dflash --dflash-gamma 15`) | Activates speculative decoding (`K=5` Inferact MTP or `K=16` DFlash). |
-| `--draft-model` | `/path/to/models/Qwen3.8-Flash-Next-Inferact-MTP` | `/path/to/models/Qwen3.8-27B-DFlash2` | Companion speculative drafter checkpoint directory. |
+| `--served-model-name` | `Qwen3.8-Flash-Next-NVFP4-Offload` | `Qwen3.8-27B` | OpenAI `/v1/models` and `/v1/chat/completions` model identifier. |
+| `--kernel-target` | `qwen3.8-flash-next` | `qwen3.8-27b` | Selects the embedded `sm_121a` / `sm_120a` PTX dispatch table. |
+| `--speculative` | Enabled (`--num-drafts 4`) | Enabled (`--dflash --dflash-gamma 7` for `B8`, `15` for `B16`) | Activates speculative decoding (`K=5` Inferact MTP or `K=8`/`K=16` DFlash). |
+| `--mtp-from-path` / `--draft-model` | `--mtp-from-path /path/to/models/Qwen3.8-Flash-Next-Inferact-MTP` | `--draft-model /path/to/models/Qwen3.8-27B-DFlash2` | Companion speculative drafter checkpoint directory (`--mtp-from-path` for Flash-Next MTP sidecar; `--draft-model` for DFlash). |
 | `--mtp-vocab` | `96000` | — | Vocabulary slice evaluated by the Inferact MTP head (`96,000` top tokens). |
 | `--max-prefill-tokens` | `16384` (`w16384`) or `4096` (`w4096`) | `4096` | Maximum tokens processed per prefill chunk. Must match `FLUX_QWEN4_PREFILL_WIDE`. |
-| `--max-seq-len` | `135168` (`128K`) or `143360` (`136K+`) | `40960` | Maximum KV cache sequence capacity allocated at server startup. |
-| `--kv-cache-dtype` | `bf16` | `bf16` | BF16 KV cache (required for lossless speculative decode equivalence). |
-| `--gpu-memory-utilization` | `0.55` | `0.55` | Safe GB10 UMA allocation cap. |
+| `--max-seq-len` | `135168` (`128K`), `143360` (`136K+`), `262144` (`256K`), or `1048576` (`1M` NVFP4) | `40960` | Maximum KV cache sequence capacity allocated at server startup. |
+| `--kv-cache-dtype` | `bf16` (or `nvfp4` for 1M) | `bf16` | BF16 KV cache (required for lossless speculative decode equivalence). |
+| `--gpu-memory-utilization` | `0.55` (`w16384` GB10) / `0.85` (general GB10) / `0.90` (discrete) | `0.55`–`0.85` (GB10) / `0.90` (discrete) | Safe GPU/UMA allocation cap. |
 | `--enable-prefix-caching` | `false` (benchmarks) / `true` (chat) | `false` | Disables prefix caching during TTFT sweeps so every prompt computes 100% of tokens. |
 | `--ssm-cache-slots` | `0` | `0` | Disables GDN recurrent state prefix caching for cold-cache measurement. |
 | `--default-chat-template-kwargs` | `'{"enable_thinking":false}'` | `'{"enable_thinking":false}'` | Default Jinja template kwargs when omitted by the client request. When neither this flag nor `FLUX_THINKING` is given, the `MODEL.toml` `thinking_default` applies (`false` for Qwen3.8-Flash-Next since `9.15.3.1`). |
@@ -187,8 +187,8 @@ Sourcing [`scripts/flux_env_bridge.sh`](../scripts/flux_env_bridge.sh) translate
 | `QWEN4_PREFILL_GDN_NORM_FP8` | `2` (recommended) / `1` (`exact`) | `2`: state-deterministic static-scale FP8 norm (`LOSSLESS 10/10`); `1`: exact two-pass reference. (`3` is quarantined due to a multi-chunk store-warp ordering race under `K=5` speculative parity.) |
 | `QWEN4_PREFILL_GDN_NORM_FP8_V2` | `1` | Vectorized `v2` epilogue for `GDN_NORM_FP8=2`. |
 | `QWEN4_PREFILL_FP8_ACT_AMAX_FUSED` | `1` | Dispatches 64-row tile fused `qwen4_fp8_act_and_ba_gates_mma` (`72` regs, `0` spills). |
-| `QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE` | `1` | Caches 96 FP8 `E4M3` fast-projection weight matrices in unified memory. |
-| `QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB` | `7` (`128K`) / `10` (`136K+`) | Stops FP8 projection caching if free unified memory (`MemAvailable`) approaches the reserve floor. |
+| `QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE` | `1` | Caches 120 FP8 `E4M3` fast-projection weight matrices (`72` GDN + `48` QSA) in unified memory. |
+| `QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB` | `6` (nextgen) / `7` (`128K`) / `10` (`136K+`) | Stops FP8 projection caching if free unified memory (`MemAvailable`) approaches the reserve floor. |
 
 ### 3.5 4-Ring NVFP4 Per-Layer Embeddings (`PLE`)
 
@@ -215,7 +215,7 @@ These free memory without changing what any kernel reads. Both are opt-in until 
 |---|:---:|---|---|
 | `QWEN4_MTP_CHAIN` | `1` | `Qwen3.8-Flash-Next` | Chains all 4 Inferact MTP draft steps on device without host synchronization. |
 | `QWEN4_K5_HYBRID` / `K5_NATIVE_MOE` | `1` | `Qwen3.8-Flash-Next` | Enables native 5-row batched verification across GDN, QSA, mHC, and MoE layers. |
-| `QWEN4_MTP_CONF` / `MTP_CONF_EARLY` | `0.6` / `1` | `Qwen3.8-Flash-Next` | Confidence-gated early draft truncation when draft entropy spikes. Set in `flux-v9-max-prefill.env` (`auto`, `max-prefill`, `256k`, `512k`, `1m`) since `9.15.3.1`, and in `flux-k5-lossless-decode.env` and `flux-estonia-136k.env`. `0` / `0` in `flux-v9-w4096-interactive.env` and bounded-transpose concurrency / native-262K BF16 recipes. The launcher forces `0` / `0` when `FLUX_CONCURRENCY > 1`. Engagement is logged once as `MTP_DRAFT_CONF_ENGAGED ... threshold=Some(0.6) early=true`. |
+| `QWEN4_MTP_CONF` / `MTP_CONF_EARLY` | `0.6` / `1` | `Qwen3.8-Flash-Next` | Confidence-gated early draft truncation when draft entropy spikes. Set in `flux-nextgen-max-prefill-decode.env` (`auto`, `nextgen`), `flux-v9-max-prefill.env` (`max-prefill`, `256k`), `flux-k5-lossless-decode.env`, and `flux-estonia-136k.env`. `0` / `0` in `flux-v9-w4096-interactive.env`. Under `FLUX_CONCURRENCY > 1`, the launcher keeps them enabled because Rust gates them per-cohort at runtime (solo `c=1` cohorts keep full parity while `live >= 2` cohorts stay protected). Engagement is logged once as `MTP_DRAFT_CONF_ENGAGED ... threshold=Some(0.6) early=true`. |
 | `QWEN4_QSA_VERIFY_ROWS` | `1` (eligible only when frame endpoint `<=2,048`) | `Qwen3.8-Flash-Next` | Enables the specialized multi-row 0-ULP Flash-Decoding candidate (`partial_rows_v2` + `reduce_rows`) inside its source-enforced dense-endpoint boundary. Longer frames stay on native K=5 and use row-serial QSA; setting this flag cannot override that safety boundary. |
 | `SSM_GDN_LAZY` | `1` | `Qwen3.8-27B` & `Flash-Next` | Skips intermediate GDN DRAM snapshot writes during verify (`+5.16 tok/s` on 27B, `0-ULP` bit-exact). |
 | `SSM_GDN_SEQ_PERSISTENT` | `1` | `Qwen3.8-27B` | Keeps GDN recurrent state persistent across verify tiles (`+1.70 tok/s`). |
@@ -228,8 +228,8 @@ No shipped recipe sets these, so the defaults below apply.
 
 | Selector (`FLUX_*` or `ATLAS_*`) | Default | Effect |
 |---|:---:|---|
-| `QWEN4_NATIVE_BATCH` | unset (native) | Qwen3.8-Flash-Next decode route at `--max-batch-size` 2-32. Unset: one native batched forward per step; a frame that cannot batch runs C1 once per row and is counted by reason in `atlas_qwen4_decode_frames_total` (`qsa_required`, `moe_exact_rows_unavailable`, ...). A width the native kernels cannot run in this process (for example no exact LM-head tier, `ATLAS_TARGET_LMHEAD_VOCAB`, or a MoE layout without the exact row route) serializes with that reason, logged once at startup as `QWEN4_BATCH_PLAN widths=…`. `1`: native or refuse to start, including for any such width. `0`: always serial, and the only way to run `--max-batch-size` 33-128. |
-| `QWEN4_NATIVE_BATCH_QSA` | unset (off) | Not GPU-qualified. `1`: requests that can reach 2,048 tokens (QSA-required) join the native frame as per-row QSA rows. Each QSA row runs the C1 QSA index and attention core inside the batched frame; everything else stays batched. Needs native batching and the QSA side index: with `QWEN4_NATIVE_BATCH=0`, a serial plan (for example without `ATLAS_MOE_T_LANES=1`), or without `--qwen4-qsa`, startup is refused. Values other than `0`/`1` are a startup error. |
+| `QWEN4_NATIVE_BATCH` | unset (native) | Qwen3.8-Flash-Next decode route at `--max-batch-size` `2..128` (Rust engine ceiling `256`). Unset: one native batched forward per step; a frame that cannot batch runs C1 once per row and is counted by reason in `atlas_qwen4_decode_frames_total` (`qsa_required`, `moe_exact_rows_unavailable`, ...). A width the native kernels cannot run in this process (for example no exact LM-head tier, `ATLAS_TARGET_LMHEAD_VOCAB`, or a MoE layout without the exact row route) serializes with that reason, logged once at startup as `QWEN4_BATCH_PLAN widths=…`. `1`: native or refuse to start, including for any such width. `0`: always serial C1 per row. |
+| `QWEN4_NATIVE_BATCH_QSA` | unset (on when QSA + native batch active) | `1` (or unset when `--qwen4-qsa` and native batching are active): requests that reach 2,048 tokens (QSA-required) join the native frame as per-row QSA rows while non-QSA layers stay batched. Set `=0` to disable per-row QSA inside native frames. Explicit `=1` requires native batching and the QSA side index (startup is refused with `QWEN4_NATIVE_BATCH=0` or without `--qwen4-qsa`). Values other than `0`/`1` are a startup error. |
 | `PREFILL_INTERLEAVE` | unset (off) | Opt-in. `1`: while rows are decoding, at most one prefill chunk runs per scheduler tick, so a burst of new prompts stalls running streams for one chunk at a time instead of all at once. Unset or `0`: the legacy tick. Any other value logs an error and keeps the legacy tick. |
 | `PREFILL_INTERLEAVE_DECODE_STEPS` | `1` | Decode steps between prefill chunks while rows are decoding (`1..=64`). Higher values favor running streams over time to first token for the burst. |
 | `PREFILL_INTERLEAVE_TOKEN_BUDGET` | `0` (= `--max-prefill-tokens`) | Per-tick prefill token budget while rows are decoding, a multiple of 16. On the Qwen3.8-Flash-Next fast-prefill family the chunk stays `--max-prefill-tokens`, because a smaller chunk would drop the request off the fast path; MLA models and non-chunked serving ignore it. |

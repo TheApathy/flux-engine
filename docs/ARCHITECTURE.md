@@ -81,7 +81,9 @@ compiled with `nvcc -arch=sm_121a -Xptxas -v -fmad=false` under a hard
 On `Qwen3.8-Flash-Next`, every layer routes each token to top-10 of 512 routed
 experts plus 1 shared expert (`moe_intermediate_size = 640`). At `w16384`, a
 single prefill chunk dispatches `16,384 × 10 = 163,840` token-expert pairs
-(~320 rows per expert), making MoE 50.8% of total prefill time (`684.5 ms / 8K`):
+(~320 rows per expert), making MoE 50.8% of total prefill time (`684.5 ms / 8K`
+in the `v0.9.11`/`v0.9.12` `1,348 ms` reference stage census; `v1.0.3` reaches
+`6,501 tok/s` @ 32K via `flux-nextgen-max-prefill-decode.env`):
 
 - **Fused Router + Slot Quantization (`rmsnorm + mxfp8_quant`):**
   - `qwen4_mxfp8_quant_rows_v16q4_gate` fuses post-attention RMSNorm, router
@@ -213,23 +215,25 @@ Per-Layer Embedding table split across 128 sector-aligned NVFP4 shards:
 
 ---
 
-## 3. TurboQuant+ KV Cache Compression (`turbo2` / `turbo3` / `turbo4` / `turbo8` & Asymmetric K/V)
+## 3. TurboQuant+ KV Cache Compression (`turbo3` / `turbo4` / `turbo8` & Asymmetric K/V)
 
 Implemented in `kernels/gb10/common/wht_bf16.cu`, `reshape_and_cache_turbo.cu`,
 `paged_decode_attn_turbo*.cu`, and `tq_plus_innerq.cu`, Flux Engine supports
-symmetric (`turbo2`, `turbo3`, `turbo4`, `turbo8`) and asymmetric
-(`fp8k_turbo4v` / `fp8k4v` = 6 bits/elem avg, `bf16k_turbo4v`, `turbo4k_turbo3v`)
-online **TurboQuant+** KV cache formats:
+symmetric (`turbo3`, `turbo4`, `turbo8`) and asymmetric
+(`fp8k_turbo4v` / `fp8k4v` = 6 bits/elem avg, `bf16k_turbo4v`, `bf16k_turbo2v`,
+`turbo4k_turbo3v`) online **TurboQuant+** KV cache formats *(note: symmetric
+`turbo2` has a write-side packing kernel only and is not wired for full decode
+serving; use `turbo3`/`turbo4` or asymmetric `bf16k_turbo2v`)*:
 
 1. **Randomized Walsh-Hadamard Transform (`wht_bf16.cu`):** Rotates per-head
    key/value vectors before quantization so channel outliers are spread into a
    near-Gaussian distribution across all head dimensions.
 2. **Lloyd-Max Optimal Codebooks & Matched-`L2`-Norm Scaling:** Instead of uniform
-   scalar min/max binning, `turbo2` (2-bit), `turbo3` (3-bit), `turbo4` (4-bit),
+   scalar min/max binning, `turbo3` (3-bit), `turbo4` (4-bit),
    `turbo8` (8-bit E4M3 + BF16 group scales), and asymmetric K/V modes
-   (`fp8k_turbo4v` / `fp8k4v`, `bf16k_turbo4v`, `turbo4k_turbo3v`) use Gaussian
-   Lloyd-Max centroids with matched-`L2`-norm scale correction to eliminate
-   centroid-rounding norm shrinkage.
+   (`fp8k_turbo4v` / `fp8k4v`, `bf16k_turbo4v`, `bf16k_turbo2v`, `turbo4k_turbo3v`)
+   use Gaussian Lloyd-Max centroids with matched-`L2`-norm scale correction to
+   eliminate centroid-rounding norm shrinkage.
 3. **InnerQ Per-Channel Equalization & Sparse-V Dequant (`tq_plus_innerq.cu`):**
    Applies pre-rotation channel equalization and skips V dequantization when
    attention weights fall below `1e-3`, cutting decode KV bandwidth by up to 4×
@@ -243,7 +247,7 @@ online **TurboQuant+** KV cache formats:
 Shared configuration and trait definitions:
 - `ModelConfig`: normalized representation of HuggingFace `config.json` across
   `Qwen3.8-Flash-Next` (`qwen4_exp_text`), `Qwen3.8-27B`, `DeepSeek-V4.1`,
-  `GLM-5.3`, `SuperGemma4`, `Qwen3.5/3.6`, `Nemotron-H`, `Mistral-Small-4`, and
+  `GLM-5.3`, `Gemma-4`, `Qwen3.5/3.6`, `Nemotron-H`, `Mistral-Small-4`, and
   `MiniMax-M2.7`.
 - `KernelTarget` / `TargetPtxSet`: build-time and runtime kernel target descriptors.
 

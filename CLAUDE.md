@@ -3,13 +3,13 @@
 # Flux Engine — Contributor & Coding Agent Guide (`CLAUDE.md`)
 
 > See [`AGENTS.md`](AGENTS.md) for the full production engineering contract,
-> formal verification requirements (Z3 SMT, TLA+ BFS, CUDA PTX zero-spill),
+> formal verification requirements (Z3 SMT, Python TLA+-style BFS, CUDA PTX zero-spill),
 > 4-part PR template, and anti-slop rejection criteria.
 
-**Flux Engine** (`TheApathy/flux-engine`) is a pure-Rust + custom CUDA/PTX
+**Flux Engine** (`TheApathy/flux-engine`) is a native Rust + custom CUDA/PTX
 large language model inference engine licensed under **`AGPL-3.0-only`**. It
 targets NVIDIA Grace Blackwell (`GB10`, `sm_121a` / `sm_121f`), discrete
-Blackwell (`SM120` / `sm_120a` and `SM103` / `sm_103a`), and experimental Apple
+Blackwell (`SM120` / `sm_120a` and Phase-A `SM103` / `sm_103a`), and experimental Apple
 Silicon (`Metal`).
 
 ---
@@ -41,7 +41,7 @@ MSRV `1.88`, version `1.0.3`):
 ### Key Top-Level Directories
 
 - `kernels/`: Per-hardware CUDA (`kernels/gb10/`, `kernels/rtx6000/`, `kernels/gb300/`) and Metal (`kernels/metal/common/`) kernel sources + `HARDWARE.toml` / `MODEL.toml` manifests.
-- `recipes/` & `repro-kit/recipes/`: Mirrored operating recipes (`.env`, `.toml`, `.argv`). Keep `recipes/` and `repro-kit/recipes/` byte-identical and respect SHA-256 pins in `repro-kit/ENGINE_STABLE_PIN.json`.
+- `recipes/` & `repro-kit/recipes/`: Mirrored operating recipes (`.env`, `.toml`, `.argv`). Keep `.env`, `.toml`, and `.argv` files byte-identical between `recipes/` and `repro-kit/recipes/` and respect SHA-256 pins in `repro-kit/ENGINE_STABLE_PIN.json`.
 - `repro-kit/`: Container entrypoint (`flux-autodetect`), benchmark harnesses (`flux-bench`, `lil-bench`), formal PTX/invariant verifiers (`repro-kit/formal/`), and Python contract tests (`repro-kit/tests/`).
 - `docker/`: Production Dockerfiles (`docker/sm120/Dockerfile`, `docker/gb10/Dockerfile`, per-model images).
 - `docs/`: Technical guides (`docs/API.md`, `docs/CLAUDE_CODE.md`, `docs/SM120_SM103_BRINGUP.md`, `docs/KERNEL-PROFILE.md`, `docs/compatibility/`, `docs/verification/`).
@@ -109,9 +109,11 @@ python3 -B scripts/verify_no_leaks.py --root .
    files with `-Xptxas -v -fmad=false` and verify `0 bytes stack frame, 0 spill
    stores, 0 spill loads` on production hot-path kernels. Never introduce
    thread-divergent early returns before `__syncthreads()` or warp shuffles.
-4. **Fail-Closed Admission & Secure Defaults:** Default bind address is
-   `127.0.0.1` (`--bind 0.0.0.0` requires explicit opt-in and `--api-key` /
-   `--auth-tokens-file` for non-loopback exposure). CORS defaults to loopback
+4. **Fail-Closed Admission & Secure Defaults:** Default bind address for raw
+   `flux-server` is `127.0.0.1` (`--bind 0.0.0.0` requires explicit opt-in and
+   `--api-key` / `--auth-tokens-file` for non-loopback exposure; container images
+   default `FLUX_HOST=0.0.0.0` inside the container namespace so host
+   `-p 127.0.0.1:8899:8899` forwarding works). CORS defaults to loopback
    origins only. Never silently fall back across numerical precision contracts
    or bypass OOM / UMA headroom admission guards.
 5. **Privacy, Zero PII & Peer-Respectful Tone:** Never commit personal paths

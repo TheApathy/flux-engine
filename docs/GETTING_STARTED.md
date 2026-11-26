@@ -1,6 +1,6 @@
 # Apathy Flux Engine — Getting Started, Benchmark Reproduction & Diagnostics Guide
 
-**Container Image:** `ghcr.io/theapathy/flux-engine:v1.0.3` *(also tagged `:v1.0`, `:gb10`, `:latest`; prior `v0.9.x` tags remain available)*  
+**Container Image:** `ghcr.io/theapathy/flux-engine:v1.0.3` *(multi-arch `:v1.0.3` & `:latest`, plus per-arch `:v1.0.3-gb10`, `:gb10`, `:v1.0.3-sm120`, `:sm120`)*  
 **Target Hardware:** NVIDIA DGX Spark (`GB10` / `sm_121a`, 128 GB Unified LPDDR5x), Multi-Spark (`2x` / `4x`), or discrete Blackwell (`sm_120a`) GPUs  
 **Privacy Policy:** 100% Air-Gapped Local Execution by Default (`FLUX_OPT_OUT=all` — zero external telemetry, host/prompt logs redacted)
 
@@ -190,12 +190,12 @@ All other supported architectures fit directly in unified memory without a PLE o
 
 | Model Family | Base Checkpoint (Hugging Face Link) | Companion Speculative Drafter (Hugging Face Link) | `block_size` / `gamma` | Auto-Detected `--kernel-target` |
 | :--- | :--- | :--- | :--- | :--- |
-| **Qwen3.8-27B Dense Hybrid** *(63.9+ tok/s)* | [`nvidia/Qwen3.8-27B-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) *(canonical public ModelOpt NVFP4)* | • **Recommended (`63.9 tok/s`):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2)<br>• **V3 Control (`58.0–59.5 tok/s`):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3)<br>• **Public DFlash2 (`58.0–81.1 tok/s` GB10 / `487.2 tok/s` SM120):** [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) *(or [`incoai/Qwen3.5-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.5-27B-DFlash2))*<br>• **Public 8-tok DFlash2 (`43.9 tok/s`):** [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | `block_size=16` -> `gamma=15` *(for `Apathy-v2/v3`)*<br>`block_size=8` -> `gamma=7` *(for `z-lab/Qwen3.8-27B-DFlash2` & `incoai`)* | `qwen3.8-27b` |
+| **Qwen3.8-27B Dense Hybrid** *(64.0–81.1 tok/s GB10)* | [`nvidia/Qwen3.8-27B-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) *(canonical public ModelOpt NVFP4)* | • **Public DFlash2 (`58.0–81.1 tok/s` GB10 / `497.1 tok/s` SM120):** [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)<br>• **Recommended γ=15 (`64.0 tok/s` BF16-KV):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2)<br>• **V3 Control (`58.0–59.5 tok/s`):** [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3)<br>• **Public 8-tok DFlash2:** [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | `block_size=8` -> `gamma=7` *(for `z-lab/Qwen3.8-27B-DFlash2` & `incoai`)*<br>`block_size=16` -> `gamma=15` *(for `Apathy-v2/v3`)* | `qwen3.8-27b` |
 | **Qwen3.6-27B / AEON-27B** | [`RedHatAI/Qwen3.6-27B-NVFP4`](https://huggingface.co/RedHatAI/Qwen3.6-27B-NVFP4) | [`z-lab/Qwen3.6-27B-DFlash`](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) | `block_size=16` -> `gamma=15` | `qwen3.6-27b` |
 | **Qwen3.6 / 3.5 35B-A3B MoE** | [`Qwen/Qwen3.5-35B-A3B-FP8`](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8) | Built-in MTP or [`z-lab/Qwen3.5-35B-A3B-DFlash`](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | `gamma=4` (MTP) / `15` (DFlash) | `qwen3.6-35b-a3b` / `qwen3.5-35b-a3b` |
-| **DeepSeek-V4.1 Flash MoE** | `DeepSeek-V4.1-Flash-Next-DGX-Spark-512K` | In-checkpoint 3-layer MTP | `gamma=3` | `deepseek-v4-flash` |
+| **DeepSeek-V4.1 Flash MoE** | `deepseek-ai/DeepSeek-V4.1-Flash-Next` | Target-only default (optional DSpark) | — | `deepseek-v4.1` |
 | **GLM-5.3 Flash MoE** | `GLM-5.3-Flash-exl3-2.05bpw` | None: target-only (the engine refuses DFlash2 for GLM; the launcher never attaches one) | — | `glm5.3-flash` |
-| **SuperGemma4 26B-A4B / 31B** | `SuperGemma4-26B-abl-NVFP4` | Native | — | `gemma-4-26b-a4b` |
+| **Gemma-4 26B-A4B / 31B** | `bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16` / `nvidia/Gemma-4-31B-IT-NVFP4` | Target-only | — | `gemma-4-26b-a4b` / `gemma-4-31b` |
 
 #### Download Example for `Qwen3.8-27B-NVFP4` + Companion `DFlash` / `DFlash2` Drafter
 ```bash
@@ -213,7 +213,7 @@ hf download onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2 \
 hf download z-lab/Qwen3.8-27B-DFlash2 \
   --local-dir "$MODELS_DIR/Qwen3.8-27B-DFlash2"
 ```
-*(Note: The container's `flux` entrypoint automatically reads `block_size` from the drafter's `config.json` and sets `--dflash-gamma = block_size - 1` — `15` for `block_size: 16` drafters like `Apathy-Qwen3.8-27B-DFlash-drafter-v2` and `z-lab/Qwen3.8-27B-DFlash2`, or `7` for `block_size: 8` drafters like `incoai/Qwen3.8-27B-DFlash2`.)*
+*(Note: The container's `flux` entrypoint automatically reads `block_size` from the drafter's `config.json` and sets `--dflash-gamma = block_size - 1` — `7` for `block_size: 8` drafters like `z-lab/Qwen3.8-27B-DFlash2` and `incoai/Qwen3.8-27B-DFlash2`, or `15` for `block_size: 16` drafters like `Apathy-Qwen3.8-27B-DFlash-drafter-v2`.)*
 
 ---
 
@@ -329,10 +329,10 @@ Wait ~35–55 seconds for weight loading + warmup to complete (`Listening on htt
 ```bash
 # 1. Health check:
 curl -s http://localhost:8899/health
-# {"status":"ok"}
+# {"status":"ready","model":"Qwen3.8-Flash-Next-NVFP4"}
 
-# 2. Standard chat completion. Qwen3.8-Flash-Next defaults to thinking off and
-#    greedy decoding (temperature 0) since 9.15.3.1, so no sampling fields are needed:
+# 2. Standard chat completion (Qwen3.8-Flash-Next defaults to thinking off and
+#    greedy decoding temperature=0, so no extra sampling fields are required):
 curl -s http://localhost:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -538,32 +538,33 @@ docker run --rm -it --gpus all --ipc=host --shm-size 16g \
 | `FLUX_QWEN4_PREFILL_MHC_ROOF` | `t128` | Selects fused `t128` Manifold Hyper-Connection (`mHC`) pre-attention roofline kernel (`87%` of GB10 DRAM roof). |
 | `FLUX_QWEN4_PREFILL_QSA_FP8` | `qkpv` | Enables FP8 E4M3 `Q*K` and `P*V` tensor-core attention in the 12 QSA sparse-attention layers. |
 | `FLUX_QWEN4_PREFILL_GDN_NORM_FP8` | `2` (`3` in `fast-prefill`) | Gated DeltaNet RMSNorm + FP8 quantization fusion tier (`2` = lossless under `K=5` MTP, `3` = pure-prefill only). |
-| `FLUX_QWEN4_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB` | `7` (`10` in `long-context`) | Free unified memory floor (in GiB) below which FP8 fast-projection weight caching stops allocating. |
+| `FLUX_QWEN4_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB` | `6` (`10` in `long-context`) | Free unified memory floor (in GiB) below which FP8 fast-projection weight caching stops allocating. |
 | `FLUX_PLE_READ_RINGS` | `4` | Number of asynchronous `io_uring` `O_DIRECT` NVMe DMA read rings for `ple-offload/`. |
 | `FLUX_PLE_READ_AFFINITY` | `big` | Pins PLE NVMe reader threads to Cortex-X925 performance cores (`5-9,15-19`) on DGX Spark. |
-| `FLUX_QWEN4_MTP_CONF` | `0.6` in `auto` / `max-prefill` / `256k` / `512k` / `1m` (since `9.15.3.1`), `decode`, `long-context`; `0` (off) in `interactive` | Confidence threshold for early-exit gating in the 4-step native MTP draft proposer. The launcher forces `0` when `FLUX_CONCURRENCY > 1`. The server logs `MTP_DRAFT_CONF_ENGAGED ... threshold=Some(0.6) early=true` when the gate is on. |
+| `FLUX_QWEN4_MTP_CONF` | `0.6` in `auto` / `max-prefill` / `256k` / `decode` / `long-context`; `0` (off) in `interactive` | Confidence threshold for early-exit gating in the 4-step native MTP draft proposer (kept enabled at `FLUX_CONCURRENCY > 1` because the runtime gates per-cohort safely). The server logs `MTP_DRAFT_CONF_ENGAGED ... threshold=Some(0.6) early=true` when active. |
 | `FLUX_QWEN4_MTP_CONF_EARLY` | `1` wherever `FLUX_QWEN4_MTP_CONF=0.6` | `1` stops drafting at the first draft step below the threshold, so a weak draft does not pay for the full `K=5` verify. |
 | `FLUX_DRAFT_MODEL` | *(built-in `mtp.*` or auto-paired DFlash)* | Optional override path to an external MTP/DFlash drafter directory, or `none` to run pure `K=1` non-speculative decoding. |
-| `FLUX_GAMMA` | `4` (MTP `K=5`) / `15` (DFlash) | Number of speculative draft tokens proposed per verify step. |
+| `FLUX_GAMMA` | `4` (MTP `K=5`) / `block_size - 1` (DFlash) | Number of speculative draft tokens proposed per verify step. |
 | `FLUX_DFLASH_LOOKUP` | `off` | DFlash only (Qwen3.8-27B with its DFlash2 drafter): adds a context-lookup drafter, lossless (byte-identical to the TC-parity reference). `sam` (suffix automaton) or `retrieval`. Measured A/B on 27B: edit-heavy prompts +33% (`sam`) / +37% (`retrieval`); 32K matrix decode 14.8 -> 16.7 (`sam`) / 18.9 (`retrieval`) tok/s. `retrieval` measured faster here but costs up to ~3.7 ms per step on a lookup miss at 262K context (microbench). Forced off with a warning when the launch does not run `--dflash`; set it instead of `ATLAS_DFLASH_SAM` / `ATLAS_DFLASH_RETRIEVAL`. |
-| `FLUX_CPU_AFFINITY` | `5-9,15-19` | CPU core affinity mask (`taskset -c`) on 20-core DGX Spark (`GB10`). |
+| `FLUX_CPU_AFFINITY` | unset (`5-9,15-19` in multi-Spark cluster recipes) | CPU core affinity mask applied via `os.sched_setaffinity` on 20-core DGX Spark (`GB10`). |
 
 ---
 
 ## 6. Built-In Operating Modes Summary
 
-> **Which mode to run:** use `FLUX_MODE=auto` (the default, = `max-prefill`, `135,168`-token context) unless a request needs more than ~`135K` tokens. `256k` is the native-`262K` **BF16 correctness profile** (BF16 QSA Q/K/V prefill operands, QSA verify rows `0`): it costs **~5% prefill** against `auto` / `max-prefill` at `16K`–`128K` and ~`15%` at `8K` (measured A/B on GB10), and the launcher logs one `INFO` line saying so when it engages.
+> **Which mode to run:** `FLUX_MODE=auto` (default) selects `flux-nextgen-max-prefill-decode.env` (`262,144`-token capacity on 262K-native checkpoints with `w16384` chunking; legacy `--mode max-prefill` uses `flux-v9-max-prefill.env` at `135,168`). Select `256k` when you explicitly want the native-`262K` **BF16 QSA correctness profile** (BF16 QSA Q/K/V prefill operands, QSA verify rows `0`): it costs **~5% prefill** against FP8 QSA at `16K`–`128K` and ~`15%` at `8K`. For 1M YaRN4 extended context on `Qwen3.8-Flash-Next`, use `1m-nvfp4` (1× GPU) or `2x-spark-1m` (2× Spark); `512k`/`1m` are for non-QSA models only.
 
 | Mode (`--mode`) | Recipe File | Default Chunk / Max Seq | Description |
 | :--- | :--- | :--- | :--- |
-| `max-prefill` *(or `v9`, `auto`)* | `flux-v9-max-prefill.env` | `16,384` / `135,168` | Maximum prefill (`6,291.0 / 6,299.3 tok/s` @ 16K, `5,905.6 tok/s` @ 128K) + `91.26 tok/s` (`tf_code`) / `86.86 tok/s` (`rep0`) / `62.59 tok/s` (`code0`) lossless `K=5` MTP decode (`>= 7,429 MiB` free UMA). |
-| `interactive` *(or `w4096`)* | `flux-v9-w4096-interactive.env` | `4,096` / `135,168` | Interactive 4K chunking with `>= 9,890 MiB` free UMA memory floor (`5,447.7 tok/s` @ 8K, `5,063.0 tok/s` @ 128K, `5/5 >= 5,000 tok/s`). |
-| `decode` *(or `k5-decode`)* | `flux-k5-lossless-decode.env` | `4,096` / `135,168` | Dedicated lossless `K=5` MTP & DFlash speculative decode profile (`91.26 tok/s` `tf_code`, `87.72 tok/s` `sd_code`, `55.27 tok/s` @ 8K, `53.03 tok/s` @ 64K, `8/8 id=OK`). |
-| `long-context` *(or `estonia`)* | `flux-estonia-136k.env` | `16,384` / `139,264` | 136.6K+ long-context needle & synthesis profile (`100%` Estonia 6-hop pass rate, `8.4+ GiB` free UMA floor). |
+| `auto` *(default)* / `nextgen` | `flux-nextgen-max-prefill-decode.env` | `16,384` / `262,144` *(135,168 min)* | Default `v1.0.3` unified prefill + speculative decode profile (`6,501 tok/s` @ 16K GB10, `30,869` W4A8 SM120; `91.3` `K=5` / `113.4` `DFlash2` arith; `>= 7,429 MiB` free UMA). |
+| `max-prefill` *(or `v9`)* | `flux-v9-max-prefill.env` | `16,384` / `135,168` | Legacy `v9` 16K-chunk max-prefill profile (`>= 7,429 MiB` free UMA). |
+| `interactive` *(or `w4096`)* | `flux-v9-w4096-interactive.env` | `4,096` / `135,168` | Interactive 4K chunking with `>= 9,890 MiB` (`>= 9.7 GiB`) free UMA memory floor (`5,448 tok/s` @ 8K, `5,063 tok/s` @ 128K, `5/5 >= 5,000 tok/s`). |
+| `decode` *(or `k5-decode`)* | `flux-k5-lossless-decode.env` | `8,192` / `135,168` | Dedicated `K=5` MTP & DFlash speculative decode profile (`91.3 tok/s` code, `55.3` @ 8K, `53.0` @ 64K). |
+| `long-context` *(or `estonia`)* | `flux-estonia-136k.env` | `16,384` / `143,360` | 136.5K+ long-context needle & synthesis profile (`100%` Estonia 6-hop pass rate, `8.4+ GiB` free UMA floor). |
 | `fast-prefill` *(or `fast`)* | `flux-fast-prefill.env` | `16,384` / `135,168` | Pure prefill velocity (`GDN_NORM_FP8=3` Ultra tier + prefill logit skip, for batch ingestion / RAG / TTFT). |
-| `agent` *(or `coding`)* | `flux-v9-w4096-interactive.env` | `4,096` / `131,072` | Enables Radix prefix caching, `16` SSM state slots, and `16K` tool-call token budget for OpenAI/Anthropic agentic coding clients (`docker run ... ghcr.io/theapathy/flux-engine:gb10 agents`). |
-| `256k` / `512k` / `1m` | Extended Context + Auto-YaRN | `16,384` / `262K–1M` | Only for requests above ~`135K` tokens; otherwise use `auto` / `max-prefill`. `256k` is the BF16 correctness profile (BF16 QSA Q/K/V prefill operands, QSA verify rows `0`, ~5% slower prefill than `auto` at `16K`–`128K`, ~`15%` at `8K`). Native `262,144`-token context (`5,524.7 tok/s` `w16384` / `4,990.7 tok/s` `w4096` prefill, `41.8 tok/s` decode, `5/5` needles `1%..99%`, `>= 11,452 MiB` free UMA). |
-| `exact` *(or `strict`)* | `flux-exact-reference.env` | `4,096` / `135,168` | Unfused W4A16 bit-exact reference baseline (`K=1`, `35.2 tok/s` @ `C=1`, `85.5 tok/s` @ `C=8` native batched QSA). |
+| `agent` *(or `coding`)* | `flux-v9-w4096-interactive.env` | `4,096` / `135,168` | Enables Radix prefix caching, `16` SSM state slots, and `>= 65,536`-token (`--tool-max-tokens`) tool-call budget for OpenAI/Anthropic agentic coding clients (`docker run ... ghcr.io/theapathy/flux-engine:gb10 agents`). |
+| `256k` / `1m-nvfp4` (`512k`/`1m` non-QSA) | Extended Context + Auto-YaRN | `16,384` / `262K–1M` | `256k` is the BF16 QSA correctness profile (`5,525 tok/s` `w16384` / `4,991 tok/s` `w4096`, `41.8 tok/s` decode, `5/5` needles, `>= 11,452 MiB` free UMA). For `1M` YaRN4 on Flash-Next use `1m-nvfp4` (1× GPU) or `2x-spark-1m` (2× Spark). |
+| `exact` *(or `strict`)* | `flux-exact-reference.env` | `16,384` / `135,168` | Unfused W4A16 exact reference baseline (`K=1`, `43.1 tok/s` @ `C=1`, `85.5 tok/s` @ `C=8` native batched QSA). |
 
 ---
 

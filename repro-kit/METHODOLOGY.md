@@ -17,7 +17,7 @@
 
 **Per single request (`concurrency = 1`, `batch_size = 1`, `--max-batch-size 1 --max-num-seqs 1`).**
 
-- Every prefill figure reported in our headline tables is **single-request end-to-end Time-To-First-Token (TTFT) throughput**, defined strictly as:
+- Every GB10 prefill figure reported in our headline tables is **single-request end-to-end Time-To-First-Token (TTFT) throughput** *(discrete SM120 tables in `docs/SM120_SM103_BRINGUP.md` report both server-measured TTFT and client wall-clock TTFT side by side)*, defined strictly as:
   ```text
   Prefill Throughput (tok/s) = prompt_tokens / TTFT_seconds
   ```
@@ -35,15 +35,15 @@
 
 - **Multi-Request Concurrency & Multi-Spark (`2x–4x GB10`) Scaling:**
   - On a **single DGX Spark (`1x GB10`)**, the 512-expert MoE grouped GEMM is already compute-saturated at `C=1` (`w16384` routes `16,384 * 10 = 163,840` token-expert pairs across 512 experts = `320` rows/expert per chunk). Running concurrent requests in `--mode interactive-w4096` (`4,096`-token chunks, `11,907 MiB` free UMA floor) maintains `5,164–5,266 tok/s` aggregate prefill while interleaving decode steps with bounded tail latency.
-  - Across a **4x DGX Spark cluster (`4x GB10` connected via 200GbE QSFP56 ConnectX-7 RoCEv2)**:
-    - In **4-way Data-Parallel / Disaggregated Prefill** mode (`C=4`), aggregate cluster prefill scales linearly to **`23,800–24,200 tok/s`**.
-    - In **TP=2, EP=4 Single-Request** mode, cross-node single-request prefill reaches **`18,400+ tok/s`** while expanding aggregate coherent UMA to **512 GB**.
+  - Across a **4x DGX Spark cluster (`4x GB10` connected via 200GbE QSFP56 ConnectX-7 RoCEv2)** *(projected scaling estimates — not yet live-benchmarked on 4x hardware)*:
+    - In **4-way Data-Parallel / Disaggregated Prefill** mode (`C=4`), projected aggregate cluster prefill scales linearly to **`~23,800–24,200 tok/s`**.
+    - In **TP=2, EP=4 Single-Request** mode, projected cross-node single-request prefill targets **`~18,400+ tok/s`** across **512 GB** of aggregate cluster memory (`4x 128 GB` per-node UMA linked over 200GbE RoCEv2).
 
 ---
 
 ### 2. Which model and quantization?
 
-- **Model ID:** `Qwen/Qwen3.8-Flash-Next-NVFP4-Offload` (served as `qwen38-native-mtp-frontier-v1`, kernel target `qwen3.8-flash-next`, checkpoint manifest SHA-256 `ed8aa879996dc322e3720eb9848a4193c4cfc1d7c05e0421d85108429bd15869`, 548 files).
+- **Model ID:** `Hotshot2000/Qwen3.8-Flash-Next-NVFP4` (repacked NVFP4 PLE offload `Qwen3.8-Flash-Next-NVFP4-Offload`, kernel target `qwen3.8-flash-next`, checkpoint manifest SHA-256 `ed8aa879996dc322e3720eb9848a4193c4cfc1d7c05e0421d85108429bd15869`, 548 files).
 - **Architecture (`qwen4_exp_text`):**
   - **48 hidden layers** in a 3:1 hybrid pattern (`full_attention_interval = 4`):
     - **36 Gated DeltaNet (GDN)** linear-attention layers (`linear_num_key_heads = 16`, `linear_num_value_heads = 48`, `head_dim = 128`, `conv_kernel_dim = 4`, FP32 recurrent state).
@@ -54,7 +54,7 @@
   - **Speculative Draft Head (`Qwen3.8-Flash-Next-Inferact-MTP`):** 1-layer full-attention MoE Multi-Token Prediction (MTP) head (`num_drafts = 4`, verification batch `K = 5`, `mtp_vocab = 96000`).
 - **Quantization:**
   - **Routed MoE Weights:** **NVFP4** (`FP4 E2M1` 4-bit float weights with hardware `UE4M3` block-16 scale factors, calibrated via NVIDIA ModelOpt `0.46.0` on 128 real CNN/DailyMail sequences).
-  - **Fast Projections (GDN / QSA Linear Layers):** Cached **FP8 E4M3** tensor-scaled weights (`96` projection matrices cached via `ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE=1`).
+  - **Fast Projections (GDN / QSA Linear Layers):** Cached **FP8 E4M3** tensor-scaled weights (`120` projection matrices — `72` GDN + `48` QSA — cached via `ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE=1`).
   - **Activations:** Dynamic **MXFP8 / FP8-E4M3** (slot-quantized MoE inputs and fused `o_proj` / QSA `qkpv` FP8 E4M3 activations).
   - **KV Cache & Residual Stream:** **BF16** KV cache (`--kv-cache-dtype bf16`) and BF16 residual stream, paired with **FP8-E4M3** QSA sparse block-selection/attention core (`qsa_sparse_e4m3_qkpv`).
   - **PLE Offload:** Direct sector-aligned **NVFP4** (`qwen38-flash-next-ple-nvfp4-direct-v1`, 4-ring asynchronous DMA).
@@ -71,7 +71,7 @@
 - **Supported Multi-Node & Discrete GPU Targets:**
   - **2x / 3x / 4x NVIDIA DGX Spark (`GB10`):** Connected via dual-port NVIDIA ConnectX-7 200GbE QSFP56 RoCEv2 (`recipes/2x-spark-tp2-disagg.env`, `recipes/3x-spark-pp3-disagg.env`, `recipes/4x-spark-cluster.env`).
   - **NVIDIA RTX PRO 6000 Blackwell (`SM120`):** 188 SMs, 96 MiB L2 cache, 96 GB GDDR7 (`1,792 GB/s`), sharing the register-backed block-scaled FP4/FP8 Tensor Core ISA with `SM121a`.
-  - **NVIDIA B200 (`SM100a`) & H100/H200 (`SM90a`):** Supported via runtime capability dispatch.
+  - **NVIDIA B300/GB300 (`SM103a`, Phase-A builds cleanly), B200 (`SM100a`), & H100/H200 (`SM90a`):** Roadmap / launcher capability stubs (not yet live-benchmarked; see `docs/SM120_SM103_BRINGUP.md`).
 
 ---
 

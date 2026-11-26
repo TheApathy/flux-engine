@@ -91,7 +91,7 @@ models:
   # 1. Qwen3.8-Flash-Next (Flagship Production Target — NVFP4 + Inferact MTP K=5)
   # ----------------------------------------------------------------------------
   - model_family: "Qwen3.8-Flash-Next"
-    model_id: "Qwen/Qwen3.8-Flash-Next-NVFP4-Offload + Qwen/Qwen3.8-Flash-Next-Inferact-MTP"
+    model_id: "Hotshot2000/Qwen3.8-Flash-Next-NVFP4 (repacked NVFP4 PLE offload) + Inferact-MTP"
     revision: "ae58bc27efd8b35aa4272da15dd5f4c549ec332a"
     model_type: "qwen4_exp"
     precision: "W4A8-MXFP8 / FP8-E4M3 / BF16"
@@ -108,7 +108,7 @@ models:
       - "crates/spark-model/src/layers/qwen4_prefill_moe.rs"
       - "kernels/gb10/qwen3.8-flash-next/MODEL.toml"
     first_seen_commit: "5e9a7dd44"
-    owner_delta: "Complete Flux SM121a custom pipeline: W4A8 MXFP8 MoE v28q, fused gatepre + sort/plan, 0-SMEM warp-shfl mHC prologue, 96-weight FP8 fast-proj cache, FP8 E4M3 QSA QK/PV core + fused top-k, 4-ring sector-aligned NVMe PLE DMA on big cores, and lossless K=5 Inferact MTP batched verify."
+    owner_delta: "Complete Flux SM121a custom pipeline: W4A8 MXFP8 MoE v28q, fused gatepre + sort/plan, 0-SMEM warp-shfl mHC prologue, 120-weight FP8 fast-proj cache, FP8 E4M3 QSA QK/PV core + fused top-k, 4-ring sector-aligned NVMe PLE DMA on big cores, and lossless K=5 Inferact MTP batched verify."
     implemented_features:
       - "48 layers (36 GDN linear attention + 12 QSA full attention, 3:1 pattern, hidden=2560)"
       - "512 routed experts (top-10 sigmoid/softmax normalized) + 1 shared expert per layer"
@@ -116,9 +116,9 @@ models:
       - "Query-Sparse Attention (QSA) with 4-head indexer, budget=2048, compress_ratio=16, FP8 E4M3 QK/PV core"
       - "Per-Layer Embedding (PLE) 51B n-gram table with 4-ring io_uring/pread sector-aligned NVMe DMA on Cortex-X925 big cores"
       - "Lossless K=5 Inferact MTP speculative decoding (num_drafts=4, unified-T MoE verify, tree-WY GDN state retention)"
-      - "16K-chunk (w16384) and 4K-chunk (w4096) prefill modes up to 147,456 max_seq_len"
+      - "16K-chunk (w16384) and 4K-chunk (w4096) prefill modes; 262,144 native BF16 capacity (136,576 retrieval verified) and 1,048,576 opt-in NVFP4 KV capacity"
     unsupported_features:
-      - "TP > 1 multi-GPU tensor parallelism (designed for single-GB10 unified memory)"
+      - "Multi-GPU TP > 1 on a single host is not yet live-benchmarked (single-GB10 UMA and single-SM120 are live-verified; 2x/4x Spark TP/EP recipes are experimental)"
       - "Combining resident FP8 fast-proj weight cache without an explicit UMA reserve budget"
     correctness_test: "Same-prompt bit-identity (5 groups, 20 requests, 0 ULP drift); Decode LOSSLESS 10/10 (2,560/2,560 exact tokens vs --no-speculative across 0..64K); Estonia 136.5K 6-hop reasoning 5/5 (100% PASS); 47/47 runtime engagement receipts."
     accuracy_tolerance: "0 ULP same-prompt prefill identity; 100% (10/10) greedy token bit-identity on K=5 MTP decode; 100% (5/5) exact country match on 136,576-token Estonia chain."
@@ -158,7 +158,7 @@ models:
   # 2. Qwen3.8-27B Dense (Hybrid GDN + Full Attention + MRoPE + DFlash2 / MTP)
   # ----------------------------------------------------------------------------
   - model_family: "Qwen3.8"
-    model_id: "Qwen/Qwen3.8-27B (optimized-qwen NVFP4 + drafter-qwen38-v3-final)"
+    model_id: "nvidia/Qwen3.8-27B-NVFP4 + z-lab/Qwen3.8-27B-DFlash2"
     revision: "67e3cf5ce6feb4cb2de7855aab13a502f6600052"
     model_type: "qwen3_5"
     precision: "W4A16-NVFP4 / FP8-E4M3 / BF16"
@@ -515,21 +515,20 @@ models:
       - "kernels/gb10/qwen3-next-80b-a3b/MODEL.toml"
 
   # ----------------------------------------------------------------------------
-  # 6. Qwen3-VL Family (30B-A3B NVFP4 & 4B MLX INT8)
+  # 6. Qwen3-VL Family (30B-A3B NVFP4 on GB10; 4B MLX INT8 prototype tracked separately)
   # ----------------------------------------------------------------------------
   - model_family: "Qwen3-VL"
-    model_id: "ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4 (and mlx-community/Qwen3.5-4B-MLX-8bit)"
+    model_id: "ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4"
     revision: "daeb822ea"
     model_type: "qwen3_vl_moe"
-    precision: "NVFP4 / INT8-MLX / BF16"
-    quantization: "NVFP4 weights + NVFP4/FP8 KV cache (and MLX INT8 on Apple Metal)"
-    gpu: "NVIDIA GB10 (and Apple Silicon Metal M2+/M3/M4)"
-    compute_capability: "sm_121a / metal3.1"
+    precision: "NVFP4 / BF16"
+    quantization: "NVFP4 weights + NVFP4/FP8 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
     source_refs:
       - "crates/spark-model/src/weight_loader/qwen3_vl.rs"
       - "crates/spark-model/src/layers/vision_encoder.rs"
       - "kernels/gb10/qwen3-vl-30b-a3b/MODEL.toml"
-      - "kernels/metal/qwen3-5-4b-vlm-mlx-int8/MODEL.toml"
     first_seen_commit: "daeb822ea"
     owner_delta: "163 compiled sm_121 kernels (4 overrides), GEMM-based tensor-core ViT attention SDPA + batched multi-image forward (~2x faster image TTFT on GB10, #202)."
     implemented_features:
@@ -554,6 +553,45 @@ models:
       paradigm: "27-Layer ViT Vision Encoder + Full Attention + 128-Expert MoE"
       moe: true
       gdn_ssm: false
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+
+  # ----------------------------------------------------------------------------
+  # 6b. Qwen3.5-4B VLM (Apple Metal MLX-INT8 — experimental / prototype)
+  # ----------------------------------------------------------------------------
+  - model_family: "Qwen3.5-VLM-Metal"
+    model_id: "mlx-community/Qwen3.5-4B-MLX-8bit"
+    revision: "daeb822ea"
+    model_type: "qwen3_5"
+    precision: "INT8-MLX / FP16"
+    quantization: "MLX INT8 on Apple Silicon Metal"
+    gpu: "Apple Silicon Metal (M2+/M3/M4)"
+    compute_capability: "metal3.1"
+    source_refs:
+      - "kernels/metal/qwen3-5-4b-vlm-mlx-int8/MODEL.toml"
+    first_seen_commit: "daeb822ea"
+    owner_delta: "Experimental Apple Metal backend target scaffold (not release-qualified on CUDA/GB10 CI)."
+    implemented_features:
+      - "Metal shader target definition for 4B MLX-8bit VLM"
+    unsupported_features:
+      - "Production CUDA serving and release CI qualification"
+    correctness_test: "Prototype target (not verified in release CI)."
+    accuracy_tolerance: "unverified"
+    prefill_tps: "unmeasured"
+    decode_tps: "unmeasured"
+    ttft_ms: "unmeasured"
+    peak_vram: "unmeasured"
+    status: "experimental"
+    status_category: "prototype"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Apple Metal VLM Prototype"
+      moe: false
+      gdn_ssm: true
       qsa_sparse_attention: false
       mhc_hyper_connections: false
       ple_per_layer_embedding: false
@@ -1070,7 +1108,7 @@ models:
       - "Fits on a single 128 GB GB10 with 64K context under FP8 KV"
     unsupported_features:
       - "MTP speculative decoding"
-    correctness_test: "Pass-30 bare_json tool-calling verification and single-GB10 64K context stability."
+    correctness_test: "Automated bare_json tool-calling verification and single-GB10 64K context stability."
     accuracy_tolerance: "100% valid JSON tool-call extraction and serve matrix coherence."
     prefill_tps: "740.0 tok/s"
     decode_tps: "24.0 tok/s (FP8 KV, single GB10)"

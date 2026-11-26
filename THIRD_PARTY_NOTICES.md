@@ -31,7 +31,7 @@ Full verbatim copies of the standard permissive licenses referenced below are pr
 - **Upstream Project:** [`mlc-ai/xgrammar`](https://github.com/mlc-ai/xgrammar) (`v0.1.32`)
 - **Upstream Copyright:** Copyright (c) 2024 MLC-AI Contributors
 - **Upstream License:** Apache License, Version 2.0 (`Apache-2.0`, [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt))
-- **Adaptation & Modification Notice (Apache-2.0 §4):** `crates/xgrammar` is a zero-`unsafe` (`#![forbid(unsafe_code)]`) pure-Rust line-by-line derivative port of the upstream C++ core of `mlc-ai/xgrammar` `v0.1.32` (see `crates/xgrammar/src/lib.rs` and [`crates/xgrammar/NOTICE`](crates/xgrammar/NOTICE)), extended with Rust-native support types and additional XML tool-calling grammar converters. It is distributed in this workspace under `AGPL-3.0-only` in accordance with Apache-2.0 one-way compatibility with GPLv3/AGPLv3 and Apache-2.0 §4 attribution requirements.
+- **Adaptation & Modification Notice (Apache-2.0 §4):** `crates/xgrammar` is a zero-`unsafe` (`[lints.rust] unsafe_code = "forbid"` in `crates/xgrammar/Cargo.toml`) pure-Rust line-by-line derivative port of the upstream C++ core of `mlc-ai/xgrammar` `v0.1.32` (see `crates/xgrammar/src/lib.rs` and [`crates/xgrammar/NOTICE`](crates/xgrammar/NOTICE)), extended with Rust-native support types and additional XML tool-calling grammar converters. It is distributed in this workspace under `AGPL-3.0-only` in accordance with Apache-2.0 one-way compatibility with GPLv3/AGPLv3 and Apache-2.0 §4 attribution requirements.
 
 ### 2.2 FlashInfer Kernels & Optional Gated DeltaNet Bridge
 - **Upstream Project:** [`flashinfer-ai/flashinfer`](https://github.com/flashinfer-ai/flashinfer)

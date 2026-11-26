@@ -13,32 +13,33 @@ For end-to-end recipes per supported model see [`OPERATOR-GUIDE.md`](OPERATOR-GU
 ```bash
 docker run -d \
   --name flux \
-  --gpus all --ipc=host -p 8888:8888 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --gpus all --ipc=host -p 8899:8899 \
+  -v /path/to/models:/models:ro \
   ghcr.io/theapathy/flux-engine:v1.0.3 \
-  serve <hf-model-id> \
+  serve /models/<checkpoint-dir> \
     --max-seq-len 16384 \
-    --max-batch-size 1 \
-    --gpu-memory-utilization 0.55
+    --concurrency 1
 ```
+
+*(Flux Engine containers run offline with `HF_HUB_OFFLINE=1` by default — download checkpoints locally with `hf download` or `huggingface-cli download` and mount them read-only at `/models`.)*
 
 Required:
 - NVIDIA Container Toolkit installed on the host.
-- HuggingFace cache or local `/models` directory mounted.
+- Local `/models` checkpoint directory mounted read-only.
 - `--gpus all` to expose the GPU.
 - `--ipc=host` so CUDA shared-memory IPC works.
 
 Then:
 ```bash
-curl http://localhost:8888/v1/chat/completions \
+curl http://localhost:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"<hf-model-id>","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"<checkpoint-dir>","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ### Memory tuning
 
-- **NVIDIA GB10 / DGX Spark (128 GB Unified Memory):** Keep `--gpu-memory-utilization 0.55` or lower. On unified memory, the OS kernel, Linux page cache, model weights, and CUDA scratch arenas share the same 128 GB pool; setting `> 0.55` can exhaust `MemAvailable` and trigger an OS OOM or hardware watchdog reset.
-- **Discrete GPUs (dedicated VRAM, e.g. RTX PRO 6000 / `sm_120a`):** You may raise `--gpu-memory-utilization` to `0.85`–`0.90` since VRAM is isolated from host OS memory (drop to `0.70` if you see boot-time allocation failures).
+- **NVIDIA GB10 / DGX Spark (128 GB Unified Memory):** `flux-autodetect` defaults to `--gpu-memory-utilization 0.85` for general models (`0.78` on large MoE) and clamps tight `w16384` Flash-Next recipes to `0.55`. On unified memory, the OS kernel, Linux page cache, model weights, and CUDA scratch arenas share the same 128 GB pool; keep `<= 0.55` on tight 16K-chunk Flash-Next recipes so `MemAvailable` never approaches the 6 GiB hardware watchdog floor.
+- **Discrete GPUs (dedicated VRAM, e.g. RTX PRO 6000 / `sm_120a`):** `flux-autodetect` defaults to `0.90` since VRAM is isolated from host OS memory (drop to `0.70`–`0.85` if you see boot-time allocation failures).
 
 `--max-seq-len 16384` caps the context window. Longer requires either:
 - more KV memory (lower batch size)
@@ -126,25 +127,29 @@ Disk requirements:
 ## Health check + observability
 
 ```bash
-# Liveness
-curl http://localhost:8888/health
+# Readiness (HTTP 200 when model is loaded and accepting traffic; 503 while loading/draining)
+curl http://localhost:8899/health
+
+# Process liveness (HTTP 200 while HTTP server is alive)
+curl http://localhost:8899/health/live
 
 # Loaded model info
-curl http://localhost:8888/v1/models
+curl http://localhost:8899/v1/models
 
 # Metrics (Prometheus exposition)
-curl http://localhost:8888/metrics
+curl http://localhost:8899/metrics
 ```
 
 Logs go to stdout (`docker logs <container>`). The `RUST_LOG` env var
 controls verbosity (`info` default, `debug` for kernel call traces, `warn`
 for production).
 
-## Kubernetes (community-maintained)
+## Kubernetes & Monitoring Templates
 
-No official manifest yet. The Docker image is self-contained, so a basic
-Deployment + Service is sufficient. Open a PR with a working example if
-you build one.
+Reference deployment manifests and monitoring assets live in [`deploy/`](../deploy/README.md):
+- [`deploy/k8s-deployment.yaml`](../deploy/k8s-deployment.yaml) — single-node Kubernetes Deployment & Service (with `/health/live` liveness and `/health` readiness probes).
+- [`deploy/flux-engine.service`](../deploy/flux-engine.service) — systemd service unit template for bare-metal hosts.
+- [`deploy/grafana-dashboard.json`](../deploy/grafana-dashboard.json) — Prometheus + Grafana dashboard wired to Flux Engine's `/metrics` exposition.
 
 ## See also
 

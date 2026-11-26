@@ -8,9 +8,9 @@ license: AGPL-3.0-only
 repository-code: "https://github.com/TheApathy/flux-engine"
 url: "https://github.com/TheApathy/flux-engine"
 authors:
-  - alias: "TheApathy"
+  - name: "TheApathy"
 abstract: >-
-  Flux Engine is a pure-Rust and custom CUDA/PTX large language model inference
+  Flux Engine is a native Rust and custom CUDA/PTX large language model inference
   runtime optimized for NVIDIA Grace Blackwell (GB10 SM121a), discrete Blackwell
   (SM120a / SM103a), and experimental Apple Metal targets, featuring native
   block-scaled NVFP4/MXFP8 Tensor Core kernels, Gated DeltaNet and Query-Sparse

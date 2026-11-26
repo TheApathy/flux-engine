@@ -34,6 +34,7 @@ FLUX_API_KEY="flux-local-dev" \
   --model-from-path "$HOME/models/Qwen3.8-Flash-Next-NVFP4-Offload" \
   --served-model-name qwen3.8-flash-next \
   --kernel-target qwen3.8-flash-next \
+  --qwen4-qsa \
   --bind 127.0.0.1 \
   --port 8888 \
   --max-seq-len 135168 \
@@ -41,6 +42,7 @@ FLUX_API_KEY="flux-local-dev" \
   --gpu-memory-utilization 0.55 \
   --speculative --num-drafts 4
 ```
+*(Use `--gpu-memory-utilization 0.85` on discrete GPUs or general GB10 models; keep `0.55` for tight `w16384` Flash-Next recipes on GB10 UMA.)*
 
 Verify the server is ready before launching your coding agent:
 

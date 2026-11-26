@@ -1,19 +1,19 @@
 # Reproducing the measurements in this repository
 
-`TheApathy/flux-engine` is a standalone pure-Rust and `sm_121a` CUDA/PTX
+`TheApathy/flux-engine` is a standalone native Rust and `sm_121a` / `sm_120a` CUDA/PTX
 inference repository developed from a fork of
 [Atlas](https://github.com/Avarok-Cybersecurity/atlas) and
 [MonumentalSystems/atlas](https://github.com/MonumentalSystems/atlas) via
 [TheApathy/apathy-atlas](https://github.com/TheApathy/apathy-atlas). Where
 `apathy-atlas` kept measured model stacks on separate branches (`perf/qwen38-gb10-dflash`,
-`qwen`, `laguna`, `ds4-flash`), `flux-engine` consolidates the `sm_121a` kernel
+`qwen`, `laguna`, `ds4-flash`), `flux-engine` consolidates the `sm_121a` / `sm_120a` kernel
 targets, self-verifying launchers, operating recipes, and OCI reproducibility
 kit onto `main`.
 
 | Harness / Directory | Model Target | What it measures |
 |---|---|---|
-| [`bench/qwen38-flash-next-gb10/`](../bench/qwen38-flash-next-gb10/) | `Hotshot2000/Qwen3.8-Flash-Next-NVFP4` *(+ repacked NVFP4 PLE + Inferact MTP)* | Single-stream 16K-chunk prefill (`6,021.8 tok/s` short, `5,969.4 tok/s` 8K, `6,082.2 tok/s` 16K peak, `5,694.4 tok/s` 128K), `w4096` interactive prefill (`5,046–5,276 tok/s`), lossless `K=5` MTP decode (`56.5 tok/s` med / `57.4` peak, `2,560/2,560` greedy exact), and 136,576-token 6-hop Estonia needle retrieval (`5,400.4 tok/s` prefill, `48.2 tok/s` decode, `5/5 PASS`). |
-| [`bench/qwen38-gb10/`](../bench/qwen38-gb10/) | `unsloth/Qwen3.8-27B-NVFP4` + `z-lab/Qwen3.8-27B-DFlash2` / `v1` | Single-stream `gamma=15` DFlash speculative decode (`63.9 tok/s` on qualified `BF16-KV`, `58.012 tok/s` on corrected-ABI `v3` control) on the deterministic MinHeap coding probe. |
+| [`bench/qwen38-flash-next-gb10/`](../bench/qwen38-flash-next-gb10/) | `Qwen/Qwen3.8-Flash-Next` (`Hotshot2000/Qwen3.8-Flash-Next-NVFP4` + repacked NVFP4 PLE + Inferact MTP) | Single-stream 16K-chunk prefill (`v1.0.3` headline `6,501 tok/s` @ 32K, `v0.9.12` `w16384` certified baseline `5,830.2` @ 8K, `6,082.2` @ 16K, `5,969.6` @ 32K, `5,694.4` @ 128K), `w4096` interactive prefill (`5,046–5,276 tok/s`), lossless `K=5` MTP decode (`56.5 tok/s` med / `57.4` peak, `2,560/2,560` greedy exact), and 136,576-token 6-hop Estonia needle retrieval (`5,400.4 tok/s` prefill, `48.2 tok/s` cli / `48.6 tok/s` srv decode, `5/5 PASS`). |
+| [`bench/qwen38-gb10/`](../bench/qwen38-gb10/) | `nvidia/Qwen3.8-27B-NVFP4` (or compatible NVFP4 checkpoint) + `z-lab/Qwen3.8-27B-DFlash2` / `v1` | Single-stream `gamma=15` DFlash speculative decode (`63.9 tok/s` on qualified `BF16-KV`, `58.012 tok/s` on corrected-ABI `v3` control) on the deterministic MinHeap coding probe. |
 | [`repro-kit/`](../repro-kit/) | `Qwen3.8-Flash-Next-NVFP4-Offload` (`v1.0.3` / `v1.0.x`) | One-command container (`flux-bench run`) and host (`benchmark.sh`) reproduction with SHA-256 manifest verification (`model-manifest.json`, `ENGINE_STABLE_PIN.json`). |
 | [`repro/qwen38-coding/`](../repro/qwen38-coding/) | `Qwen3.8-27B` / `Qwen3.8-Flash-Next` | Deterministic coding endpoint verifier (`run.py`) writing output-sanitized SHA-256 fingerprints and server TPS telemetry. |
 

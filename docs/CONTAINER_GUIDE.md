@@ -1,6 +1,6 @@
 # Flux Engine — Production Container & GHCR Reference (`v1.0.3`)
 
-> **Image Registry**: `ghcr.io/theapathy/flux-engine:v1.0.3` · `ghcr.io/theapathy/flux-engine:gb10` · `ghcr.io/theapathy/flux-engine:latest`  
+> **Image Registry**: `ghcr.io/theapathy/flux-engine:v1.0.3` · `:latest` *(multi-arch)* · `:v1.0.3-gb10` / `:gb10` (`linux/arm64`) · `:v1.0.3-sm120` / `:sm120` (`linux/amd64`)  
 > **Source Repository**: [https://github.com/TheApathy/flux-engine](https://github.com/TheApathy/flux-engine)  
 > **License**: `AGPL-3.0-only` (Corresponding Source and license notices included; see [`SOURCE_AND_LICENSES.md`](../SOURCE_AND_LICENSES.md))  
 > **Target Architectures**: `linux/arm64` NVIDIA GB10 Grace Blackwell (`sm_121a`, 128 GB unified memory) and `linux/amd64` NVIDIA Blackwell (`sm_120a` / RTX PRO 6000)
@@ -64,16 +64,17 @@ docker run --rm -it --gpus all \
 
 | `FLUX_MODE` | Primary Use Case | Behavior & Key Controls |
 | :--- | :--- | :--- |
-| `auto` *(default)* | Balanced high-speed prefill + lossless decode | Selects the qualified hardware/model recipe (`recipes/` + `MODEL.toml` defaults, 135,168-token context on Qwen3.8-Flash-Next) |
-| `max-prefill` | Peak long-prompt ingestion throughput | Enables FP8 prefill projections and QSA FP8 prefill path (`ATLAS_QWEN4_PREFILL_QSA_FP8=1`) |
-| `decode` | Interactive / speculative decode throughput | Enables qualified K=5 native MTP or DFlash2 (`gamma=15`) speculation with CUDA graph capture |
-| `long-context` / `136k` | 136.6K document synthesis & Estonia benchmark | Raises `--max-seq-len` to `139264` (`136K`) |
+| `auto` *(default)* | Balanced high-speed prefill + lossless greedy verify | Selects `flux-nextgen-max-prefill-decode.env` (`262,144`-token capacity on 262K-native checkpoints, `135,168` minimum) |
+| `max-prefill` | Legacy `v9` long-prompt ingestion throughput | Enables FP8 prefill projections and QSA FP8 prefill path (`ATLAS_QWEN4_PREFILL_QSA_FP8=qkpv`) |
+| `decode` | Interactive / speculative decode throughput | Enables K=5 native MTP or DFlash2 (`gamma=7` for `block_size=8`, `gamma=15` for `block_size=16`) with CUDA graph capture |
+| `long-context` / `136k` | 136.5K document synthesis & Estonia benchmark | Raises `--max-seq-len` to `143360` (`140K`) |
 | `256k` *(Qwen3.8-Flash-Next)* | Requests exceeding ~135K tokens (up to 262,144) | Native 262K BF16-operand QSA profile (`ATLAS_QWEN4_PREFILL_QSA_FP8=0`, `ATLAS_QWEN4_QSA_VERIFY_ROWS=0`, `--max-seq-len 262144`) |
-| `exact` | Reference correctness validation | Disables optional speculative approximations and uses conservative chunking (`flux-exact-reference.env`) |
+| `1m-nvfp4` | 1M YaRN4 extended context (discrete / 1× GPU) | Pooled NVFP4 KV (`4×BF16+8×NVFP4`) with YaRN factor 4 (`1,048,576` tokens) |
+| `exact` | Reference correctness validation | Disables optional speculative approximations (`flux-exact-reference.env`) |
 
-Run `auto` (the default on Qwen3.8-Flash-Next, 135,168-token context) unless a workload explicitly requires contexts beyond ~135K tokens, in which case select `256k`.
+Run `auto` (the default on Qwen3.8-Flash-Next) for normal serving; select `256k` when you want the BF16-operand QSA correctness profile at full 262K context, or `1m-nvfp4` for 1M YaRN4.
 
-> **GB10 unified memory guidance:** Keep `--gpu-memory-utilization` at `0.55` or lower on 128 GB GB10 systems so OS page cache and CUDA runtime allocations do not contend. See [`FLAGS.md`](FLAGS.md) and [`docs/OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md).
+> **GB10 unified memory guidance:** `flux-autodetect` automatically sets safe per-model UMA caps (`0.85` for Qwen3.8-Flash-Next with PLE offload + `6 GiB` reserve floor, `0.78` for Gemma-4, `0.55` for other 128 GB GB10 checkpoints; `0.90`–`0.92` on discrete GPUs). See [`FLAGS.md`](FLAGS.md) and [`docs/OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md).
 
 ---
 
@@ -83,11 +84,11 @@ When you mount a model directory under `/models`, `flux` inspects `config.json`,
 
 | Model Family | Supported Quantizations | Auto-Selected `--kernel-target` | Speculative / MTP Engine |
 | :--- | :--- | :--- | :--- |
-| **Qwen3.8-Flash-Next (`qwen4_exp`)** | `NVFP4`, `FP8`, `BF16` | `qwen3.8-flash-next` | Native MTP (`K=5`) or 5-layer DFlash2 (`gamma=15`) |
+| **Qwen3.8-Flash-Next (`qwen4_exp`)** | `NVFP4`, `FP8`, `BF16` | `qwen3.8-flash-next` | Native MTP (`K=5`) or 5-layer DFlash2 (`gamma=7`, `block_size=8`) |
 | **Qwen3.5 / Qwen3.6 35B-A3B MoE** | `NVFP4`, `FP8`, `BF16` | `qwen3.5-35b-a3b` | Native MTP (`K=2`) |
-| **Qwen3.8-27B Dense Hybrid DeltaNet** | `NVFP4`, `FP8`, `BF16` | `qwen3.8-27b` | 5-layer DFlash2 (`gamma=15`) or 8-layer DFlash v1 |
+| **Qwen3.8-27B Dense Hybrid DeltaNet** | `NVFP4`, `FP8`, `BF16` | `qwen3.8-27b` | 5-layer DFlash2 (`gamma=7`, `block_size=8`) or 8-layer DFlash (`gamma=15`, `block_size=16`) |
 | **Qwen3.6-27B Dense Hybrid DeltaNet** | `NVFP4`, `FP8`, `BF16` | `qwen3.6-27b` | 8-layer DFlash (`gamma=15`) |
-| **DeepSeek-V3.2 / V4.1 MoE** | `NVFP4`, `FP8` | `deepseek-v4.1` | Native Multi-Token Prediction (`K=5`) |
+| **DeepSeek-V4.1 MoE** | `CB3`, `NVFP4`, `FP8` | `deepseek-v4.1` | Target-only default (optional DSpark) |
 | **GLM-5.3 Flash MoE** | `EXL3` (2.05 bpw) | `glm5.3-flash` | Target-only (speculation disabled at load) |
 | **Gemma-4 26B-A4B / 31B Multimodal** | `NVFP4`, `FP8`, `BF16` | `gemma-4-26b-a4b` / `gemma-4-31b` | Target-only; auto-detects `ple-offload/` (`ATLAS_PLE_OFFLOAD_DIR`) & Vision tower |
 | **Nemotron-3 Nano 30B / Super 120B** | `NVFP4`, `FP8` | `nemotron-3-nano-30b-a3b` | Native Hybrid Mamba-MoE |

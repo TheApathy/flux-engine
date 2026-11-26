@@ -78,9 +78,9 @@ docker run --rm -it --gpus all \
 ```
 
 ### C. Repacking Qwen3.8-Flash-Next 51B PLE Weights to NVFP4 (`repack-ple` / `export-repacker`)
-The container ships a self-contained NVFP4 PLE repacker (`/opt/flux/scripts/repack_qwen38_flash_next_ple_nvfp4.py`, aliased to `/usr/local/bin/repack-ple` and `flux repack-ple`) that converts `Apathy-Qwen3.8-Flash-Next-NVFP4` (167 GB raw BF16 PLE table) into either:
-- **`--mode offload` (Recommended for 1x DGX Spark 128 GB UMA)**: Keeps backbone + router + MTP in NVFP4 (`~22 GB`) and writes 48 `io_uring`-aligned NVFP4 PLE shards (`ple_layer_XX.bin`, `~28.8 GB` total) into `<dst>/ple-offload/`.
-- **`--mode resident` (For >=64 GB free GPU RAM / multi-Spark)**: Quantizes `ple_embed_tokens.weight` to ModelOpt NVFP4 tensors inside `.safetensors` (`~51 GB` total).
+The container ships a self-contained NVFP4 PLE repacker (`/opt/flux/scripts/repack_qwen38_flash_next_ple_nvfp4.py`, aliased to `/usr/local/bin/repack-ple` and `flux repack-ple`) that converts a raw `Qwen3.8-Flash-Next-NVFP4` checkpoint (e.g. `Hotshot2000/Qwen3.8-Flash-Next-NVFP4`, ~167 GiB with BF16 PLE table) into either:
+- **`--mode offload` (Recommended for 1x DGX Spark 128 GB UMA / 96 GB SM120)**: Keeps backbone + router + MTP in NVFP4 (`~70–71 GiB` resident) and writes 128 sector-aligned NVFP4 PLE shards (`ple-ngram-nvfp4-XXX.bin`, `~28.8 GiB` total on NVMe) into `<dst>/ple-offload/`.
+- **`--mode resident` (For multi-Spark / large-VRAM hosts)**: Quantizes `ple_embed_tokens.weight` to ModelOpt NVFP4 tensors inside `.safetensors` (`~100 GiB` total checkpoint).
 
 ```bash
 # 1. Run the PLE repacker directly inside the container (zero host dependencies required):
@@ -88,8 +88,8 @@ docker run --rm \
   -v /path/to/your/models:/models:rw \
   ghcr.io/theapathy/flux-engine:gb10 \
   repack-ple \
-    /models/Apathy-Qwen3.8-Flash-Next-NVFP4 \
-    /models/Qwen3.8-Flash-Next-NVFP4-Offload \
+    --source /models/Qwen3.8-Flash-Next-NVFP4 \
+    --output /models/Qwen3.8-Flash-Next-NVFP4-Offload \
     --mode offload
 
 # 2. Or export the standalone Python repacker script to your host:
@@ -120,7 +120,7 @@ Once the container is running, query it from your host, web UI (OpenWebUI, Curso
 curl http://localhost:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3.8-35B-A3B-NVFP4",
+    "model": "Qwen3.8-Flash-Next-NVFP4-Offload",
     "messages": [{"role": "user", "content": "Write a lock-free ring buffer in C++20."}],
     "max_tokens": 512,
     "temperature": 0.2
@@ -139,7 +139,7 @@ docker exec -it <container_name> flux verify-endpoint http://127.0.0.1:8899
 
 ## 4. Running `lil-bench`, Estonia 136.6K, Concurrency Sweeps & Model Cards
 
-The container bundles **`local-inference-lab/llm-inference-bench` (`v0.7.9`)** at `/opt/flux/llm-inference-bench` and `/usr/local/bin/lil-bench`, plus an SVG/PNG + Markdown **Model Card Generator** (`rsvg-convert` pre-installed).
+The `repro-kit/Dockerfile` evaluation image bundles **`local-inference-lab/llm-inference-bench` (`v0.7.9`)** at `/opt/flux/llm-inference-bench` and `/usr/local/bin/lil-bench`, plus an SVG/PNG + Markdown **Model Card Generator** (`rsvg-convert` pre-installed in `repro-kit/Dockerfile`; slim release images `docker/{gb10,sm120}/Dockerfile` emit SVG/Markdown cards without `librsvg2-bin`).
 
 ### A. Standard All-Context Matrix (`0, 8k, 16k, 32k, 64k, 128k`) + Auto-Generated Cards
 Replicates our exact single-stream evaluation (`--token-targeting exact --request-seed 20261011 --duration 30 --max-tokens 2048`) and automatically writes `/results/repetition-1.json`, `/results/card.svg`, `/results/card.png`, and `/results/MODEL_CARD.md`:
@@ -272,7 +272,7 @@ docker run --rm -it --gpus all --ipc=host --shm-size 16g -p 8899:8899 \
 
 | Harness | Protocol / Endpoint | Quick Configuration |
 | :--- | :--- | :--- |
-| **Claude Code (`claude`)** | Anthropic `/v1/messages` | `export ANTHROPIC_BASE_URL=http://localhost:8899 ANTHROPIC_API_KEY=flux-local ANTHROPIC_MODEL=Qwen3.8-35B-A3B-NVFP4 && claude` |
+| **Claude Code (`claude`)** | Anthropic `/v1/messages` | `export ANTHROPIC_BASE_URL=http://localhost:8899 ANTHROPIC_API_KEY=flux-local ANTHROPIC_MODEL=Qwen3.8-Flash-Next-NVFP4-Offload && claude` |
 | **ohmypi (`pi` / `omp`)** | OpenAI `/v1/chat/completions` | Add provider `"baseUrl": "http://localhost:8899/v1"`, `"api": "openai-completions"`, `"maxTokens": 16384` in `~/.pi/agent/models.json` |
 | **OpenAI Codex CLI (`codex`)** | OpenAI `/v1/chat/completions` or `/v1/responses` | Set `base_url = "http://localhost:8899/v1"`, `wire_api = "chat"` in `~/.codex/config.toml` |
 | **Antigravity (`agy`) / OpenCode / Cline** | OpenAI `/v1` or Anthropic `/` | Point Base URL to `http://localhost:8899/v1` (OpenAI) or `http://localhost:8899` (Anthropic) |
@@ -281,7 +281,7 @@ docker run --rm -it --gpus all --ipc=host --shm-size 16g -p 8899:8899 \
 
 ## 8. Hardware Topology Auto-Detection & Extended Context Scaling (`256K`, `512K`, `1M` via RoPE / YaRN)
 
-Flux Engine automatically inspects both your **model checkpoint (`max_position_embeddings`, `rope_theta`, `rope_scaling`)** and your **host GPU topology (`detect_hardware_topology()` — VRAM/UMA capacity, SM architecture `sm_121a`/`sm_120`/`sm_100`/`sm_90a`, and multi-GPU count)**:
+Flux Engine automatically inspects both your **model checkpoint (`max_position_embeddings`, `rope_theta`, `rope_scaling`)** and your **host GPU topology (`detect_hardware_topology()` — VRAM/UMA capacity, SM architecture `sm_121a`/`sm_120a` live-verified plus `sm_103a`/`sm_100a`/`sm_90a` roadmap detection stubs, and multi-GPU count)**:
 - **Native `256K` Capacity (`FLUX_MODE=256k` or `--max-seq-len 262144`)**: At the checkpoint's native limit, Qwen4 QSA defaults to BF16 KV and does not enable YaRN. Set `FLUX_KV_CACHE_DTYPE=nvfp4` (or pass `--kv-cache-dtype nvfp4`) only when you explicitly want the memory/quality tradeoff. This mode configures capacity; it is not a 262K retrieval qualification. The currently published long-context retrieval proof ends at 136,576 tokens.
 - **Qwen4 concurrent sessions (`FLUX_CONCURRENCY=2..128`; engine native row ceiling `256`)**: The launcher enables native batching by default (`ATLAS_QWEN4_NATIVE_BATCH` unset) up to `QWEN4_NATIVE_MAX_ROWS=128` (the live Rust engine hard ceiling is `256` in `crates/spark-model/src/layers/mod.rs`). Setting `ATLAS_QWEN4_NATIVE_BATCH=0` forces the serialized C1-per-row path; setting `=1` refuses to start unless the native route is available. For speculation under concurrency, batched DFlash2 supports `C2-C16` on GB10 UMA (`C2-C32` on discrete Blackwell), fixed K5 native MTP supports `C2-C32`, adaptive-K native MTP supports up to `C64` (or `C128` with `FLUX_SPEC_MODE=mtp`), and wider concurrency falls back to native target-only batching. Every serialized C2+ frame is counted by reason in `atlas_qwen4_decode_frames_total`, and each serialized request is logged once as `QWEN4_REQUEST_ROUTE ... route=serial reason=<reason>`. A recipe without `ATLAS_MOE_T_LANES=1`, or with `ATLAS_SSM_H_FP16=1`, `ATLAS_LM_HEAD_TC=1`, `ATLAS_QWEN4_LMHEAD_BF16=1` or `--profile`, serializes with that reason unless the selector is `1`.
 - **Native MTP beyond 2K**: K=5 remains enabled. The Issue #13 v5 qualifier pins `ATLAS_QWEN4_QSA_VERIFY_ROWS=1`, checks 2,043 through 2,050 plus every disclosed long-context length, and requires the source-pinned exact row fallback beyond the safe dense endpoint. Every K5 request must carry its own dispatch, verify-frame, completed-cycle, and runtime-request-ID evidence. The normal K5 arm must emit a verify-graph capture/use marker. A separate forced-eager K5 arm uses `ATLAS_DFLASH_DEBUG_NO_GRAPH=1`, proves completed partial-accept rollback between exact sole-slot canaries, and consumes request-scoped executed-route receipts for the exact twelve-layer QSA set. Plain-only admission probes prove 262,143 plus one is accepted, 262,144 plus one is rejected before scheduler-owned prefill counters move, and post-rejection health, response geometry, and prefill counters recover exactly; lazy chat/TUI counters are not required. A final whole-log census excludes late overflow dispatch. A stopped 262,080 semantic request rejects contradictory answer text, while a separate forced 64-token row reaches 262,144 and compares plain/K5 text and scheduler token IDs without treating fill text as semantics. Strict duplicate-key, parsed non-finite, and exponent-overflow JSON rejection plus manifest and artifact revalidation close receipt ambiguity and TOCTOU gaps. These are harness requirements, not a runtime claim. The direct binary and immutable container must each produce a PASS receipt before Issue #13 is updated or closed.

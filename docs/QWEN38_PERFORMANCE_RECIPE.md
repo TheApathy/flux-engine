@@ -32,8 +32,8 @@ AEON v4 text suite, best full board (greedy + all serving fixes, 2026-08-23):
 | Prose | 17/35 | |
 | **Total** | **113/174 (65%)** | reference attested run: 147/174 (84.5%) on an RTX PRO 6000 |
 
-The reference submission (`unsloth/Qwen3.8-27B-NVFP4`, stock vLLM) ran on an
-RTX PRO 6000 Blackwell: ~1792 GB/s against GB10's ~273 GB/s. That 6.5x
+The reference submission (`unsloth/Qwen3.8-27B-NVFP4`, stock vLLM; for current deployments use canonical `nvidia/Qwen3.8-27B-NVFP4`) ran on an
+RTX PRO 6000 Blackwell: ~1792 GB/s against GB10's ~273 GB/s. That ~6.6x
 bandwidth difference explains its 107-150 tok/s decode. The quality gap is a
 separate question and is not fully explained by hardware.
 
@@ -614,7 +614,7 @@ this Flux Engine SM121 candidate.
 
 ## 3. Weights, drafter, and cache
 
-**Target.** `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`.
+**Target.** Historical 2026-08 archive runs used `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` (for current deployments use canonical `nvidia/Qwen3.8-27B-NVFP4`).
 Byte-verified against upstream: `model.safetensors` sha256 `c473512c70eace07…`,
 `model_mtp.safetensors` `1d8268aa85ace093…`, 2 shards, 21.8 GB. Upstream
 super-squashed the repo on 2026-08-15, which is why older revision hashes
@@ -643,10 +643,10 @@ TOTAL             132.42 ms
 emitted/cycle       5.87        (accepted 4.87 of 15)
 ```
 
-Verify cost is linear in draft width. Three-point fit (gamma 15/11/7):
+Verify cost is linear in verify width `K = γ + 1`. Three-point fit (`γ = 15 / 11 / 7` ⇒ `K = 16 / 12 / 8`):
 
 ```
-verify(k) = 75.53 + 1.890k ms      residuals -0.20 / +0.41 / -0.20
+verify(K) = 75.53 + 1.890·K ms     residuals -0.20 / +0.41 / -0.20  (105.77 ms at K=16)
 ```
 
 The intercept is the weight sweep: 16.327 GB at 232 GB/s achievable = **70.37 ms**,
@@ -658,7 +658,7 @@ quality-of-drafter signal we have:
 
 | probe length | accepted / 15 |
 |---|---|
-| 400 tokens | 7.23 (48.2%) |
+| 400 tokens | 7.23 (48.2%; `7.33` in the qualified `BF16-KV` probe run) |
 | 800 tokens | 5.81 (38.7%) |
 | 1500 tokens | 4.87 (32.5%) |
 

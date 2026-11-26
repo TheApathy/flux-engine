@@ -45,13 +45,13 @@ The NVIDIA Grace Blackwell GB10 pairs a 20-core ARMv9.2 Grace CPU (`10x Cortex-X
 
 | Model Target | Architecture | Headline Prefill (`1x GB10`) | Headline Decode (`1x GB10`) | Key Breakthrough |
 |---|---|---:|---:|---|
-| **`Qwen3.8-Flash-Next-NVFP4`** | 48L hybrid (36 GDN + 12 QSA, 512+1 MoE top-10, 4-stream mHC, 51B PLE) | **6,082.2 tok/s** @ 16K<br/>**6,021.8 tok/s** short<br/>**5,969.4 tok/s** @ 8K<br/>**5,400.4 tok/s** @ 136.5K | **56.5 tok/s** med (`57.4` peak, `LOSSLESS 10/10`)<br/>**48.2 tok/s** @ 136.5K (`5/5 PASS`) | `cutlass_5222` `v28q`/`v17q` W4A8 MoE, `gdn_umma_prefill`, `qwen4_qsa_prefill_select`, `mHC` `t128` roof, 4-ring NVFP4 PLE, lossless `K=5` MTP. |
+| **`Qwen3.8-Flash-Next-NVFP4`** | 48L hybrid (36 GDN + 12 QSA, 512+1 MoE top-10, 4-stream mHC, 51B PLE) | **6,501 tok/s** @ 32K (`v1.0.3`)<br/>`v0.9.12`: **6,082.2** @ 16K · **5,969.6** @ 32K · **5,830.2** @ 8K · **5,400.4** @ 136.5K | **56.5 tok/s** med (`57.4` peak, `LOSSLESS 10/10`)<br/>**48.2 tok/s** @ 136.5K (`5/5 PASS`) | `cutlass_5222` `v28q`/`v17q` W4A8 MoE, `gdn_umma_prefill`, `qwen4_qsa_prefill_select`, `mHC` `t128` roof, 4-ring NVFP4 PLE, lossless `K=5` MTP. |
 | **`Qwen3.8-27B-NVFP4`** | 64L dense hybrid (48 GDN + 16 GQA) + `5L` DFlash2 / `8L` DFlash v1 drafter | **1,050 – 1,411 tok/s** | **63.9 tok/s** (`BF16-KV`, `gamma=15`)<br/>**58.012 tok/s** (`v3` control) | DFlash `gamma=15` speculative verify, split-K `ffn_down`/`ssm_out`/`qkvz`, `WY17` lazy state commit. |
 | **`Qwen3.5-35B-A3B` / `Qwen3.6-35B-A3B`** | 40L hybrid (GDN + GQA + 256 MoE + MTP) | **3,800+ tok/s** | **130 – 131 tok/s** (`MTP K=2`) | Fused GDN recurrence + coalesced W4A16/FP8 grouped MoE + BF16 MTP head. |
-| **`Qwen3-Next-80B-A3B-NVFP4`** | 48L hybrid (36 GDN + 12 GQA + 512 MoE) | **2,900+ tok/s** | **99.1 tok/s** peak (`74–97` sustained) | Pure-Rust FP8 KV + native MTP speculative decode on a single GB10. |
+| **`Qwen3-Next-80B-A3B-NVFP4`** | 48L hybrid (36 GDN + 12 GQA + 512 MoE) | **2,900+ tok/s** | **99.1 tok/s** peak (`74–97` sustained) | Native Rust FP8 KV + native MTP speculative decode on a single GB10. |
 | **`DeepSeek-V4.1`** | MLA (`head_dim=512`, `qk_rope_head_dim=64`, `q_lora_rank=1280`) + 384-expert CB3 MoE + DSpark | **1,980 – 2,010 tok/s** (`8K–16K`) | **14.8 tok/s** plain / **19.0 – 30.8 tok/s** (`DSpark`) | K124/K154 CB3 routed-expert pack + persistent Engram lookup + cross-layer sparse MLA. |
 | **`GLM-5.3-Flash` (EXL3 2.05 bpw)** | KDA linear attention + NoPE DSA + 4-stream mHC + MoE | **694 tok/s** @ 8K / **603 tok/s** @ 32K | **14.6 tok/s** (`8.6` @ 32K, target-only) | EXL3 trellis quantization on single GB10 (target-only, no speculation). |
-| **`SuperGemma4` (`26B-A4B` / `31B`)** | Sliding + full attention alternation, GeGLU MoE/Dense | **3,100+ tok/s** | **67 tok/s** (`26B-A4B`) | Fused GeGLU + sliding-window causal mask hoist + TurboQuant+ KV cache. |
+| **`Gemma-4` (`26B-A4B` / `31B`)** | Sliding + full attention alternation, GeGLU MoE/Dense | **3,100+ tok/s** | **67 tok/s** (`26B-A4B`) | Fused GeGLU + sliding-window causal mask hoist + TurboQuant+ KV cache. |
 
 For the full release history and kernel walkthrough, see
 [`CHANGELOG.md`](../CHANGELOG.md), [`ARCHITECTURE.md`](ARCHITECTURE.md),

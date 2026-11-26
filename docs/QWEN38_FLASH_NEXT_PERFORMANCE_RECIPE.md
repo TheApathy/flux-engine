@@ -1,10 +1,10 @@
 # Qwen3.8-Flash-Next on GB10 — production recipe and measurement record
 
-Status: current as of v1.0.3 (initial measurement campaign 2026-10-17). Every number here is measured on a single NVIDIA DGX Spark (GB10 `sm_121a`, 128 GB unified LPDDR5X @ ~273 GB/s). Estimates are labeled as such. Where a lever was tested and found null or regressive, it is recorded as null: the negative results are the most expensive part of this document and the most useful.
+Status: `v0.9.12` certified stage-census & recipe measurement record (initial campaign 2026-10-17; on `v1.0.3` with `flux-nextgen-max-prefill-decode.env`, GB10 prefill reaches `6,501 tok/s` @ 32K and `5,906 tok/s` @ 128K). Every number here is measured on a single NVIDIA DGX Spark (GB10 `sm_121a`, 128 GB unified LPDDR5X @ ~273 GB/s). Estimates are labeled as such. Where a lever was tested and found null or regressive, it is recorded as null: the negative results are the most expensive part of this document and the most useful.
 
 ---
 
-## 1. Headline numbers
+## 1. Headline numbers (`v0.9.12` Certified Reference Campaign)
 
 Canonical harnesses: [`bench/qwen38-flash-next-gb10/lil_decode_bench.py`](../bench/qwen38-flash-next-gb10/lil_decode_bench.py),
 [`bench/qwen38-flash-next-gb10/estonia_bench.py`](../bench/qwen38-flash-next-gb10/estonia_bench.py),
@@ -13,7 +13,7 @@ and [`repro-kit/flux-bench`](../repro-kit/flux-bench): single stream (`C=1`,
 
 | Configuration | Short / 4K Prefill | 8K Prefill | 16K Prefill | 128K Prefill | Decode (`K=5` MTP) | Free UMA Floor |
 |---|---:|---:|---:|---:|---:|---:|
-| **`v9` (`w16384`, qualified champion)** | **6,021.8** | **5,969.4** (`5,830.2`–`5,969.4`) | **6,082.2** peak (`6,076.7` med) | **5,694.4** peak (`5,684.0` med) | **56.5** med (`57.4` peak) | `7,072 – 8,450 MiB` |
+| **`v9` (`w16384`, certified baseline)** | **6,021.8** | **5,830.2** peak (`5,819.3` med) | **6,082.2** peak (`6,076.7` med) | **5,694.4** peak (`5,684.0` med) | **56.5** med (`57.4` peak) | `7,072 – 8,450 MiB` |
 | **`v9-w4096` (`w4096` interactive)** | **5,046.0** | **5,276.3** peak (`5,266.8` med) | **5,164.5** med | **4,899.8** peak (`4,891.7` med) | **56.5** med (`57.4` peak) | **11,907 – 12,695 MiB** |
 | **`estonia-136k` (`136,576` tok, 6-hop)** | — | — | — | **5,400.4** (`25.29 s` TTFT) | **48.2** client (`48.6` srv) | **8,412 – 8,431 MiB** |
 | **`k5-lossless-decode` (`w8192`, cache off)** | ~4,400 | ~4,410 | — | — | **56.5** med (`57.4` peak) | **10,500+ MiB** |
@@ -140,7 +140,7 @@ Measured at 16K context (`w16384`, `1,348.0 ms` per 8,192 tokens = `6,076.7 tok/
 | Candidate / Lever | Hypothesis | Measured Effect | Why it failed |
 |---|---|---|---|
 | `GDN_NORM_FP8=3` during `K=5` speculative decode | Use store-warp asynchronous absmax reduction in unified serving | Breaks `LOSSLESS 10/10` (`2,560/2,560`) token parity on multi-row verify rollback | Store-warp reduction order is not state-deterministic across partial draft rollbacks. Kept in `fast-prefill` (prefill-only) and replaced by `GDN_NORM_FP8=2` + `V2=1` in `v9`. |
-| Unbounded `FAST_PROJ_FP8_WEIGHT_CACHE=1` at 144K context | Cache all 96 FP8 projection matrices regardless of KV size | Drops `MemAvailable` below `6,144 MiB` at 136.5K tokens | Triggers the GB10 unified-memory watchdog. Fixed by `_RESERVE_GB=7` (`w16384`) and `_RESERVE_GB=10` (`estonia-136k`). |
-| 3-stage `cp.async` SMEM buffering in `v17q` MoE `down_proj` | Deeper prefetch pipeline to hide LPDDR5x latency | **−6.4% MoE throughput** (`+44 ms/8K`) | Raises per-CTA shared memory above the 2-CTA/SM boundary (`99 KB/SM` on GB10), halving occupancy from 2 CTAs/SM to 1 CTA/SM. |
+| Unbounded `FAST_PROJ_FP8_WEIGHT_CACHE=1` at 144K context | Cache all 120 FP8 projection matrices (`72` GDN + `48` QSA) regardless of KV size | Drops `MemAvailable` below `6,144 MiB` at 136.5K tokens | Triggers the GB10 unified-memory watchdog. Fixed by `_RESERVE_GB=7` (`w16384`) and `_RESERVE_GB=10` (`estonia-136k`). |
+| 3-stage `cp.async` SMEM buffering in `v17q` MoE `down_proj` | Deeper prefetch pipeline to hide LPDDR5x latency | **−6.4% MoE throughput** (`+44 ms/8K`) | Raises per-CTA shared memory above the `~49.5 KiB/CTA` 2-CTA/SM occupancy boundary (`99 KiB/SM` max configurable dynamic SMEM on GB10), halving occupancy from 2 CTAs/SM to 1 CTA/SM. |
 | Per-request `mmap`/`munmap` on NVFP4 PLE shards | Map PLE shards on demand to save host RAM | **+110 ms/8K** kernel-launch jitter | Causes kernel-wide ARMv9.2 TLB shootdowns across the 10 `Cortex-X925` cores. Replaced by persistent `Arc<PackedPleBlock>` cache (`14.3 ms/8K`). |
 | `QSA_VERIFY_ROWS=1` above 131,072 tokens | Use multi-row Flash-Decoding split workspace at 136.5K | Scratch tile wrap past 128K boundary | Explicitly disabled (`QSA_VERIFY_ROWS=0`) in `flux-estonia-136k.env` for >131K contexts. |

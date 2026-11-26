@@ -1,6 +1,6 @@
 # Engine Card — Flux Engine (`sm_121a` / GB10)
 
-Native Rust + CUDA 13.0 (`sm_121a`) inference runtime and universal local-model container appliance for **NVIDIA DGX Spark (Grace Blackwell GB10)** and discrete Blackwell/Hopper GPUs.
+Native Rust + CUDA 13.0 (`sm_121a` / `sm_120a`) inference runtime and universal local-model container appliance for **NVIDIA DGX Spark (Grace Blackwell GB10)** and discrete Blackwell GPUs (`SM120`).
 
 ---
 
@@ -53,9 +53,9 @@ docker run --rm --gpus all -v /path/to/models:/models:ro \
 
 ## 3. Headline Measured Performance (`1× NVIDIA GB10`)
 
-### 3.1 `Qwen3.8-Flash-Next-NVFP4-Offload` (`qwen3.8-flash-next`, `C=1`)
+### 3.1 `Qwen3.8-Flash-Next-NVFP4-Offload` (`qwen3.8-flash-next`, `C=1`, `v0.9.12` Certified Baseline; `v1.0.3` reaches `6,501 tok/s` @ 32K)
 
-| Workload / Context | Mode (`FLUX_MODE`) | Certified Peak | Certified Median (`N=3`) | TTFT (Median / Min) | Correctness / Determinism | Free UMA Floor |
+| Workload / Context | Mode (`FLUX_MODE`) | Certified Peak | Certified Median (`N=3`, Estonia `N=5`) | TTFT (Median / Min) | Correctness / Determinism | Free UMA Floor |
 |---|---|:---:|:---:|:---:|---|:---:|
 | **8K Prefill (`8,192` tok)** | `max-prefill` (`w16384`) | **`5,830.2 tok/s`** | **`5,819.3 tok/s`** | `1.408 s` (`1.405 s`) | `4/4` bit-identical (`dbba921ce205`) | `7,464 MiB` |
 | **16K Prefill (`16,384` tok)** | `max-prefill` (`w16384`) | **`6,082.2 tok/s`** | **`6,076.7 tok/s`** | `2.696 s` (`2.694 s`) | `4/4` bit-identical (`0695b563acde`) | `7,252 MiB` |
@@ -64,14 +64,14 @@ docker run --rm --gpus all -v /path/to/models:/models:ro \
 | **128K Prefill (`131,072` tok)** | `max-prefill` (`w16384`) | **`5,694.4 tok/s`** | **`5,684.0 tok/s`** | `23.060 s` (`23.018 s`) | `4/4` bit-identical (`c51cdffb6e38`) | `7,072 MiB` |
 | **8K–64K Interactive (`w4096`)** | `interactive` (`w4096`) | **`5,276.3 tok/s`** | **`5,266.8 – 5,016.1 tok/s`** | `1.555 s – 13.065 s` | `20/20` bit-identical (`8K..128K`) | **`11,907 MiB`** |
 | **Lossless `K=5` MTP Decode** | `max-prefill` / `decode` | **`57.4 tok/s`** | **`56.3 tok/s`** (`1.70×` vs `K=1`) | — | **`LOSSLESS 10/10`** (`2,560/2,560` exact) | `7,579 MiB` |
-| **Estonia `136,584`-tok 6-Hop** | `long-context` (`136k`) | **`5,428.3 tok/s`** | **`5,400.4 tok/s`** (`48.6` dec) | `25.290 s` (`25.160 s`) | **`5/5 (100% PASS)`** across 2 runs (`10/10`) | `8,431 MiB` |
+| **Estonia `136,584`-tok 6-Hop** | `long-context` (`136k`) | **`5,428.3 tok/s`** (`48.2` cli / `48.6` srv dec) | **`5,400.4 tok/s`** (`43.8` avg cli dec) | `25.290 s` (`25.160 s`) | **`5/5 (100% PASS)`** across 2 runs (`10/10`) | `8,431 MiB` |
 
 ### 3.2 `Qwen3.8-27B-NVFP4` (`qwen3.8-27b` + DFlash `gamma=15`, `C=1`)
 
 | Configuration | Decode Throughput (`tok/s`) | Emitted / Accept Rate | Output Reference | Launcher |
 |---|:---:|:---:|---|---|
 | **DFlash (`bf16` KV, `WY17` lazy GDN, drafter split-K, 400-tok probe)** | **`63.91 – 64.05 tok/s`** | `8.33` emitted / `129.8 ms` (`7.33 / 15` drafts; 800-tok probe: `5.81 / 15` @ `51.89 tok/s`) | `f3b4b2cedd78` (`5/5` bit-identical) | [`bench/qwen38-gb10/serve.sh`](../bench/qwen38-gb10/serve.sh) |
-| **DFlash2 official (`incoai`, corrected 11-arg ABI)** | **`58.01 tok/s`** | `5.12 / 15` (`p = 0.831`) | `9b86c6d92123` (`5/5` bit-identical) | [`bench/qwen38-gb10/serve-dflash2-official.sh`](../bench/qwen38-gb10/serve-dflash2-official.sh) |
+| **DFlash2 (`6`-layer B16 drafter, corrected 13-arg ABI)** | **`58.01 tok/s`** | `5.12 / 15` (`p = 0.831`) | `9b86c6d92123` (`5/5` bit-identical) | [`bench/qwen38-gb10/serve-dflash2-official.sh`](../bench/qwen38-gb10/serve-dflash2-official.sh) |
 | **No-speculation baseline (`ATLAS_DISABLE_SPECULATION=1`)** | `12.90 – 13.35 tok/s` | — (`1` tok/step) | `f3b4b2cedd78` | `flux` launcher `--no-speculative` (raw server: `ATLAS_DISABLE_SPECULATION=1`) |
 
 ---

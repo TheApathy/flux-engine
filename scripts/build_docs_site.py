@@ -20,6 +20,7 @@ from pathlib import Path
 
 REPO_BLOB_BASE = "https://github.com/TheApathy/flux-engine/blob/main"
 REPO_TREE_BASE = "https://github.com/TheApathy/flux-engine/tree/main"
+SITE_BASE_URL = "https://theapathy.github.io/flux-engine"
 
 BOOK_TOML = """[book]
 title = "Flux Engine Documentation"
@@ -32,7 +33,7 @@ src = "src"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/TheApathy/flux-engine"
-edit-url-template = "https://github.com/TheApathy/flux-engine/edit/main/{path}"
+site-url = "/flux-engine/"
 no-section-label = true
 """
 
@@ -61,17 +62,25 @@ PAGES: list[tuple[str, str, str]] = [
 
 MD_LINK_RE = re.compile(r'(!?\[[^\]]*\]\()([^)\s]+)(\))')
 HREF_RE = re.compile(r'(href=")([^"]+)(")')
+SRC_RE = re.compile(r'(src=")([^"]+)(")')
+
+
+def _normalize_mdbook_fragment(frag: str) -> str:
+    """Collapse GitHub double-hyphen heading slugs (`--`) to mdBook single-hyphen slugs."""
+    return re.sub(r"-{2,}", "-", frag)
 
 
 def rewrite_links(content: str, src_rel: str, dest_map: dict[str, str], repo_root: Path) -> str:
     """Rewrite repo-relative links to mdBook destinations or GitHub blob URLs."""
     src_dir = Path(src_rel).parent
 
-    def _map_target(target: str) -> str:
-        if target.startswith(("#", "http://", "https://", "mailto:", "assets/")):
+    def _map_target(target: str, *, html_attr: bool = False) -> str:
+        if target.startswith(("http://", "https://", "mailto:", "assets/")):
             return target
+        if target.startswith("#"):
+            return "#" + _normalize_mdbook_fragment(target[1:])
         base, frag = (target.split("#", 1) + [""])[:2]
-        frag_suffix = f"#{frag}" if frag else ""
+        frag_suffix = f"#{_normalize_mdbook_fragment(frag)}" if frag else ""
         if not base:
             return target
         resolved = (src_dir / base).as_posix()
@@ -86,21 +95,57 @@ def rewrite_links(content: str, src_rel: str, dest_map: dict[str, str], repo_roo
                 parts.append(part)
         norm = "/".join(parts)
         if norm in dest_map:
-            return dest_map[norm] + frag_suffix
+            dest = dest_map[norm]
+            if html_attr and dest.endswith(".md"):
+                dest = dest[:-3] + ".html"
+            return dest + frag_suffix
         if norm.startswith("assets/"):
             return norm + frag_suffix
         candidate = repo_root / norm
         if candidate.is_dir():
             if f"{norm}/README.md" in dest_map:
-                return dest_map[f"{norm}/README.md"] + frag_suffix
+                dest = dest_map[f"{norm}/README.md"]
+                if html_attr and dest.endswith(".md"):
+                    dest = dest[:-3] + ".html"
+                return dest + frag_suffix
             return f"{REPO_TREE_BASE}/{norm}{frag_suffix}"
         if candidate.is_file():
             return f"{REPO_BLOB_BASE}/{norm}{frag_suffix}"
         return target
 
     content = MD_LINK_RE.sub(lambda m: f"{m.group(1)}{_map_target(m.group(2))}{m.group(3)}", content)
-    content = HREF_RE.sub(lambda m: f"{m.group(1)}{_map_target(m.group(2))}{m.group(3)}", content)
+    content = HREF_RE.sub(lambda m: f"{m.group(1)}{_map_target(m.group(2), html_attr=True)}{m.group(3)}", content)
+    content = SRC_RE.sub(lambda m: f"{m.group(1)}{_map_target(m.group(2), html_attr=True)}{m.group(3)}", content)
     return content
+
+
+def rewrite_llms_txt(content: str, dest_map: dict[str, str], repo_root: Path) -> str:
+    """Rewrite repo-relative Markdown links in llms.txt to live GitHub Pages or GitHub blob URLs."""
+
+    def _replace(m: re.Match[str]) -> str:
+        prefix, target, suffix = m.group(1), m.group(2), m.group(3)
+        if target.startswith(("http://", "https://", "mailto:", "#")):
+            return m.group(0)
+        norm = target.lstrip("./")
+        if norm in dest_map:
+            html_page = dest_map[norm].removesuffix(".md") + ".html"
+            return f"{prefix}{SITE_BASE_URL}/{html_page}{suffix}"
+        candidate = repo_root / norm
+        if candidate.is_dir():
+            return f"{prefix}{REPO_TREE_BASE}/{norm}{suffix}"
+        if candidate.is_file():
+            return f"{prefix}{REPO_BLOB_BASE}/{norm}{suffix}"
+        return m.group(0)
+
+    rewritten = MD_LINK_RE.sub(_replace, content)
+    if "/api-explorer/" not in rewritten:
+        rewritten = rewritten.rstrip() + (
+            "\n\n## Interactive & Machine-Readable Endpoints\n\n"
+            f"- [Interactive API Explorer (Scalar)]({SITE_BASE_URL}/api-explorer/): Live OpenAPI 3.1 endpoint explorer.\n"
+            f"- [OpenAPI 3.1 JSON]({SITE_BASE_URL}/openapi.json): Machine-readable HTTP API schema.\n"
+            f"- [Rustdoc Crate API]({SITE_BASE_URL}/api/): Generated Rust workspace API documentation.\n"
+        )
+    return rewritten
 
 
 def build_site(repo_root: Path, output_dir: Path, rustdoc_dir: Path | None) -> None:
@@ -152,10 +197,10 @@ def build_site(repo_root: Path, output_dir: Path, rustdoc_dir: Path | None) -> N
             check=True,
         )
 
-    for extra_file in ("llms.txt",):
-        src = repo_root / extra_file
-        if src.is_file():
-            shutil.copy2(src, output_dir / extra_file)
+    llms_src = repo_root / "llms.txt"
+    if llms_src.is_file():
+        llms_out = rewrite_llms_txt(llms_src.read_text(encoding="utf-8"), dest_map, repo_root)
+        (output_dir / "llms.txt").write_text(llms_out, encoding="utf-8")
 
     openapi = repo_root / "docs/openapi.json"
     if openapi.is_file():

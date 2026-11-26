@@ -27,7 +27,7 @@ and `crates/spark-server/src/{anthropic,openai}/`.
 | `GET /v1/responses/{id}` | No | Retrieve a stored Response object. |
 | `DELETE /v1/responses/{id}` | No | Delete a stored Response object. |
 | `GET /v1/responses/{id}/input_items` | No | List input items associated with a stored Response. |
-| `POST /v1/responses/{id}/cancel` | No | Cancel an in-flight Response generation. |
+| `POST /v1/responses/{id}/cancel` | No | Returns `400 response_not_cancellable` (Flux completes responses synchronously; `background: true` is not supported). |
 | `POST /v1/conversations` | No | Create a conversation container for `/v1/responses`. |
 | `GET / POST / DELETE /v1/conversations/{id}` | No | Read, update, or delete a conversation. |
 | `POST / GET /v1/conversations/{id}/items` | No | Append or list conversation items. |
@@ -39,7 +39,7 @@ and `crates/spark-server/src/{anthropic,openai}/`.
 
 | Method & Path | Streaming (SSE) | Description |
 |---|---|---|
-| `POST /v1/messages` | Yes (`stream: true`) | Native Anthropic Messages endpoint supporting `system`, `messages`, `tools` (`tool_use` / `tool_result`), `thinking` blocks, and base64/URL `image` content blocks. Emits Anthropic SSE events: `message_start`, `content_block_start`, `content_block_delta` (`text_delta`, `thinking_delta`, `input_json_delta`), `content_block_stop`, `message_delta`, `message_stop`, and `error`. |
+| `POST /v1/messages` | Yes (`stream: true`) | Native Anthropic Messages endpoint supporting `system`, `messages`, `tools` (`tool_use` / `tool_result`), `thinking` blocks, `output_config` / `output_format` structured JSON schemas, and inline base64 / data-URI `image` content blocks (no remote HTTP image fetching). Emits Anthropic SSE events: `message_start`, `content_block_start`, `content_block_delta` (`text_delta`, `thinking_delta`, `input_json_delta`), `content_block_stop`, `message_delta`, `message_stop`, and `error`. |
 | `POST /v1/messages/count_tokens` | No | Exact token count for an Anthropic Messages payload using the loaded model's tokenizer and chat template. |
 
 ### 1.3 Ollama-Compatible Discovery Endpoints
@@ -97,8 +97,9 @@ any token is configured, or explicitly via `--require-auth`:
 - **Accepted client headers:**
   - `Authorization: Bearer <token>` (OpenAI SDKs)
   - `x-api-key: <token>` (Anthropic SDKs / Claude Code)
-- **Protected routes:** `/v1/*`, `/tokenize`, `/detokenize`, `/api/tags`, `/api/show`, `/flux/modes`, `/recipes`.
-- **Open probe/UI routes:** `/`, `/health`, `/ready`, `/health/live`, `/metrics`.
+- **Protected routes:** `/v1/*` (including `/v1/flux/modes`, `/v1/flux/settings`, `/v1/disagg/*`), `/tokenize`, `/detokenize`, `/api/tags`, `/api/show`.
+- **Scoped tokens (optional):** Tokens in `--auth-tokens-file` or `--auth-token` may carry optional scope prefixes (`read:`, `inference:`, `admin:`); unprefixed tokens grant full access. Insufficient scope returns `403 Forbidden` (`insufficient_scope`). `PATCH /v1/flux/settings` and `POST /v1/disagg/*` require `admin` scope.
+- **Open probe/UI routes:** `/`, `/flux/modes`, `/recipes`, `/health`, `/ready`, `/health/live`, `/metrics`.
 - **Reverse-proxy client IP:** Rate limiting uses the socket peer address by default; set `FLUX_TRUST_PROXY=1` only behind a trusted reverse proxy to read `X-Forwarded-For`.
 
 ### 2.2 Loopback-Only Default CORS
@@ -116,7 +117,7 @@ explicitly when serving a browser frontend on another host.
 |---|---|---|---|
 | **Streaming SSE** | Yes | Yes | Live token, reasoning, and tool-call argument deltas. |
 | **Tool / Function Calling** | Yes (`tools`, `tool_choice`) | Yes (`tools`, `tool_use`, `tool_result`) | Per-model tool parsers (`hermes`, `qwen`, `glm`, `gemma4`, `dsv41`, etc.). |
-| **Structured Outputs (`xgrammar`)** | Yes (`response_format`: `json_object`, `json_schema`) | Via tool schema | Pure-Rust pushdown-automaton grammar mask in `crates/xgrammar`. |
+| **Structured Outputs (`xgrammar`)** | Yes (`response_format`: `json_object`, `json_schema`) | Yes (`output_config` / `output_format` JSON schema + tool schema) | Safe Rust pushdown-automaton grammar mask in `crates/xgrammar`. |
 | **Reasoning / Thinking Streams** | Yes (`reasoning`, `reasoning_effort`, `chat_template_kwargs`) | Yes (`thinking` blocks + `thinking_delta`) | Budget capped by `--max-thinking-budget` / `MODEL.toml` (`262144` on Qwen3.8). |
 | **Vision / Multimodal** | Yes (`image_url` base64 / data URI) | Yes (`image` content blocks) | Supported on VLM checkpoints (`Qwen3-VL`, `Qwen3.6`, `Gemma-4`, `Qwen3.8-Flash-Next`). |
 | **Intervention Ledger** | Yes (`"report_interventions": true`) | — | Opt-in report-only audit ledger (`FLAGS.md` §2.1). |
