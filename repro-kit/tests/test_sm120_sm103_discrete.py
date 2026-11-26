@@ -638,10 +638,40 @@ class ContainerTagAndDiagnosticsTests(TestCase):
         self.assertIn('FLUX_OPT_OUT="all"', text)
         self.assertIn('HF_HUB_OFFLINE="1"', text)
         self.assertIn('NCCL_P2P_LEVEL="SYS"', text)
-        self.assertIn('ATLAS_QWEN4_PREFILL_ATTN_FI="0"', text)
+        self.assertIn('ARG FLASHINFER_REV=74fb3fb8a64cd36b8f4452a5ef1a7f865eef013e', text)
+        self.assertIn('ENV FLASHINFER_HOME=/opt/fi_src', text)
+        self.assertIn('RUSTFLAGS="-C target-cpu=x86-64-v3"', text)
+        self.assertIn('cargo build --release --locked -p spark-server', text)
+        self.assertNotIn('ATLAS_QWEN4_PREFILL_ATTN_FI="0"', text)
         self.assertIn('/opt/flux/bin/flux-server-universal', text)
         self.assertIn('/opt/flux/bin/flux-server-glm53', text)
         # Never allow blanket COPY . . or copying local VCS/untracked workspace files
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("COPY "):
+                self.assertNotIn(".git", stripped)
+                self.assertFalse(stripped.startswith("COPY . "), f"Blanket COPY forbidden: {stripped}")
+        self.assertNotIn("/home/", text)
+
+    def test_gb10_dockerfile_hygiene_and_privacy(self):
+        gb10_dockerfile = SM120_DOCKERFILE.parent.parent / "gb10" / "Dockerfile"
+        self.assertTrue(gb10_dockerfile.is_file(), f"Missing {gb10_dockerfile}")
+        text = gb10_dockerfile.read_text(encoding="utf-8")
+        self.assertIn("--platform=linux/arm64 nvidia/cuda:13.0.0-devel-ubuntu24.04", text)
+        self.assertIn("--platform=linux/arm64 nvidia/cuda:13.0.0-runtime-ubuntu24.04", text)
+        self.assertIn("ARG FLUX_TARGET_HW=gb10", text)
+        self.assertIn('ARG FLASHINFER_REV=74fb3fb8a64cd36b8f4452a5ef1a7f865eef013e', text)
+        self.assertIn('ENV FLASHINFER_HOME=/opt/fi_src', text)
+        self.assertIn('RUSTFLAGS="-C target-cpu=neoverse-v2"', text)
+        self.assertIn('cargo build --release --locked -p spark-server', text)
+        self.assertIn("repro-kit/cache/cublaslt_plans_v2.json", text)
+        self.assertIn("repro-kit/flux-autodetect /usr/local/bin/flux", text)
+        self.assertIn("repro-kit/recipes/ /opt/flux/repro-kit/recipes/", text)
+        self.assertIn('ENTRYPOINT ["/usr/local/bin/flux"]', text)
+        self.assertIn("libnccl2", text)
+        self.assertIn('ge "2.28"', text)
+        self.assertIn('FLUX_OPT_OUT="all"', text)
+        self.assertIn('HF_HUB_OFFLINE="1"', text)
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("COPY "):

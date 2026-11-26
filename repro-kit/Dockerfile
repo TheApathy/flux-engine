@@ -4,7 +4,7 @@
 # use docker/gb10/Dockerfile or docker/sm120/Dockerfile.
 FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04@sha256:95318efecfd68ab3d109da5277863257b06137c84f34a87f38de970d5cd035d3
 
-ARG FLUX_ENGINE_VERSION="1.0.2"
+ARG FLUX_ENGINE_VERSION="1.0.3"
 ARG FLUX_SOURCE_REVISION
 ARG FLUX_SOURCE_TREE
 ARG FLUX_BINARY_SHA256
@@ -17,7 +17,7 @@ ARG FLUX_RECIPE_NAME=flux-nextgen-max-prefill-decode.env
 LABEL org.opencontainers.image.title="Flux Engine (GB10 / SM121 Blackwell)" \
       org.opencontainers.image.description="Native Rust/CUDA inference engine for NVIDIA DGX Spark (GB10), with model auto-detection, OpenAI/Anthropic endpoints, and local qualification tools." \
       org.opencontainers.image.version="${FLUX_ENGINE_VERSION}" \
-      org.opencontainers.image.ref.name="1.0.2" \
+      org.opencontainers.image.ref.name="${FLUX_ENGINE_VERSION}" \
       org.opencontainers.image.revision="${FLUX_SOURCE_REVISION}" \
       org.opencontainers.image.vendor="TheApathy" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \

@@ -217,6 +217,8 @@ jobs:
     if: needs.preflight.outputs.build_sm120 == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -352,6 +354,8 @@ jobs:
     if: needs.preflight.outputs.build_gb10 == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -408,6 +412,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=flux-gb10
@@ -423,6 +429,8 @@ jobs:
           push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
           cache-from: type=gha,scope=flux-gb10
           cache-to: type=gha,scope=flux-gb10,mode=max
 
@@ -476,3 +484,76 @@ jobs:
         with:
           sarif_file: trivy-gb10.sarif
           category: trivy-gb10
+
+  publish-manifest:
+    name: Publish & Sign Multi-Arch OCI Index (linux/amd64 + linux/arm64)
+    needs: [preflight, build-sm120, build-gb10]
+    if: >-
+      needs.preflight.outputs.dry_run != 'true' &&
+      needs.preflight.outputs.build_sm120 == 'true' &&
+      needs.preflight.outputs.build_gb10 == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Harden runner (eBPF egress audit)
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch OCI manifest index
+        id: manifest
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+          SM120_DIGEST: ${{ needs.build-sm120.outputs.digest }}
+          GB10_DIGEST: ${{ needs.build-gb10.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SM120_DIGEST:-}" || -z "${GB10_DIGEST:-}" ]]; then
+            echo "::error::Missing child image digest (SM120=${SM120_DIGEST:-}, GB10=${GB10_DIGEST:-})."
+            exit 1
+          fi
+          tags=( -t "ghcr.io/theapathy/flux-engine:${RELEASE_TAG}" )
+          if [[ "${IS_PRERELEASE}" != "true" ]]; then
+            tags+=( -t "ghcr.io/theapathy/flux-engine:latest" )
+          fi
+          docker buildx imagetools create \
+            "${tags[@]}" \
+            "ghcr.io/theapathy/flux-engine@${SM120_DIGEST}" \
+            "ghcr.io/theapathy/flux-engine@${GB10_DIGEST}"
+          index_digest="$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "ghcr.io/theapathy/flux-engine:${RELEASE_TAG}" | tr -d '"')"
+          if [[ -z "$index_digest" ]]; then
+            echo "::error::Failed to resolve multi-arch OCI manifest index digest."
+            exit 1
+          fi
+          echo "digest=${index_digest}" >> "$GITHUB_OUTPUT"
+          echo "Published multi-arch index ghcr.io/theapathy/flux-engine:${RELEASE_TAG} (${index_digest})"
+
+      - name: Install Sigstore Cosign
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+
+      - name: Keyless-sign & verify multi-arch OCI index with Cosign
+        env:
+          INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "ghcr.io/theapathy/flux-engine@${INDEX_DIGEST}"
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\.com/TheApathy/flux-engine/\.github/workflows/container-release\.yml@.*$" \
+            "ghcr.io/theapathy/flux-engine@${INDEX_DIGEST}" >/dev/null
+          echo "Verified Cosign keyless OCI signature on multi-arch index ghcr.io/theapathy/flux-engine@${INDEX_DIGEST}"

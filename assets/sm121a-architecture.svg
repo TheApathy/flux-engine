@@ -9,7 +9,7 @@
 
   <!-- Header -->
   <text x="32" y="38" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="800" fill="#F0F6FC">SM121a Layer Execution Pipeline — Qwen3.8-Flash-Next-NVFP4 (48 Layers)</text>
-  <text x="32" y="62" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" fill="#8B949E">Zero-spill PTX/SASS pipeline (-arch=sm_121a -Xptxas -v -fmad=false) · 1,348 ms total per 8,192-token prefill chunk</text>
+  <text x="32" y="62" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" fill="#8B949E">Zero-spill PTX/SASS pipeline (sm_121a GB10 + sm_120a Blackwell · -Xptxas -v -fmad=false) · v1.0.3 (6,501 GB10 / 30,869 SM120 tok/s)</text>
 
   <!-- Pipeline Boxes -->
   
@@ -88,13 +88,13 @@
     <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">γ=4 · 3.1 Accept</text>
     <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
     <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#38BDF8" stroke-width="1.1"/>
-    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#38BDF8" text-anchor="middle">56.5 tok/s</text>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#38BDF8" text-anchor="middle">89–91 tok/s</text>
   </g>
 
   <!-- Bottom 8K Stage Census Card (x=29, y=314, width=1222, height=138) -->
   <g transform="translate(29, 314)">
     <rect x="0" y="0" width="1222" height="138" rx="12" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
-    <text x="24" y="28" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12.5" font-weight="800" fill="#F0F6FC">8,192-TOKEN STAGE CENSUS — 1,348 ms TOTAL (6,076.7 tok/s MEDIAN / 6,082.2 tok/s PEAK @ 16K)</text>
+    <text x="24" y="28" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12.5" font-weight="800" fill="#F0F6FC">8K STAGE CENSUS (GB10) — v1.0.3: 6,501 tok/s @ 16K GB10 · 30,869 tok/s (34.3K W4A4) @ 16K SM120 · 0 REGISTER SPILLS</text>
 
     <!-- Proportional Bar: Total width 1174 (x=24..1198) -->
     <!-- MoE: 38% (446px), GDN/QSA: 31% (364px), mHC/Norm: 14.5% (170px), PLE/Router: 16.5% (188px) -->
@@ -112,7 +112,7 @@
 
     <!-- Bottom Telemetry Sub-Strip -->
     <text x="24" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">PTX Occupancy Gate: <tspan fill="#34D399" font-weight="700">≤124 Regs/Thread (2–5 CTAs/SM)</tspan></text>
-    <text x="396" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">Spill Stores/Loads: <tspan fill="#38BDF8" font-weight="700">0 B / 0 B across 1,954 Kernels</tspan></text>
-    <text x="790" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">Speculative Verify: <tspan fill="#FBBF24" font-weight="700">LOSSLESS 10/10 (2,560/2,560 Exact)</tspan></text>
+    <text x="396" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">Spill Stores/Loads: <tspan fill="#38BDF8" font-weight="700">0 B / 0 B (sm_121a + sm_120a)</tspan></text>
+    <text x="790" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">Speculative Verify: <tspan fill="#FBBF24" font-weight="700">0-ULP Exact (MTP K=5 + DFlash2 W=8)</tspan></text>
   </g>
 </svg>

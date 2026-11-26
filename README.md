@@ -38,13 +38,15 @@
 | **Benchmarks & Specs** | [Profile Tables](#why-the-defaults-are-baked-in) · [`repro-kit/`](repro-kit/README.md) · [`BENCHMARK_VERIFICATION.md`](docs/verification/BENCHMARK_VERIFICATION.md) · [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/KERNEL-PROFILE.md`](docs/KERNEL-PROFILE.md) |
 | **Engineering & Security** | [`AGENTS.md`](AGENTS.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`SIGNING.md`](SIGNING.md) · [`.github/SECURITY.md`](.github/SECURITY.md) · [`CHANGELOG.md`](CHANGELOG.md) · [`CREDITS.md`](CREDITS.md) |
 
-## Qualified Performance (`GB10` / `sm_121a`)
+## Qualified Performance (`v1.0.3` — `GB10` & Discrete `SM120`)
 
-| Model / Workload | Measured Result | Verification |
+| Hardware / Model | Measured Result | Verification |
 |---|---|---|
-| **`Qwen3.8-Flash-Next-NVFP4`** (`125B + 51B` PLE, `6B` active) — Prefill | **6,028–6,299 tok/s** (`8K–16K`) · **5,906 tok/s** (`128K`) · **5,525 tok/s** (`262K`) | `w16384` default; interactive `w4096` delivers **5,063–5,448 tok/s** (`11.9–12.7 GiB` free UMA) |
-| **`Qwen3.8-Flash-Next-NVFP4`** — Lossless `K=5` MTP Decode | **56.5–57.4 tok/s** coding (**62.6–91.3 tok/s** high-accept) · **46.1 tok/s** (`128K`) · **41.8 tok/s** (`262K`) · **580.7 tok/s** (`C=8`) | `0` token divergence vs `K=1`; **97.27%** GSM8K (`1,283/1,319`); **5/5 PASS** `262K` & `136.5K` 6-hop needle |
-| **`Qwen3.8-27B-NVFP4`** (dense hybrid + `DFlash`) | **63.9 tok/s** (`400`-tok coding probe, `BF16-KV`, `γ=15`) · **58.012 tok/s** (`1,500`-tok control) | Reproducible via [`repro-kit/`](repro-kit/README.md) · [full profile tables](#why-the-defaults-are-baked-in) |
+| **GB10 (`sm_121a`) · `Qwen3.8-Flash-Next-NVFP4`** (`125B + 51B` PLE, `6B` active) — Prefill | **6,501 tok/s** (`16K` peak) · **6,359** (`32K`) · **5,937** (`128K`) · **5,525** (`255K`) · **12,056** warm 8K cache | `w16384` default; interactive `w4096` delivers **4,991–5,448 tok/s** (`~12 GiB` free UMA) |
+| **GB10 (`sm_121a`) · `Qwen3.8-Flash-Next-NVFP4`** — Lossless Speculative Decode | **91.3 tok/s** (`K=5` MTP code) · **89.1** (`DFlash2 W=8` greedy code, **86.1** math) · **43.1** (`K=1` oracle) · **580.7** (`C=8` `K=5`) | `0` token divergence vs `K=1`; **97.27%** GSM8K (`1,283/1,319`); **5/5 PASS** `262K` & `136.6K` 6-hop needle |
+| **GB10 (`sm_121a`) · `Qwen3.8-27B-NVFP4`** (dense hybrid + `DFlash` / `DFlash2`) | **72.4 tok/s** (`DFlash γ=15`, `FP8` KV) · **64.0 tok/s** (`BF16` KV) · **58.0 tok/s** (`DFlash2 γ=7`) · **172.6 tok/s** (`C=8` hoisted) | Prefill **1,773 tok/s** (`2K`) / **1,395 tok/s** (`8K`); `5/5` bit-identical verification |
+| **SM120 (`1× RTX PRO 6000 WS`, `600 W`) · `Qwen3.8-Flash-Next-NVFP4`** | **30,869 tok/s** `16K` W4A8 (**34,308** W4A4) · **678 tok/s** `C=1` `DFlash2` · **3,406 tok/s** `C=64` steady (**3,687** `C=16` arith) | **`1M` YaRN4: 3/3 PASS** (`1,011,019` tok in `82.1 s`, `12,319 tok/s`); `1.46M–2.30M` resident KV pool |
+| **SM120 (`1× RTX PRO 6000 WS`, `600 W`) · `Qwen3.8-27B-NVFP4`** | **16,248 tok/s** `8K` prefill · **438.4 tok/s** `C=1` `DFlash2` · **1,073.8 tok/s** `C=8` wall · **1,974.8 tok/s** `C=64` plain | `C=64` hits **`97.3%`** of `1,792 GB/s` GDDR7 roofline · [full profile tables](#why-the-defaults-are-baked-in) |
 
 <a id="serve-it-now"></a>
 
@@ -52,7 +54,7 @@
 
 ### 1. Run with Docker (GHCR)
 
-Mount your local models directory at `/models` — the entrypoint auto-detects the checkpoint architecture, quantization config, PLE shards, vision towers, and companion `DFlash2`/`MTP` drafters. Official signed images are published for **GB10 (`linux/arm64`)** (`:v1.0.3-gb10` / `:gb10`) and **SM120 (`linux/amd64`)** (`:v1.0.3-sm120` / `:sm120`).
+Mount your local models directory at `/models` — the entrypoint auto-detects the checkpoint architecture, quantization config, PLE shards, vision towers, and companion `DFlash2`/`MTP` drafters. Official signed multi-arch images (`:v1.0.3` / `:latest`) resolve automatically to **GB10 (`linux/arm64`, `:v1.0.3-gb10`)** and **SM120 (`linux/amd64`, `:v1.0.3-sm120`)**, with statically compiled FlashInfer FA2 prefill and tuned deterministic recipes built in.
 
 ```bash
 # NVIDIA GB10 / DGX Spark (linux/arm64) — auto-detects model & recipe under /models
@@ -167,31 +169,32 @@ profiles (`v1.0.x` / `v0.9.15` vs `v0.9.12-6k-stable` baseline):
 
 | Operating Profile (`--mode` / Recipe) | 8K Prefill | 16K Prefill | 32K / 64K Prefill | 128K / 255K Prefill | Decode (`tok/s`) | Free UMA Floor |
 |---|---:|---:|---:|---:|---:|---:|
-| **`v9` (`flux-v9-max-prefill.env`, `w16384` default)** | **6,028.5** (`6,050.1` pk) | **6,291.0** (`6,299.3` pk) | **6,168.5** @ 32K / **6,006.5** @ 64K | **5,905.6** @ 128K / **5,524.7** @ 255K | **91.26** (`tf_code`) · **87.72** (`sd_code`) · **86.86** (`rep0`) · **62.59** (`code0`) · **53.03** @ 64K · **46.1** @ 128K · **41.8** @ 255K (`8/8 id=OK`) | `>= 7,429 MiB` |
-| **`v9-w4096` (`flux-v9-w4096-interactive.env`, `w4096`)** | **5,447.7** (`5,449.8` pk) | **5,326.8** (`5,340.9` pk) | **5,294.8** @ 32K / **5,158.2** @ 64K | **5,063.0** @ 128K / **4,990.7** @ 255K | **91.26** (`tf_code`) · **87.72** (`sd_code`) · **63.98** (`chat0`) · **62.59** (`code0`, `8/8 id=OK`) | **`>= 9,890 MiB`** |
-| **Native Concurrency (`C=2..8` batched `K=5`)** | — | — | — | — | `C=2..5`: **173.55 / 258.22 / 340.45 / 420.28** (`code`) · **121.94 / 181.90 / 241.71 / 295.73** (`prose`) · `C=8`: **580.66** (`4.12x`) | `>= 9,500 MiB` |
-| **Native `262K` (`--mode 256k`, `262,144` tokens; BF16 correctness profile, only for >135K context)** | — | — | — | **5,524.7** (`5/5` needles `1%..99%`) | **41.8** @ 255K/262K · **46.1** @ 128K (`100%` parity) | **`>= 11,452 MiB`** |
+| **`v1.0.3` (`flux-nextgen-max-prefill-decode.env`, `w16384` default)** | **5,994** (`12,056` warm cache) | **6,501** *(roofline reached)* | **6,359** @ 32K / **6,224** @ 64K | **5,937** @ 128K / **5,525** @ 255K | **91.26** (`K=5` `code_256`) · **87.72** (`code_400`) · **89.07** (`DFlash2 W=8` code, **86.08** math) · **66.20** (`prose_400`) · **53.03** @ 64K · **46.1** @ 128K · **41.8** @ 262K (`0-ULP` exact) | `>= 7,429 MiB` |
+| **`v9-w4096` (`flux-v9-w4096-interactive.env`, `w4096`)** | **5,448** (`5,450` pk) | **5,327** (`5,341` pk) | **5,295** @ 32K / **5,158** @ 64K | **5,063** @ 128K / **4,991** @ 255K | **91.26** (`tf_code`) · **87.72** (`sd_code`) · **63.98** (`chat0`) · **62.59** (`code0`, `8/8 id=OK`) | **`>= 9,890 MiB`** |
+| **Native Concurrency (`C=2..8` batched `K=5`, `C=1..16` `DFlash2`)** | — | — | — | — | `C=2..5`: **173.6 / 258.2 / 340.5 / 420.3** (`code`) · **121.9 / 181.9 / 241.7 / 295.7** (`prose`) · `C=8`: **580.7** (`K=5`) · `DFlash2 C=16`: **234.5** | `>= 9,500 MiB` |
+| **Native `262K` (`--mode 256k`, `262,144` tokens; BF16 correctness profile)** | — | — | — | **5,525** (`5/5` needles `1%..99%`) | **41.8** @ 255K/262K · **46.1** @ 128K (`100%` parity) | **`>= 11,452 MiB`** |
 | **`v0.9.12-6k-stable` (historical baseline, `w16384`)** | 5,830.2 | 6,082.2 | 5,969.6 @ 32K / 5,828.3 @ 64K | 5,694.4 @ 128K | 56.5 (`57.4` peak) | `7,072 – 8,450 MiB` |
 | **`estonia-136k` (`flux-estonia-136k.env`, `136,576` tok)** | — | — | — | **5,400.4** (`25.29 s` TTFT) | **48.2** client (`48.6` srv, `5/5 PASS`) | **8,412 – 8,431 MiB** |
-| **`exact-reference` (`flux-exact-reference.env`, `K=1`)** | 3,420 | 3,390 | 3,350 | — | **35.2** @ `C=1` · **85.5** @ `C=8` native batched QSA | `8,800+ MiB` |
+| **`exact-reference` (`flux-exact-reference.env`, `K=1` oracle)** | 3,420 | 3,390 | 3,350 | — | **43.06** @ `C=1` *(up from 33.5)* · **85.5** @ `C=8` native batched QSA | `8,800+ MiB` |
 | **Untuned baseline (no `v28q`/`v17q`, no `qkpv_pipe`, no `mHC` roof)** | ~1,480 | ~1,410 | ~1,320 | OOM / watchdog | ~18.4 | `< 6,144 MiB` |
 
 <p align="center">
-  <img src="assets/prefill-curve.svg" alt="Qwen3.8-Flash-Next-NVFP4 Single-GB10 Prefill Throughput Curve (4K to 136.5K)" width="880" />
+  <img src="assets/prefill-curve.svg" alt="Qwen3.8-Flash-Next-NVFP4 Single-GB10 Prefill Throughput Curve (v1.0.3, 8K to 255K)" width="880" />
 </p>
 
-And on **`Qwen3.8-27B-NVFP4`** (`bench/qwen38-gb10/`, deterministic 400-token MinHeap coding probe):
+And on **`Qwen3.8-27B-NVFP4`** (`bench/qwen38-gb10/`, GB10 `sm_121a` — prefill `1,773 tok/s` @ `2K`, `1,395 tok/s` @ `8K`):
 
 | Configuration | Decode (`tok/s`) |
 |---|---:|
-| **Qualified `BF16-KV` default (`400`-tok probe, `--dflash-gamma 15`)** | **63.9** |
-| Corrected-ABI `NVFP4-KV` control (`1,500`-tok probe) | 58.012 |
-| Public `incoai/Qwen3.8-27B-DFlash2` drafter (`--dflash-gamma 7`) | 43.9 |
-| No speculation, tuned kernels | 13.9 |
+| **`DFlash γ=15` (`FP8-KV` peak)** | **72.4** |
+| **Qualified `DFlash γ=15` (`BF16-KV`, `5/5` bit-identical)** | **64.0** |
+| **Official `z-lab/Qwen3.8-27B-DFlash2` (`--dflash-gamma 7`, `W=8`)** | **58.0** *(up from 43.9)* |
+| **Hoisted Batched `DFlash2` (`C=2 / C=4 / C=8`)** | **76.2 / 79.3 / 172.6** |
+| No speculation, tuned kernels (`BF16/FP8 KV` / `NVFP4 KV`) | **13.9** / **25.7** |
 | Speculation on, **no tuning at all** | 8.8 |
 
 <p align="center">
-  <img src="assets/decode-comparison.svg" alt="Single-Stream GB10 Decode Throughput vs 273 GB/s LPDDR5x Bandwidth Ceiling" width="880" />
+  <img src="assets/decode-comparison.svg" alt="Single-Stream GB10 Decode Throughput vs 273 GB/s LPDDR5x Bandwidth Ceiling (v1.0.3)" width="880" />
 </p>
 
 Every `FLUX_*` and `ATLAS_*` flag is documented in [`FLAGS.md`](docs/FLAGS.md),
@@ -489,24 +492,30 @@ Measured end-to-end through the HTTP API on a single NVIDIA GB10 (`sm_121a`,
 
 | Model | Mode / Recipe | Prefill (`tok/s`) | Decode (`tok/s`) | Notes |
 |---|---|---:|---:|---|
-| **Qwen3.8-Flash-Next-NVFP4** | `max-prefill` (`w16384`, `K=5` MTP) | **6,028.5** @ 8K \| **6,291.0** (`6,299.3` pk) @ 16K \| **5,905.6** @ 128K | **91.3** peak code (`62.6–66.2` mixed, `53.0` @ 64K, `46.1` @ 128K) | `LOSSLESS` 0-ULP greedy exact, GSM8K `97.27%` (`1,283/1,319`); `v1.0.x` + DFlash2 reaches `82.4` greedy C=1 / `52.0` @ 128K |
-| **Qwen3.8-Flash-Next-NVFP4** | `interactive` (`w4096`) | **5,447.7** @ 8K \| **5,326.8** @ 16K \| **5,063.0** @ 128K | **91.3** peak code (`62.6–64.0` mixed) | `5/5 >= 5,000 tok/s` (`8K..128K`), `>= 9,890 MiB` free UMA floor |
-| **Qwen3.8-Flash-Next-NVFP4** | Bounded-transpose concurrency (`C=5 / C=8` batched `K=5`, `C=16` `v1.0.x`) | — | **420.3** (`C=5` code) \| **580.7** (`C=8`) \| **298.8** (`C=16` prose) | `295.7 tok/s` (`C=5` prose), `85.5 tok/s` (`C=8` `K=1` QSA) |
-| **Qwen3.8-Flash-Next-NVFP4** | `256k` (`262,144` native context) | **5,524.7** (`w16384`) / **4,990.7** (`w4096`) | **41.8** @ 255K–262K (`46.1` @ 128K) | **5/5 (100% PASS)** exact needle retrieval (`1%..99%` depth), `>= 11,452 MiB` free |
+| **Qwen3.8-Flash-Next-NVFP4** | `max-prefill` (`w16384`, `K=5` MTP / `DFlash2 W=8`) | **5,994** @ 8K \| **6,501** @ 16K \| **6,359** @ 32K \| **5,937** @ 128K | **91.3** (`K=5` code) \| **89.1** (`DFlash2` code, **86.1** math) \| **43.1** (`K=1` oracle) | `LOSSLESS` 0-ULP exact, GSM8K `97.27%` (`1,283/1,319`); warm 8K prefix cache `12,056 eff. tok/s` |
+| **Qwen3.8-Flash-Next-NVFP4** | `interactive` (`w4096`) | **5,448** @ 8K \| **5,327** @ 16K \| **5,063** @ 128K | **91.3** peak code (`62.6–64.0` mixed) | `5/5 >= 5,000 tok/s` (`8K..128K`), `>= 9,890 MiB` free UMA floor |
+| **Qwen3.8-Flash-Next-NVFP4** | Native Concurrency (`C=5 / C=8` batched `K=5`, `C=16` `DFlash2`) | — | **420.3** (`C=5` code) \| **580.7** (`C=8` `K=5`) \| **234.5** (`C=16` `DFlash2`) | `295.7 tok/s` (`C=5` prose), `85.5 tok/s` (`C=8` `K=1` QSA) |
+| **Qwen3.8-Flash-Next-NVFP4** | `256k` (`262,144` native context) | **5,525** (`w16384`) / **4,991** (`w4096`) | **41.8** @ 255K–262K (`46.1` @ 128K) | **5/5 (100% PASS)** exact needle retrieval (`1%..99%` depth), `>= 11,452 MiB` free |
 | **Qwen3.8-Flash-Next-NVFP4** | `estonia-136k` (`136,576` tokens) | **5,400.4** (`25.29 s` TTFT) | **48.2** client (`48.6` srv) | **5/5 (100% PASS)** 6-hop needle past `Latvia` decoy |
-| **Qwen3.8-27B-NVFP4** | DFlash (`--dflash-gamma 15`, BF16 KV) | **1,050–1,411** | **63.9** | 400-token MinHeap coding probe (`58.012` on corrected-ABI `v3` control) |
-| **Qwen3.5-35B-A3B** | MTP speculative (`K=2`) | **3,800+** | **131** | 35B-A3B MoE with native `K=2` MTP speculation on a single GB10 |
-| **Qwen3.6-35B-A3B** | FP8 + MTP (`K=2`) | **3,600+** | **130** | Hybrid MoE with native `K=2` MTP and tool calling |
+| **Qwen3.8-27B-NVFP4** | `DFlash` (`γ=15`) / `DFlash2` (`γ=7`, hoisted `C=8`) | **1,773** @ 2K \| **1,395** @ 8K | **72.4** (`FP8` KV) \| **64.0** (`BF16` KV) \| **58.0** (`DFlash2`) \| **172.6** (`C=8`) | `5/5` bit-identical verification; plain `13.9` (`25.7` NVFP4 KV) |
+| **Qwen3.6-35B-A3B** | NVFP4 / FP8 + MTP (`K=2`) | **3,600+** | **157** (`NVFP4`) / **130** (`FP8`) | Hybrid MoE with native `K=2` MTP and tool calling |
+| **Qwen3.5-35B-A3B** | NVFP4 + MTP (`K=2`) | **3,800+** | **131** | 35B-A3B MoE with native `K=2` MTP speculation on a single GB10 |
+| **Qwen3-Next-80B-A3B** | FP8 KV + MTP | **2,900+** | **74–104** | Pure-Rust FP8 KV + native MTP speculative decode on a single GB10 |
 | **Qwen3-VL-30B-A3B** | NVFP4 KV | — | **97** | Vision + text |
-| **Qwen3-Next-80B-A3B** | FP8 KV + MTP | **2,900+** | **99.1** peak (`74` no-MTP) | Pure-Rust FP8 KV + native MTP speculative decode on a single GB10 |
 | **Nemotron-3-Nano-30B-A3B** | FP8 KV | — | **88** | Mamba-2 + attention + MoE |
 | **SuperGemma4-26B-A4B** | NVFP4 | **3,100+** | **67** | GeGLU MoE + sliding/full attention |
-| **DeepSeek-V4.1** | CB3 MoE + MLA (`deepseek_v41`) | **1,980 – 2,010** (`8K–16K`) | **14.8** plain / **19.0 – 30.8** (`DSpark`) | MLA (`head_dim=512`, `qk_rope_head_dim=64`, `q_lora_rank=1280`) + CB3 MoE |
-| **GLM-5.3-Flash** | EXL3 2.05 bpw, target-only | **694** @ 8K / **603** @ 32K | **14.6** (`8.6` @ 32K) | KDA + DSA + mHC MoE; no speculation |
-| **Qwen3.5-122B-A10B** | EP=2, MTP `K=2` (`2x Spark`) / 1x Spark | — | **46** (`EP=2`) / **32** (`1x`) | Single-Spark fits 16K context with `--ssm-cache-slots 0` |
+| **Qwen3.5-122B-A10B** | EP=2, MTP `K=2` (`2× Spark`) / `1× Spark` | — | **46–51** (`EP=2`) / **32–33** (`1×`) | Single-Spark fits 16K context with `--ssm-cache-slots 0` |
 | **Mistral-Small-4-119B** | NVFP4 | — | **33** | 119B MoE on a single Spark |
+| **MiniMax-M2.7** | NVFP4 (`229B` / `10B` active) | — | **28** | 256-expert sigmoid-routed MoE + MTP |
+| **Nemotron-Super-120B** | NVFP4 (`120B` / `12B` active) | — | **24** | Mamba-2 + GQA attention + MoE |
+| **DeepSeek-V4.1** | CB3 MoE + MLA (`deepseek_v41`) | **1,980 – 2,010** (`8K–16K`) | **14.8** plain / **19.0 – 30.8** (`DSpark`) | MLA (`head_dim=512`, `qk_rope_head_dim=64`, `q_lora_rank=1280`) + CB3 MoE |
+| **GLM-5.3-Flash** | EXL3 2.05 bpw, target-only | **928** @ 2K / **694** @ 8K | **14.2–14.6** (`8.6` @ 32K) | KDA + DSA + mHC MoE; no speculation |
 
 #### Discrete Blackwell (`SM120` — `1× NVIDIA RTX PRO 6000 Blackwell Workstation Edition`, `600 W`, `96 GB GDDR7`)
+
+<p align="center">
+  <img src="assets/sm120-benchmarks.svg" alt="Discrete Blackwell SM120 (1x RTX PRO 6000 Workstation 600W) Prefill, Decode & Concurrency Benchmarks (v1.0.3)" width="880" />
+</p>
 
 Certified end-to-end results (see [`docs/SM120_SM103_BRINGUP.md`](docs/SM120_SM103_BRINGUP.md) for recipes, methodology, and full tables):
 
@@ -546,10 +555,9 @@ boundary layers at BF16 while compressing the middle.
 
 ## 🚀 Quick Start
 
-### Recipe A — `Qwen3.8-Flash-Next-NVFP4` (`v9` 16K-chunk max-prefill + `K=5` lossless decode)
+### Recipe A — `Qwen3.8-Flash-Next-NVFP4` (`v1.0.3` 16K-chunk max-prefill + `K=5` lossless decode)
 
-6,021.8 tok/s short prefill, 5,969.4 tok/s @ 8K, 6,082.2 tok/s peak @ 16K, and
-56.5 tok/s lossless `K=5` decode (uses the checkpoint's built-in `mtp.*` head automatically; pass `MTP_DIR=/path/to/mtp` only if overriding with an external sidecar):
+5,994 tok/s @ 8K, **6,501 tok/s** peak @ 16K (`6,359` @ 32K, `5,937` @ 128K), and up to **91.3 tok/s** lossless `K=5` decode (`89.1 tok/s` with `DFlash2 W=8`; uses the checkpoint's built-in `mtp.*` head automatically; pass `MTP_DIR=/path/to/mtp` only if overriding with an external sidecar):
 
 ```bash
 MODEL_DIR=/path/to/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid \
@@ -558,15 +566,14 @@ MODEL_DIR=/path/to/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid \
 
 ### Recipe B — `Qwen3.8-Flash-Next-NVFP4` (`v9-w4096` interactive, ~12 GiB free UMA floor)
 
-5,046–5,276 tok/s prefill across 8K..64K and 56.5 tok/s decode while keeping
-11,907–12,695 MiB of free unified memory:
+**4,991–5,448 tok/s** prefill across 8K..255K and up to **91.3 tok/s** decode while keeping ~12 GiB of free unified memory:
 
 ```bash
 MODEL_DIR=/path/to/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid \
   ./bench/qwen38-flash-next-gb10/serve-w4096.sh
 ```
 
-### Recipe C — `Qwen3.8-27B-NVFP4` (`DFlash` `gamma=15`, 63.9 tok/s single-stream)
+### Recipe C — `Qwen3.8-27B-NVFP4` (`DFlash` `gamma=15`, **64.0 tok/s** BF16-KV / **72.4 tok/s** FP8-KV)
 
 ```bash
 MODEL_DIR=/path/to/Qwen3.8-27B-NVFP4 \

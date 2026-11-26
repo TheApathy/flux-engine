@@ -1,4 +1,4 @@
-# Flux Engine — Production Container (`ghcr.io/theapathy/flux-engine:v1.0.2` / `:gb10` / `:latest`)
+# Flux Engine — Production Container (`ghcr.io/theapathy/flux-engine:v1.0.3` / `:gb10` / `:sm120` / `:latest`)
 
 **Native Rust/CUDA (`sm_121a` / `sm_120a`) Inference Engine for NVIDIA Blackwell & DGX Spark (GB10)**  
 *Zero-Config Local Model Auto-Detection · OpenAI & Anthropic Compatible Server · Built-in `lil-bench` (Matrix, Concurrency Sweeps & Estonia 136.6K) · Automated SVG/PNG & Markdown Model Cards · Full Diagnostics & Privacy Opt-Out*
@@ -8,16 +8,20 @@
 ## 1. Container Image Tags & Installation
 
 ```bash
-# Primary v1.0.2 GB10 / DGX Spark production tags
-docker pull ghcr.io/theapathy/flux-engine:v1.0.2
-docker pull ghcr.io/theapathy/flux-engine:gb10
+# Multi-arch v1.0.3 tags (automatically selects linux/arm64 on GB10 and linux/amd64 on SM120)
+docker pull ghcr.io/theapathy/flux-engine:v1.0.3
 docker pull ghcr.io/theapathy/flux-engine:latest
+
+# Or pin an explicit architecture tag
+docker pull ghcr.io/theapathy/flux-engine:v1.0.3-gb10   # linux/arm64 (NVIDIA GB10 / DGX Spark)
+docker pull ghcr.io/theapathy/flux-engine:v1.0.3-sm120  # linux/amd64 (RTX 50-series / RTX PRO 6000)
 ```
 
 | Image Reference | Architecture | CUDA / OS Runtime | Included Capabilities |
 | :--- | :--- | :--- | :--- |
-| `ghcr.io/theapathy/flux-engine:v1.0.2` (`:1.0.2`, `:gb10`, `:latest`) | `linux/arm64` (`sm_121a`) | CUDA 13.0 / Ubuntu 24.04 | GB10 production release (`repro-kit/Dockerfile` packages `flux-server-real` aliased as `flux-server`, plus `flux` CLI, `flux-bench`, `flux-lens`, `lil-bench`) |
-| `flux-engine:latest` | `linux/arm64` (`sm_121a`) | CUDA 13.0 / Ubuntu 24.04 | Local convenience alias |
+| `ghcr.io/theapathy/flux-engine:v1.0.3` (`:latest`) | Multi-arch (`linux/arm64` + `linux/amd64`) | CUDA 13.0 / Ubuntu 24.04 | Signed multi-arch OCI index resolving to `v1.0.3-gb10` on ARM64 and `v1.0.3-sm120` on x86_64 |
+| `ghcr.io/theapathy/flux-engine:v1.0.3-gb10` (`:gb10`) | `linux/arm64` (`sm_121a`) | CUDA 13.0 / Ubuntu 24.04 | GB10 production release (`docker/gb10/Dockerfile` packages `flux-server-real` with FlashInfer FA2, pre-seeded `cublaslt_plans_v2.json`, `flux` CLI, `flux-bench`, `flux-lens`, `lil-bench`, `recipes/`) |
+| `ghcr.io/theapathy/flux-engine:v1.0.3-sm120` (`:sm120`) | `linux/amd64` (`sm_120a`) | CUDA 13.0 / Ubuntu 24.04 | Discrete Blackwell SM120 production release (`docker/sm120/Dockerfile` packages `flux-server-real` with FlashInfer FA2, NCCL multi-GPU, `flux` CLI, `flux-bench`, `flux-lens`, `lil-bench`, `recipes/`) |
 
 See the [qualification runbook](QWEN4_R9_QUALIFICATION.md) and
 [exact-image release wrapper](R15_EXACT_IMAGE_RELEASE.md) for receipt verification

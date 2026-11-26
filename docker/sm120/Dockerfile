@@ -42,8 +42,9 @@ COPY --from=rust:1.93.1-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8
 COPY --from=rust:1.93.1-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 /usr/local/rustup /usr/local/rustup
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:/usr/local/cuda/bin:${PATH}"
-ENV CUDA_HOME=/usr/local/cuda
+    CUDA_HOME=/usr/local/cuda \
+    PATH="/usr/local/cargo/bin:/usr/local/cuda/bin:${PATH}" \
+    RUSTFLAGS="-C target-cpu=x86-64-v3"
 
 WORKDIR /build
 
@@ -55,12 +56,23 @@ COPY crates/ crates/
 COPY kernels/ kernels/
 COPY jinja-templates/ jinja-templates/
 
-ENV FLUX_TARGET_HW=${FLUX_TARGET_HW}
-ENV FLUX_TARGET_MODEL=${FLUX_TARGET_MODEL}
-ENV FLUX_TARGET_QUANT=${FLUX_TARGET_QUANT}
-ENV ATLAS_TARGET_HW=${FLUX_TARGET_HW}
-ENV ATLAS_TARGET_MODEL=${FLUX_TARGET_MODEL}
-ENV ATLAS_TARGET_QUANT=${FLUX_TARGET_QUANT}
+ENV FLUX_TARGET_HW=${FLUX_TARGET_HW} \
+    FLUX_TARGET_MODEL=${FLUX_TARGET_MODEL} \
+    FLUX_TARGET_QUANT=${FLUX_TARGET_QUANT} \
+    ATLAS_TARGET_HW=${FLUX_TARGET_HW} \
+    ATLAS_TARGET_MODEL=${FLUX_TARGET_MODEL} \
+    ATLAS_TARGET_QUANT=${FLUX_TARGET_QUANT}
+
+# Pinned Apache-2.0 FlashInfer + 3rdparty/cccl headers for build-time static
+# compilation of `qwen4_fi_attn.cu` (`ATLAS_QWEN4_PREFILL_ATTN_FI=1`).
+# Statically linked into `spark`; zero runtime stage bloat.
+ARG FLASHINFER_REV=74fb3fb8a64cd36b8f4452a5ef1a7f865eef013e
+RUN git init -q /opt/fi_src && \
+    git -C /opt/fi_src remote add origin https://github.com/flashinfer-ai/flashinfer.git && \
+    git -C /opt/fi_src fetch --depth 1 origin "${FLASHINFER_REV}" && \
+    git -C /opt/fi_src checkout -q --detach FETCH_HEAD && \
+    git -C /opt/fi_src submodule update --init --depth 1 3rdparty/cccl
+ENV FLASHINFER_HOME=/opt/fi_src
 
 # Pinned MIT ExLlamaV3 source required by crates/atlas-kernels/build.rs when
 # building universal (`FLUX_TARGET_MODEL=*`) images including GLM-5.3-Flash EXL3.
@@ -71,7 +83,7 @@ RUN git init -q /tmp/exllamav3 && \
     git -C /tmp/exllamav3 checkout -q FETCH_HEAD
 ENV ATLAS_EXLLAMAV3_SOURCE=/tmp/exllamav3
 
-RUN cargo build --release -p spark-server
+RUN cargo build --release --locked -p spark-server
 
 # ── Runtime stage (linux/amd64, CUDA 13.0 runtime) ───────────────
 FROM --platform=linux/amd64 nvidia/cuda:13.0.0-runtime-ubuntu24.04@sha256:95318efecfd68ab3d109da5277863257b06137c84f34a87f38de970d5cd035d3
@@ -80,7 +92,7 @@ ARG FLUX_TARGET_HW=rtx6000
 ARG FLUX_ENGINE_VERSION=1.0.3
 
 LABEL org.opencontainers.image.title="Flux Engine (Blackwell SM120 / linux-amd64)" \
-      org.opencontainers.image.description="Native Rust/CUDA inference engine for discrete NVIDIA Blackwell SM120 GPUs (RTX 50-series & RTX PRO 5000/6000), single- and multi-GPU NCCL serving." \
+      org.opencontainers.image.description="Native Rust/CUDA inference engine for discrete NVIDIA Blackwell SM120 GPUs (RTX 50-series & RTX PRO 5000/6000), with FlashInfer FA2 prefill, single- and multi-GPU NCCL serving, and local qualification tools." \
       org.opencontainers.image.version="${FLUX_ENGINE_VERSION}" \
       org.opencontainers.image.vendor="TheApathy" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
@@ -108,20 +120,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_MODULE_LOADING="LAZY" \
     NCCL_P2P_DISABLE="0" \
     NCCL_P2P_LEVEL="SYS" \
-    ATLAS_QWEN4_PREFILL_ATTN_FI="0" \
     PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
+    LIL_BENCH_DIR="/opt/flux/llm-inference-bench" \
+    LLM_BENCH_NO_UPDATE_CHECK="1" \
     RUST_LOG="info" \
     LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:/usr/local/cuda-13.0/compat"
 
 # NCCL >= 2.28 for single-host multi-GPU (TP/EP/PP) symmetric memory windows,
 # RDMA userspace libs, CUDA 13.0 runtime libraries, libturbojpeg for multimodal
-# JPEG decoding, and Python 3 for the flux auto-detect entrypoint.
+# JPEG decoding, and Python 3 + stdlib/bench helpers for flux-autodetect.
 RUN apt-mark unhold libcublas-13-0 libnccl2 2>/dev/null || true && \
     apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends --allow-change-held-packages \
       ca-certificates \
       curl \
+      jq \
       python3 \
+      python3-httpx \
+      python3-psutil \
+      python3-rich \
+      python3-numpy \
       procps \
       libgomp1 \
       libnuma1 \
@@ -137,7 +155,8 @@ RUN apt-mark unhold libcublas-13-0 libnccl2 2>/dev/null || true && \
       cuda-cudart-13-0 \
       cuda-nvrtc-13-0 \
       libnvjitlink-13-0 \
-      libnvfatbin-13-0 && \
+      libnvfatbin-13-0 \
+      libcufile-13-0 && \
     rm -rf /var/lib/apt/lists/* && \
     NCCL_VER=$(dpkg-query -W -f='${Version}' libnccl2) && \
     echo "Linked NCCL: $NCCL_VER" && \
@@ -145,24 +164,38 @@ RUN apt-mark unhold libcublas-13-0 libnccl2 2>/dev/null || true && \
       { echo "ERROR: NCCL $NCCL_VER < 2.28 — symmetric memory APIs unavailable" >&2; exit 1; } && \
     echo "/usr/local/cuda-13.0/compat" > /etc/ld.so.conf.d/zz-cuda-compat.conf && \
     ldconfig && \
-    mkdir -p /opt/flux/bin /opt/flux/repro-kit/recipes /models /results && \
+    mkdir -p /opt/flux/bin /opt/flux/scripts /opt/flux/repro-kit/recipes /opt/flux/llm-inference-bench /models /results && \
     chmod 1777 /results
 
 # Explicit allowlist COPY into runtime stage — never copies local workspace notes.
 COPY --from=builder /build/target/release/spark /opt/flux/bin/flux-server-real
 COPY --from=builder /build/jinja-templates/ /jinja-templates/
 COPY repro-kit/flux-autodetect /usr/local/bin/flux
+COPY repro-kit/flux-bench /usr/local/bin/flux-bench
+COPY repro-kit/flux_lens.py /usr/local/bin/flux-lens
+COPY repro-kit/lil-bench /usr/local/bin/lil-bench
+COPY repro-kit/scripts/repack_qwen38_flash_next_ple_nvfp4.py /opt/flux/scripts/repack_qwen38_flash_next_ple_nvfp4.py
+COPY repro-kit/llm-inference-bench /opt/flux/llm-inference-bench
 COPY repro-kit/recipes/ /opt/flux/repro-kit/recipes/
+COPY repro-kit/benchmark-config.yaml repro-kit/model-manifest.json repro-kit/METHODOLOGY.md repro-kit/README.md repro-kit/SOURCE_AND_LICENSES.md repro-kit/FLUX_LENS.md /opt/flux/repro-kit/
 COPY LICENSE /LICENSE
 COPY LICENSE CREDITS.md THIRD_PARTY_NOTICES.md SOURCE_AND_LICENSES.md /usr/share/licenses/flux-engine/
 COPY LICENSES/ /usr/share/licenses/flux-engine/LICENSES/
 
-RUN chmod 0755 /opt/flux/bin/flux-server-real /usr/local/bin/flux && \
+RUN chmod 0755 \
+      /opt/flux/bin/flux-server-real \
+      /usr/local/bin/flux \
+      /usr/local/bin/flux-bench \
+      /usr/local/bin/flux-lens \
+      /usr/local/bin/lil-bench \
+      /opt/flux/scripts/repack_qwen38_flash_next_ple_nvfp4.py && \
     ln -sf /opt/flux/bin/flux-server-real /opt/flux/bin/flux-server-universal && \
     ln -sf /opt/flux/bin/flux-server-real /opt/flux/bin/flux-server-glm53 && \
+    ln -sf /opt/flux/bin/flux-server-real /opt/flux/bin/flux-server-qwen38-27b && \
     ln -sf /opt/flux/bin/flux-server-real /usr/local/bin/flux-server && \
     ln -sf /opt/flux/bin/flux-server-real /usr/local/bin/spark && \
-    ln -sf /usr/local/bin/flux /usr/local/bin/flux-autodetect
+    ln -sf /usr/local/bin/flux /usr/local/bin/flux-autodetect && \
+    ln -sf /opt/flux/scripts/repack_qwen38_flash_next_ple_nvfp4.py /usr/local/bin/repack-ple
 
 WORKDIR /opt/flux
 EXPOSE 8899

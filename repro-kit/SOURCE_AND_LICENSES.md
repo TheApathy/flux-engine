@@ -1,7 +1,7 @@
 # Source Code Availability, OCI Layer Mapping & License Disclosures
 
 - **Kit Version:** `Flux Reproducibility Kit`
-- **Engine Release:** `ghcr.io/theapathy/flux-engine:v1.0.2`
+- **Engine Release:** `ghcr.io/theapathy/flux-engine:v1.0.3` (`:v1.0.3-gb10`, `:v1.0.3-sm120`)
 - **Primary License:** **GNU Affero General Public License v3.0 only (`SPDX-License-Identifier: AGPL-3.0-only`)**
 - **Sanitization Policy:** `FLUX-SEC-0001`
 

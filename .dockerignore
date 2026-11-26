@@ -34,8 +34,12 @@ CLAUDE.md
 !THIRD_PARTY_NOTICES.md
 !SOURCE_AND_LICENSES.md
 !repro-kit/recipes/README.md
+!repro-kit/METHODOLOGY.md
+!repro-kit/README.md
+!repro-kit/SOURCE_AND_LICENSES.md
+!repro-kit/FLUX_LENS.md
+!repro-kit/scripts/
 repro-kit/tests/
-repro-kit/llm-inference-bench/
 repro-kit/formal/
 repro-kit/router/
 repro-kit/bin/
