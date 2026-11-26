@@ -42,6 +42,11 @@ const W4A8_SETS: [(&str, &str); 5] = [
 ];
 const KERNEL_V28: &str =
     include_str!("../../../kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4_moe_compact_t_k32_v28.cu");
+const KERNEL_V28_SHARED: &str = include_str!(
+    "../../../kernels/gb10/qwen3.8-flash-next/nvfp4/detail/moe_compact/v28_shared.cuh"
+);
+const KERNEL_V28_Q4: &str =
+    include_str!("../../../kernels/gb10/qwen3.8-flash-next/nvfp4/detail/moe_compact/v28_q4.cuh");
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = source
@@ -372,10 +377,13 @@ fn selector_is_default_off_v16_gated_and_receipted() {
 
 #[test]
 fn v28_k11b2_l2_residency_and_512t_pretranscode_contract() {
+    assert!(KERNEL_V28.contains("#include \"detail/moe_compact/v28_shared.cuh\""));
+    assert!(KERNEL_V28.contains("#include \"detail/moe_compact/v28_q4.cuh\""));
+
     let pre = section(
-        KERNEL_V28,
+        KERNEL_V28_SHARED,
         "void v28_pretranscode_slice(",
-        "template <bool GATEUP, bool DISCARD = false>\n__device__ __forceinline__ void v28_shared_impl(",
+        "template <bool GATEUP, bool DISCARD = false, typename Shape = Qwen4FlashNextShape>\n__device__ __forceinline__ void v28_shared_impl(",
     );
     let pre_c = compact(pre);
     assert!(pre_c.contains("v28_cp16_evict_first(&sB[mtx][r][cc*16]"));
@@ -384,7 +392,7 @@ fn v28_k11b2_l2_residency_and_512t_pretranscode_contract() {
     assert!(!pre_c.contains("if(tid<V14_BC)"));
 
     let shared = section(
-        KERNEL_V28,
+        KERNEL_V28_SHARED,
         "void v28_shared_impl(",
         "extern \"C\" __global__ __launch_bounds__(512, 2) void qwen4_shared_pretranscode_v28(",
     );
@@ -399,7 +407,7 @@ fn v28_k11b2_l2_residency_and_512t_pretranscode_contract() {
     assert!(shared_c.contains("if(task+gridDim.x<task_count)__syncthreads();"));
 
     let v28q = section(
-        KERNEL_V28,
+        KERNEL_V28_Q4,
         "void v28q_impl(",
         "extern \"C\" __global__ __launch_bounds__(512, 1) void qwen4_moe_compact_t_gemm_gateup_k32_v28q4(",
     );
