@@ -73,7 +73,7 @@ docker run --rm -it --gpus all \
 
 Run `auto` (the default on Qwen3.8-Flash-Next, 135,168-token context) unless a workload explicitly requires contexts beyond ~135K tokens, in which case select `256k`.
 
-> **GB10 unified memory guidance:** Keep `--gpu-memory-utilization` at `0.55` or lower on 128 GB GB10 systems so OS page cache and CUDA runtime allocations do not contend. See [`FLAGS.md`](../FLAGS.md) and [`docs/OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md).
+> **GB10 unified memory guidance:** Keep `--gpu-memory-utilization` at `0.55` or lower on 128 GB GB10 systems so OS page cache and CUDA runtime allocations do not contend. See [`FLAGS.md`](FLAGS.md) and [`docs/OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md).
 
 ---
 

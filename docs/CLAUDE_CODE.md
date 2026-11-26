@@ -177,5 +177,5 @@ for chunk in resp:
    GB10 UMA.
 3. **Thinking controls:** Leave `FLUX_THINKING` unset so individual agent
    requests can opt into reasoning via `thinking` (Anthropic) or
-   `chat_template_kwargs` (OpenAI). See [`FLAGS.md`](../FLAGS.md) for
+   `chat_template_kwargs` (OpenAI). See [`FLAGS.md`](FLAGS.md) for
    `FLUX_THINKING_BUDGET` and `FLUX_THINK_NUDGE`.

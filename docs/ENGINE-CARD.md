@@ -70,8 +70,8 @@ docker run --rm --gpus all -v /path/to/models:/models:ro \
 
 | Configuration | Decode Throughput (`tok/s`) | Emitted / Accept Rate | Output Reference | Launcher |
 |---|:---:|:---:|---|---|
-| **DFlash (`bf16` KV, `WY17` lazy GDN, drafter split-K, 400-tok probe)** | **`63.91 – 64.05 tok/s`** | `8.33` emitted / `129.8 ms` (`7.33 / 15` drafts; 800-tok probe: `5.81 / 15` @ `51.89 tok/s`) | `f3b4b2cedd78` (`5/5` bit-identical) | [`bench/qwen38-gb10/serve.sh`](bench/qwen38-gb10/serve.sh) |
-| **DFlash2 official (`incoai`, corrected 11-arg ABI)** | **`58.01 tok/s`** | `5.12 / 15` (`p = 0.831`) | `9b86c6d92123` (`5/5` bit-identical) | [`bench/qwen38-gb10/serve-dflash2-official.sh`](bench/qwen38-gb10/serve-dflash2-official.sh) |
+| **DFlash (`bf16` KV, `WY17` lazy GDN, drafter split-K, 400-tok probe)** | **`63.91 – 64.05 tok/s`** | `8.33` emitted / `129.8 ms` (`7.33 / 15` drafts; 800-tok probe: `5.81 / 15` @ `51.89 tok/s`) | `f3b4b2cedd78` (`5/5` bit-identical) | [`bench/qwen38-gb10/serve.sh`](../bench/qwen38-gb10/serve.sh) |
+| **DFlash2 official (`incoai`, corrected 11-arg ABI)** | **`58.01 tok/s`** | `5.12 / 15` (`p = 0.831`) | `9b86c6d92123` (`5/5` bit-identical) | [`bench/qwen38-gb10/serve-dflash2-official.sh`](../bench/qwen38-gb10/serve-dflash2-official.sh) |
 | **No-speculation baseline (`ATLAS_DISABLE_SPECULATION=1`)** | `12.90 – 13.35 tok/s` | — (`1` tok/step) | `f3b4b2cedd78` | `flux` launcher `--no-speculative` (raw server: `ATLAS_DISABLE_SPECULATION=1`) |
 
 ---
@@ -99,7 +99,7 @@ strings target/release/spark | grep -E '^qwen3\.8-(flash-next|27b)$'
 
 - [`MODEL-CARD.md`](MODEL-CARD.md). Checkpoint architecture, quantization layout, and SHA-256 manifests.
 - [`FLAGS.md`](FLAGS.md). Complete `FLUX_*` / `ATLAS_*` environment variable and CLI flag reference.
-- [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md). One-command serving, OpenAI API queries, thinking/tool-call controls, and GB10 UMA gotchas.
-- [`docs/CONTAINER_GUIDE.md`](docs/CONTAINER_GUIDE.md). Universal local-model container guide (`ghcr.io/theapathy/flux-engine:v1.0.3`).
-- [`docs/KERNEL-PROFILE.md`](docs/KERNEL-PROFILE.md). Per-stage `sm_121a` kernel timing breakdown (`1,348.0 ms / 8K` prefill and `K=5` / `K=16` verify).
-- [`docs/verification/BENCHMARK_VERIFICATION.md`](docs/verification/BENCHMARK_VERIFICATION.md). Roofline physics, prefix-cache controls, and benchmark verification proofs.
+- [`docs/OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md). One-command serving, OpenAI API queries, thinking/tool-call controls, and GB10 UMA gotchas.
+- [`docs/CONTAINER_GUIDE.md`](CONTAINER_GUIDE.md). Universal local-model container guide (`ghcr.io/theapathy/flux-engine:v1.0.3`).
+- [`docs/KERNEL-PROFILE.md`](KERNEL-PROFILE.md). Per-stage `sm_121a` kernel timing breakdown (`1,348.0 ms / 8K` prefill and `K=5` / `K=16` verify).
+- [`docs/verification/BENCHMARK_VERIFICATION.md`](verification/BENCHMARK_VERIFICATION.md). Roofline physics, prefix-cache controls, and benchmark verification proofs.

@@ -1,6 +1,6 @@
 # Environment Variables & CLI Flags Reference (`FLAGS.md`)
 
-Complete reference for configuring **Flux Engine** via the universal container appliance (`ghcr.io/theapathy/flux-engine:gb10`), the host environment bridge ([`scripts/flux_env_bridge.sh`](scripts/flux_env_bridge.sh)), and the [`bench/qwen38-flash-next-gb10/`](bench/qwen38-flash-next-gb10/) / [`bench/qwen38-gb10/`](bench/qwen38-gb10/) launchers.
+Complete reference for configuring **Flux Engine** via the universal container appliance (`ghcr.io/theapathy/flux-engine:gb10`), the host environment bridge ([`scripts/flux_env_bridge.sh`](../scripts/flux_env_bridge.sh)), and the [`bench/qwen38-flash-next-gb10/`](../bench/qwen38-flash-next-gb10/) / [`bench/qwen38-gb10/`](../bench/qwen38-gb10/) launchers.
 
 ---
 
@@ -140,7 +140,7 @@ text, tool bytes, token IDs, and nonced server-produced rendered-prompt digests.
 
 ## 3. Advanced Kernel & Runtime Selectors (`FLUX_*` / `ATLAS_*`)
 
-Sourcing [`scripts/flux_env_bridge.sh`](scripts/flux_env_bridge.sh) translates any `FLUX_<SUFFIX>` variable directly to `ATLAS_<SUFFIX>`. Every selector below is active in [`recipes/flux-v9-max-prefill.env`](recipes/flux-v9-max-prefill.env):
+Sourcing [`scripts/flux_env_bridge.sh`](../scripts/flux_env_bridge.sh) translates any `FLUX_<SUFFIX>` variable directly to `ATLAS_<SUFFIX>`. Every selector below is active in [`recipes/flux-v9-max-prefill.env`](../recipes/flux-v9-max-prefill.env):
 
 ### 3.1 Routed & Shared MoE (`512` Routed Top-10 + `1` Shared Expert)
 

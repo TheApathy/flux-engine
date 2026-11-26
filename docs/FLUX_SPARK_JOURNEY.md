@@ -54,5 +54,5 @@ The NVIDIA Grace Blackwell GB10 pairs a 20-core ARMv9.2 Grace CPU (`10x Cortex-X
 | **`SuperGemma4` (`26B-A4B` / `31B`)** | Sliding + full attention alternation, GeGLU MoE/Dense | **3,100+ tok/s** | **67 tok/s** (`26B-A4B`) | Fused GeGLU + sliding-window causal mask hoist + TurboQuant+ KV cache. |
 
 For the full release history and kernel walkthrough, see
-[`CHANGELOG.md`](../CHANGELOG.md), [`ARCHITECTURE.md`](../ARCHITECTURE.md),
+[`CHANGELOG.md`](../CHANGELOG.md), [`ARCHITECTURE.md`](ARCHITECTURE.md),
 and [`docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md`](QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md).

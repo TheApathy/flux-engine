@@ -12,10 +12,10 @@ kit onto `main`.
 
 | Harness / Directory | Model Target | What it measures |
 |---|---|---|
-| [`bench/qwen38-flash-next-gb10/`](bench/qwen38-flash-next-gb10/) | `Hotshot2000/Qwen3.8-Flash-Next-NVFP4` *(+ repacked NVFP4 PLE + Inferact MTP)* | Single-stream 16K-chunk prefill (`6,021.8 tok/s` short, `5,969.4 tok/s` 8K, `6,082.2 tok/s` 16K peak, `5,694.4 tok/s` 128K), `w4096` interactive prefill (`5,046–5,276 tok/s`), lossless `K=5` MTP decode (`56.5 tok/s` med / `57.4` peak, `2,560/2,560` greedy exact), and 136,576-token 6-hop Estonia needle retrieval (`5,400.4 tok/s` prefill, `48.2 tok/s` decode, `5/5 PASS`). |
-| [`bench/qwen38-gb10/`](bench/qwen38-gb10/) | `unsloth/Qwen3.8-27B-NVFP4` + `z-lab/Qwen3.8-27B-DFlash2` / `v1` | Single-stream `gamma=15` DFlash speculative decode (`63.9 tok/s` on qualified `BF16-KV`, `58.012 tok/s` on corrected-ABI `v3` control) on the deterministic MinHeap coding probe. |
-| [`repro-kit/`](repro-kit/) | `Qwen3.8-Flash-Next-NVFP4-Offload` (`v1.0.3` / `v1.0.x`) | One-command container (`flux-bench run`) and host (`benchmark.sh`) reproduction with SHA-256 manifest verification (`model-manifest.json`, `ENGINE_STABLE_PIN.json`). |
-| [`repro/qwen38-coding/`](repro/qwen38-coding/) | `Qwen3.8-27B` / `Qwen3.8-Flash-Next` | Deterministic coding endpoint verifier (`run.py`) writing output-sanitized SHA-256 fingerprints and server TPS telemetry. |
+| [`bench/qwen38-flash-next-gb10/`](../bench/qwen38-flash-next-gb10/) | `Hotshot2000/Qwen3.8-Flash-Next-NVFP4` *(+ repacked NVFP4 PLE + Inferact MTP)* | Single-stream 16K-chunk prefill (`6,021.8 tok/s` short, `5,969.4 tok/s` 8K, `6,082.2 tok/s` 16K peak, `5,694.4 tok/s` 128K), `w4096` interactive prefill (`5,046–5,276 tok/s`), lossless `K=5` MTP decode (`56.5 tok/s` med / `57.4` peak, `2,560/2,560` greedy exact), and 136,576-token 6-hop Estonia needle retrieval (`5,400.4 tok/s` prefill, `48.2 tok/s` decode, `5/5 PASS`). |
+| [`bench/qwen38-gb10/`](../bench/qwen38-gb10/) | `unsloth/Qwen3.8-27B-NVFP4` + `z-lab/Qwen3.8-27B-DFlash2` / `v1` | Single-stream `gamma=15` DFlash speculative decode (`63.9 tok/s` on qualified `BF16-KV`, `58.012 tok/s` on corrected-ABI `v3` control) on the deterministic MinHeap coding probe. |
+| [`repro-kit/`](../repro-kit/) | `Qwen3.8-Flash-Next-NVFP4-Offload` (`v1.0.3` / `v1.0.x`) | One-command container (`flux-bench run`) and host (`benchmark.sh`) reproduction with SHA-256 manifest verification (`model-manifest.json`, `ENGINE_STABLE_PIN.json`). |
+| [`repro/qwen38-coding/`](../repro/qwen38-coding/) | `Qwen3.8-27B` / `Qwen3.8-Flash-Next` | Deterministic coding endpoint verifier (`run.py`) writing output-sanitized SHA-256 fingerprints and server TPS telemetry. |
 
 ## Where every commit came from
 
@@ -43,9 +43,9 @@ cat repro-kit/README.md
 
 ## The two Qwen3.8 harnesses are siblings, not variants
 
-[`bench/qwen38-flash-next-gb10/`](bench/qwen38-flash-next-gb10/) (`125B+51B PLE`,
+[`bench/qwen38-flash-next-gb10/`](../bench/qwen38-flash-next-gb10/) (`125B+51B PLE`,
 `6B` active MoE + 1-layer `K=5` Inferact MTP head) and
-[`bench/qwen38-gb10/`](bench/qwen38-gb10/) (27B dense + `5`-layer DFlash2 `B8` /
+[`bench/qwen38-gb10/`](../bench/qwen38-gb10/) (27B dense + `5`-layer DFlash2 `B8` /
 `8`-layer DFlash v1 `B16` drafter) are deliberately the same shape: one self-verifying `serve.sh`,
 one complete `FLAGS.md` reference, one `ARTIFACTS.sha256` manifest, and
 deterministic Python probes that verify output hashes alongside throughput.

@@ -38,25 +38,25 @@ no-section-label = true
 
 PAGES: list[tuple[str, str, str]] = [
     ("Overview", "README.md", "index.md"),
-    ("Getting Started", "GETTING_STARTED.md", "getting-started.md"),
+    ("Getting Started", "docs/GETTING_STARTED.md", "getting-started.md"),
     ("HTTP API Reference", "docs/API.md", "api-reference.md"),
     ("Coding Clients (Claude Code, Codex, OpenCode)", "docs/clients/README.md", "clients.md"),
     ("Claude Code Integration", "docs/CLAUDE_CODE.md", "claude-code.md"),
     ("Production Deployment (systemd, K8s, Grafana)", "deploy/README.md", "deploy.md"),
-    ("CLI Flags Reference", "FLAGS.md", "flags.md"),
-    ("Architecture", "ARCHITECTURE.md", "architecture.md"),
+    ("CLI Flags Reference", "docs/FLAGS.md", "flags.md"),
+    ("Architecture", "docs/ARCHITECTURE.md", "architecture.md"),
     ("Kernel Profile", "docs/KERNEL-PROFILE.md", "kernel-profile.md"),
     ("Discrete Blackwell (SM120 / SM103)", "docs/SM120_SM103_BRINGUP.md", "sm120-bringup.md"),
     ("Hardware Support", "docs/HARDWARE.md", "hardware.md"),
     ("Container Guide", "docs/CONTAINER_GUIDE.md", "container-guide.md"),
     ("Benchmark Verification", "docs/verification/BENCHMARK_VERIFICATION.md", "benchmark-verification.md"),
-    ("Reproducing Benchmarks", "REPRODUCING.md", "reproducing.md"),
+    ("Reproducing Benchmarks", "docs/REPRODUCING.md", "reproducing.md"),
     ("Agent & Engineering Contract (AGENTS.md)", "AGENTS.md", "agents.md"),
     ("Release Signing & SLSA Provenance", "SIGNING.md", "signing.md"),
     ("Contributing", "CONTRIBUTING.md", "contributing.md"),
     ("Changelog", "CHANGELOG.md", "changelog.md"),
     ("Credits & Attribution", "CREDITS.md", "credits.md"),
-    ("Trademarks", "TRADEMARKS.md", "trademarks.md"),
+    ("Trademarks", "docs/TRADEMARKS.md", "trademarks.md"),
 ]
 
 MD_LINK_RE = re.compile(r'(!?\[[^\]]*\]\()([^)\s]+)(\))')

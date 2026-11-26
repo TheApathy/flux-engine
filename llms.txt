@@ -5,11 +5,11 @@
 ## Getting Started & Operations
 
 - [README.md](README.md): Project overview, container & source quickstart, model catalog, and headline benchmarks.
-- [GETTING_STARTED.md](GETTING_STARTED.md): End-to-end DGX Spark (`GB10`) setup, PLE offload preparation, benchmarking, and Top 11 operational gotchas.
+- [GETTING_STARTED.md](docs/GETTING_STARTED.md): End-to-end DGX Spark (`GB10`) setup, PLE offload preparation, benchmarking, and Top 11 operational gotchas.
 - [docs/SM120_SM103_BRINGUP.md](docs/SM120_SM103_BRINGUP.md): Discrete Blackwell (`SM120` RTX 5090 / RTX PRO 6000) and Blackwell Ultra (`SM103` B300/GB300) build & tuning guide.
 - [docs/OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md): Day-2 serving runbook, OpenAI queries, thinking budgets, and GB10 unified memory management.
 - [docs/CONTAINER_GUIDE.md](docs/CONTAINER_GUIDE.md): Building and running AGPL-3.0 OCI containers (`ghcr.io/theapathy/flux-engine:v1.0.3`).
-- [FLAGS.md](FLAGS.md): Complete reference for `FLUX_*` / `ATLAS_*` environment variables, CLI flags, and the opt-in benchmark intervention ledger.
+- [FLAGS.md](docs/FLAGS.md): Complete reference for `FLUX_*` / `ATLAS_*` environment variables, CLI flags, and the opt-in benchmark intervention ledger.
 
 ## APIs & Coding Agent Integration
 
@@ -18,23 +18,23 @@
 
 ## Architecture, Kernels & Models
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): 16-crate Rust workspace architecture, `sm_121a` W4A8 MoE / GDN / QSA / mHC / PLE pipelines, TurboQuant+, and speculative decode.
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md): 16-crate Rust workspace architecture, `sm_121a` W4A8 MoE / GDN / QSA / mHC / PLE pipelines, TurboQuant+, and speculative decode.
 - [crates/README.md](crates/README.md): Crate-by-crate breakdown (11 active crates + 5 reserved interface stubs).
 - [docs/FLUX_KERNELS.md](docs/FLUX_KERNELS.md): Custom `sm_121a` CUDA/PTX kernel registry and zero-spill compilation gates.
 - [docs/KERNEL-PROFILE.md](docs/KERNEL-PROFILE.md): Per-stage prefill (`1,348 ms / 8K`) and speculative verify timing breakdown.
 - [docs/turboquant-plus.md](docs/turboquant-plus.md): TurboQuant+ KV-cache quantization (`turbo2`/`3`/`4`/`8`, asymmetric `fp8k_turbo4v`, `bf16k_turbo4v`, `turbo4k_turbo3v`).
 - [docs/compatibility/model-matrix.yaml](docs/compatibility/model-matrix.yaml): Machine-readable compatibility matrix across 19 model entries.
 - [docs/compatibility/hardware-matrix.yaml](docs/compatibility/hardware-matrix.yaml): Hardware target capabilities across GB10, RTX PRO 6000, B200, H100, and Apple Metal.
-- [ENGINE-CARD.md](ENGINE-CARD.md): Engine architecture and model auto-detection summary card.
-- [MODEL-CARD.md](MODEL-CARD.md): `Qwen3.8-Flash-Next` and `Qwen3.8-27B` quantization & memory topology card.
+- [ENGINE-CARD.md](docs/ENGINE-CARD.md): Engine architecture and model auto-detection summary card.
+- [MODEL-CARD.md](docs/MODEL-CARD.md): `Qwen3.8-Flash-Next` and `Qwen3.8-27B` quantization & memory topology card.
 
 ## Verification, Security & Contributing
 
 - [docs/verification/BENCHMARK_VERIFICATION.md](docs/verification/BENCHMARK_VERIFICATION.md): Roofline physics, prefix-cache falsification controls, decode accounting, and quality gates.
-- [REPRODUCING.md](REPRODUCING.md): End-to-end reproduction workflow and upstream lineage.
+- [REPRODUCING.md](docs/REPRODUCING.md): End-to-end reproduction workflow and upstream lineage.
 - [SIGNING.md](SIGNING.md): Cryptographic release signing (`.github/allowed_signers`), SLSA Build Level 3 provenance, Sigstore Cosign keyless verification, GitHub Attestations, and SPDX 2.3 SBOMs.
 - [CLAUDE.md](CLAUDE.md): Public contributor and coding-agent guide (workspace map, build/lint/test commands, and engineering invariants).
 - [CONTRIBUTING.md](CONTRIBUTING.md): Contribution process, `AGPL-3.0-only` inbound=outbound licensing, and PR expectations.
-- [TRADEMARKS.md](TRADEMARKS.md): Trademark & brand policy preserving AGPL-3.0 freedoms.
+- [TRADEMARKS.md](docs/TRADEMARKS.md): Trademark & brand policy preserving AGPL-3.0 freedoms.
 - [CITATION.cff](CITATION.cff): Machine-readable CFF 1.2.0 citation metadata.
 - [CREDITS.md](CREDITS.md): Upstream Atlas lineage, contributor acknowledgments, and third-party research credits.

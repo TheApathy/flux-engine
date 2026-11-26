@@ -33,9 +33,9 @@
 
 | Area | Links |
 |---|---|
-| **Docs & API** | [Documentation Site](https://theapathy.github.io/flux-engine/) · [OpenAPI Explorer](https://theapathy.github.io/flux-engine/api-explorer/) · [`GETTING_STARTED.md`](GETTING_STARTED.md) · [`FLAGS.md`](FLAGS.md) · [`docs/API.md`](docs/API.md) |
+| **Docs & API** | [Documentation Site](https://theapathy.github.io/flux-engine/) · [OpenAPI Explorer](https://theapathy.github.io/flux-engine/api-explorer/) · [`GETTING_STARTED.md`](docs/GETTING_STARTED.md) · [`FLAGS.md`](docs/FLAGS.md) · [`docs/API.md`](docs/API.md) |
 | **Serve & Deploy** | [Quick Start](#serve-it-now) · [Build from Source](#or-build-from-source) · [`deploy/` (systemd, K8s, Grafana)](deploy/README.md) · [`docs/clients/` (Claude Code, Codex, OpenCode)](docs/clients/README.md) |
-| **Benchmarks & Specs** | [Profile Tables](#why-the-defaults-are-baked-in) · [`repro-kit/`](repro-kit/README.md) · [`BENCHMARK_VERIFICATION.md`](docs/verification/BENCHMARK_VERIFICATION.md) · [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/KERNEL-PROFILE.md`](docs/KERNEL-PROFILE.md) |
+| **Benchmarks & Specs** | [Profile Tables](#why-the-defaults-are-baked-in) · [`repro-kit/`](repro-kit/README.md) · [`BENCHMARK_VERIFICATION.md`](docs/verification/BENCHMARK_VERIFICATION.md) · [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/KERNEL-PROFILE.md`](docs/KERNEL-PROFILE.md) |
 | **Engineering & Security** | [`AGENTS.md`](AGENTS.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`SIGNING.md`](SIGNING.md) · [`.github/SECURITY.md`](.github/SECURITY.md) · [`CHANGELOG.md`](CHANGELOG.md) · [`CREDITS.md`](CREDITS.md) |
 
 ## Qualified Performance (`GB10` / `sm_121a`)
@@ -129,7 +129,7 @@ docker run --rm --gpus all -v "$MODELS_ROOT:/models:ro" \
 | `FLUX_PLE_RAM_STAGE` | `0` *(opt-in)* | Stage `ple-offload/` shards into `/dev/shm` `tmpfs` (`--shm-size=32g` required) |
 | `FLUX_PLE_RAM_DIR` | `/dev/shm/flux-ple-offload` | Base `tmpfs` directory for `--ple-ram` / `FLUX_PLE_RAM_STAGE=1` |
 
-See [`FLAGS.md`](FLAGS.md), [`docs/CONTAINER_GUIDE.md`](docs/CONTAINER_GUIDE.md), and [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md) for the complete CLI and environment reference.
+See [`FLAGS.md`](docs/FLAGS.md), [`docs/CONTAINER_GUIDE.md`](docs/CONTAINER_GUIDE.md), and [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md) for the complete CLI and environment reference.
 
 </details>
 
@@ -194,7 +194,7 @@ And on **`Qwen3.8-27B-NVFP4`** (`bench/qwen38-gb10/`, deterministic 400-token Mi
   <img src="assets/decode-comparison.svg" alt="Single-Stream GB10 Decode Throughput vs 273 GB/s LPDDR5x Bandwidth Ceiling" width="880" />
 </p>
 
-Every `FLUX_*` and `ATLAS_*` flag is documented in [`FLAGS.md`](FLAGS.md),
+Every `FLUX_*` and `ATLAS_*` flag is documented in [`FLAGS.md`](docs/FLAGS.md),
 [`bench/qwen38-flash-next-gb10/FLAGS.md`](bench/qwen38-flash-next-gb10/FLAGS.md),
 and [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md). To switch recipes
 on the host, source [`scripts/flux_env_bridge.sh`](scripts/flux_env_bridge.sh)
@@ -301,17 +301,17 @@ match `K=1` non-speculative greedy decode **2,560 / 2,560 tokens bit-for-bit**.
 | Universal container guide (`ghcr.io/theapathy/flux-engine:v1.0.3`) & auto-detection | [`docs/CONTAINER_GUIDE.md`](docs/CONTAINER_GUIDE.md) |
 | Benchmark methodology, roofline physics & quality-gate verification | [`docs/verification/`](docs/verification/README.md) · [`BENCHMARK_VERIFICATION.md`](docs/verification/BENCHMARK_VERIFICATION.md) |
 | Turnkey `local-inference-lab/llm-inference-bench` (`v0.7.9`) runner & reference reports | [`bench/llm-inference-bench/`](bench/llm-inference-bench/) & [`bench/llm-inference-bench/README.md`](bench/llm-inference-bench/README.md) |
-| Engine card, model card, & kernel profile (`1,348 ms/8K`) | [`ENGINE-CARD.md`](ENGINE-CARD.md) · [`MODEL-CARD.md`](MODEL-CARD.md) · [`docs/KERNEL-PROFILE.md`](docs/KERNEL-PROFILE.md) |
-| Complete `FLUX_*` / `ATLAS_*` environment variable and CLI flag reference | [`FLAGS.md`](FLAGS.md) |
+| Engine card, model card, & kernel profile (`1,348 ms/8K`) | [`ENGINE-CARD.md`](docs/ENGINE-CARD.md) · [`MODEL-CARD.md`](docs/MODEL-CARD.md) · [`docs/KERNEL-PROFILE.md`](docs/KERNEL-PROFILE.md) |
+| Complete `FLUX_*` / `ATLAS_*` environment variable and CLI flag reference | [`FLAGS.md`](docs/FLAGS.md) |
 | `Qwen3.8-Flash-Next` GB10 harness, launchers, Estonia & decode probes | [`bench/qwen38-flash-next-gb10/`](bench/qwen38-flash-next-gb10/) & [`bench/qwen38-flash-next-gb10/FLAGS.md`](bench/qwen38-flash-next-gb10/FLAGS.md) |
 | `Qwen3.8-Flash-Next` stage breakdown (`1,348 ms/8K`) and null-lever record | [`docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md`](docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md) |
 | `Qwen3.8-27B` DFlash GB10 harness, coding probe, and flag reference | [`bench/qwen38-gb10/`](bench/qwen38-gb10/) & [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md) |
 | `Qwen3.8-27B` measurement record and per-flag evidence | [`docs/QWEN38_PERFORMANCE_RECIPE.md`](docs/QWEN38_PERFORMANCE_RECIPE.md) |
 | Operating mode recipes (`max-prefill`, `w4096`, `fast-prefill`, `k5-decode`, `estonia-136k`, `exact`) | [`recipes/`](recipes/) & [`recipes/README.md`](recipes/README.md) |
 | OCI Reproducibility Kit (`flux`, `flux-bench`, Compose topologies, methodology Q&A) | [`repro-kit/`](repro-kit/) & [`repro-kit/METHODOLOGY.md`](repro-kit/METHODOLOGY.md) |
-| Sanitized endpoint reproduction verifiers & expected hashes | [`repro/`](repro/README.md) · [`REPRODUCING.md`](REPRODUCING.md) · [`bench/qwen38-gb10/coding-repro/`](bench/qwen38-gb10/coding-repro/) |
-| Rust domain crates (`16` crates) & `sm_121a` CUDA/PTX kernel targets (`kernels/gb10/`) | [`crates/`](crates/README.md) · [`kernels/`](kernels/README.md) · [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/FLUX_KERNELS.md`](docs/FLUX_KERNELS.md) |
-| Release history, signing, citation, trademarks & upstream attribution | [`CHANGELOG.md`](CHANGELOG.md) · [`SIGNING.md`](SIGNING.md) · [`CITATION.cff`](CITATION.cff) · [`TRADEMARKS.md`](TRADEMARKS.md) · [`docs/CUSTOM-FLUX-PLAYBOOK.md`](docs/CUSTOM-FLUX-PLAYBOOK.md) · [`CREDITS.md`](CREDITS.md) |
+| Sanitized endpoint reproduction verifiers & expected hashes | [`repro/`](repro/README.md) · [`REPRODUCING.md`](docs/REPRODUCING.md) · [`bench/qwen38-gb10/coding-repro/`](bench/qwen38-gb10/coding-repro/) |
+| Rust domain crates (`16` crates) & `sm_121a` CUDA/PTX kernel targets (`kernels/gb10/`) | [`crates/`](crates/README.md) · [`kernels/`](kernels/README.md) · [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/FLUX_KERNELS.md`](docs/FLUX_KERNELS.md) |
+| Release history, signing, citation, trademarks & upstream attribution | [`CHANGELOG.md`](CHANGELOG.md) · [`SIGNING.md`](SIGNING.md) · [`CITATION.cff`](CITATION.cff) · [`TRADEMARKS.md`](docs/TRADEMARKS.md) · [`docs/CUSTOM-FLUX-PLAYBOOK.md`](docs/CUSTOM-FLUX-PLAYBOOK.md) · [`CREDITS.md`](CREDITS.md) |
 | Per-model Dockerfiles and multi-Spark deployment | [`docker/`](docker/README.md) · [`docker/docker-guide.md`](docker/docker-guide.md) · [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) |
 
 ## Requirements
@@ -451,7 +451,7 @@ flowchart TB
 
 For a deep technical walkthrough of the `sm_121a` kernels (`cutlass_5222` W4A8
 MoE, `qwen4_qsa_prefill_select`, `gdn_umma_prefill`, fused `rmsnorm + mxfp8_quant`,
-and 6-bit/4-bit/8-bit TurboQuant+ KV cache), read [**`ARCHITECTURE.md`**](ARCHITECTURE.md).
+and 6-bit/4-bit/8-bit TurboQuant+ KV cache), read [**`ARCHITECTURE.md`**](docs/ARCHITECTURE.md).
 
 ---
 
@@ -677,7 +677,7 @@ See [`CITATION.cff`](CITATION.cff), [`docs/CITATIONS.md`](docs/CITATIONS.md), an
 Flux Engine is licensed under the **GNU Affero General Public License v3.0 only
 (`AGPL-3.0-only`)**. See [`LICENSE`](LICENSE),
 [`SOURCE_AND_LICENSES.md`](SOURCE_AND_LICENSES.md), and
-[`TRADEMARKS.md`](TRADEMARKS.md) for brand and naming guidelines.
+[`TRADEMARKS.md`](docs/TRADEMARKS.md) for brand and naming guidelines.
 
 Releases and GHCR container images are protected by signed Git tags, SLSA Build
 Level 3 provenance, keyless Sigstore Cosign signatures, GitHub Artifact

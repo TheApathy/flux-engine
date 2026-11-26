@@ -150,4 +150,4 @@ you build one.
 
 - [`OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md): copy-paste recipes for each supported model.
 - [`docs/adr/0007-tp-ep-composition.md`](adr/0007-tp-ep-composition.md): multi-rank TP/EP composition and NCCL configuration.
-- [`ARCHITECTURE.md`](../ARCHITECTURE.md): what's running inside the binary.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): what's running inside the binary.

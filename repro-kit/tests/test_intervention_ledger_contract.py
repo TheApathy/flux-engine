@@ -155,7 +155,7 @@ class InterventionLedgerContractTests(TestCase):
         self.assertIn("flush_content_sanitizer_with_report", flush)
 
     def test_docs_define_complete_scope_and_protocol_exclusions(self):
-        flags = source("FLAGS.md")
+        flags = source("docs/FLAGS.md")
         normalized_flags = " ".join(flags.split())
 
         for code in (

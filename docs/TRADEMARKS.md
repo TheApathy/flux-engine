@@ -3,7 +3,7 @@
 # Flux Engine Trademark & Brand Policy (`TRADEMARKS.md`)
 
 **Flux Engine** is free and open-source software licensed under the **GNU Affero
-General Public License v3.0 only (`AGPL-3.0-only`)** (see [`LICENSE`](LICENSE)).
+General Public License v3.0 only (`AGPL-3.0-only`)** (see [`LICENSE`](../LICENSE)).
 This policy clarifies how the **Flux Engine** name and logos may be used so
 users can always tell official releases apart from modified forks or third-party
 distributions.
@@ -15,7 +15,7 @@ distributions.
 Nothing in this policy restricts or adds conditions to your rights under
 `AGPL-3.0-only`. You are always free to run, study, modify, redistribute, and
 publish forks of the source code in compliance with the `AGPL-3.0-only` license
-and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+and [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
 
 ---
 
@@ -25,8 +25,8 @@ The following marks identify official releases, binaries, and container images
 published by `TheApathy/flux-engine`:
 
 - The name **"Flux Engine"** (and **"Flux Inference Engine"**)
-- The Flux Engine logo and hero artwork in [`assets/logo.svg`](assets/logo.svg)
-  and [`assets/flux-engine-hero.svg`](assets/flux-engine-hero.svg)
+- The Flux Engine logo and hero artwork in [`assets/logo.svg`](../assets/logo.svg)
+  and [`assets/flux-engine-hero.svg`](../assets/flux-engine-hero.svg)
 
 ---
 
@@ -43,14 +43,14 @@ including:
   attribution remain intact.
 - **Research, benchmarks & education:** Referencing Flux Engine by name in
   academic papers, blog posts, talks, tutorials, and reproducible benchmark
-  comparisons (see [`CITATION.cff`](CITATION.cff)).
+  comparisons (see [`CITATION.cff`](../CITATION.cff)).
 
 ---
 
 ## 4. Uses That Require Distinguishable Naming
 
 To prevent confusion about release provenance, security signatures
-([`SIGNING.md`](SIGNING.md)), and support boundaries, please do **not**:
+([`SIGNING.md`](../SIGNING.md)), and support boundaries, please do **not**:
 
 - Distribute a **modified** fork, custom binary, or third-party container image
   under the unmodified name **"Flux Engine"** or official Flux Engine logo in a

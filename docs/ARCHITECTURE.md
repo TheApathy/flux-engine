@@ -183,7 +183,7 @@ All 48 layers maintain a 4-stream hyper-connection residual bus (`hc_count = 4`,
 `Qwen3.8-Flash-Next` includes a 51B-parameter (`20,000,000 × 2,560`) 3-gram
 Per-Layer Embedding table split across 128 sector-aligned NVFP4 shards:
 
-- [`scripts/repack_qwen38_flash_next_ple_nvfp4.py`](scripts/repack_qwen38_flash_next_ple_nvfp4.py)
+- [`scripts/repack_qwen38_flash_next_ple_nvfp4.py`](../scripts/repack_qwen38_flash_next_ple_nvfp4.py)
   converts the 128 PLE shards into group-16 NVFP4 (`E2M1` packed nibbles + `FP8`
   group scales + `FP32` global scale).
 - At runtime, `PackedPleBlock` caches pre-deinterleaved shards in `Arc` host
@@ -233,7 +233,7 @@ online **TurboQuant+** KV cache formats:
 3. **InnerQ Per-Channel Equalization & Sparse-V Dequant (`tq_plus_innerq.cu`):**
    Applies pre-rotation channel equalization and skips V dequantization when
    attention weights fall below `1e-3`, cutting decode KV bandwidth by up to 4×
-   with near-BF16 perplexity. See [`docs/turboquant-plus.md`](docs/turboquant-plus.md).
+   with near-BF16 perplexity. See [`docs/turboquant-plus.md`](turboquant-plus.md).
 
 ---
 
@@ -292,7 +292,7 @@ FLUX_TARGET_HW=gb10 FLUX_TARGET_MODEL='qwen3.8-flash-next,qwen3.8-27b' FLUX_TARG
 ```
 
 See also:
-- [`docs/FLUX_KERNELS.md`](docs/FLUX_KERNELS.md): `sm_121a` kernel inventory.
-- [`docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md`](docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md): per-stage breakdown and null-lever record for `Qwen3.8-Flash-Next`.
-- [`docs/QWEN38_PERFORMANCE_RECIPE.md`](docs/QWEN38_PERFORMANCE_RECIPE.md): measurement record for `Qwen3.8-27B` DFlash.
-- [`docs/HARDWARE.md`](docs/HARDWARE.md): adding a new hardware target or model family.
+- [`docs/FLUX_KERNELS.md`](FLUX_KERNELS.md): `sm_121a` kernel inventory.
+- [`docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md`](QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md): per-stage breakdown and null-lever record for `Qwen3.8-Flash-Next`.
+- [`docs/QWEN38_PERFORMANCE_RECIPE.md`](QWEN38_PERFORMANCE_RECIPE.md): measurement record for `Qwen3.8-27B` DFlash.
+- [`docs/HARDWARE.md`](HARDWARE.md): adding a new hardware target or model family.

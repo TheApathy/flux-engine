@@ -12,4 +12,4 @@ Step-by-step operator reproduction guides for verifying deterministic outputs, s
 |---|---|---|
 | [`qwen38.md`](qwen38.md) | `Qwen3.8-27B-NVFP4` & `Qwen3.8-Flash-Next-NVFP4` | Running `repro/qwen38-coding/run.py`, evidence sanitization policy, and `verify_no_leaks.py` checks on DGX Spark (`GB10`). |
 
-For full host and container reproduction steps, see [`REPRODUCING.md`](../../REPRODUCING.md) and [`repro-kit/README.md`](../../repro-kit/README.md).
+For full host and container reproduction steps, see [`REPRODUCING.md`](../REPRODUCING.md) and [`repro-kit/README.md`](../../repro-kit/README.md).

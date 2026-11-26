@@ -15,10 +15,10 @@ Architecture guides, operator runbooks, kernel profiles, and per-model performan
 | [`CLAUDE_CODE.md`](CLAUDE_CODE.md) | Connecting Claude Code, OpenCode, Cursor, Continue, Cline, and OpenAI/Anthropic SDKs directly to Flux Engine. |
 | [`OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md) | One-command serving (container & host), checkpoint layout, build commands (`-p spark-server`), OpenAI query examples, `<think>` controls, and GB10 UMA rules. |
 | [`CONTAINER_GUIDE.md`](CONTAINER_GUIDE.md) | Production container guide (`ghcr.io/theapathy/flux-engine:v1.0.3`), building from source, `flux serve / inspect / list-models`, and AGPL-3.0 provenance. |
-| [`../ENGINE-CARD.md`](../ENGINE-CARD.md) | Engine identity, supported model architectures, auto-detection table, and headline GB10 benchmarks. |
-| [`../MODEL-CARD.md`](../MODEL-CARD.md) | `Qwen3.8-Flash-Next-NVFP4-Offload` and `Qwen3.8-27B-NVFP4` layer topology, quantization map, and unified memory footprint. |
+| [`../ENGINE-CARD.md`](ENGINE-CARD.md) | Engine identity, supported model architectures, auto-detection table, and headline GB10 benchmarks. |
+| [`../MODEL-CARD.md`](MODEL-CARD.md) | `Qwen3.8-Flash-Next-NVFP4-Offload` and `Qwen3.8-27B-NVFP4` layer topology, quantization map, and unified memory footprint. |
 | [`KERNEL-PROFILE.md`](KERNEL-PROFILE.md) | Per-stage `sm_121a` CUDA kernel timing (`1,348.0 ms / 8K` prefill and `K=5` / `K=16` speculative verify). |
-| [`../FLAGS.md`](../FLAGS.md) | Complete reference of `FLUX_*` and `ATLAS_*` environment variables and CLI flags. |
+| [`../FLAGS.md`](FLAGS.md) | Complete reference of `FLUX_*` and `ATLAS_*` environment variables and CLI flags. |
 
 ---
 
@@ -38,7 +38,7 @@ Architecture guides, operator runbooks, kernel profiles, and per-model performan
 
 | Document | Purpose |
 |---|---|
-| [`../ARCHITECTURE.md`](../ARCHITECTURE.md) | Deep walkthrough of the 16-crate Rust workspace and `sm_121a` CUDA/PTX kernel subsystems. |
+| [`../ARCHITECTURE.md`](ARCHITECTURE.md) | Deep walkthrough of the 16-crate Rust workspace and `sm_121a` CUDA/PTX kernel subsystems. |
 | [`FLUX_KERNELS.md`](FLUX_KERNELS.md) | Build-time `(hardware × model × quant)` kernel discovery, `nvcc` compilation, and zero-spill verification. |
 | [`FLUX_SPARK_JOURNEY.md`](FLUX_SPARK_JOURNEY.md) | Architectural evolution from baseline W4A16 to `6,082.2 tok/s` prefill and lossless `K=5` MTP on DGX Spark. |
 | [`SM120_SM103_BRINGUP.md`](SM120_SM103_BRINGUP.md) & [`METAL_BACKEND.md`](METAL_BACKEND.md) | Discrete Blackwell (`sm_120a` / `sm_103a`) bring-up guide and experimental Apple Metal backend reference. |

@@ -11,8 +11,8 @@ The endpoint verification harnesses and sanitized reference evidence live under
 [`repro/qwen38-coding/`](../../repro/qwen38-coding/) and
 [`repro/qwen38-flash-next/`](../../repro/qwen38-flash-next/). These commands
 verify an already-running compatible `flux-server` instance; for full container
-and host launch instructions see [`REPRODUCING.md`](../../REPRODUCING.md) and
-[`GETTING_STARTED.md`](../../GETTING_STARTED.md).
+and host launch instructions see [`REPRODUCING.md`](../REPRODUCING.md) and
+[`GETTING_STARTED.md`](../GETTING_STARTED.md).
 
 ## Reproduce Against a Running Server
 

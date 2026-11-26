@@ -23,4 +23,4 @@ FLUX_TARGET_MODEL='qwen3.8-flash-next,qwen3.8-27b' FLUX_TARGET_QUANT=nvfp4 \
   cargo build --release -p spark-server
 ```
 
-See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) and [`../docs/FLUX_KERNELS.md`](../docs/FLUX_KERNELS.md) for the complete kernel architecture guide.
+See [`../ARCHITECTURE.md`](../docs/ARCHITECTURE.md) and [`../docs/FLUX_KERNELS.md`](../docs/FLUX_KERNELS.md) for the complete kernel architecture guide.
