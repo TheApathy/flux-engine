@@ -582,6 +582,11 @@ jobs:
     if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      ATLAS_SKIP_BUILD: "0"
+      ATLAS_TARGET_HW: metal
+      ATLAS_TARGET_MODEL: qwen3-5-4b-vlm-mlx-int8
+      ATLAS_TARGET_QUANT: mlx_int8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -598,10 +603,6 @@ jobs:
       - name: cargo check spark-runtime --features metal
         run: cargo check -p spark-runtime --no-default-features --features metal
       - name: cargo test -p spark-runtime --features metal
-        env:
-          ATLAS_TARGET_HW: metal
-          ATLAS_TARGET_MODEL: qwen3-5-4b-vlm-mlx-int8
-          ATLAS_TARGET_QUANT: mlx_int8
         run: |
           cargo test -p spark-runtime --no-default-features \
             --features metal --locked metal_backend

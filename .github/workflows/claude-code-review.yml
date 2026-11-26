@@ -42,10 +42,23 @@ jobs:
       issues: write
       id-token: write
     steps:
-      - name: Harden runner (eBPF egress audit)
+      - name: Harden runner (eBPF egress block — Anthropic + GitHub + Ubuntu apt only)
         uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
-          egress-policy: audit
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            release-assets.githubusercontent.com:443
+            objects.githubusercontent.com:443
+            registry.npmjs.org:443
+            api.anthropic.com:443
+            claude.ai:443
+            downloads.claude.ai:443
+            azure.archive.ubuntu.com:80
+            azure.archive.ubuntu.com:443
+            security.ubuntu.com:80
+            security.ubuntu.com:443
 
       - name: Check Anthropic credentials configured
         id: auth
@@ -70,7 +83,7 @@ jobs:
       - name: Install bubblewrap for Claude subprocess sandbox & env scrubbing
         if: steps.auth.outputs.configured == 'true'
         run: |
-          sudo apt-get update -qq
+          sudo apt-get update -qq -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
           sudo apt-get install -y -qq --no-install-recommends bubblewrap
 
       - name: Run Claude Code Review
@@ -79,6 +92,10 @@ jobs:
         env:
           # Scrub Anthropic, cloud, and GitHub secrets from subprocess environments.
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+          # Disable Datadog / non-essential telemetry traffic completely.
+          DISABLE_TELEMETRY: "1"
+          DISABLE_ERROR_REPORTING: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -93,6 +110,8 @@ jobs:
           use_sticky_comment: "true"
           include_fix_links: "false"
           claude_args: >-
+            --model opus
+            --max-budget-usd 3
             --permission-mode default
             --max-turns 15
             --allowedTools "Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
