@@ -1,0 +1,419 @@
+name: Container Release (GHCR)
+
+# Builds, publishes, keyless-signs (Sigstore Cosign + Rekor), and attests
+# (GitHub Artifact Attestations + BuildKit SBOM/provenance) official Flux
+# Engine OCI images to ghcr.io/theapathy/flux-engine on signed semver tags
+# (`vX.Y.Z` / `vX.Y.Z-rc.N`) or manual dispatches (default `dry_run: true`).
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Container architecture target(s) to build"
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - sm120
+          - gb10
+      tag:
+        description: "Release tag to verify/tag (optional when dry_run=true; defaults to v0.0.0-dryrun.<sha>)"
+        required: false
+        type: string
+      dry_run:
+        description: "Build images and verify preflight without pushing to GHCR or signing"
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+# Never cancel a tagged container publish mid-flight.
+concurrency:
+  group: container-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Container Release Preflight & Signed-Tag Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.context.outputs.release_tag }}
+      engine_version: ${{ steps.context.outputs.engine_version }}
+      dry_run: ${{ steps.context.outputs.dry_run }}
+      is_prerelease: ${{ steps.context.outputs.is_prerelease }}
+      build_sm120: ${{ steps.context.outputs.build_sm120 }}
+      build_gb10: ${{ steps.context.outputs.build_gb10 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and validate release context
+        id: context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INPUT_TARGET: ${{ inputs.target }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            dry_run="false"
+            tag="$REF_NAME"
+            target="both"
+            # Require tagged commits to be reachable from the default branch so
+            # unmerged or rogue branch tags cannot publish official GHCR images.
+            git fetch --no-tags origin "$DEFAULT_BRANCH"
+            if ! git merge-base --is-ancestor HEAD "origin/$DEFAULT_BRANCH"; then
+              echo "::error::Tagged commit $(git rev-parse HEAD) is not an ancestor of origin/$DEFAULT_BRANCH."
+              exit 1
+            fi
+          else
+            dry_run="${INPUT_DRY_RUN:-true}"
+            target="${INPUT_TARGET:-both}"
+            if [ -n "$INPUT_TAG" ]; then
+              tag="$INPUT_TAG"
+            elif [ "$dry_run" = "true" ]; then
+              short_sha="$(git rev-parse --short=9 HEAD)"
+              tag="v0.0.0-dryrun.${short_sha}"
+            else
+              echo "::error::An explicit semver tag is required when dry_run=false."
+              exit 1
+            fi
+          fi
+
+          semver_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$tag" =~ $semver_re ]]; then
+            echo "::error::Invalid release tag format: $tag (expected vX.Y.Z or vX.Y.Z-prerelease)"
+            exit 1
+          fi
+
+          is_prerelease="false"
+          if [[ "$tag" == *-* ]]; then
+            is_prerelease="true"
+          fi
+
+          engine_version="${tag#v}"
+
+          # For real publishes, verify tag matches Cargo.toml [workspace.package] version.
+          if [ "$dry_run" != "true" ]; then
+            tag_core="${engine_version%%-*}"
+            cargo_ver="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+            if [ "$tag_core" != "$cargo_ver" ]; then
+              echo "::error::Release tag version ($tag_core) does not match Cargo.toml workspace.package.version ($cargo_ver)."
+              exit 1
+            fi
+          fi
+
+          build_sm120="false"
+          build_gb10="false"
+          case "$target" in
+            both)
+              build_sm120="true"
+              build_gb10="true"
+              ;;
+            sm120)
+              build_sm120="true"
+              ;;
+            gb10)
+              build_gb10="true"
+              ;;
+            *)
+              echo "::error::Unsupported target: $target (expected both, sm120, or gb10)"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "release_tag=$tag"
+            echo "engine_version=$engine_version"
+            echo "dry_run=$dry_run"
+            echo "is_prerelease=$is_prerelease"
+            echo "build_sm120=$build_sm120"
+            echo "build_gb10=$build_gb10"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release_tag=$tag engine_version=$engine_version dry_run=$dry_run is_prerelease=$is_prerelease build_sm120=$build_sm120 build_gb10=$build_gb10"
+
+      - name: Verify allowed_signers & cryptographic tag signature
+        env:
+          RELEASE_TAG: ${{ steps.context.outputs.release_tag }}
+          DRY_RUN: ${{ steps.context.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          SIGNERS=".github/allowed_signers"
+          if [ ! -f "$SIGNERS" ]; then
+            echo "::error::Missing required $SIGNERS file."
+            exit 1
+          fi
+
+          active_keys=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+            if [[ ! "$trimmed" =~ ^[^[:space:]]+[[:space:]]+namespaces=\"git\"[[:space:]]+(sk-ssh-ed25519@openssh\.com|ssh-ed25519|sk-ecdsa-sha2-nistp256@openssh\.com|ecdsa-sha2-nistp256)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; then
+              echo "::error::Malformed entry in $SIGNERS: expected '<principal> namespaces=\"git\" <ssh-key-type> <pubkey>'."
+              exit 1
+            fi
+            active_keys=$((active_keys + 1))
+          done < "$SIGNERS"
+
+          if [ "$DRY_RUN" != "true" ]; then
+            if [ "$active_keys" -eq 0 ]; then
+              echo "::error::$SIGNERS contains no active maintainer signing keys; register a key before publishing signed container images (see SIGNING.md)."
+              exit 1
+            fi
+            git -c "gpg.ssh.allowedSignersFile=$SIGNERS" verify-tag "$RELEASE_TAG"
+            echo "Verified SSH signature on tag $RELEASE_TAG against $SIGNERS ($active_keys active key(s))."
+          else
+            if [ "$active_keys" -eq 0 ]; then
+              echo "::warning::$SIGNERS has 0 active maintainer keys registered yet. Dry-run continues, but real tag publishes will fail closed."
+            else
+              echo "$SIGNERS validated ($active_keys active key(s))."
+              if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+                git -c "gpg.ssh.allowedSignersFile=$SIGNERS" verify-tag "$RELEASE_TAG"
+              fi
+            fi
+          fi
+
+      - name: Verify required AGPL-3.0 license and notice files
+        run: |
+          set -euo pipefail
+          for f in LICENSE CREDITS.md THIRD_PARTY_NOTICES.md SOURCE_AND_LICENSES.md; do
+            if [ ! -s "$f" ]; then
+              echo "::error::Required AGPL-3.0 compliance file missing or empty: $f"
+              exit 1
+            fi
+          done
+          if [ ! -d LICENSES ] || [ -z "$(ls -A LICENSES)" ]; then
+            echo "::error::Required LICENSES/ directory missing or empty."
+            exit 1
+          fi
+
+  build-sm120:
+    name: Build & Sign SM120 Container (linux/amd64)
+    needs: preflight
+    if: needs.preflight.outputs.build_sm120 == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate OCI metadata & tags (SM120)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/theapathy/flux-engine
+          tags: |
+            type=raw,value=${{ needs.preflight.outputs.release_tag }}-sm120
+            type=raw,value=sm120,enable=${{ needs.preflight.outputs.is_prerelease != 'true' && needs.preflight.outputs.dry_run != 'true' }}
+          labels: |
+            org.opencontainers.image.title=Flux Engine (Blackwell SM120 / linux-amd64)
+            org.opencontainers.image.description=Native Rust/CUDA inference engine for discrete NVIDIA Blackwell SM120 GPUs (RTX 50-series & RTX PRO 5000/6000)
+            org.opencontainers.image.version=${{ needs.preflight.outputs.engine_version }}
+            org.opencontainers.image.vendor=TheApathy
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.source=https://github.com/TheApathy/flux-engine
+            org.opencontainers.image.url=https://github.com/TheApathy/flux-engine
+
+      - name: Build and push SM120 image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/sm120/Dockerfile
+          platforms: linux/amd64
+          push: ${{ needs.preflight.outputs.dry_run != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FLUX_ENGINE_VERSION=${{ needs.preflight.outputs.engine_version }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=flux-sm120
+          cache-to: type=gha,scope=flux-sm120,mode=max
+
+      - name: Install Sigstore Cosign
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+
+      - name: Keyless-sign SM120 image digest with Cosign (OIDC + Rekor)
+        if: needs.preflight.outputs.dry_run != 'true'
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IMAGE_DIGEST:-}" ]]; then
+            echo "::error::Build step did not produce an OCI image digest."
+            exit 1
+          fi
+          cosign sign --yes "ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}"
+
+      - name: Attest SM120 image build provenance (GitHub Artifact Attestations)
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/theapathy/flux-engine
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Scan SM120 image for fixable HIGH/CRITICAL CVEs (Trivy SARIF)
+        # Advisory upload (`exit-code: '0'`) ensures upstream CUDA/Ubuntu base
+        # package CVEs never block emergency patch releases while surfacing all
+        # fixable HIGH/CRITICAL findings in GitHub Code Scanning Security alerts.
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ghcr.io/theapathy/flux-engine@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-sm120.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload SM120 Trivy SARIF to GitHub Security
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          sarif_file: trivy-sm120.sarif
+          category: trivy-sm120
+
+  build-gb10:
+    name: Build & Sign GB10 Container (linux/arm64)
+    needs: preflight
+    if: needs.preflight.outputs.build_gb10 == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate OCI metadata & tags (GB10)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/theapathy/flux-engine
+          tags: |
+            type=raw,value=${{ needs.preflight.outputs.release_tag }}-gb10
+            type=raw,value=gb10,enable=${{ needs.preflight.outputs.is_prerelease != 'true' && needs.preflight.outputs.dry_run != 'true' }}
+          labels: |
+            org.opencontainers.image.title=Flux Engine (NVIDIA GB10 / linux-arm64)
+            org.opencontainers.image.description=Native Rust/CUDA inference engine for NVIDIA GB10 (DGX Spark) ARM64 Blackwell GPUs
+            org.opencontainers.image.version=${{ needs.preflight.outputs.engine_version }}
+            org.opencontainers.image.vendor=TheApathy
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.source=https://github.com/TheApathy/flux-engine
+            org.opencontainers.image.url=https://github.com/TheApathy/flux-engine
+
+      - name: Build and push GB10 image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/gb10/Dockerfile
+          platforms: linux/arm64
+          push: ${{ needs.preflight.outputs.dry_run != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=flux-gb10
+          cache-to: type=gha,scope=flux-gb10,mode=max
+
+      - name: Install Sigstore Cosign
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+
+      - name: Keyless-sign GB10 image digest with Cosign (OIDC + Rekor)
+        if: needs.preflight.outputs.dry_run != 'true'
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IMAGE_DIGEST:-}" ]]; then
+            echo "::error::Build step did not produce an OCI image digest."
+            exit 1
+          fi
+          cosign sign --yes "ghcr.io/theapathy/flux-engine@${IMAGE_DIGEST}"
+
+      - name: Attest GB10 image build provenance (GitHub Artifact Attestations)
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/theapathy/flux-engine
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Scan GB10 image for fixable HIGH/CRITICAL CVEs (Trivy SARIF)
+        # Advisory upload (`exit-code: '0'`) ensures upstream CUDA/Ubuntu base
+        # package CVEs never block emergency patch releases while surfacing all
+        # fixable HIGH/CRITICAL findings in GitHub Code Scanning Security alerts.
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ghcr.io/theapathy/flux-engine@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-gb10.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload GB10 Trivy SARIF to GitHub Security
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          sarif_file: trivy-gb10.sarif
+          category: trivy-gb10

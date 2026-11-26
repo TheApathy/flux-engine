@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 248" width="1160" height="248">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d14"/>
+      <stop offset="55%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#131a24"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#76B900"/>
+      <stop offset="45%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+    <linearGradient id="coreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F59E0B" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.08"/>
+    </linearGradient>
+    <linearGradient id="goldBoltGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FEF08A"/>
+      <stop offset="45%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#21262d" stroke-width="0.7" opacity="0.55"/>
+    </pattern>
+  </defs>
+
+  <!-- Outer Card -->
+  <rect x="2" y="2" width="1156" height="244" rx="16" fill="url(#bgGrad)" stroke="#30363d" stroke-width="2"/>
+  <rect x="4" y="4" width="1152" height="240" rx="14" fill="url(#grid)"/>
+  <path d="M 18 3 H 1142" stroke="url(#accentGrad)" stroke-width="3.5" stroke-linecap="round"/>
+
+  <!-- Dedicated Left Emblem Column (x=28..208, y=24..224) -->
+  <g transform="translate(28, 24)">
+    <rect x="0" y="0" width="180" height="200" rx="18" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <!-- Hexagon Tensor Core Geometry centered at (90, 82) -->
+    <polygon points="90,20 146,52 146,114 90,146 34,114 34,52" fill="url(#coreGrad)" stroke="#38BDF8" stroke-width="2.2" stroke-linejoin="round"/>
+    <!-- Gold Dashed Hexagon & Directional Vectors Around the Box -->
+    <polygon points="90,36 132,60 132,106 90,130 48,106 48,60" fill="none" stroke="#FBBF24" stroke-width="2.0" stroke-dasharray="5 3"/>
+    <line x1="34" y1="52" x2="90" y2="83" stroke="#F59E0B" stroke-width="1.8" stroke-dasharray="4 3" opacity="0.85"/>
+    <line x1="146" y1="52" x2="90" y2="83" stroke="#F59E0B" stroke-width="1.8" stroke-dasharray="4 3" opacity="0.85"/>
+    <line x1="90" y1="83" x2="90" y2="146" stroke="#FBBF24" stroke-width="1.8" stroke-dasharray="4 3" opacity="0.85"/>
+    <!-- Gold Arrow Tips on Dashed Ring -->
+    <polygon points="90,32 95,40 85,40" fill="#FBBF24"/>
+    <polygon points="135,108 127,109 131,101" fill="#FBBF24"/>
+    <polygon points="45,108 49,101 53,109" fill="#FBBF24"/>
+    <!-- Gold Flux Vector Lightning Bolt -->
+    <path d="M 72 54 H 112 L 90 79 H 110 L 70 114 L 81 84 H 65 Z" fill="url(#goldBoltGrad)" stroke="#FEF08A" stroke-width="1.3" stroke-linejoin="round"/>
+    <!-- Bottom Pill cleanly inside Emblem Card (y=160..186) -->
+    <rect x="22" y="160" width="136" height="26" rx="13" fill="#0d1117" stroke="#F59E0B" stroke-width="1.4"/>
+    <text x="90" y="177" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#FBBF24" text-anchor="middle">SM121a · GB10</text>
+  </g>
+
+  <!-- Right Column: Wordmark & Title Block (x=232..1132) -->
+  <g transform="translate(232, 0)">
+    <text x="0" y="66" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="34" font-weight="900" fill="#F0F6FC" letter-spacing="1.2">APATHY FLUX ENGINE</text>
+
+    <rect x="442" y="40" width="144" height="26" rx="13" fill="#122d1f" stroke="#10B981" stroke-width="1.3"/>
+    <text x="514" y="57" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#34D399" text-anchor="middle">v1.0.3 · RELEASE</text>
+
+    <rect x="598" y="40" width="166" height="26" rx="13" fill="#111d2e" stroke="#38BDF8" stroke-width="1.3"/>
+    <text x="681" y="57" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#38BDF8" text-anchor="middle">0 REGISTER SPILLS</text>
+
+    <rect x="776" y="40" width="124" height="26" rx="13" fill="#271c0c" stroke="#F59E0B" stroke-width="1.3"/>
+    <text x="838" y="57" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#FBBF24" text-anchor="middle">AGPL-3.0</text>
+
+    <text x="0" y="98" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="14" font-weight="700" fill="#38BDF8" letter-spacing="1.1">PURE RUST + SM121a CUDA/PTX INFERENCE RUNTIME</text>
+    <text x="0" y="122" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#8B949E">Hardware-specific NVFP4 / MXFP8 / W4A8 kernels at the NVIDIA Grace Blackwell 273 GB/s LPDDR5x ceiling</text>
+  </g>
+
+  <!-- Divider -->
+  <line x1="232" y1="140" x2="1132" y2="140" stroke="#21262d" stroke-width="1.5"/>
+
+  <!-- 4 Telemetry Cards in Right Column (x=232..1132, each 213px wide, gap 16px, y=156..224) -->
+  <g transform="translate(232, 156)">
+    <!-- Card 1: Prefill -->
+    <rect x="0" y="0" width="213" height="68" rx="10" fill="#161b22" stroke="#10B981" stroke-width="1.4"/>
+    <circle cx="16" cy="18" r="4.5" fill="#10B981"/>
+    <text x="28" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#8B949E">16K PREFILL PEAK</text>
+    <text x="16" y="45" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="17" font-weight="800" fill="#34D399">6,082.2 tok/s</text>
+    <text x="16" y="60" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E">6,076.7 med · 5,694 @ 128K</text>
+
+    <!-- Card 2: MTP K=5 -->
+    <rect x="229" y="0" width="213" height="68" rx="10" fill="#161b22" stroke="#38BDF8" stroke-width="1.4"/>
+    <circle cx="245" cy="18" r="4.5" fill="#38BDF8"/>
+    <text x="257" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#8B949E">LOSSLESS MTP K=5</text>
+    <text x="245" y="45" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="17" font-weight="800" fill="#38BDF8">56.5 tok/s</text>
+    <text x="245" y="60" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E">57.4 peak · 2,560/2,560 exact</text>
+
+    <!-- Card 3: DFlash -->
+    <rect x="458" y="0" width="213" height="68" rx="10" fill="#161b22" stroke="#A855F7" stroke-width="1.4"/>
+    <circle cx="474" cy="18" r="4.5" fill="#A855F7"/>
+    <text x="486" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#8B949E">QWEN3.8-27B DFLASH γ=15</text>
+    <text x="474" y="45" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="17" font-weight="800" fill="#C084FC">63.9 tok/s</text>
+    <text x="474" y="60" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E">1-stream · 4.6× 27B roofline</text>
+
+    <!-- Card 4: Estonia 136.5K -->
+    <rect x="687" y="0" width="213" height="68" rx="10" fill="#161b22" stroke="#F59E0B" stroke-width="1.4"/>
+    <circle cx="703" cy="18" r="4.5" fill="#F59E0B"/>
+    <text x="715" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="700" fill="#8B949E">136.5K 6-HOP ESTONIA</text>
+    <text x="703" y="45" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="17" font-weight="800" fill="#FBBF24">5/5 PASS (100%)</text>
+    <text x="703" y="60" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E">5,400.4 prefill · 48.2 decode</text>
+  </g>
+</svg>

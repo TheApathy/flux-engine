@@ -1,0 +1,360 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Atlas W4A16 GEMM v2 — MiniMax-only shadow kernel.
+//
+// Baseline (`w4a16_gemm_t_m128` in `w4a16_gemm.cu`):
+//   - 128 (M) × 128 (N) × 32 (K per step) CTA tile
+//   - blockDim 128 (4 warps), 2-stage cp.async pipeline
+//   - Chunk 0 (rows 0-63) and chunk 1 (rows 64-127) MMAs computed
+//     **serially**: 4 warps run 64 MMAs for chunk 0, then 64 for chunk 1.
+//
+// v2 change (this file):
+//   - blockDim 256 (8 warps). Warps 0-3 own chunk 0 rows, warps 4-7 own
+//     chunk 1 rows → both chunks' MMAs run **in parallel**.
+//   - SMEM layout and 2-stage pipeline unchanged (still 3 CTAs/SM).
+//
+// Occupancy: SMEM footprint identical to v1 (~29.8 KB/CTA → 3 CTAs/SM),
+// so we get 3 × 256 = 768 threads/SM vs v1's 3 × 128 = 384 threads/SM.
+// More warps/SM = more MMA pipeline slots in flight.
+//
+// Exported symbols: `w4a16_gemm_t_m128_v2`, `cast_bf16_to_e4m3`, and
+// `dequant_nvfp4_to_e4m3` — v1 symbols stay in `w4a16_gemm.cu` untouched.
+// ═══════════════════════════════════════════════════════════════════
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+#define M_TILE     64
+#define N_TILE_LG  128
+#define K_STEP_T   32
+#define PAD_T      8
+#define BP_PAD     16
+#define GROUP_SIZE 16
+
+__device__ __constant__ float E2M1_LUT_V2[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+__device__ __forceinline__ void v2_cp_async_pred_16(void* dst_smem, const void* src_gmem, bool pred) {
+    unsigned int dst = __cvta_generic_to_shared(dst_smem);
+    unsigned int src_bytes = pred ? 16 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(dst), "l"(src_gmem), "r"(src_bytes));
+}
+
+__device__ __forceinline__ void v2_cp_async_commit() {
+    asm volatile("cp.async.commit_group;");
+}
+
+__device__ __forceinline__ void v2_cp_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;");
+}
+
+__device__ __forceinline__ unsigned int v2_bf16x4_to_e4m3x4(const unsigned short* src) {
+    unsigned int p0 = *(const unsigned int*)src;
+    unsigned int p1 = *(const unsigned int*)(src + 2);
+    unsigned short bf0 = (unsigned short)(p0 & 0xFFFFu);
+    unsigned short bf1 = (unsigned short)(p0 >> 16);
+    unsigned short bf2 = (unsigned short)(p1 & 0xFFFFu);
+    unsigned short bf3 = (unsigned short)(p1 >> 16);
+    float f0, f1, f2, f3;
+    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f0) : "h"(bf0));
+    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f1) : "h"(bf1));
+    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f2) : "h"(bf2));
+    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f3) : "h"(bf3));
+    unsigned short h0, h1;
+    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h0) : "f"(f1), "f"(f0));
+    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h1) : "f"(f3), "f"(f2));
+    return ((unsigned int)h1 << 16) | (unsigned int)h0;
+}
+
+extern "C" __global__
+__launch_bounds__(256, 3)
+void w4a16_gemm_t_m128_v2(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned int cta_m = blockIdx.y * (2 * M_TILE);
+    if (cta_m >= M) return;
+
+    const unsigned int warp_id = threadIdx.x >> 5;    // 0..7
+    const unsigned int lane_id = threadIdx.x & 31;
+    const unsigned int chunk   = warp_id >> 2;        // 0 or 1
+    const unsigned int sub     = warp_id & 3;         // 0..3 within chunk
+    const unsigned int warp_m_offset = sub * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    // Same SMEM layout as v1's w4a16_gemm_t_m128 (2 stages).
+    __shared__ __nv_bfloat16 smem_A[2][2 * M_TILE][K_STEP_T + PAD_T];
+    __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_Bs[2][K_STEP_T / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_B_fp8[N_TILE_LG][K_STEP_T];
+    __shared__ float smem_LUT[16];
+
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT_V2[threadIdx.x];
+
+    // Each warp owns 16 M-rows × 16 N-tiles of the output (16 MMAs/K-step).
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.f; acc[i][1] = 0.f; acc[i][2] = 0.f; acc[i][3] = 0.f;
+    }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    // Load tile [buf] from global.
+    //   A: 256 threads × 2 rounds × 16 B = 128×32×2 = 8192 B (one full tile)
+    //   Bp: first 128 threads × 1 round × 16 B = 16×128 = 2048 B
+    //   Bs: first 16 threads × 1 round × 16 B = 256 B effective
+    #define V2_LOADS(buf, kb) do { \
+        { \
+            unsigned int a_row_base = threadIdx.x >> 2;        /* 0..63 */ \
+            unsigned int a_col      = (threadIdx.x & 3) << 3;  /* 0/8/16/24 */ \
+            unsigned int gc = (kb) + a_col; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 2; rnd++) { \
+                unsigned int row = (unsigned int)(rnd * 64) + a_row_base; \
+                unsigned int gr  = cta_m + row; \
+                v2_cp_async_pred_16(&smem_A[(buf)][row][a_col], \
+                    &A[(unsigned long long)gr * K + gc], \
+                    (gr < M) && (gc + 7 < K)); \
+            } \
+        } \
+        if (threadIdx.x < 128) { \
+            unsigned int kp  = threadIdx.x >> 3;        /* 0..15 */ \
+            unsigned int ns  = (threadIdx.x & 7) << 4;  /* 0/16/.../112 */ \
+            unsigned int gke = (kb) + (kp << 1); \
+            unsigned int gns = cta_n + ns; \
+            v2_cp_async_pred_16(&smem_Bp[(buf)][kp][ns], \
+                &B_packed[(unsigned long long)(gke >> 1) * N + gns], \
+                (gke + 1 <= K) && (gns + 15 < N)); \
+            if (kp < K_STEP_T / GROUP_SIZE) { \
+                unsigned int sg = (kb) / GROUP_SIZE + kp; \
+                v2_cp_async_pred_16(&smem_Bs[(buf)][kp][ns], \
+                    &B_scale[(unsigned long long)sg * N + gns], \
+                    (sg < K / GROUP_SIZE) && (gns + 15 < N)); \
+            } \
+        } \
+    } while(0)
+
+    // Dequant buf's NVFP4 into shared FP8 E4M3 (128 threads, 1 N-col each).
+    #define V2_DEQUANT(buf) do { \
+        if (threadIdx.x < 128) { \
+            unsigned int my_n = threadIdx.x; \
+            unsigned char sb0 = smem_Bs[(buf)][0][my_n]; \
+            unsigned char sb1 = smem_Bs[(buf)][1][my_n]; \
+            __nv_fp8_e4m3 f0, f1; \
+            *(unsigned char*)&f0 = sb0; *(unsigned char*)&f1 = sb1; \
+            float sv0 = (float)f0 * scale2, sv1 = (float)f1 * scale2; \
+            _Pragma("unroll") \
+            for (int kp = 0; kp < 8; kp++) { \
+                unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
+                float lo = smem_LUT[packed & 0xF] * sv0; \
+                float hi = smem_LUT[packed >> 4]  * sv0; \
+                unsigned short fp8_pair; \
+                asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                             : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+                *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+            } \
+            _Pragma("unroll") \
+            for (int kp = 8; kp < 16; kp++) { \
+                unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
+                float lo = smem_LUT[packed & 0xF] * sv1; \
+                float hi = smem_LUT[packed >> 4]  * sv1; \
+                unsigned short fp8_pair; \
+                asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                             : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+                *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+            } \
+        } \
+    } while(0)
+
+#ifndef ATLAS_MMA_FP8_UNIT_M16N8K32
+#if __CUDA_ARCH__ >= 1200
+#define ATLAS_MMA_FP8_UNIT_M16N8K32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3) \
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},{%14},{0,0},{%14},{0,0};" \
+        :"=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3) \
+        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+         "f"(c0),"f"(c1),"f"(c2),"f"(c3),"r"(0x7fu))
+#else
+#define ATLAS_MMA_FP8_UNIT_M16N8K32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        :"=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3) \
+        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+         "f"(c0),"f"(c1),"f"(c2),"f"(c3))
+#endif
+#endif
+
+    // Compute. Each warp does 16 MMAs against its owned M-rows.
+    // Chunk 0 warps (0-3) and chunk 1 warps (4-7) run in parallel, unlike
+    // v1's serialized chunk-0-then-chunk-1 compute pass.
+    #define V2_COMPUTE(a_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
+        unsigned int fr0, fr1, a0, a1, a2, a3; \
+        fr0 = chunk * M_TILE + warp_m_offset + group_id; \
+        fr1 = fr0 + 8; \
+        a0 = v2_bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
+        a1 = v2_bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
+        a2 = v2_bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
+        a3 = v2_bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 16; nt++) { \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
+            ATLAS_MMA_FP8_UNIT_M16N8K32( \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3], \
+                a0, a1, a2, a3, b0, b1, \
+                acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]); \
+        } \
+    } while(0)
+
+    // 2-stage pipeline — same structure as v1's w4a16_gemm_t_m128.
+    V2_LOADS(0, 0);
+    v2_cp_async_commit();
+    v2_cp_async_wait_all();
+    __syncthreads();
+    V2_DEQUANT(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
+        int nxt = 1 - cur;
+        V2_LOADS(nxt, k_base);
+        v2_cp_async_commit();
+        V2_COMPUTE(cur);
+        v2_cp_async_wait_all();
+        __syncthreads();
+        V2_DEQUANT(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    V2_COMPUTE(cur);
+
+    #undef V2_LOADS
+    #undef V2_DEQUANT
+    #undef V2_COMPUTE
+
+    // Epilogue: each warp writes its own 16 M-rows × 128 N-cols (no shuffle).
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int row_base = cta_m + chunk * M_TILE + warp_m_offset;
+        unsigned int r0_lo = row_base + group_id;
+        unsigned int r0_hi = row_base + group_id + 8;
+        if (r0_lo < M) {
+            if (c0 < N)
+                C[(unsigned long long)r0_lo * N + c0]     = __float2bfloat16_rn(acc[nt][0]);
+            if (c0 + 1 < N)
+                C[(unsigned long long)r0_lo * N + c0 + 1] = __float2bfloat16_rn(acc[nt][1]);
+        }
+        if (r0_hi < M) {
+            if (c0 < N)
+                C[(unsigned long long)r0_hi * N + c0]     = __float2bfloat16_rn(acc[nt][2]);
+            if (c0 + 1 < N)
+                C[(unsigned long long)r0_hi * N + c0 + 1] = __float2bfloat16_rn(acc[nt][3]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cast_bf16_to_e4m3: materialise the exact e4m3 activation bytes that the
+// W4A16 / FP8 prefill MMAs already consume, so a library GEMM (cuBLASLt FP8)
+// can be handed the identical operands.
+//
+// The conversion is statement-for-statement `v2_bf16x4_to_e4m3x4` above:
+// bf16 -> f32 via cvt.f32.bf16, then cvt.rn.satfinite.e4m3x2.f32, no scaling
+// and no per-row normalisation. So feeding these bytes to an e4m3 x e4m3 GEMM
+// reproduces the current products exactly; only the accumulation order differs.
+//
+// `n_elems` must be a multiple of 4. Grid-stride over packed groups of 4.
+extern "C" __global__ void cast_bf16_to_e4m3(
+    const unsigned short* __restrict__ input,   // [n_elems] BF16
+    unsigned int* __restrict__ output,          // [n_elems/4] packed e4m3 bytes
+    unsigned long long n_groups                 // n_elems / 4
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (; i < n_groups; i += stride) {
+        output[i] = v2_bf16x4_to_e4m3x4(input + i * 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dequant_nvfp4_to_e4m3: materialise, once, the exact e4m3 weight bytes that
+// V2_DEQUANT above produces on the fly, laid out row-major [N, K] so cuBLASLt
+// can consume them as the A operand of a TN FP8 GEMM.
+//
+// Per element this is statement-for-statement V2_DEQUANT:
+//     val = LUT[code] * ((float)block_scale_e4m3 * scale2)
+//     out = cvt.rn.satfinite.e4m3(val)
+// so the library multiplies the identical bytes the MMA path would have built.
+//
+// Source layout (from V2_LOADS): B_packed[(k >> 1) * N + n] holds the code for
+// even k in the low nibble and odd k in the high nibble; B_scale[(k / 16) * N + n].
+//
+// One block per (128-wide n tile, 32-deep k tile): reads are coalesced across n,
+// and each thread emits its 32 output bytes as one contiguous store. Runs once
+// per layer, so clarity beats micro-optimisation.
+#define DQ_NT 128
+#define DQ_KT 32
+
+extern "C" __global__ void dequant_nvfp4_to_e4m3(
+    const unsigned char* __restrict__ B_packed,  // [K/2, N]
+    const unsigned char* __restrict__ B_scale,   // [K/16, N] e4m3 bytes
+    unsigned char* __restrict__ out,             // [N, K] e4m3 bytes
+    float scale2,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int n0 = blockIdx.x * DQ_NT;
+    const unsigned int k0 = blockIdx.y * DQ_KT;
+    const unsigned int n = n0 + threadIdx.x;
+    if (n >= N || k0 >= K) return;
+
+    // Up to two 16-element groups span this 32-deep k tile.
+    float sv[DQ_KT / GROUP_SIZE];
+    #pragma unroll
+    for (int g = 0; g < DQ_KT / GROUP_SIZE; g++) {
+        if (k0 + (unsigned int)g * GROUP_SIZE < K) {
+            const unsigned int sg = (k0 / GROUP_SIZE) + g;
+            __nv_fp8_e4m3 f;
+            *(unsigned char*)&f = B_scale[(unsigned long long)sg * N + n];
+            sv[g] = (float)f * scale2;
+        } else {
+            sv[g] = 0.0f;
+        }
+    }
+
+    unsigned char local[DQ_KT];
+    #pragma unroll
+    for (int kk = 0; kk < DQ_KT; kk += 2) {
+        const unsigned int k = k0 + kk;
+        if (k >= K) break;
+        const unsigned char packed = B_packed[(unsigned long long)(k >> 1) * N + n];
+        const float s = sv[kk / GROUP_SIZE];
+        const float lo = E2M1_LUT_V2[packed & 0xF] * s;
+        const float hi = E2M1_LUT_V2[packed >> 4] * s;
+        unsigned short fp8_pair;
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+                     : "=h"(fp8_pair) : "f"(hi), "f"(lo));
+        local[kk]     = (unsigned char)(fp8_pair & 0xFF);
+        local[kk + 1] = (unsigned char)(fp8_pair >> 8);
+    }
+
+    unsigned char* dst = out + (unsigned long long)n * K + k0;
+    const unsigned int span = (k0 + DQ_KT <= K) ? DQ_KT : (K - k0);
+    #pragma unroll
+    for (unsigned int kk = 0; kk < DQ_KT; kk++) {
+        if (kk < span) dst[kk] = local[kk];
+    }
+}

@@ -1,0 +1,1673 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! `DraftProposer::propose` body for [`super::BlockDiffusionDraftHead`].
+//!
+//! Split out of `dflash_head.rs` for file-size budget. Trait impl
+//! delegates to [`BlockDiffusionDraftHead::propose_drafts`].
+
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
+
+use super::draft_budget::{DflashDraftBudget, clear_proposal_outputs};
+use super::forward_block::{checked_topk_difference, validate_topk_request};
+use super::{BlockDiffusionDraftHead, DflashProposerState};
+use crate::layer::ForwardContext;
+use crate::speculative::ProposerState;
+
+pub(super) fn parse_ddtree_top_k(
+    atlas_value: std::result::Result<String, std::env::VarError>,
+    legacy_value: std::result::Result<String, std::env::VarError>,
+    vocab: usize,
+) -> Result<usize> {
+    let raw = match atlas_value {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => match legacy_value {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("DDTREE_TOP_K is not valid Unicode")
+            }
+        },
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("ATLAS_DDTREE_TOP_K is not valid Unicode")
+        }
+    };
+    let Some(raw) = raw else {
+        return validate_topk_request(8, vocab);
+    };
+    let k = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("invalid DDTree top-K value {raw:?}"))?;
+    validate_topk_request(k, vocab)
+}
+
+fn retrieval_corroborates_drafter(drafter: &[u32], retrieval: &[u32], min_prefix: usize) -> bool {
+    retrieval.len() > drafter.len()
+        && min_prefix > 0
+        && drafter.len() >= min_prefix
+        && retrieval.len() >= min_prefix
+        && drafter[..min_prefix] == retrieval[..min_prefix]
+}
+
+fn retrieval_lookup(
+    haystack: &[u32],
+    last_token: u32,
+    cfg: &super::retrieval::RetrievalConfig,
+) -> Option<super::retrieval::RetrievalHit> {
+    let key_retrieval = std::env::var("ATLAS_DFLASH_KEY_RETRIEVAL").ok().as_deref() == Some("1");
+    if key_retrieval {
+        let max_distance = std::env::var("ATLAS_DFLASH_KEY_DISTANCE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 2);
+        super::retrieval::retrieve_by_key(haystack, last_token, cfg, max_distance)
+    } else if cfg.sam {
+        super::retrieval::retrieve_longest(haystack, last_token, cfg)
+    } else {
+        super::retrieval::retrieve(haystack, last_token, cfg)
+    }
+}
+
+impl BlockDiffusionDraftHead {
+    pub(super) fn propose_drafts(
+        &self,
+        last_token: u32,
+        _target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        _stream: u64,
+        _draft_embed_target: Option<DevicePtr>,
+        _grammar_bitmask: Option<&[i32]>,
+        target_hidden_stack: Option<DevicePtr>,
+    ) -> Result<Vec<u32>> {
+        let dstate = state
+            .as_any_mut()
+            .downcast_mut::<DflashProposerState>()
+            .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        let policy = self
+            .proposal_policy
+            .get_or_init(super::proposal_policy::ProposalPolicy::from_env);
+
+        // Quiesce the single shared scratch before any host-only early return.
+        if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
+            clear_proposal_outputs(dstate);
+            return Err(error);
+        }
+        let budget = DflashDraftBudget::new(
+            num_drafts,
+            super::effective_draft_width(self.gamma),
+            self.physical_verify_k,
+        )?;
+        dstate.draft_budget = Some(budget);
+        // PCTree (ATLAS_PCTREE=1). Resolved per propose so the reason is
+        // visible in the log rather than inferred. On the production
+        // checkpoint this is always `NoScorer` — the drafter carries no
+        // parent-conditioned head — and drafting stays on the chain.
+        match self.pctree_decision() {
+            super::pctree::PcTreeDecision::Disabled => {}
+            super::pctree::PcTreeDecision::NoScorer => {}
+            super::pctree::PcTreeDecision::Engaged(kind, params) => {
+                static PENDING: std::sync::Once = std::sync::Once::new();
+                PENDING.call_once(|| {
+                    tracing::warn!(
+                        "PCTree is applicable on this checkpoint ({kind:?}, nodes={} k={}) \
+                         but the device-side parent-conditioned scorer is not wired yet: \
+                         it needs a batched top-k-over-(base+bias) kernel, which does not \
+                         exist in this tree. Falling back to chain drafting.",
+                        params.nodes,
+                        params.k,
+                    );
+                });
+            }
+        }
+        if budget.flat == 0 {
+            clear_proposal_outputs(dstate);
+            return Ok(Vec::new());
+        }
+
+        // Host-side draft shortcuts (Echo, PLD, Retrieval/SAM, Recycle) emit
+        // flat token chains with no sparse-q frame; under probabilistic
+        // sampling (`temperature > 0.0`), `finalize_proposal` requires a
+        // sparse-q frame and would otherwise reject the step to 0 drafts.
+        let requires_sampled_q = dstate
+            .active_sampling_request
+            .as_ref()
+            .is_some_and(|request| request.request_sampler.temperature > 0.0);
+
+        let _ = (ctx, position, last_token);
+
+        // Append the model's latest single-slot ctx capture into the
+        // per-seq accumulator. Skip when `target_hidden_stack` is None
+        // (e.g. EP=2 worker rank or the very first call before any
+        // capture has fired). Absolute positions are checked against
+        // `max_ctx_len`; only the latest bounded ring remains resident.
+        //
+        // ATLAS_DFLASH_DEBUG_NO_DECODE_APPEND=1 disables the post-decode
+        // append. The captured target_hidden_stack is the K-1 token of
+        // the last K=2 verify (the draft, NOT the bonus). On REJECT
+        // (the typical case during cold-start training-distribution
+        // mismatch) the draft was never accepted, so appending its
+        // hiddens to the accumulator poisons the ctx for subsequent
+        // propose() calls. Setting this flag uses ONLY prefill captures
+        // — clean ctx isolation for diagnosing real-traffic acceptance.
+        let skip_decode_append = policy.skip_decode_append;
+        // Drop the `first_propose_done` gate. The previous logic skipped
+        // the append on the very first propose call, assuming
+        // dflash_hidden_save was uninitialized. But after a regular
+        // bootstrap decode (mtp_step's Phase A), `decode_a.rs` has
+        // already populated dflash_hidden_save[0] with the
+        // bootstrap-decoded token's hidden at sequence position M (=
+        // seq_len after prefill, BEFORE bootstrap increment). Skipping
+        // the append left ctx_len = M (prefill captures) while
+        // seq.seq_len = M+1, so the drafter's RoPE positions for ctx
+        // were assigned [1..M] instead of [0..M-1] — an off-by-one
+        // that shifted every ctx position by 1 RoPE rotation. Every
+        // subsequent step inherited the off-by-one (ctx_len fell one
+        // behind seq.seq_len). Result: drafter accept rate collapsed
+        // to ~1% because attention K/V were rotated to the wrong
+        // positions. Verified by reading position=5, eff_ctx=4 from
+        // the very first propose dump.
+        //
+        // Fix: always append on every propose. On first propose,
+        // last_num_accepted=0 → num_append=1 → appends the bootstrap
+        // hidden, ctx_len becomes M+1 = seq.seq_len, RoPE positions
+        // align. On subsequent proposes, the existing logic
+        // (last_num_accepted+1 slots) keeps ctx_len in lockstep with
+        // seq.seq_len.
+        if !skip_decode_append && let Some(base) = target_hidden_stack {
+            // Append the new tokens' hidden states from the previous
+            // verify step.
+            //
+            // dflash_hidden_save layout (set during verify of
+            // [last_token, draft_0, ..., draft_{γ-1}]):
+            //   [0]   = hidden of verify input position 0 = last_token
+            //   [1..] = hidden of draft_0, draft_1, ...
+            //
+            // ctx_hidden_acc semantics: slot i = hidden of token at
+            // sequence position i. ctx_start in forward_block.rs is
+            // computed as `position - eff_ctx`, so position i in ctx
+            // corresponds to absolute position (position - eff_ctx + i).
+            //
+            // After step N's verify (last_token at sequence position P,
+            // num_accepted=N accepted drafts, bonus emitted next):
+            //   - decode_verify wrote last_token at KV position P,
+            //     draft_0 at P+1, ..., draft_{N-1} at P+N
+            //   - seq.seq_len = P + N + 1 after rollback
+            //   - The bonus is logically at position P+N+1 but has no
+            //     KV yet (will be written when next verify processes it
+            //     as input position 0)
+            //
+            // For step N+1 propose:
+            //   - position = P + N + 1
+            //   - We need ctx slots P, P+1, ..., P+N populated with
+            //     hiddens of (last_token, draft_0, ..., draft_{N-1})
+            //   - dflash_hidden_save[0..N+1] has EXACTLY this in order
+            //
+            // So src_idx 0..N+1 is correct and matches sequence order.
+            // The bonus's hidden is NOT needed in ctx — bonus appears
+            // as the first noise embedding (Q-side input).
+            // The ring cursor, target position, and verify accept count form
+            // one exact transaction.  This shared helper is also used by the
+            // pre-bootstrap boundary reconciler; it rejects holes instead of
+            // moving the cursor over captures that were never copied.
+            let last_num_accepted = dstate.last_num_accepted;
+            let ctx_len_before = dstate.ctx_len;
+            let num_append = dstate.append_pending_ctx_captures(
+                ctx.gpu,
+                base,
+                position,
+                self.physical_verify_k,
+                _stream,
+            )?;
+            tracing::debug!(
+                "DFlash propose append: last_num_accepted={} num_append={} first_pos={} ctx_len_before={}",
+                last_num_accepted,
+                num_append,
+                ctx_len_before,
+                ctx_len_before,
+            );
+        }
+
+        // ── ATLAS_DFLASH_ECHO=1: echo-drafting / Jacobi salvage (default off) ──
+        //
+        // On the previous step's rejection, `dflash_stash_echo` (called from
+        // verify_dflash_step.rs on the FLAT chain path only) stashed the
+        // TARGET'S OWN verify argmaxes downstream of the bonus —
+        // `verified[num_accepted+1 ..]`, the target's next-token choices
+        // conditioned on a near-miss prefix. After the one-token bonus
+        // substitution they are usually still right, so offer them directly
+        // as this step's draft chain and SKIP the drafter forward entirely
+        // (the 25-50ms propose slice → ~0). Highest precedence among the
+        // draft sources (PLD / retrieval / recycle below): a target-authored
+        // draft beats any drafter- or lookup-authored one.
+        //
+        // LOSSLESS by the same oracle argument as retrieval/recycle: echo
+        // tokens are only PROPOSED; the verify commits solely the target's
+        // greedy token, so a wrong echo costs one rejected speculation and
+        // can never change committed output (proven by greedy byte-match).
+        //
+        // ctx-hidden maintenance: the append block ABOVE already ran, so the
+        // drafter's context accumulator stays in lockstep even though its
+        // forward is skipped — the next real propose is not ctx-starved.
+        //
+        // Anti-degenerate-loop: `echo_streak` counts CONSECUTIVE echo offers
+        // and is capped (ATLAS_DFLASH_ECHO_MAX_STREAK, default 2) so an echo
+        // step that itself rejects cannot keep salvaging its own wreckage;
+        // after the cap the real drafter runs and resets the streak. The
+        // stash-side min-accept floor (>=2) already blocks re-echo from an
+        // early-rejecting echo step; the cap is the backstop.
+        if !requires_sampled_q && let Some(echo_cfg) = super::echo::EchoConfig::from_env() {
+            // Salvage-accept telemetry: attribute the previous step's accept
+            // to the echo draft that produced it (`last_num_accepted` was
+            // just set by after_verify). This line + the offer line below
+            // are the fire-rate / salvage-distribution measurement.
+            if dstate.echo_offered_last {
+                dstate.echo_offered_last = false;
+                tracing::info!(
+                    "DFLASH_ECHO result: accepted={} streak={}",
+                    dstate.last_num_accepted,
+                    dstate.echo_streak,
+                );
+            }
+            // Take the stash unconditionally (single-use): an echo tail is
+            // only valid for the immediately-following step whose last_token
+            // == the stashed bonus key.
+            let valid = dstate.echo_valid;
+            let key = dstate.echo_key;
+            let tail = std::mem::take(&mut dstate.echo_tail);
+            dstate.echo_valid = false;
+            if dstate.first_propose_done
+                && super::echo::should_offer(
+                    &echo_cfg,
+                    valid,
+                    key == last_token,
+                    tail.len(),
+                    dstate.echo_streak,
+                )
+            {
+                // Shape to γ_eff (pad with a trailing repeat / truncate) so
+                // the K=γ_eff+1 verify dispatch — and its CUDA graph — is
+                // identical to the drafter path (same contract as recycle).
+                let echo_gamma_eff = budget.flat;
+                let drafts = super::echo::pad_tail_to_gamma(&tail, echo_gamma_eff);
+                dstate.last_num_drafted = drafts.len();
+                dstate.echo_streak += 1;
+                dstate.echo_offered_last = true;
+                // Flat chain → wy17 verify path, identical dispatch to
+                // drafter output. No tree payload.
+                dstate.pending_tree_payload = None;
+                static ECHO_OFFERS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = ECHO_OFFERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::info!(
+                    "DFLASH_ECHO offer #{n}: tail_len={} padded_to={} streak={} key={key}",
+                    tail.len(),
+                    drafts.len(),
+                    dstate.echo_streak,
+                );
+                return Ok(drafts);
+            }
+            // Echo did not fire this propose — every draft source below is
+            // non-echo, so the consecutive-offer streak resets here.
+            dstate.echo_streak = 0;
+        }
+
+        // ATLAS_DFLASH_PLD=1: prompt-lookup drafting. If the trailing n-gram
+        // (ATLAS_PLD_NGRAM, default 5) recurs earlier in the committed
+        // sequence, draft the effective trained/capped width that followed it and
+        // skip the drafter forward entirely. Highly repetitive text (story
+        // names/phrases, code idioms) accepts these at high rates; misses are
+        // rejected by the verifier as usual. Draft count stays gamma so the
+        // K=17 verify path is unchanged. Ctx bookkeeping above already ran.
+        // Precision gates (naive 3-gram PLD regressed coding 53.7->37: short
+        // matches preempt a strong drafter with wrong continuations): only
+        // fire in the weak-drafter regime (previous step accepted <=1, never
+        // true on coding/counting at 8-16 accepts) and require a long suffix
+        // match (8 down to ATLAS_PLD_NGRAM, default 5; longest wins).
+        if !requires_sampled_q
+            && policy.pld
+            && dstate.first_propose_done
+            && dstate.last_num_accepted <= 1
+        {
+            let ng_min = policy.pld_ngram;
+            // Host lookup drafting must obey the same trained/runtime width as
+            // the neural block. A block-16 checkpoint has 15 trained draft
+            // rows; the old literal 16 produced a K=17 verify against the
+            // default K=16 target buffers.
+            let need = budget.flat;
+            let toks = &dstate.pld_tokens;
+            let l = toks.len();
+            let mut hit: Option<usize> = None;
+            for ng in (ng_min..=8).rev() {
+                if l <= ng + need {
+                    continue;
+                }
+                let mut suffix: Vec<u32> = toks[l - (ng - 1)..].to_vec();
+                suffix.push(last_token);
+                let mut p = l.saturating_sub(ng + 1);
+                loop {
+                    if toks[p..p + ng] == suffix[..] && p + ng + need <= l {
+                        hit = Some(p + ng);
+                        break;
+                    }
+                    if p == 0 {
+                        break;
+                    }
+                    p -= 1;
+                }
+                if hit.is_some() {
+                    break;
+                }
+            }
+            if let Some(cs) = hit {
+                let drafts: Vec<u32> = toks[cs..cs + need].to_vec();
+                dstate.last_num_drafted = drafts.len();
+                dstate.first_propose_done = true;
+                dstate.pending_tree_payload = None;
+                return Ok(drafts);
+            }
+        }
+
+        // ── ATLAS_DFLASH_RETRIEVAL=1: retrieval-augmented drafting (default off) ──
+        //
+        // Generalization of the PLD path above. Searches a BROADER haystack
+        // (`dstate.pld_tokens` = prompt + generated, populated by the caller
+        // when this flag is on) with a longest-suffix match over L_max..L_min,
+        // and proposes the γ tokens that followed the longest occurrence.
+        // Unlike PLD, it fires whenever a strong match exists — NOT only in
+        // the weak-drafter regime — because the DFlash verify is a lossless
+        // oracle: it commits only the target's greedy token and accepts a
+        // draft solely when draft==greedy. A wrong retrieval guess therefore
+        // costs only a rejected speculation and can never change committed
+        // output (token-exact by construction; proven by greedy byte-match).
+        //
+        // Cheap hybrid (implemented here): pre-empt the neural drafter ONLY
+        // when the match is strong (match_len >= hybrid_min, default = L_max).
+        // Otherwise fall through to the drafter forward below. Keeping draft
+        // count = γ leaves the K=γ verify CUDA-graph path unchanged.
+        //
+        // ATLAS_RETRIEVAL_LMAX (16), ATLAS_RETRIEVAL_LMIN (4),
+        // ATLAS_RETRIEVAL_HYBRID_MIN (=LMAX) tune the gates.
+        // Match the drafter's effective draft count exactly: forward_block
+        // shrinks the noise block to γ_eff (= DRAFT_CAP clamped to [1, γ]).
+        // Proposing γ_eff drafts keeps drafts.len() identical to the drafter
+        // path so the K=γ_eff+1 verify dispatch is unchanged regardless of
+        // which source fired. A block-16 checkpoint defaults to γ=15 (K=16).
+        //
+        // ── WIDE RETRIEVAL (ATLAS_DFLASH_RETR_WIDE=<N>, default off) ──
+        // The NEURAL drafter is structurally capped at `self.gamma` (=15 for a
+        // block-16 checkpoint: one anchor plus 15 trained draft rows). But the retrieval
+        // path emits its drafts straight from the context haystack — it can
+        // return as many follow-on tokens as it likes, at zero extra propose
+        // cost. Because the verify reads all 27B NVFP4 weights ONCE per step
+        // regardless of K (bandwidth-bound), a K=32 verify costs ≈ K=17 + a
+        // small O(K²) WY term + a few extra M-rows. So when a STRONG suffix
+        // match has ≥N follow-on tokens, propose up to N of them (K = N+1
+        // verify) instead of only γ_eff.
+        //
+        // N is clamped to [γ_eff, K_MAX-1] where K_MAX=32 is the tree-WY /
+        // ddtree buffer capacity (parent_ids, SSM intermediates, hidden_save).
+        // The head carries the exact model allocation and the immutable outer
+        // budget clamps N to that capacity minus one. LOSSLESS either way — retrieval only
+        // decides WHAT to propose; verify commits the target's greedy token.
+        const RETR_WIDE_HARD_CAP: usize = 31; // = tree-WY K_MAX(32) - 1 bonus
+        let retr_wide = policy.retr_wide;
+        // The immutable outer budget is the sole verify-capacity authority.
+        let base_gamma_eff = budget.flat;
+        // Wide draft count for the RETRIEVAL path only: at least the neural
+        // width (so nothing regresses when wide is off / not applicable), at
+        // most min(N, K_MAX-1, ddtree_cap-1).
+        let retrieval_gamma_eff = if retr_wide > base_gamma_eff {
+            retr_wide
+                .min(RETR_WIDE_HARD_CAP)
+                .min(budget.tree_nodes)
+                .max(base_gamma_eff)
+        } else {
+            base_gamma_eff
+        };
+        // ── PORTFOLIO verify (ATLAS_DFLASH_PORTFOLIO=1, default off) ──
+        // Instead of retrieval PRE-EMPTING the neural drafter on a strong
+        // match, run BOTH and verify them as a 2-root forest in ONE K verify
+        // pass (see `build_portfolio_payload`). The retrieval chain becomes a
+        // sibling branch off the shared root, so at each divergence the target
+        // can ride EITHER the drafter's diffusion chain OR the retrieval chain,
+        // whichever it actually continues onto — captured in the same
+        // bandwidth-bound verify. LOSSLESS by the same oracle argument as plain
+        // retrieval (the greedy walk commits only the target's argmax). When
+        // on, retrieval no longer pre-empts; its `ATLAS_RETRIEVAL_HYBRID_MIN`
+        // threshold still applies (defaults to `l_max`; set explicitly to a
+        // lower value to fire on shorter matches) and the hit is stashed here
+        // for the drafter path to fuse below.
+        let portfolio_on = policy.portfolio;
+        let corroborate_on = policy.corroborate;
+        let corroborate_min = policy.corroborate_min;
+        // Retrieval branch budget for the portfolio forest: the K-1 verify
+        // outer node budget minus the drafter's own chain length, so drafter
+        // (chain A) is never truncated.
+        let portfolio_b_budget = budget.tree_nodes.saturating_sub(base_gamma_eff);
+        // Portfolio's retrieval chain length (chain B). Sized to fit the
+        // remaining forest budget; falls back to base_gamma_eff draft count so
+        // RetrievalConfig::from_env caps the matcher correctly.
+        let portfolio_b_len = portfolio_b_budget.max(1).min(base_gamma_eff);
+        let mut portfolio_retrieval_chain: Option<Vec<u32>> = None;
+        let mut corroborated_retrieval_chain: Option<Vec<u32>> = None;
+        if !requires_sampled_q
+            && portfolio_on
+            && let Some(rcfg) = super::retrieval::RetrievalConfig::from_env(portfolio_b_len)
+            && dstate.first_propose_done
+        {
+            // Portfolio retrieval never pre-empts, so no adaptive misfire gate
+            // is needed (a wrong retrieval chain costs at most rejected sibling
+            // nodes in a verify pass that runs anyway). Fire on any match that
+            // clears hybrid_min and fills the B budget.
+            let lookup = retrieval_lookup(&dstate.pld_tokens, last_token, &rcfg);
+            if let Some(hit) = lookup
+                && hit.match_len >= rcfg.hybrid_min
+                && hit.drafts.len() == portfolio_b_len
+            {
+                static PORTF_DBG: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !PORTF_DBG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "DFlash PORTFOLIO: first retrieval sibling match_len={} b_len={} \
+                         b_budget={} drafter_len={} (fused into 2-root forest)",
+                        hit.match_len,
+                        hit.drafts.len(),
+                        portfolio_b_budget,
+                        base_gamma_eff,
+                    );
+                }
+                portfolio_retrieval_chain = Some(hit.drafts);
+            }
+        }
+        if !requires_sampled_q
+            && corroborate_on
+            && !portfolio_on
+            && let Some(rcfg) = super::retrieval::RetrievalConfig::from_env(retrieval_gamma_eff)
+            && dstate.first_propose_done
+        {
+            let lookup = retrieval_lookup(&dstate.pld_tokens, last_token, &rcfg);
+            if let Some(hit) = lookup
+                && hit.match_len >= rcfg.hybrid_min
+                && hit.drafts.len() == retrieval_gamma_eff
+            {
+                corroborated_retrieval_chain = Some(hit.drafts);
+            }
+        }
+        // Store for the drafter-path fusion below (after the neural forward).
+        let portfolio_active = portfolio_on && !requires_sampled_q;
+
+        if !requires_sampled_q
+            && !portfolio_on
+            && !corroborate_on
+            && let Some(rcfg) = super::retrieval::RetrievalConfig::from_env(retrieval_gamma_eff)
+            && dstate.first_propose_done
+        {
+            // ── Adaptive retrieval gate (ATLAS_DFLASH_SAM_ADAPTIVE, default ON) ──
+            // Attribute the previous step's accept to retrieval (when it fired)
+            // and back off after sustained misfires, so SAM auto-disables on
+            // content where strong suffix matches mis-predict (counting: digit
+            // runs match but the next number is always new → wasted drafts,
+            // measured 77→65 tok/s regression) while staying fully active on
+            // reuse-heavy editing (where retrieval keeps accepting). LOSSLESS:
+            // only changes WHETHER we retrieve; the verify still commits the
+            // target's greedy token regardless.
+            let adaptive = std::env::var("ATLAS_DFLASH_SAM_ADAPTIVE").ok().as_deref() != Some("0");
+            if adaptive {
+                let min_accept: usize = std::env::var("ATLAS_DFLASH_SAM_MIN_ACCEPT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
+                let misfire_limit: u32 = std::env::var("ATLAS_DFLASH_SAM_MISFIRE_LIMIT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
+                let cooldown: u32 = std::env::var("ATLAS_DFLASH_SAM_COOLDOWN")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(24);
+                if dstate.retr_used_last {
+                    if dstate.last_num_accepted < min_accept {
+                        dstate.retr_misfire_streak += 1;
+                        dstate.lookup_stats.record_misfire();
+                    } else {
+                        dstate.retr_misfire_streak = 0;
+                    }
+                }
+                dstate.retr_used_last = false;
+                if dstate.retr_cooldown == 0 && dstate.retr_misfire_streak >= misfire_limit {
+                    dstate.retr_cooldown = cooldown;
+                    dstate.retr_misfire_streak = 0;
+                    dstate.lookup_stats.record_cooldown();
+                }
+            }
+            let retr_suppressed = adaptive && dstate.retr_cooldown > 0;
+            if dstate.retr_cooldown > 0 {
+                dstate.retr_cooldown -= 1;
+            }
+            // SAM mode (ATLAS_DFLASH_SAM=1): longest-suffix match at ANY length
+            // via retrieve_longest. Else the legacy fixed-window range matcher.
+            // Suppressed ⇒ None ⇒ falls through to the neural drafter below.
+            let lookup = if retr_suppressed {
+                dstate.lookup_stats.record_suppressed();
+                None
+            } else {
+                let lookup = retrieval_lookup(&dstate.pld_tokens, last_token, &rcfg);
+                dstate.lookup_stats.record_attempt(lookup.is_some());
+                lookup
+            };
+            if let Some(hit) = lookup
+                && hit.match_len >= rcfg.hybrid_min
+                && hit.drafts.len() == retrieval_gamma_eff
+            {
+                static RETR_DBG_DONE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !RETR_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "DFlash retrieval: first hit match_len={} key_distance={} draft_count={} haystack_len={} (lmax={} lmin={} hybrid_min={})",
+                        hit.match_len,
+                        hit.key_distance,
+                        hit.drafts.len(),
+                        dstate.pld_tokens.len(),
+                        rcfg.l_max,
+                        rcfg.l_min,
+                        rcfg.hybrid_min,
+                    );
+                }
+                tracing::debug!(
+                    "DFlash retrieval hit: match_len={} proposing {} drafts (skip drafter)",
+                    hit.match_len,
+                    hit.drafts.len()
+                );
+                if std::env::var("ATLAS_DFLASH_KEY_RETRIEVAL").ok().as_deref() == Some("1") {
+                    static KEY_HITS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let hits = KEY_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if hits == 1 || hits.is_multiple_of(64) {
+                        tracing::info!(
+                            "DFlash key retrieval engagement: hits={} context_tokens={} match_len={} key_distance={} drafts={}",
+                            hits,
+                            dstate.pld_tokens.len(),
+                            hit.match_len,
+                            hit.key_distance,
+                            hit.drafts.len(),
+                        );
+                    }
+                }
+                dstate.last_num_drafted = hit.drafts.len();
+                dstate.lookup_stats.record_preempt(hit.drafts.len());
+                dstate.first_propose_done = true;
+                // Adaptive gate: mark that retrieval fired so the NEXT propose
+                // attributes this step's accept to retrieval (misfire tracking).
+                dstate.retr_used_last = true;
+                // Flat chain → requires_tree_kernel false → wy17 verify path,
+                // identical dispatch to drafter output. No tree payload.
+                // (Any prior async in-flight handle was already resolved at
+                // entry to `propose_drafts`.)
+                dstate.pending_tree_payload = None;
+                return Ok(hit.drafts);
+            }
+        }
+
+        // ── ATLAS_DFLASH_RECYCLE=1: recycle the discarded draft tail (default off) ──
+        //
+        // The linear γ chain discards every correct draft token DOWNSTREAM of
+        // the first content miss (a measured 46.9% of correct drafts). Recover
+        // them: after verify, `dflash_stash_recycle` stashed the rejected tail
+        // `drafts[num_accepted+1..γ_eff]` keyed by the corrected token the
+        // target committed at the miss (= this step's `last_token`). When that
+        // key matches, OFFER the stashed tail as the draft instead of running
+        // the neural drafter — the structural part (indentation, closing
+        // brackets, `):`) is usually still correct given the corrected token,
+        // so it re-accepts; content-dependent parts get rejected for free.
+        //
+        // LOSSLESS by construction (identical contract to the retrieval path
+        // above): the recycled tokens are only PROPOSED. The DFlash verify is
+        // the oracle — it commits only the target's greedy token and accepts a
+        // draft solely when draft==greedy. A wrong recycle costs one rejected
+        // speculation and can NEVER change committed output (proven by greedy
+        // byte-match ON vs OFF).
+        //
+        // PRECEDENCE: secondary to PLD/RETRIEVAL. If either of those already
+        // returned above, recycle never runs this step (they pre-empt the
+        // drafter on a strong match; recycle is the fallback when no such match
+        // exists). Recycle is consumed (cleared) whether or not it fires so a
+        // stale tail is never re-offered after its key stops matching.
+        //
+        // PRECISION GATE (critical — mirrors the PLD gate at line ~336):
+        // recycle pre-empts the NEURAL DRAFTER. On high-accept content
+        // (counting, structured code: ~15/16) the drafter is excellent and a
+        // recycled tail — conditioned on the OLD pre-correction context and
+        // padded with a repeat — is far worse, collapsing accept to ~1/16 and
+        // ballooning step count. So only fire recycle when the drafter is
+        // already WEAK this step (`last_num_accepted <= ATLAS_DFLASH_RECYCLE_MAX_ACCEPT`,
+        // default 1) — exactly the regime (novel prose/code) where the tail
+        // recovery in the research targets the discarded 46.9%, and where
+        // there is nothing to lose because the neural drafter is failing too.
+        // Without this gate, ON measured ~8x SLOWER on counting (82→9.6 tok/s)
+        // because recycle fired every step and replaced 15/16 drafter accepts
+        // with ~1/16 stale-tail accepts. Lossless either way (verify is the
+        // oracle); the gate is purely a THROUGHPUT precision filter.
+        //
+        // The offered tail is a FLAT CHAIN of length `recycle_gamma_eff`
+        // (= γ_eff, same as the drafter / retrieval paths), so the K=γ_eff+1
+        // verify dispatch is UNCHANGED (→ wy17, no tree). When the stashed
+        // tail is shorter than γ_eff it is padded with the corrected token's
+        // mask-equivalent neutral fill (last token repeated) so drafts.len()
+        // stays at γ_eff and the verify graph is never re-captured.
+        // ANTI-TRAP: never fire recycle two steps in a row. After any offer the
+        // next step MUST run the real drafter so the true accept signal is
+        // re-established (otherwise a poorly-re-accepting tail keeps
+        // last_num_accepted low and re-opens the gate forever — measured
+        // counting 82→9 tok/s). `recycle_last_offered` is set when we offer and
+        // cleared on the drafter path below.
+        if dstate.recycle_last_offered {
+            dstate.recycle_last_offered = false;
+        } else if !requires_sampled_q
+            && policy.recycle
+            && dstate.first_propose_done
+            && dstate.last_num_accepted <= policy.recycle_max_accept
+        {
+            let recycle_gamma_eff = budget.flat;
+            // Take the stash unconditionally (single-use): a tail is only valid
+            // for the immediately-following step whose last_token == the key.
+            let valid = dstate.recycle_valid;
+            let key = dstate.recycle_key;
+            let tail = std::mem::take(&mut dstate.recycle_tail);
+            dstate.recycle_valid = false;
+            if valid && key == last_token && !tail.is_empty() {
+                // Build the offered drafts: the recycled tail, truncated or
+                // padded to exactly recycle_gamma_eff so the verify dispatch
+                // (K = γ_eff + 1) is identical to the drafter path. Pad with
+                // the last tail token (a harmless repeat — verify rejects it
+                // if wrong, at zero output cost).
+                let mut drafts: Vec<u32> = Vec::with_capacity(recycle_gamma_eff);
+                for i in 0..recycle_gamma_eff {
+                    let t = if i < tail.len() {
+                        tail[i]
+                    } else {
+                        *tail.last().unwrap()
+                    };
+                    drafts.push(t);
+                }
+                static RECYCLE_DBG_DONE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !RECYCLE_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "DFlash recycle: first offer key={} tail_len={} γ_eff={} (offering recycled tail, skip drafter)",
+                        key,
+                        tail.len(),
+                        recycle_gamma_eff,
+                    );
+                }
+                tracing::debug!(
+                    "DFlash recycle hit: key={} tail_len={} offering {} drafts (skip drafter)",
+                    key,
+                    tail.len(),
+                    drafts.len()
+                );
+                dstate.last_num_drafted = drafts.len();
+                dstate.first_propose_done = true;
+                // Mark so the NEXT step skips recycle and runs the drafter
+                // (anti-trap — see the gate above).
+                dstate.recycle_last_offered = true;
+                // Flat chain → requires_tree_kernel false → wy17 verify path,
+                // identical dispatch to drafter output. No tree payload.
+                dstate.pending_tree_payload = None;
+                return Ok(drafts);
+            }
+        }
+
+        // ── ATLAS_DFLASH_ACCEPT_FALLBACK (default off) ──
+        //
+        // The γ=16 draft+verify cycle is a net LOSS on low-acceptance (novel)
+        // content: the expensive K=16 propose+verify emits only a few tokens,
+        // so the per-step wall exceeds what plain single-token decode would
+        // cost. This gate detects that regime per-sequence from the rolling
+        // accept window and, when accept is low, SUPPRESSES speculation by
+        // returning an empty draft vector. An empty `pending_drafts` routes
+        // the sequence through the scheduler's bootstrap plain-decode path
+        // (mtp_step.rs Phase A) on the next step — recovering plain-decode
+        // throughput. Suppression lasts `COOLDOWN` steps, after which one
+        // full-γ PROBE runs to re-measure acceptance: if the content has
+        // turned predictable (counting, repeated structure) the probe accepts
+        // well and we resume full speculation; if still novel, we re-suppress.
+        //
+        // This is intentionally a TWO-MODE switch (full-γ spec graph, or plain
+        // decode) — never a variable γ — so the K=γ verify CUDA graph is never
+        // re-captured. Variable-γ adaptive shrink (ATLAS_DFLASH_ADAPTIVE_GAMMA)
+        // both wrecked the graph cache AND shrank γ on high-accept counting;
+        // this gate avoids both failure modes.
+        //
+        //   ATLAS_DFLASH_ACCEPT_FALLBACK=1     enable (default off ⇒ identical
+        //                                      to legacy behavior, byte-for-byte)
+        //   ATLAS_DFLASH_FALLBACK_THRESH=<n>   mean-accept threshold over the
+        //                                      window; below it ⇒ suppress.
+        //                                      Default 6 (of γ=16).
+        //   ATLAS_DFLASH_FALLBACK_COOLDOWN=<n> plain-decode steps to stay
+        //                                      suppressed before the next probe.
+        //                                      Default 8.
+        if policy.accept_fallback {
+            let thresh = policy.fallback_thresh;
+            let cooldown = policy.fallback_cooldown;
+            // Already in a suppression window: stay on plain decode, count down.
+            if dstate.fallback_suppressed_remaining > 0 {
+                dstate.fallback_suppressed_remaining -= 1;
+                dstate.last_num_drafted = 0;
+                dstate.pending_tree_payload = None;
+                tracing::debug!(
+                    "DFlash accept-fallback: suppressed (remaining={})",
+                    dstate.fallback_suppressed_remaining
+                );
+                return Ok(Vec::new());
+            }
+            // Not suppressed. If we have a stable accept signal and it's low,
+            // ENTER suppression now (this step also routes to plain decode).
+            // Require a full window of >=4 verifies so warmup doesn't trip it.
+            if dstate.accept_history_count >= 4 {
+                let n = dstate.accept_history_count.min(dstate.accept_history.len());
+                let sum: usize = dstate
+                    .accept_history
+                    .iter()
+                    .take(n)
+                    .map(|&v| v as usize)
+                    .sum();
+                let mean = sum / n;
+                if mean < thresh {
+                    dstate.fallback_suppressed_remaining = cooldown;
+                    dstate.last_num_drafted = 0;
+                    dstate.pending_tree_payload = None;
+                    tracing::debug!(
+                        "DFlash accept-fallback: entering suppression (mean_accept={} < thresh={}, cooldown={})",
+                        mean,
+                        thresh,
+                        cooldown
+                    );
+                    return Ok(Vec::new());
+                }
+            }
+            // mean >= thresh (or warming up) ⇒ fall through to full-γ propose.
+        }
+
+        // ── ATLAS_DFLASH_ASYNC=1 (task #20): async propose‖commit-tail ──
+        // Enqueue the drafter forward on the dedicated propose stream and
+        // return a placeholder chain immediately; the real drafts are
+        // collected (stream sync + γ×4B D2H) by the scheduler at the top of
+        // the NEXT step, so the SSM commit tail + step-tail CPU work overlap
+        // the drafter GPU time. Falls through to the sync path (None) when
+        // the flag is off or any host-interactive feature is active. When
+        // the flag is on but this call is ineligible, still resolve any
+        // stale in-flight launch before the sync forward touches the shared
+        // scratch buffers.
+        if super::async_propose::dflash_async_enabled() {
+            match self.try_launch_async_propose(
+                last_token,
+                position,
+                budget,
+                ctx,
+                _stream,
+                _grammar_bitmask.is_some(),
+                dstate,
+            ) {
+                Ok(Some(placeholder)) => return Ok(placeholder),
+                Ok(None) => {
+                    if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
+                        clear_proposal_outputs(dstate);
+                        return Err(error);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("DFLASH_ASYNC launch failed ({e:#}); degrading to no-spec");
+                    clear_proposal_outputs(dstate);
+                    return Err(e);
+                }
+            }
+        }
+
+        if policy.tps_router {
+            dstate.throughput_cycle_started = Some(std::time::Instant::now());
+            dstate.throughput_last_width = budget.flat;
+        }
+        let drafts = match self.forward_block(
+            last_token,
+            position,
+            budget.flat,
+            ctx,
+            _stream,
+            dstate,
+            false,
+        ) {
+            Ok(drafts) => drafts,
+            Err(error) => {
+                tracing::warn!("DFlash forward_block failed, falling back to no-spec: {error:#}");
+                clear_proposal_outputs(dstate);
+                return Err(error);
+            }
+        };
+        // Phase 2.5e: K=γ verify path is implemented in model.rs
+        // (decode_verify_graphed_kgamma → decode_verify) and dispatched via
+        // step_verify_dflash when drafts.len()>=4. The SSM intermediate
+        // checkpoint/rollback path is fully wired:
+        //   - SSM pool allocates 17 intermediate slots (γ+1) at model init
+        //   - decode_batched → decode_batched_conv_gdn saves per-token
+        //     h_state and conv_state intermediates (WY17 fused path or
+        //     sequential fallback, both write to pool addresses)
+        //   - commit_verify_state_async reads intermediates[num_accepted-1]
+        //     from the pool for partial-accept rollback
+        //
+        // The earlier cap=1 default was a conservative workaround from early
+        // development when SSM intermediate semantics were not yet verified.
+        // Audit (2026-05-15) confirmed all paths produce correct
+        // intermediates. Default raised to γ to enable full DFlash speedup.
+        // Set ATLAS_DFLASH_DRAFT_CAP=1 to force K=2 verify if regression
+        // is observed.
+        // ATLAS_DFLASH_DRAFT_CAP is consumed in
+        // dflash_head.rs::effective_draft_width and shrinks the noise block to
+        // gamma_eff+1 rows — so `drafts` already has length = gamma_eff. The
+        // legacy post-filter is removed (was wasting drafter compute on tokens
+        // we'd then discard).
+        dstate.last_num_drafted = drafts.len();
+        dstate.first_propose_done = true;
+
+        // ── ATLAS_DFLASH_BRANCH=1: entropy-gated top-2 cliff branch (default off) ──
+        //
+        // Coding acceptance dies because the linear γ=16 chain hits ONE
+        // high-entropy content token (the "cliff") where the drafter's top-1 is
+        // a coin-flip, the chain truncates there, and the whole predictable tail
+        // after it is thrown away. Instead of committing only top-1 at that one
+        // cliff, spend ONE of the 16 nodes on a SIBLING carrying the drafter's
+        // top-2 token at the cliff row: a 2-way fork. The target verifies both
+        // candidates and the greedy walk commits whichever it would have picked
+        // — covering the cliff with two shots roughly doubles the chance of
+        // clearing it. K is held at γ+1=17 (the CUDA graph shape): we shorten
+        // the linear chain depth by 1 (drop the last chain node) and reuse that
+        // node as the sibling, so drafts.len() (== node count) is UNCHANGED and
+        // the K=17 verify graph is never re-captured.
+        //
+        // LOSSLESS by construction. The DFlash verify is a greedy oracle:
+        // greedy_sample_ddtree walks the tree with the target's per-row argmax
+        // and commits a draft token ONLY when draft == target_argmax; the bonus
+        // is always the target's greedy token. The sibling merely gives the walk
+        // a SECOND candidate to match at the cliff — it can never change which
+        // token the target commits (proven by greedy byte-match ON vs OFF).
+        //
+        // GATE (the whole point): branch ONLY at a real cliff (lowest margin <
+        // threshold). On confident / structural blocks (counting, prose,
+        // boilerplate code) every row has a large top1−top2 margin, the gate
+        // stays closed, the flat chain is emitted unchanged, and those workloads
+        // do not regress. The threshold is tuned to fire on the bursty
+        // high-entropy content token that code blocks usually contain exactly
+        // one of per γ-block.
+        // ── ATLAS_DFLASH_CATERPILLAR=1: depth-contiguous Sequoia-DP caterpillar
+        //    (default off) ──
+        //
+        // The successor to ATLAS_DFLASH_BRANCH. The branch builder placed the
+        // fork leaf at the LAST compact slot (slot ≫ depth), so committing the
+        // fork tail required relocating KV whose RoPE/attention were baked at
+        // the wrong slot — corrupting counting md5 (the `1..7 1..` reset).
+        //
+        // The caterpillar fixes this with a DEPTH-CONTIGUOUS layout
+        // (`build_caterpillar_payload`): the top-1 chain is the spine at compact
+        // slots 1..S, and the top-2 fork is a LEAF placed at compact slot ==
+        // its tree depth (right after its parent), with the spine continuation
+        // shifted one slot deeper. Then RoPE position == depth and the leaf's
+        // slot-prefix == its ancestor chain, so tree-path-commit + KV-compaction
+        // become byte-exact for the committed fork branch (see the builder's
+        // module doc for the full invariant proof).
+        //
+        // Cliff gate: the margin gate below picks the SHALLOWEST low-margin row
+        // (EAGLE-2: shallow accept ≫ deep). Under pure flat verify metadata only
+        // the single shallowest fork is strictly lossless; deeper cliffs need
+        // the depth-RoPE tree-aware verify path. So this builds a one-fork
+        // depth-contiguous caterpillar per block and relies on the lossless
+        // greedy oracle (verify commits only draft == target argmax) for safety.
+        let caterpillar_enabled = policy.caterpillar;
+        if caterpillar_enabled && drafts.len() >= 3 {
+            let margin_thresh = policy.branch_margin;
+            let n = drafts.len();
+            match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
+                Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
+                    // Shallowest cliff: first row (depth) in [1, n) whose top1−top2
+                    // margin drops below threshold. Row index r == spine depth of
+                    // the node the fork attaches BELOW (slot r in compact frame).
+                    let mut cliff = 0usize;
+                    let mut cliff_margin = f32::INFINITY;
+                    for r in 1..n - 1 {
+                        let m = match checked_topk_difference(
+                            topk_logits[2 * r],
+                            topk_logits[2 * r + 1],
+                        ) {
+                            Ok(margin) => margin,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "DFlash CATERPILLAR invalid top-2 row {r} ({error:#}); flat chain fallback"
+                                );
+                                dstate.pending_tree_payload = None;
+                                return Ok(drafts);
+                            }
+                        };
+                        if m < margin_thresh {
+                            cliff = r;
+                            cliff_margin = m;
+                            break;
+                        }
+                    }
+                    let fork_tok = if cliff >= 1 {
+                        topk_tokens[2 * cliff + 1]
+                    } else {
+                        0
+                    };
+                    if cliff >= 1 && cliff_margin < margin_thresh && fork_tok != drafts[cliff] {
+                        // build_caterpillar_payload takes the fork's tree DEPTH:
+                        // the fork is a child of the spine node at depth `cliff`
+                        // (compact slot `cliff`), so the leaf's depth = cliff + 1.
+                        //
+                        // ATLAS_DFLASH_CAT_TAIL=1: the EV variant — the top-2
+                        // fork carries the post-cliff predictable tail (the
+                        // linear drafts after the cliff, re-rooted on top-2) as
+                        // a contiguous run; the top-1-at-cliff becomes the
+                        // high-slot leaf. Gains when the target's greedy picks
+                        // top-2 at the cliff and the tail re-accepts. Default
+                        // (off) keeps the lossless single-leaf fork (no tail,
+                        // no contamination), which proved no-gain at K=17.
+                        let cat_tail =
+                            std::env::var("ATLAS_DFLASH_CAT_TAIL").ok().as_deref() == Some("1");
+                        let payload = if cat_tail {
+                            let tail: Vec<u32> = drafts[(cliff + 1).min(drafts.len())..].to_vec();
+                            super::ddtree::build_caterpillar_tail_payload(
+                                &drafts,
+                                fork_tok,
+                                cliff + 1,
+                                &tail,
+                            )
+                        } else {
+                            super::ddtree::build_caterpillar_payload(&drafts, fork_tok, cliff + 1)
+                        };
+                        static CAT_DBG: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let dbg = CAT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if dbg < 8 {
+                            tracing::info!(
+                                "DFlash CATERPILLAR #{dbg}: n={n} cliff_depth={} margin={cliff_margin:.2} \
+                                 fork_tok={fork_tok} spine_top1={} tokens[..min(8)]={:?} parents[..min(8)]={:?}",
+                                cliff + 1,
+                                drafts[cliff],
+                                &payload.tree_token_ids[..payload.tree_token_ids.len().min(8)],
+                                &payload.parent_indices[..payload.parent_indices.len().min(8)],
+                            );
+                        }
+                        dstate.pending_tree_payload = Some(payload);
+                        dstate.last_num_drafted = drafts.len();
+                        return Ok(drafts);
+                    }
+                    // Gate closed → flat chain, identical to non-branch path.
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+                Ok(_) => {
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash CATERPILLAR top-2 extraction failed ({e}); flat chain fallback"
+                    );
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+            }
+        }
+
+        // ── ATLAS_DFLASH_FREE_SLOTS=<N>: free-slot branch verify (default off) ──
+        //
+        // The whole thesis of the K=32 verify: it is weight-bandwidth-bound, so
+        // verifying 32 nodes costs the same wall-clock as 17. The free 15 slots
+        // are free candidate tokens. Instead of a single cliff fork (BRANCH /
+        // CATERPILLAR, both held at K=17 by dropping spine nodes), keep the full
+        // γ spine AND spend the extra slots on SIBLING BRANCHES placed at the
+        // low-confidence draft positions where the chain statistically dies
+        // (the cliffs) — the DDTree / SAM-retrieval finding (+46% accept on
+        // coding). Each branch carries the drafter's top-2 at the cliff plus a
+        // short re-rooted tail; multiple branches fill the budget shallowest
+        // first (EAGLE-2: shallow accept dominates).
+        //
+        // The verify-side persistent buffers (parent_ids, SSM intermediates,
+        // hidden_save) must have been constructed for the wider tree; the
+        // immutable outer budget enforces their actual capacity. To
+        // commit the deep branch tails byte-exactly,
+        // ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 (per-row
+        // ancestor KV indirection) + ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 +
+        // ATLAS_DFLASH_TREE_COMMIT=1. NOTE (2026-07-08 root cause):
+        // ATLAS_DDTREE_DFS_REORDER's depth-prefix reads are ancestor-exact
+        // only for the spine; a branch row's own argmax (consumed for tail
+        // acceptance + the tip bonus) is mis-conditioned, so deep commits
+        // under DFS corrupt — the scheduler now degrades them to flat-safe
+        // (see `build_free_slots_payload` doc). Default off ⇒ byte-identical
+        // to the flat γ=16 path.
+        //
+        // N = the number of sibling branches to place (each ≈ 1 + tail_len
+        // extra nodes). The builder self-limits to the ddtree capacity.
+        let free_slots = policy.free_slots;
+        if free_slots >= 1 && drafts.len() >= 3 {
+            let margin_thresh = policy.branch_margin;
+            // Per-branch tail length (post-cliff continuation carried on the
+            // sibling). 0 = bare 1-node fork leaves. Default 4 — enough of the
+            // predictable post-cliff structure (indentation/closers) to re-accept.
+            let tail_len = policy.free_slots_tail;
+            let n = drafts.len();
+            match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
+                Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
+                    // Per-row top1−top2 margins over the spine rows.
+                    let margins: Result<Vec<f32>> = (0..n)
+                        .map(|r| {
+                            checked_topk_difference(topk_logits[2 * r], topk_logits[2 * r + 1])
+                        })
+                        .collect();
+                    let margins = match margins {
+                        Ok(margins) => margins,
+                        Err(error) => {
+                            tracing::warn!(
+                                "DFlash FREE_SLOTS invalid top-2 result ({error:#}); flat chain fallback"
+                            );
+                            dstate.pending_tree_payload = None;
+                            return Ok(drafts);
+                        }
+                    };
+                    let cliffs =
+                        super::ddtree::pick_free_slot_cliffs(&margins, margin_thresh, free_slots);
+                    // Build one FreeSlotBranch per cliff: fork = the drafter's
+                    // top-2 at that row; tail = the spine's own post-cliff
+                    // tokens (re-rooted onto the fork — the predictable
+                    // continuation the chain would have produced past the cliff).
+                    let branches: Vec<super::ddtree::FreeSlotBranch> = cliffs
+                        .iter()
+                        .filter_map(|&cliff_depth| {
+                            let row = cliff_depth - 1; // 0-based spine row
+                            let fork_token = topk_tokens[2 * row + 1]; // top-2
+                            // Skip a degenerate fork that equals the spine token.
+                            if fork_token == drafts[row] {
+                                return None;
+                            }
+                            let tail: Vec<u32> = drafts[(row + 1).min(n)..]
+                                .iter()
+                                .take(tail_len)
+                                .copied()
+                                .collect();
+                            Some(super::ddtree::FreeSlotBranch {
+                                cliff_depth,
+                                fork_token,
+                                tail,
+                            })
+                        })
+                        .collect();
+                    if branches.is_empty() {
+                        // No usable cliff → flat chain, identical to baseline.
+                        dstate.pending_tree_payload = None;
+                        return Ok(drafts);
+                    }
+                    // The outer caller and physical capacity jointly bound the tree.
+                    let max_nodes = budget.tree_nodes;
+                    let payload =
+                        super::ddtree::build_free_slots_payload(&drafts, &branches, max_nodes);
+                    static FREE_DBG: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let dbg = FREE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if dbg < 8 {
+                        tracing::info!(
+                            "DFlash FREE_SLOTS #{dbg}: γ={n} branches={} cliffs={:?} max_nodes={} \
+                             nodes={} tokens[..min(10)]={:?} parents[..min(10)]={:?}",
+                            branches.len(),
+                            cliffs,
+                            max_nodes,
+                            payload.tree_token_ids.len(),
+                            &payload.tree_token_ids[..payload.tree_token_ids.len().min(10)],
+                            &payload.parent_indices[..payload.parent_indices.len().min(10)],
+                        );
+                    }
+                    dstate.pending_tree_payload = Some(payload);
+                    dstate.last_num_drafted = drafts.len();
+                    return Ok(drafts);
+                }
+                Ok(_) => {
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash FREE_SLOTS top-2 extraction failed ({e}); flat chain fallback"
+                    );
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+            }
+        }
+
+        let branch_enabled = policy.branch;
+        if branch_enabled && drafts.len() >= 3 {
+            // Margin threshold in raw-BF16-logit units (top tokens are O(10-30),
+            // so a margin below ~2-4 means the drafter is genuinely unsure).
+            let margin_thresh = policy.branch_margin;
+            let n = drafts.len();
+            // Extract per-row top-2 (token + logit), sorted descending. Row i
+            // holds [top1_logit, top2_logit] at indices 2i, 2i+1 and the
+            // matching tokens. Reuses the same scratch logits forward_block
+            // just populated (survives until next propose).
+            match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
+                Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
+                    // Cliff selection. Restrict to rows [1 .. n-1): row 0 is the
+                    // token right after the bonus (its accept gates the whole
+                    // chain anyway), and the last row is the node spent on the
+                    // sibling. Two policies (ATLAS_DFLASH_BRANCH_CLIFF):
+                    //   "first" (default): the FIRST row whose margin drops below
+                    //     threshold. This is the row that ACTUALLY truncates the
+                    //     chain — branching a later (lower-margin) row the chain
+                    //     never reaches is useless. Critical: the global-min row
+                    //     is typically deep (12-13), far past the ~row-3 mean
+                    //     accept on coding, so it is never verified.
+                    //   "min": the global lowest-margin row (diagnostic).
+                    let cliff_first =
+                        std::env::var("ATLAS_DFLASH_BRANCH_CLIFF").ok().as_deref() != Some("min");
+                    let mut cliff = 0usize;
+                    let mut min_margin = f32::INFINITY;
+                    if cliff_first {
+                        for r in 1..n - 1 {
+                            let m = match checked_topk_difference(
+                                topk_logits[2 * r],
+                                topk_logits[2 * r + 1],
+                            ) {
+                                Ok(margin) => margin,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "DFlash BRANCH invalid top-2 row {r} ({error:#}); flat chain fallback"
+                                    );
+                                    dstate.pending_tree_payload = None;
+                                    return Ok(drafts);
+                                }
+                            };
+                            if m < margin_thresh {
+                                cliff = r;
+                                min_margin = m;
+                                break;
+                            }
+                        }
+                    } else {
+                        for r in 1..n - 1 {
+                            let m = match checked_topk_difference(
+                                topk_logits[2 * r],
+                                topk_logits[2 * r + 1],
+                            ) {
+                                Ok(margin) => margin,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "DFlash BRANCH invalid top-2 row {r} ({error:#}); flat chain fallback"
+                                    );
+                                    dstate.pending_tree_payload = None;
+                                    return Ok(drafts);
+                                }
+                            };
+                            if m < min_margin {
+                                min_margin = m;
+                                cliff = r;
+                            }
+                        }
+                    }
+                    let sib_token = topk_tokens[2 * cliff + 1]; // top-2 at cliff
+                    // ATLAS_DFLASH_BRANCH_TAIL selects which fork carries the
+                    // post-cliff predictable tail (only the tail laid on the
+                    // CONTIGUOUS flat chain `[1,2,..]` is committed under the
+                    // deployable flat-safe greedy contract — the other fork is a
+                    // leaf reachable only as a single bonus):
+                    //   "top1" (default): main flat chain stays on the drafter's
+                    //     top-1 at the cliff (tail off top-1); the top-2 is a leaf
+                    //     sibling. Lossless AND byte-stable, but cannot beat flat
+                    //     for greedy (flat already emits the target's greedy at
+                    //     the cliff as the free bonus) — a no-gain control.
+                    //   "top2": the main flat chain takes the drafter's TOP-2 at
+                    //     the cliff (tail off top-2, contiguous KV) and the top-1
+                    //     becomes the leaf. Commits the post-cliff tail when the
+                    //     target's greedy == top-2 at the low-margin cliff — the
+                    //     EV bet that pays off at near-equiprobable cliffs.
+                    let tail_top2 =
+                        std::env::var("ATLAS_DFLASH_BRANCH_TAIL").ok().as_deref() == Some("top2");
+                    if cliff >= 1 && min_margin < margin_thresh && sib_token != drafts[cliff] {
+                        // Build the n-node branched payload (K=17 preserved).
+                        // `chain_tok[cliff]` is the token the MAIN flat chain
+                        // carries at the cliff; `leaf_tok` is the forked leaf.
+                        let (chain_cliff_tok, leaf_tok) = if tail_top2 {
+                            (sib_token, drafts[cliff]) // main chain = top-2
+                        } else {
+                            (drafts[cliff], sib_token) // main chain = top-1
+                        };
+                        // Main flat chain over compact 0..n-1: drafts for every
+                        // row except the cliff (which carries chain_cliff_tok).
+                        // The chain is shortened by one row (the last) to free a
+                        // node for the leaf sibling.
+                        let mut tree_token_ids: Vec<u32> = Vec::with_capacity(n);
+                        for i in 0..n - 1 {
+                            tree_token_ids.push(if i == cliff {
+                                chain_cliff_tok
+                            } else {
+                                drafts[i]
+                            });
+                        }
+                        // Leaf sibling at the last compact slot: forks at the
+                        // cliff (parent = cliff-1, sharing the cliff's parent).
+                        tree_token_ids.push(leaf_tok);
+                        let mut parent_indices: Vec<i32> = Vec::with_capacity(n);
+                        parent_indices.push(-1);
+                        for i in 1..n - 1 {
+                            parent_indices.push((i - 1) as i32);
+                        }
+                        parent_indices.push((cliff as i32) - 1);
+
+                        static BRANCH_DBG: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let dbg = BRANCH_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if dbg < 8 {
+                            tracing::info!(
+                                "DFlash BRANCH #{dbg}: n={n} cliff_row={cliff} margin={min_margin:.2} \
+                                 (thresh={margin_thresh}) tail_top2={tail_top2} chain_cliff={} leaf={} \
+                                 parents[..min(8)]={:?}",
+                                chain_cliff_tok,
+                                leaf_tok,
+                                &parent_indices[..parent_indices.len().min(8)],
+                            );
+                        }
+                        dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                            tree_token_ids,
+                            parent_indices,
+                        });
+                        dstate.last_num_drafted = drafts.len();
+                        return Ok(drafts);
+                    } else {
+                        static BRANCH_FLAT_DBG: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let dbg =
+                            BRANCH_FLAT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if dbg < 5 {
+                            tracing::info!(
+                                "DFlash BRANCH gate CLOSED #{dbg}: min_margin={min_margin:.2} \
+                                 >= thresh={margin_thresh} (flat chain, no tree payload)"
+                            );
+                        }
+                        // Gate closed → flat chain, identical to non-branch path.
+                        dstate.pending_tree_payload = None;
+                        return Ok(drafts);
+                    }
+                }
+                Ok(_) => {
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash BRANCH top-2 extraction failed ({e}); flat chain fallback"
+                    );
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+            }
+        }
+
+        // Corroborated SAM extension: keep the neural drafter as the quality
+        // oracle, but use a longer retrieval continuation when both sources
+        // independently agree on a configurable prefix. This avoids tree
+        // policy semantics and never widens on an uncorroborated suffix hit.
+        if corroborate_on
+            && let Some(retrieval) = corroborated_retrieval_chain.take()
+            && retrieval_corroborates_drafter(&drafts, &retrieval, corroborate_min)
+        {
+            static CORROBORATE_DBG: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !CORROBORATE_DBG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "DFlash SAM corroborated extension: drafter_len={} retrieval_len={} prefix={}",
+                    drafts.len(),
+                    retrieval.len(),
+                    corroborate_min,
+                );
+            }
+            dstate.pending_tree_payload = None;
+            dstate.last_num_drafted = retrieval.len();
+            dstate.first_propose_done = true;
+            return Ok(retrieval);
+        }
+
+        // ── PORTFOLIO fusion (ATLAS_DFLASH_PORTFOLIO=1) ──
+        // If a retrieval sibling chain was stashed above, fuse it with the
+        // freshly-proposed drafter chain into a 2-root forest payload and
+        // return. The drafter chain (chain A) is emitted as the flat `drafts`
+        // (so the verify's `verify_input_tokens` chain-tail matches and the
+        // flat-safe fallback stays byte-exact to the drafter baseline); the
+        // retrieval chain rides the sibling B branch via `tree_token_ids`.
+        // Requires the depth-aware verify path at the scheduler
+        // (ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 + ATLAS_DDTREE_DFS_REORDER=1 or
+        // ATLAS_DDTREE_TREE_AWARE_VERIFY=1) for chain B to commit past depth 1;
+        // lossless regardless (greedy oracle rejects any mis-conditioned row).
+        if portfolio_active && !drafts.is_empty() {
+            if let Some(retr_chain) = portfolio_retrieval_chain.take() {
+                let max_nodes = budget.tree_nodes;
+                let payload =
+                    super::ddtree::build_portfolio_payload(&drafts, &retr_chain, max_nodes);
+                static PORTF_FUSE_DBG: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !PORTF_FUSE_DBG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "DFlash PORTFOLIO fuse: chain_a(drafter)={} chain_b(retrieval)={} \
+                         → forest nodes={} max_nodes={}",
+                        drafts.len(),
+                        retr_chain.len(),
+                        payload.tree_token_ids.len(),
+                        max_nodes,
+                    );
+                }
+                dstate.last_num_drafted = drafts.len();
+                dstate.first_propose_done = true;
+                dstate.pending_tree_payload = Some(payload);
+                return Ok(drafts);
+            }
+            // Portfolio on but no retrieval sibling this step → plain flat
+            // drafter chain (no tree payload). Byte-identical to baseline.
+            dstate.pending_tree_payload = None;
+            dstate.last_num_drafted = drafts.len();
+            dstate.first_propose_done = true;
+            return Ok(drafts);
+        }
+
+        // DDTree payload construction (`ATLAS_DFLASH_METHOD=ddtree`):
+        // - Default path extracts per-MASK-position top-K candidates from GPU
+        //   logits (`extract_topk_from_logits`) and builds a best-first tree
+        //   (`build_ddtree` / `build_parent_conditioned_tree`).
+        // - `ATLAS_DDTREE_CHAIN_ONLY=1` emits a flat-chain payload to keep
+        //   `requires_tree_kernel` false (wy17 parity validation).
+        // - `ATLAS_DDTREE_NONFLAT=1` emits a minimal 2-branch root-sibling
+        //   payload from top-1 drafts to exercise the tree GDN kernel directly.
+        let ddtree_active = policy.ddtree;
+        let nonflat_enabled = policy.ddtree_nonflat;
+        static PAYLOAD_DBG_DONE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if ddtree_active && !PAYLOAD_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(
+                "DFlash DDTree proposal initialized: nonflat_enabled={} drafts_len={}",
+                nonflat_enabled,
+                drafts.len()
+            );
+        }
+        // ATLAS_DDTREE_CHAIN_ONLY=1: produce a strict flat chain even in DDTree
+        // mode so requires_tree_kernel returns false → wy17 path fires → no
+        // numerical drift vs baseline. Validates that the drift cascade isolation
+        // diagnosis from m8a_diff.py is correct.
+        let chain_only = policy.ddtree_chain_only;
+        if chain_only && ddtree_active && !drafts.is_empty() {
+            let n = drafts.len();
+            let mut parent_indices = Vec::with_capacity(n);
+            parent_indices.push(-1i32);
+            for i in 0..n.saturating_sub(1) {
+                parent_indices.push(i as i32);
+            }
+            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                tree_token_ids: drafts.clone(),
+                parent_indices,
+            });
+            dstate.last_num_drafted = drafts.len();
+            dstate.first_propose_done = true;
+            return Ok(drafts);
+        }
+        if ddtree_active && nonflat_enabled && drafts.len() >= 2 {
+            // M4B v2 lite: build a NON-FLAT tree from existing γ_eff drafts so
+            // the M8A kernel actually fires (flat payloads short-circuit to
+            // wy_k). Topology: drafts[0..n-1] form the main chain; drafts[n-1]
+            // becomes a SIBLING of drafts[0] under root.
+            //
+            //                       root
+            //                      /    \
+            //               drafts[0]   drafts[n-1]     ← sibling branch
+            //                  |
+            //               drafts[1]
+            //                  |
+            //                 ...
+            //                  |
+            //               drafts[n-2]
+            //
+            // tree_token_ids order is drafts[0..n], parent_indices keys to
+            // those compact indices. drafts[n-1] sits at compact index n-1
+            // with parent -1 (root) — breaks the flat-chain assumption.
+            let n = drafts.len();
+            let mut parent_indices = Vec::with_capacity(n);
+            parent_indices.push(-1i32); // drafts[0] → root
+            for i in 1..n.saturating_sub(1) {
+                parent_indices.push((i - 1) as i32); // drafts[i] → drafts[i-1]
+            }
+            // drafts[n-1] also attaches to root — this is the sibling.
+            if n >= 2 {
+                parent_indices.push(-1i32);
+            }
+            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                tree_token_ids: drafts.clone(),
+                parent_indices,
+            });
+        } else if ddtree_active && !drafts.is_empty() {
+            // M4B v2: real top-K DDTree. Extract per-MASK-position top-K
+            // tokens from `self.scratch.logits` (already populated by the
+            // forward_block call above; survives until next propose), seed
+            // the [`super::ddtree::build_ddtree`] best-first builder, then
+            // serialize the result into [`TreePayload`].
+            //
+            // Set ATLAS_DDTREE_CHAIN_ONLY=1 (handled above as an early
+            // return) to bypass this path and emit the legacy flat-chain
+            // payload — needed when validating bit-equivalence of the wy17
+            // GDN kernel before turning on the tree-aware verifier.
+            // Match legacy env var naming (DDTREE_*) with an Atlas-prefixed
+            // alias (ATLAS_DDTREE_*) for consistency with the rest of the
+            // codebase. Legacy serve scripts set the unprefixed names.
+            let atlas_top_k = std::env::var("ATLAS_DDTREE_TOP_K");
+            let legacy_top_k = std::env::var("DDTREE_TOP_K");
+            let lm_vocab = self.target_vocab_size.min(self.vocab_size);
+            let top_k = match parse_ddtree_top_k(atlas_top_k, legacy_top_k, lm_vocab) {
+                Ok(k) => k,
+                Err(error) => {
+                    tracing::warn!(
+                        "DDTree invalid requested top-K ({error:#}); emitting flat-chain payload"
+                    );
+                    let n = drafts.len();
+                    let mut parent_indices = Vec::with_capacity(n);
+                    parent_indices.push(-1i32);
+                    for i in 0..n.saturating_sub(1) {
+                        parent_indices.push(i as i32);
+                    }
+                    dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                        tree_token_ids: drafts.clone(),
+                        parent_indices,
+                    });
+                    return Ok(drafts);
+                }
+            };
+            let tree_build_budget: usize = std::env::var("ATLAS_DDTREE_BUDGET")
+                .ok()
+                .or_else(|| std::env::var("DDTREE_BUDGET").ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15)
+                .max(1)
+                .min(budget.tree_nodes);
+            let min_root_branches: usize = std::env::var("ATLAS_DDTREE_MIN_ROOT_BRANCHES")
+                .ok()
+                .or_else(|| std::env::var("DDTREE_MIN_ROOT_BRANCHES").ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2);
+            let chain_seed = std::env::var("ATLAS_DDTREE_CHAIN_SEED").ok().as_deref() != Some("0");
+
+            // Extract top-K logits from the just-computed γ_eff logit rows.
+            let gamma_eff = drafts.len();
+            match self.extract_topk_from_logits(ctx.gpu, _stream, gamma_eff, top_k) {
+                Ok((topk_tokens, topk_logits)) => {
+                    // Reshape into [γ_eff][top_k] DraftCandidate vectors.
+                    // logprob_proxy = logit - row_max so the top-1 row gets 0
+                    // and the rest are negative — preserves ranking and acts
+                    // as a sensible additive path-score for the best-first
+                    // tree builder. Real log-softmax would require a vocab-
+                    // wide reduction we want to avoid in this hot path.
+                    let candidates_by_depth: Result<Vec<Vec<super::ddtree::DraftCandidate>>> = (0
+                        ..gamma_eff)
+                        .map(|row| {
+                            let base = row * top_k;
+                            let row_max = topk_logits[base];
+                            let row_cands: Result<Vec<super::ddtree::DraftCandidate>> = (0..top_k)
+                                .filter(|&i| topk_logits[base + i] > f32::NEG_INFINITY)
+                                .map(|i| {
+                                    Ok(super::ddtree::DraftCandidate {
+                                        token_id: topk_tokens[base + i],
+                                        logprob: checked_topk_difference(
+                                            topk_logits[base + i],
+                                            row_max,
+                                        )?,
+                                    })
+                                })
+                                .collect();
+                            let row_cands = row_cands?;
+                            if row_cands.is_empty() {
+                                anyhow::bail!("DDTree top-K row {row} has no usable candidates");
+                            }
+                            Ok(row_cands)
+                        })
+                        .collect();
+                    let candidates_by_depth = match candidates_by_depth {
+                        Ok(candidates) => candidates,
+                        Err(error) => {
+                            tracing::warn!(
+                                "DDTree top-K normalization failed ({error:#}); emitting flat-chain payload"
+                            );
+                            let n = drafts.len();
+                            let mut parent_indices = Vec::with_capacity(n);
+                            parent_indices.push(-1i32);
+                            for i in 0..n.saturating_sub(1) {
+                                parent_indices.push(i as i32);
+                            }
+                            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                                tree_token_ids: drafts.clone(),
+                                parent_indices,
+                            });
+                            return Ok(drafts);
+                        }
+                    };
+
+                    // Root token is irrelevant for the payload (tree_token_ids
+                    // skips index 0); pass u32::MAX as a sentinel.
+                    let parent_conditioned = self.checkpoint_family
+                        == crate::weight_loader::DrafterCheckpointFamily::Dspark
+                        && std::env::var("ATLAS_DSPARK_PARENT_TREE").ok().as_deref() == Some("1");
+                    let tree_result = if parent_conditioned {
+                        super::ddtree::build_parent_conditioned_tree(
+                            &candidates_by_depth,
+                            tree_build_budget,
+                            top_k,
+                            u32::MAX,
+                        )
+                    } else {
+                        super::ddtree::build_ddtree(
+                            &candidates_by_depth,
+                            tree_build_budget,
+                            top_k,
+                            chain_seed,
+                            min_root_branches,
+                            u32::MAX,
+                        )
+                    };
+                    match tree_result {
+                        Ok(tree) => {
+                            let tree_token_ids = tree.token_ids_for_verifier();
+                            let parent_indices = tree.parent_indices_for_verifier();
+                            static TOPK_TREE_DBG_DONE: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !TOPK_TREE_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                tracing::info!(
+                                    "DFlash DDTree top-K tree built: γ_eff={} k={} budget={} \
+                                     min_root_branches={} chain_seed={} parent_conditioned={} \
+                                     → nodes={} parent_indices={:?} \
+                                     tokens[..min(8)]={:?}",
+                                    gamma_eff,
+                                    top_k,
+                                    tree_build_budget,
+                                    min_root_branches,
+                                    chain_seed,
+                                    parent_conditioned,
+                                    tree_token_ids.len(),
+                                    parent_indices,
+                                    &tree_token_ids[..tree_token_ids.len().min(8)],
+                                );
+                            }
+                            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                                tree_token_ids,
+                                parent_indices,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "DDTree build_ddtree failed ({e}); falling back \
+                                 to flat-chain payload"
+                            );
+                            // Flat-chain fallback so the dispatch chain still
+                            // sees a valid (degenerate) payload.
+                            let n = drafts.len();
+                            let mut parent_indices = Vec::with_capacity(n);
+                            parent_indices.push(-1i32);
+                            for i in 0..n.saturating_sub(1) {
+                                parent_indices.push(i as i32);
+                            }
+                            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                                tree_token_ids: drafts.clone(),
+                                parent_indices,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DDTree top-K extraction failed ({e}); emitting flat-chain payload"
+                    );
+                    let n = drafts.len();
+                    let mut parent_indices = Vec::with_capacity(n);
+                    parent_indices.push(-1i32);
+                    for i in 0..n.saturating_sub(1) {
+                        parent_indices.push(i as i32);
+                    }
+                    dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                        tree_token_ids: drafts.clone(),
+                        parent_indices,
+                    });
+                }
+            }
+        } else {
+            dstate.pending_tree_payload = None;
+        }
+        Ok(drafts)
+    }
+}
+
+#[cfg(test)]
+mod corroboration_tests {
+    use super::retrieval_corroborates_drafter;
+
+    #[test]
+    fn requires_a_longer_chain_and_matching_prefix() {
+        assert!(retrieval_corroborates_drafter(
+            &[1, 2, 3, 4, 9, 9],
+            &[1, 2, 3, 4, 5, 6, 7],
+            4,
+        ));
+        assert!(!retrieval_corroborates_drafter(
+            &[1, 2, 3, 4, 9, 9],
+            &[1, 2, 3, 8, 5, 6, 7],
+            4,
+        ));
+        assert!(!retrieval_corroborates_drafter(
+            &[1, 2, 3, 4],
+            &[1, 2, 3, 4],
+            4,
+        ));
+    }
+}

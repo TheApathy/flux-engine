@@ -1,0 +1,103 @@
+{
+  "milestone": "Milestone 2 — Native 262K Context Qualification (R2)",
+  "verdict": "PASS",
+  "timestamp_utc": "2026-10-24T14:33:17Z",
+  "hardware": "NVIDIA DGX Spark (GB10, SM121a, 128 GB unified memory)",
+  "model": "Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+  "binary": "target/release/flux-server",
+  "binary_sha256": "4eebc7dfe11bf97919b4df33c663fca0835d6a34f267b84a6bcbbb4b81784549",
+  "recipe": "flux-qwen4-native-262k-w4096-bf16-owner16.env",
+  "gate": "native-262k-w4096-owner16",
+  "artifacts": {
+    "server_log": "qualification/native262k/server.log",
+    "server_log_sha256": "58c8b895d8d06f461b221a996629069bfd844363a0299a0768e41e3977cee70e",
+    "responses_jsonl": "qualification/native262k/responses.jsonl",
+    "responses_jsonl_sha256": "efff093f1fd6a7c75db500d055adf20606629d8566b29b798c278fdb8aba8049",
+    "report_json": "qualification/native262k/report.json",
+    "report_json_sha256": "473352696fc01225d505d461ebb57226e8eae331d0cfd504534c17aa1e14ff1a",
+    "memory_samples_csv": "qualification/native262k/memory_samples.csv",
+    "memory_samples_sha256": "7ab7a45c3bd8ccb0d69b6030c3ad0cbf75dcbc291292c72d484087bb7b982704",
+    "kernel_journal": "qualification/native262k/kernel-summary.json",
+    "kernel_journal_sha256": "360988afcade0738dd5a730d42fbef02ae4f275aedf2aaf3d2ccdd53ffd61637",
+    "kernel_journal_historical_pre_sanitization_sha256": "eaf8c6d989da982446e681110f60f4052b08aba10de38a366f6cef37854db7ed",
+    "server_log_note": "qualification/native262k/server.log is omitted from the public OSS checkout; server_log_sha256 records the historical pre-sanitization digest."
+  },
+  "context_parameters": {
+    "max_seq_len": 262144,
+    "chunk_width_tokens": 4096,
+    "kv_cache_dtype": "bf16",
+    "qsa_operand_core": "qsa_sparse_bf16_non_bit_exact",
+    "speculative_mode": "none (disabled)"
+  },
+  "needle_retrieval_summary": {
+    "prompt_tokens": 262080,
+    "depths": [
+      0.01,
+      0.25,
+      0.5,
+      0.75,
+      0.99
+    ],
+    "passkeys": {
+      "ALPHA": "alpha-0731826",
+      "BETA": "beta-0492175",
+      "GAMMA": "gamma-0863204",
+      "DELTA": "delta-0184932",
+      "EPSILON": "epsilon-0952174"
+    },
+    "all_passkeys_retrieved": true,
+    "greedy_repeat_identical": true,
+    "forced_endpoint_fill_passkeys_retrieved": true
+  },
+  "boundary_and_overflow": {
+    "control_prompt_tokens": 262080,
+    "control_token_id": 15,
+    "boundary_prompt_tokens": 262143,
+    "boundary_requested_tokens": 1,
+    "boundary_total_tokens": 262144,
+    "boundary_admitted": true,
+    "boundary_token_id_matches_control": true,
+    "overflow_prompt_tokens": 262144,
+    "overflow_requested_tokens": 1,
+    "overflow_total_tokens": 262145,
+    "overflow_http_status": 400,
+    "overflow_error_type": "invalid_request_error",
+    "overflow_request_id_correlated": true,
+    "overflow_scheduler_dispatches": 0,
+    "overflow_metric_deltas": {
+      "atlas_prefill_progress_chunks_total": 0,
+      "atlas_prefill_progress_tokens_total": 0
+    }
+  },
+  "post_overflow_recovery": {
+    "health_check_status": 200,
+    "canary_prompt_tokens": 262080,
+    "canary_requested_tokens": 1,
+    "canary_token_id_matches_control": true,
+    "canary_metric_deltas": {
+      "atlas_prefill_progress_chunks_total": 64,
+      "atlas_prefill_progress_tokens_total": 262080
+    },
+    "recovery_verified": true
+  },
+  "telemetry": {
+    "bounded_transpose_owners_ready_count": 48,
+    "destination_owners_total": 4176,
+    "destination_owner_cap_mib": 16,
+    "source_group_cap_mib": 64,
+    "qsa_side_cache_initialized": true,
+    "terminal_qsa_receipts_exact": true,
+    "fatal_log_markers": 0,
+    "kernel_fatal_events": 0
+  },
+  "memory_compliance": {
+    "measured_floor_mib": 21016,
+    "required_floor_mib": 6656,
+    "watchdog_kills": 0,
+    "compliance": true
+  },
+  "independent_review": {
+    "reviewer_signoff": true,
+    "checklist_complete": true
+  }
+}

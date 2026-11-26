@@ -1,0 +1,342 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// GPU-side predictor: loads the three PTX modules emitted by build.rs,
+// owns persistent device buffers for `P` (projection) and `K_lr` (per-token
+// low-rank projected keys per block × kv_head × token), and exposes three
+// operations:
+//
+//   1. project_q       — Q @ P, per decode step
+//   2. project_kv_block — K_lr[layer, block, kv_head, tok] = K_block[tok, kv_head] @ P, at write time
+//   3. score_blocks    — max over (q_head, tok) of ⟨q_proj[q_head], K_lr_seq[blk, kv_head(qh), tok]⟩
+//
+// Lossless contract: scores are *advisory* (eviction priority + prefetch
+// order). Mispredictions never gate attention correctness.
+
+use anyhow::{Context, Result, bail};
+use half::bf16;
+use std::ffi::c_void;
+
+use crate::cuda_min::{CudaCtx, CudaModule, DeviceBuffer, copy_d_to_h, copy_h_to_d, launch_kernel};
+use crate::projection::{PredictorShape, build_projection};
+
+include!(concat!(env!("OUT_DIR"), "/storage_ptx.rs"));
+
+#[derive(Clone, Copy, Debug)]
+pub struct PredictorDims {
+    pub num_layers: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub r: usize,
+    pub block_size: usize,
+    pub max_blocks: usize,
+}
+
+impl PredictorDims {
+    pub fn validate(&self) -> Result<()> {
+        if self.num_kv_heads == 0
+            || self.num_q_heads == 0
+            || !self.num_q_heads.is_multiple_of(self.num_kv_heads)
+        {
+            bail!(
+                "num_q_heads ({}) must be a positive multiple of num_kv_heads ({})",
+                self.num_q_heads,
+                self.num_kv_heads
+            );
+        }
+        Ok(())
+    }
+    pub fn gqa_ratio(&self) -> i32 {
+        (self.num_q_heads / self.num_kv_heads) as i32
+    }
+    pub fn a_g_bytes(&self) -> usize {
+        // K_lr is stored per-token: [num_layers, max_blocks, num_kv_heads, block_size, r]
+        self.num_layers * self.max_blocks * self.num_kv_heads * self.block_size * self.r * 2
+    }
+    pub fn per_layer_block_floats(&self) -> usize {
+        self.num_kv_heads * self.block_size * self.r
+    }
+    pub fn p_bytes(&self) -> usize {
+        self.head_dim * self.r * 2
+    }
+}
+
+pub struct Predictor {
+    dims: PredictorDims,
+    _modules: Vec<CudaModule>,
+    f_q_proj: u64,
+    f_kv_proj: u64,
+    f_score: u64,
+    p_dev: DeviceBuffer,   // [head_dim, r] BF16, immutable after init
+    a_g_dev: DeviceBuffer, // [num_layers, max_blocks, num_kv_heads, block_size, r] BF16
+}
+
+impl Predictor {
+    pub fn new(ctx: &CudaCtx, dims: PredictorDims, projection_seed: u64) -> Result<Self> {
+        Self::new_on_stream(ctx.stream, dims, projection_seed)
+    }
+
+    pub fn new_on_stream(stream: u64, dims: PredictorDims, projection_seed: u64) -> Result<Self> {
+        dims.validate()?;
+        // Load only the predictor PTX modules; tiled-attention kernels are
+        // owned by `TiledAttention` so each subsystem stays self-contained.
+        let mut modules: Vec<CudaModule> = Vec::new();
+        let mut f_q_proj = 0u64;
+        let mut f_kv_proj = 0u64;
+        let mut f_score = 0u64;
+        for entry in STORAGE_PTX.iter() {
+            match entry.name {
+                "q_lowrank_project" | "kv_lowrank_project" | "predictor_score" => {
+                    let ptx_src = entry.ptx();
+                    let m = CudaModule::from_ptx(ptx_src)
+                        .with_context(|| format!("load PTX module {}", entry.name))?;
+                    match entry.name {
+                        "q_lowrank_project" => f_q_proj = m.function("q_lowrank_project")?,
+                        "kv_lowrank_project" => f_kv_proj = m.function("kv_lowrank_project")?,
+                        "predictor_score" => f_score = m.function("predictor_score")?,
+                        _ => unreachable!(),
+                    }
+                    modules.push(m);
+                }
+                _ => {} // tiled-attention modules handled elsewhere
+            }
+        }
+        if f_q_proj == 0 || f_kv_proj == 0 || f_score == 0 {
+            bail!("missing predictor kernel function — PTX list incomplete");
+        }
+        // Allocate and upload P.
+        let shape = PredictorShape::new(dims.head_dim, dims.r);
+        let p_host = build_projection(shape, projection_seed);
+        let p_dev = DeviceBuffer::new(dims.p_bytes())?;
+        copy_h_to_d(p_dev.ptr, &p_host, stream)?;
+        // Preflight A_g sizing against free HBM. A_g grows linearly with
+        // `r × max_blocks × num_layers × num_kv_heads × block_size`, so a
+        // greedy `r=32` default plus a max-seq-len-sized block pool can blow
+        // past free HBM on the EP head (where the MoE-transpose pass already
+        // consumed ~40 GB). The raw `cuMemAlloc_v2` error gives the user
+        // nothing to act on; this preflight names the specific knobs.
+        // PR #47 follow-up — preflight pattern only, no behavior change on
+        // the happy path.
+        let a_g_need = dims.a_g_bytes();
+        let (free_hbm, _total_hbm) = crate::cuda_min::mem_info()?;
+        // Leave a 5% safety margin for the scratch pool, tiled-attention,
+        // and the smaller predictor buffers that follow.
+        let a_g_budget = free_hbm.saturating_mul(95) / 100;
+        if a_g_need > a_g_budget {
+            bail!(
+                "HSS predictor A_g would need {:.2} GB but only {:.2} GB of HBM is free \
+                 (5% margin reserved for scratch + tiled-attention).\n\
+                 Tune one of:\n  \
+                 - --high-speed-swap-rank: current {} ; try {} (halves A_g)\n  \
+                 - --max-seq-len: max_blocks={} → currently dominates A_g; halve --max-seq-len to halve A_g\n  \
+                 - --kv-cache-dtype nvfp4: halves the KV pool, freeing room for A_g\n  \
+                 - --gpu-memory-utilization: lower so weight-side allocations leave more HBM\n\
+                 A_g sizing = num_layers ({}) × max_blocks ({}) × num_kv_heads ({}) × block_size ({}) × r ({}) × 2 bytes.",
+                a_g_need as f64 / (1u64 << 30) as f64,
+                a_g_budget as f64 / (1u64 << 30) as f64,
+                dims.r,
+                dims.r / 2,
+                dims.max_blocks,
+                dims.num_layers,
+                dims.max_blocks,
+                dims.num_kv_heads,
+                dims.block_size,
+                dims.r,
+            );
+        }
+        // Allocate and zero-initialize K_lr (`a_g_dev`) on `stream` so slots that
+        // have not yet been populated by `project_kv_block` (or are offloaded via
+        // `offload_block_no_predict_on_stream`) never expose uninitialized VRAM / NaNs.
+        let a_g_dev = DeviceBuffer::new(a_g_need)?;
+        a_g_dev.zero_on_stream(stream)?;
+        Ok(Self {
+            dims,
+            _modules: modules,
+            f_q_proj,
+            f_kv_proj,
+            f_score,
+            p_dev,
+            a_g_dev,
+        })
+    }
+
+    /// `q` device pointer to `[num_q_heads, head_dim]` BF16.
+    /// `q_proj` device pointer to `[num_q_heads, r]` BF16 output.
+    pub fn project_q(&self, ctx: &CudaCtx, q: u64, q_proj: u64) -> Result<()> {
+        self.project_q_on_stream(ctx.stream, q, q_proj)
+    }
+
+    /// Stream-only variant for production callers that already own a CUDA
+    /// context (and therefore don't need the test-side `CudaCtx` wrapper).
+    pub fn project_q_on_stream(&self, stream: u64, q: u64, q_proj: u64) -> Result<()> {
+        let mut q_v = q;
+        let mut p_v = self.p_dev.ptr;
+        let mut o_v = q_proj;
+        let mut nq = self.dims.num_q_heads as i32;
+        let mut hd = self.dims.head_dim as i32;
+        let mut r = self.dims.r as i32;
+        let mut params = [
+            &mut q_v as *mut _ as *mut c_void,
+            &mut p_v as *mut _ as *mut c_void,
+            &mut o_v as *mut _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+        ];
+        // SAFETY: `self.f_q_proj` is owned by `self._modules`, `params` matches
+        // `q_lowrank_project`'s `(q, p, out, num_q_heads, head_dim, r)` ABI,
+        // `self.p_dev` is live, and caller supplies live `q`/`q_proj`/`stream`.
+        unsafe {
+            launch_kernel(
+                self.f_q_proj,
+                (self.dims.num_q_heads as u32, 1, 1),
+                (self.dims.r as u32, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )
+        }
+    }
+
+    /// Update K_lr for a single (layer, block_id) slot from the K data the
+    /// caller just wrote into the KV cache. `k_block` device ptr to
+    /// `[block_size, num_kv_heads, head_dim]` BF16.
+    pub fn project_kv_block(
+        &self,
+        ctx: &CudaCtx,
+        layer: usize,
+        block_id: usize,
+        k_block: u64,
+    ) -> Result<()> {
+        self.project_kv_block_on_stream(ctx.stream, layer, block_id, k_block)
+    }
+
+    pub fn project_kv_block_on_stream(
+        &self,
+        stream: u64,
+        layer: usize,
+        block_id: usize,
+        k_block: u64,
+    ) -> Result<()> {
+        if layer >= self.dims.num_layers || block_id >= self.dims.max_blocks {
+            bail!("project_kv_block out of range: layer {layer}, block {block_id}");
+        }
+        let slot_floats = self.dims.per_layer_block_floats();
+        let k_lr_slot = self.a_g_dev.ptr
+            + (((layer * self.dims.max_blocks + block_id) * slot_floats) * 2) as u64;
+        let mut k_v = k_block;
+        let mut p_v = self.p_dev.ptr;
+        let mut o_v = k_lr_slot;
+        let mut bs = self.dims.block_size as i32;
+        let mut nk = self.dims.num_kv_heads as i32;
+        let mut hd = self.dims.head_dim as i32;
+        let mut r = self.dims.r as i32;
+        let mut params = [
+            &mut k_v as *mut _ as *mut c_void,
+            &mut p_v as *mut _ as *mut c_void,
+            &mut o_v as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+        ];
+        // SAFETY: `self.f_kv_proj` is owned by `self._modules`, `layer`/`block_id`
+        // were bounds-checked into `self.a_g_dev`, `params` matches
+        // `kv_lowrank_project`'s signature, and caller supplies live `k_block`/`stream`.
+        unsafe {
+            launch_kernel(
+                self.f_kv_proj,
+                (
+                    self.dims.num_kv_heads as u32,
+                    self.dims.block_size as u32,
+                    1,
+                ),
+                (self.dims.r as u32, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )
+        }
+    }
+
+    /// Score `num_active_blocks` (already-laid-out) blocks for the current
+    /// layer. `q_proj` device ptr to `[num_q_heads, r]` BF16. `k_lr_seq` is a
+    /// device ptr to the active sequence's per-token low-rank keys at this layer
+    /// (`[num_active_blocks, num_kv_heads, block_size, r]` BF16), max-reduced
+    /// over `(q_head, tok)`. `scores_out` is a device ptr to a
+    /// `[num_active_blocks]` f32 buffer.
+    pub fn score_blocks(
+        &self,
+        ctx: &CudaCtx,
+        q_proj: u64,
+        k_lr_seq: u64,
+        scores_out: u64,
+        num_active_blocks: usize,
+    ) -> Result<()> {
+        self.score_blocks_on_stream(ctx.stream, q_proj, k_lr_seq, scores_out, num_active_blocks)
+    }
+
+    pub fn score_blocks_on_stream(
+        &self,
+        stream: u64,
+        q_proj: u64,
+        k_lr_seq: u64,
+        scores_out: u64,
+        num_active_blocks: usize,
+    ) -> Result<()> {
+        let mut q_v = q_proj;
+        let mut a_v = k_lr_seq;
+        let mut s_v = scores_out;
+        let mut nq = self.dims.num_q_heads as i32;
+        let mut nk = self.dims.num_kv_heads as i32;
+        let mut bs = self.dims.block_size as i32;
+        let mut r = self.dims.r as i32;
+        let mut gqa = self.dims.gqa_ratio();
+        let mut params = [
+            &mut q_v as *mut _ as *mut c_void,
+            &mut a_v as *mut _ as *mut c_void,
+            &mut s_v as *mut _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+            &mut gqa as *mut _ as *mut c_void,
+        ];
+        // SAFETY: `self.f_score` is owned by `self._modules`, `block_x == 128 == BLOCK_THREADS`
+        // matches `predictor_score.cu`'s shared `warp_max[4]`, `params` matches the kernel ABI,
+        // and caller supplies live `q_proj`/`k_lr_seq`/`scores_out`/`stream`.
+        unsafe {
+            launch_kernel(
+                self.f_score,
+                (num_active_blocks as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )
+        }
+    }
+
+    pub fn dims(&self) -> PredictorDims {
+        self.dims
+    }
+    pub fn a_g_dev_ptr(&self) -> u64 {
+        self.a_g_dev.ptr
+    }
+}
+
+/// Helper for tests / debug: copy the predictor's K_lr slot for a given
+/// (layer, block) to host as BF16. Layout `[num_kv_heads, block_size, r]`.
+pub fn read_k_lr_slot(
+    ctx: &CudaCtx,
+    pred: &Predictor,
+    layer: usize,
+    block: usize,
+) -> Result<Vec<bf16>> {
+    let dims = pred.dims();
+    let n = dims.per_layer_block_floats();
+    let slot = pred.a_g_dev.ptr + (((layer * dims.max_blocks + block) * n) * 2) as u64;
+    let mut host = vec![bf16::from_f32(0.0); n];
+    copy_d_to_h(&mut host, slot, ctx.stream)?;
+    Ok(host)
+}

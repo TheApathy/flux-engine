@@ -1,0 +1,1592 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Auto-extracted from `ops.rs` during refactor wave 4a.
+
+#![allow(unused_imports)]
+
+use anyhow::{Result, ensure};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+use crate::layers::moe;
+use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight};
+
+use super::*;
+
+/// Dense BF16 tensor-core GEMM: C = A @ B^T.
+///
+/// A: [M, K] row-major (activations)
+/// B: [N, K] row-major (weights, HuggingFace layout)
+/// C: [M, N] row-major (output)
+///
+/// Tensor-core BF16 GEMM: m16n8k16 MMA for 3-5x speedup over scalar.
+/// Grid: (ceil(N/64), ceil(M/16), 1), Block: (128, 1, 1)
+pub fn dense_gemm_tc(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 16), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Split-K GEMM: partial products over K_splits chunks, then reduce.
+/// Uses FP32 workspace of size K_splits * M * N * 4 bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_splitk(
+    gpu: &dyn GpuBackend,
+    partial_kernel: KernelHandle,
+    reduce_kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    workspace: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    k_splits: u32,
+    stream: u64,
+) -> Result<()> {
+    // Phase 1: partial products
+    KernelLaunch::new(gpu, partial_kernel)
+        .grid([div_ceil(n, 16), div_ceil(m, 16), k_splits])
+        .block([16, 16, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(workspace)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(k_splits)
+        .launch(stream)?;
+    // Phase 2: reduce and write BF16
+    KernelLaunch::new(gpu, reduce_kernel)
+        .grid([div_ceil(n, 256), m, 1])
+        .block([256, 1, 1])
+        .arg_ptr(workspace)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k_splits)
+        .launch(stream)
+}
+
+/// cuBLASLt BF16 GEMM path enabled? (`ATLAS_CUBLAS_GEMM=1`), cached.
+///
+/// Routes eligible BF16 DFlash drafter projections (`dense_gemm_routed` call
+/// sites in `dflash_head/forward_block_layer.rs`) through cuBLASLt's
+/// BF16×BF16→FP32 GEMM instead of the naive scalar `dense_gemm` kernel.
+pub fn cublas_gemm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ATLAS_CUBLAS_GEMM").ok().as_deref() == Some("1"))
+}
+
+/// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through cuBLASLt BF16
+/// for a weight that is native BF16 `[N,K]` row-major (the drafter's layout).
+///
+/// `ATLAS_CUBLAS_TUNED=1` additionally uses the per-shape autotuned plan
+/// (first use times the heuristic top-16 on a private stream — see
+/// `spark_runtime::cublaslt::bf16_gemm_act_weight_t_tuned`). Same math and
+/// precision, but accumulation order differs from the hand kernels so
+/// equivalence is validated via text/eval parity rather than bit-exactness.
+pub fn cublas_bf16_proj_dense(
+    act: DevicePtr,
+    weight: &DenseWeight,
+    out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    use std::sync::OnceLock;
+    static TUNED: OnceLock<bool> = OnceLock::new();
+    if *TUNED.get_or_init(|| std::env::var("ATLAS_CUBLAS_TUNED").ok().as_deref() == Some("1")) {
+        return spark_runtime::cublaslt::bf16_gemm_act_weight_t_tuned(
+            act.0,
+            weight.weight.0,
+            out.0,
+            m,
+            n,
+            k,
+            stream,
+        );
+    }
+    spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight.weight.0, out.0, m, n, k, stream)
+}
+
+/// Drop-in replacement for [`dense_gemm`]: takes the cuBLASLt route when
+/// `ATLAS_CUBLAS_GEMM=1`, else launches the naive scalar kernel unchanged
+/// (gate off ⇒ byte-identical to production).
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_routed(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if cublas_gemm_enabled() {
+        return cublas_bf16_proj_dense(input, weight, output, m, n, k, stream);
+    }
+    dense_gemm(gpu, kernel, input, weight, output, m, n, k, stream)
+}
+
+/// `ATLAS_ATTN_DENSE_CUBLASLT=1`: route BF16 attention projections in prefill
+/// (QKV and O, dense weights only) through cuBLASLt instead of the scalar
+/// `dense_gemm_bf16` kernel. Gemma 4 keeps attention in BF16, and the scalar
+/// kernel made its prefill ~55 tok/s. Off by default, so every other model
+/// keeps its exact kernel; not bit-exact against it (accumulation order).
+pub fn attn_dense_cublaslt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ATLAS_ATTN_DENSE_CUBLASLT").ok().as_deref() == Some("1"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_attn_prefill(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if attn_dense_cublaslt_enabled() {
+        return cublas_bf16_proj_dense(input, weight, output, m, n, k, stream);
+    }
+    dense_gemm(gpu, kernel, input, weight, output, m, n, k, stream)
+}
+
+/// Scalar dense BF16 GEMM: C = A @ B^T.
+///
+/// A: [M, K] row-major (activations)
+/// B: [N, K] row-major (weights, HuggingFace layout)
+/// C: [M, N] row-major (output)
+///
+/// Kernel: `dense_gemm_bf16(A, B, C, M, N, K)`
+/// Grid: (ceil(N/16), ceil(M/16), 1)  Block: (16, 16, 1)
+pub fn dense_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), div_ceil(m, 16), 1])
+        .block([16, 16, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM: C = A @ dequant(B).
+///
+/// A: [M, K] BF16 activations
+/// B: NVFP4 packed weights (E2M1 + FP8 scales + FP32 per-tensor scale)
+/// C: [M, N] BF16 output
+///
+/// Kernel: `w4a16_gemm(A, B_packed, B_scale, scale2, C, M, N, K)`
+/// Grid: (ceil(N/64), ceil(M/64), 1)  Block: (128, 1, 1)
+pub fn w4a16_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM via the cp.async double-buffered byte-exact shadow kernel
+/// (`w4a16_gemm_pipe`). Same signature/grid as `w4a16_gemm`; only the kernel
+/// symbol differs. Used by the prefill FFN fallback when
+/// `ATLAS_PREFILL_FFN_PIPE=1` and the pipe kernel is loaded.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// `w4a16_gemm_t_m128n128_w8`: 8-warp 128x128 bit-identical shadow of
+/// `w4a16_gemm_t` (transposed NVFP4 weights, FP8 MMA). N % 128, K % 32.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_t_w8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        n.is_multiple_of(128) && k.is_multiple_of(32) && m > 0,
+        "w4a16_gemm_t_w8 shape (M={m} N={n} K={k})"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// `fp8_gemm_t_m128n128_w8`: 8-warp 128x128 bit-identical shadow of
+/// `fp8_gemm_t` (pre-dequantized FP8 [N,K] weights). N % 128, K % 32.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_t_w8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight_fp8: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        n.is_multiple_of(128) && k.is_multiple_of(32) && m > 0,
+        "fp8_gemm_t_w8 shape (M={m} N={n} K={k})"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_fp8)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Byte-exact strided row copy (`strided_copy_rows_16`). Base pointers, strides
+/// and `row_bytes` must be multiples of 16.
+pub fn strided_copy_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    rows: u32,
+    row_bytes: u32,
+    src_stride: u64,
+    dst_stride: u64,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        row_bytes.is_multiple_of(16)
+            && src_stride.is_multiple_of(16)
+            && dst_stride.is_multiple_of(16)
+            && src.0.is_multiple_of(16)
+            && dst.0.is_multiple_of(16),
+        "strided_copy_rows requires 16-byte alignment"
+    );
+    if rows == 0 {
+        return Ok(());
+    }
+    let chunks = row_bytes / 16;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(chunks, 256).min(4), rows, 1])
+        .block([256, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u32(rows)
+        .arg_u32(row_bytes)
+        .arg_u64(src_stride)
+        .arg_u64(dst_stride)
+        .launch(stream)
+}
+
+/// Byte-exact 128x128-tile shadow of `w4a16_gemm` (`w4a16_gemm_pipe_m128n128`).
+/// Grid: (N/128, ceil(M/128), 1)  Block: (256, 1, 1). Caller guarantees
+/// N % 128 == 0 and K % 32 == 0.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe_m128n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        n.is_multiple_of(128) && k.is_multiple_of(32) && m > 0,
+        "w4a16_gemm_pipe_m128n128 requires N % 128 == 0 and K % 32 == 0 (M={m} N={n} K={k})"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 up projection with a fused SiLU(gate) * up epilogue.
+///
+/// The CUDA kernel retains the exact `w4a16_gemm_pipe` accumulation and BF16
+/// up-projection round trip, then applies the same scalar expression as
+/// `moe_silu_mul`. `gate_in_out` is updated in place.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe_silu_mul(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    gate_in_out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(gate_in_out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Full gate+up+SiLU fusion for the exact large-M prefill pipe route.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe_dual(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+    output_first: DevicePtr,
+    output_second: DevicePtr,
+    fuse_silu: bool,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate.weight)
+        .arg_ptr(gate.weight_scale)
+        .arg_f32(gate.weight_scale_2)
+        .arg_ptr(up.weight)
+        .arg_ptr(up.weight_scale)
+        .arg_f32(up.weight_scale_2)
+        .arg_ptr(output_first)
+        .arg_ptr(output_second)
+        .arg_u32(u32::from(fuse_silu))
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM with M_TILE=16: small-M specialization for K=γ verify
+/// (MTP K=3 → M=3, DFlash γ=16 → M=16-17).
+///
+/// At small M, the parent `w4a16_gemm_n128` (M_TILE=64) discards 75-95%
+/// of accumulator writes via `if (r < M)` guards. This launcher targets
+/// `w4a16_gemm_t_m16` which redesigns warp partitioning so all 4 warps
+/// process the SAME 16 rows but different N sub-tiles (32 each).
+///
+/// Grid: (ceil(N/128), ceil(M/16), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n128_m16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 16), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM with M_TILE=32 + N_TILE=64: DFlash K=γ+1=17 verify variant.
+///
+/// One 32-row M-tile = single B read for any M ≤ 32 (the m16 kernel
+/// re-reads B per 16-row tile: 2× traffic at M=17), and N_TILE=64
+/// fields 272 CTAs at intermediate=17408 (the m128 kernel's N=128 grid
+/// is SM-starved at ~136 CTAs / 110 SMs). 4 warps × (2 M-frags × 2
+/// N-subtiles) keeps the m16 kernel's MMA pipeline density.
+///
+/// Grid: (ceil(N/64), ceil(M/32), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    w4a16_gemm_n64_m32_ldb(gpu, kernel, input, weight, output, m, n, k, n, stream)
+}
+
+/// `w4a16_gemm_t_m32_n64` with an explicit B-row stride. `ldb == n` for
+/// tightly-packed T-weights; a 64-padded stride for odd-N weights (the
+/// 248077-vocab lm_head) where a tight row stride breaks cp.async 16B
+/// alignment (CUDA 716).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32_ldb(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldb: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 32), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(ldb)
+        .launch(stream)
+}
+
+/// Split-K W4A16 GEMM for the `w4a16_gemm_t_m32_n64` kernel family.
+///
+/// The DFlash K=17 verify FFN `down_proj` is [M=17, N=5120, K=16384].
+/// The single-slice m32_n64 kernel fields only ceil(5120/64)=80 CTAs
+/// (vs gate/up's 256 at N=16384) and grinds a 512-iteration K-loop, so
+/// it is occupancy-starved — measured ~91 GB/s vs gate/up ~163 GB/s on
+/// the same-size weight. Splitting K by `k_splits` multiplies the CTA
+/// count (80→320 at k_splits=4) and restores occupancy. Partial
+/// products accumulate into an FP32 `workspace` of
+/// `k_splits * M * N * 4` bytes, then `reduce_splitk_f32_to_bf16` sums
+/// the slices and writes BF16.
+///
+/// NOT BIT-IDENTICAL to the single-slice kernel. The partials are FP32, so
+/// nothing is rounded to BF16 mid-accumulation — that is what "lossless"
+/// meant here and it is the only thing it meant. It is NOT the same claim as
+/// token-exactness: the single-slice kernel accumulates the whole K-loop
+/// left-to-right into one FP32 register, while split-K restarts the
+/// accumulator at each slice boundary and the reduce sums the slices
+/// afterwards. `((a+b)+c)+d` and `(a+b)+(c+d)` differ in FP32, so the BF16
+/// output can differ by an ULP and the committed token can change. Any new use
+/// of this kernel on a committed-token path must therefore be validated for
+/// FP32 split-K accumulation order differences rather than assuming bit-exact
+/// equivalence with the serial FMA path.
+///
+/// `ldb` is the B-row stride (== n for tightly-packed T-weights).
+/// Partial grid: (ceil(N/64), ceil(M/32), k_splits)  Block (128,1,1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32_splitk(
+    gpu: &dyn GpuBackend,
+    partial_kernel: KernelHandle,
+    reduce_kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    workspace: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldb: u32,
+    k_splits: u32,
+    stream: u64,
+) -> Result<()> {
+    // Phase 1: per-slice partial products → FP32 workspace [k_splits, M, N].
+    KernelLaunch::new(gpu, partial_kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 32), k_splits])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(workspace)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(ldb)
+        .arg_u32(k_splits)
+        .launch(stream)?;
+    // Phase 2: reduce the k_splits FP32 bands → BF16 [M, N].
+    let total = m * n;
+    KernelLaunch::new(gpu, reduce_kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .pdl(m <= 64)
+        .arg_ptr(workspace)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k_splits)
+        .launch(stream)
+}
+
+/// Fused gate_proj + up_proj + SiLU·mul via `w4a16_gemm_t_m32_n64_gateup_silu`.
+///
+/// Takes two transposed NVFP4 weights (gate then up) sharing the input
+/// `A` [M, K] and output shape [M, N=inter]. Computes both projections in
+/// one launch (A loaded once, both B streamed) and writes silu(gate)*up
+/// as the single [M, N] `output`. Replaces the baseline's two m32_n64
+/// GEMMs + standalone `moe_silu_mul` launch.
+///
+/// `ldb` is the B-row stride (== n for tightly-packed T-weights).
+/// Grid: (ceil(N/64), ceil(M/32), 1)  Block (128,1,1).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32_gateup_silu(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 32), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate.weight)
+        .arg_ptr(gate.weight_scale)
+        .arg_f32(gate.weight_scale_2)
+        .arg_ptr(up.weight)
+        .arg_ptr(up.weight_scale)
+        .arg_f32(up.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(n) // ldb == N for tightly-packed T-weights
+        .launch(stream)
+}
+
+/// Fused W4A16 gate_proj + up_proj + SiLU*mul with `N_TILE=32, K_STEP=64` for
+/// wide-SM (`> 128` SM) K=gamma verify (`w4a16_gemm_t_m32_n32_gateup_silu_pipe_k64`).
+///
+/// Doubles CTA count vs `N_TILE=64` (272 -> 544 CTAs at `N=17408`) with half
+/// the register pressure and 0-ULP identical output.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches CUDA kernel ABI directly"
+)]
+pub fn w4a16_gemm_n32_m32_gateup_silu(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), div_ceil(m, 32), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate.weight)
+        .arg_ptr(gate.weight_scale)
+        .arg_f32(gate.weight_scale_2)
+        .arg_ptr(up.weight)
+        .arg_ptr(up.weight_scale)
+        .arg_f32(up.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(n)
+        .launch(stream)
+}
+
+/// W4A16 GEMM with M_TILE=16 + N_TILE=64: K=3 MTP verify variant.
+///
+/// Same FP8 MMA pipeline as `w4a16_gemm_n128_m16` but with the N tile
+/// halved (64 cols/CTA instead of 128). At intermediate=17408 this
+/// doubles the CTA count to ~272 CTAs/projection — ~2.5 CTAs/SM on
+/// GB10's 110 SMs vs the N=128 variant's ~1.2 CTAs/SM. Targets the
+/// K=3 verify path on dense Qwen3.6-27B where the N=128 grid is too
+/// small to hide cp.async/dequant latency.
+///
+/// Grid: (ceil(N/64), ceil(M/16), 1)  Block: (64, 1, 1) = 2 warps
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 16), 1])
+        .block([64, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM with N_TILE=128: same kernel signature, wider N tile.
+///
+/// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM v3: MiniMax-only shadow with K_STEP=64 (was 32 in v2).
+/// Halves K-iteration count; doubles per-iter MMA count. 1 CTA/SM
+/// (was 3 for v2) due to larger SMEM footprint.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n128_m128_v3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .shared_mem(55_488)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM v2: MiniMax-only shadow of `w4a16_gemm_n128_m128`.
+///
+/// Same CTA tile (M=128, N=128, K_STEP=32) but:
+///   - blockDim 256 (8 warps) instead of 128 (4 warps)
+///   - 3-stage cp.async pipeline instead of 2-stage
+///   - Chunk 0 (rows 0-63) and chunk 1 (rows 64-127) MMAs run in parallel
+///     across warps 0-3 and 4-7 instead of being serialized.
+///
+/// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
+/// SMEM: ~42.6 KB → 2 CTAs/SM (vs 3 for v1), but 2× warps/CTA.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n128_m128_v2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 GEMM: C = A @ B with 2-M-chunk CTA (M_TILE2=128).
+///
+/// Halves weight re-reads vs `w4a16_gemm_n128` for large M (ISL > 128):
+/// each CTA covers 128 rows of A, loading B once for both 64-row halves.
+/// ~2× speedup on qkvz (K=2048, N=12288) at ISL=1016.
+///
+/// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (128, 1, 1)
+/// SMEM: ~29.8 KB → 3 blocks/SM (vs 5 for m64 at ~19.6 KB).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n128_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Pre-dequanted FP8 GEMM (prefill): C = A @ B_fp8.
+///
+/// A: [M, K] BF16, B_fp8: [N, K] FP8 E4M3 (pre-dequanted from NVFP4), C: [M, N] BF16.
+/// Eliminates runtime NVFP4→FP8 dequant — only LOAD + FP8 MMA per K step.
+///
+/// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    b_fp8: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(b_fp8)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Pre-dequant NVFP4 → FP8 E4M3.  One-time conversion at model load.
+///
+/// Reads B_packed[N, K/2] + B_scale[N, K/GROUP_SIZE] + scale2 → B_fp8[N, K].
+///
+/// Grid: (ceil(N*K/2 / 256), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn predequant_nvfp4_to_fp8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    b_packed: DevicePtr,
+    b_scale: DevicePtr,
+    scale2: f32,
+    b_fp8: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(2),
+        "predequant_nvfp4_to_fp8 requires even k, got {k}"
+    );
+    let total = u32::try_from((u64::from(n) * u64::from(k)) / 2)
+        .map_err(|_| anyhow::anyhow!("predequant_nvfp4_to_fp8 pair count exceeds u32::MAX"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(b_packed)
+        .arg_ptr(b_scale)
+        .arg_f32(scale2)
+        .arg_ptr(b_fp8)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Convert BF16 activations to FP8 E4M3 for FP8×FP8 GEMM (`total_elements` must be even).
+///
+/// Grid: (ceil((total_elements / 2) / 256), 1, 1)  Block: (256, 1, 1)
+pub fn bf16_to_fp8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    total_elements: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        total_elements.is_multiple_of(2),
+        "bf16_to_fp8 requires even total_elements (kernel converts BF16 pairs), got {total_elements}"
+    );
+    let threads_needed = total_elements / 2;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(threads_needed, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u32(total_elements)
+        .launch(stream)
+}
+
+/// NVFP4 global absmax scan: scans BF16 [N, K] input, writes per-tensor
+/// `max(|x|)` into `global_max` (FP32 scalar).
+///
+/// Caller must zero-initialize `global_max` BEFORE launch (the kernel
+/// reduces via `atomicMax`). Kernel: `nvfp4_global_absmax`.
+///
+/// Grid: (min(total/256, 1024), 1, 1)  Block: (256, 1, 1)
+pub fn nvfp4_global_absmax(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    global_max: DevicePtr,
+    total_elements: u32,
+    stream: u64,
+) -> Result<()> {
+    // Match `quantize_to_nvfp4` (loaders_fp8.rs) grid math.
+    let grid = (total_elements / 256).clamp(1, 1024);
+    KernelLaunch::new(gpu, kernel)
+        .grid([grid, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(global_max)
+        .arg_u32(total_elements)
+        .launch(stream)
+}
+
+/// Per-row NVFP4 quantization: takes BF16 [N, K], emits packed E2M1
+/// nibbles `[N, K/2]` + FP8 E4M3 per-group scales `[N, K/16]`.
+///
+/// `scale2` is the per-tensor second-level scale: `global_max / (6.0 * 448.0)`.
+///
+/// Grid: (N, 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_bf16_to_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([n, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Grid CTA cap for grid-stride Flux 128x4 NVFP4 row quantizers:
+/// `max(2 * sm_count, 96)` (96 on 48-SM GB10; 220–376 on 110–188 SM GPUs).
+#[inline]
+#[must_use]
+fn quantize_128x4_cta_cap_for_sm(sm_count: u32) -> u32 {
+    sm_count.saturating_mul(2).max(96)
+}
+
+#[inline]
+#[must_use]
+fn quantize_128x4_grid_x(padded_rows: u32) -> u32 {
+    padded_rows.min(quantize_128x4_cta_cap_for_sm(
+        atlas_core::device::active_sm_count(),
+    ))
+}
+
+/// Byte-exact Flux activation quantization with CUTLASS 128x4 physical
+/// scale placement. Unlike [`quantize_bf16_to_nvfp4`], `scale_out` includes
+/// explicit row padding to a multiple of 128 so it can be consumed directly
+/// by the FlashInfer SM121 NVFP4 GEMM ABI.
+///
+/// Grid: (min(padded_rows, max(2 * active_sm_count(), 96)), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_bf16_to_nvfp4_atlas_128x4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "Flux 128x4 NVFP4 quantizer handle is missing"
+    );
+    ensure!(rows > 0, "Flux 128x4 NVFP4 quantizer requires rows > 0");
+    ensure!(
+        cols >= 16 && cols.is_multiple_of(16),
+        "Flux 128x4 NVFP4 quantizer requires cols >= 16 and cols % 16 == 0; got {cols}"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "Flux 128x4 NVFP4 quantizer requires a finite positive scale2"
+    );
+    ensure!(
+        !input.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "Flux 128x4 NVFP4 quantizer received a null device pointer"
+    );
+    let padded_rows = div_ceil(rows, 128) * 128;
+    KernelLaunch::new(gpu, kernel)
+        .grid([quantize_128x4_grid_x(padded_rows), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(rows)
+        .arg_u32(cols)
+        .launch(stream)
+}
+
+/// Fuse the SwiGLU boundary with NVFP4 activation quantization.
+///
+/// Reads independent BF16 gate/up projections `[N, K]`, reproduces the
+/// standalone `moe_silu_mul` BF16 round trip in registers, and emits packed
+/// E2M1 values plus E4M3 group scales for the W4A4 down projection.
+///
+/// Grid: (N, 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_silu_mul_bf16_to_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "fused SwiGLU NVFP4 quantizer handle is missing"
+    );
+    ensure!(n > 0, "fused SwiGLU NVFP4 quantizer requires N > 0");
+    ensure!(
+        k >= 16 && k.is_multiple_of(16),
+        "fused SwiGLU NVFP4 quantizer requires K >= 16 and K % 16 == 0; got {k}"
+    );
+    ensure!(
+        !gate.is_null() && !up.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "fused SwiGLU NVFP4 quantizer requires non-null gate, up, packed, and scale pointers"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "fused SwiGLU NVFP4 quantizer requires a finite positive scale2; got {scale2}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Fuse the BF16-rounded SwiGLU boundary with NVFP4 quantization and emit
+/// FlashInfer/CUTLASS padded 128x4 physical scales.
+///
+/// This ABI is deliberately separate from [`quantize_silu_mul_bf16_to_nvfp4`],
+/// whose logical scale layout remains the W4A4 contract.
+///
+/// Grid: (min(padded_rows, max(2 * active_sm_count(), 96)), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_silu_mul_bf16_to_nvfp4_atlas_128x4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "fused SwiGLU Flux 128x4 NVFP4 quantizer handle is missing"
+    );
+    ensure!(
+        rows > 0,
+        "fused SwiGLU Flux 128x4 NVFP4 quantizer requires rows > 0"
+    );
+    ensure!(
+        cols >= 64 && cols.is_multiple_of(64),
+        "fused SwiGLU Flux 128x4 NVFP4 quantizer requires cols >= 64 and cols % 64 == 0; got {cols}"
+    );
+    ensure!(
+        !gate.is_null() && !up.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "fused SwiGLU Flux 128x4 NVFP4 quantizer requires non-null gate, up, packed, and scale pointers"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "fused SwiGLU Flux 128x4 NVFP4 quantizer requires a finite positive scale2; got {scale2}"
+    );
+    let padded_rows = rows
+        .checked_add(127)
+        .and_then(|value| (value / 128).checked_mul(128))
+        .ok_or_else(|| anyhow::anyhow!("fused SwiGLU Flux 128x4 row padding overflow"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([quantize_128x4_grid_x(padded_rows), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(rows)
+        .arg_u32(cols)
+        .launch(stream)
+}
+
+/// Read a merged `[rows, gate cols | up cols]` BF16 projection once, apply
+/// the BF16-rounded SwiGLU boundary, and emit NVFP4 activation bytes plus
+/// FlashInfer/CUTLASS padded 128x4 physical scales.
+///
+/// This ABI is separate from the two-input fused quantizer so the production
+/// route cannot accidentally reinterpret independent gate/up allocations as a
+/// merged row.
+///
+/// Grid: (min(padded_rows, max(2 * active_sm_count(), 96)), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    merged_gate_up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "merged SwiGLU Flux 128x4 NVFP4 quantizer handle is missing"
+    );
+    ensure!(
+        rows > 0,
+        "merged SwiGLU Flux 128x4 NVFP4 quantizer requires rows > 0"
+    );
+    ensure!(
+        cols >= 64 && cols.is_multiple_of(64),
+        "merged SwiGLU Flux 128x4 NVFP4 quantizer requires cols >= 64 and cols % 64 == 0; got {cols}"
+    );
+    ensure!(
+        !merged_gate_up.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "merged SwiGLU Flux 128x4 NVFP4 quantizer requires non-null merged, packed, and scale pointers"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "merged SwiGLU Flux 128x4 NVFP4 quantizer requires a finite positive scale2; got {scale2}"
+    );
+    let padded_rows = rows
+        .checked_add(127)
+        .and_then(|value| (value / 128).checked_mul(128))
+        .ok_or_else(|| anyhow::anyhow!("merged SwiGLU Flux 128x4 row padding overflow"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([quantize_128x4_grid_x(padded_rows), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(merged_gate_up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(rows)
+        .arg_u32(cols)
+        .launch(stream)
+}
+
+/// Fused Residual Add + Qwen3 `(1 + w)` RMSNorm + Static-Scale NVFP4 `128x4`
+/// activation quantizer.
+///
+/// Updates `hidden += src` in place, optionally saves `hidden` to `residual`
+/// (skipped when `residual` is `DevicePtr::NULL`), normalizes in registers
+/// with the BF16 round-trip boundary, and emits packed E2M1 nibbles plus
+/// CUTLASS/cuBLASLt `128x4` swizzled UE4M3 group scales.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "CUDA kernel launcher forwarding residual/norm/quantize device pointers and shape"
+)]
+pub fn residual_add_rms_norm_quantize_nvfp4_128x4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    hidden: DevicePtr,
+    src: DevicePtr,
+    weight: &DenseWeight,
+    residual: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    eps: f32,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "fused residual_add_rms_norm_quantize_nvfp4_128x4 handle is missing"
+    );
+    ensure!(
+        rows > 0,
+        "residual_add_rms_norm_quantize_nvfp4_128x4 requires rows > 0"
+    );
+    ensure!(
+        cols >= 64 && cols.is_multiple_of(64),
+        "residual_add_rms_norm_quantize_nvfp4_128x4 requires cols >= 64 and cols % 64 == 0; got {cols}"
+    );
+    ensure!(
+        !hidden.is_null()
+            && !src.is_null()
+            && !weight.weight.is_null()
+            && !packed_out.is_null()
+            && !scale_out.is_null(),
+        "residual_add_rms_norm_quantize_nvfp4_128x4 requires non-null device pointers"
+    );
+    ensure!(
+        hidden.0.is_multiple_of(16)
+            && src.0.is_multiple_of(16)
+            && weight.weight.0.is_multiple_of(16)
+            && (residual.is_null() || residual.0.is_multiple_of(16)),
+        "residual_add_rms_norm_quantize_nvfp4_128x4 requires 16-byte aligned BF16 pointers"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "residual_add_rms_norm_quantize_nvfp4_128x4 requires finite positive scale2; got {scale2}"
+    );
+    let padded_rows = rows
+        .checked_add(127)
+        .and_then(|value| (value / 128).checked_mul(128))
+        .ok_or_else(|| anyhow::anyhow!("residual_add_rms_norm_quantize_nvfp4_128x4 overflow"))?;
+    let groups = cols / 16;
+    let block_x = if groups <= 512 {
+        div_ceil(groups, 32) * 32
+    } else {
+        256
+    };
+    let sm_count = gpu
+        .sm_count()
+        .filter(|&s| s > 0)
+        .unwrap_or_else(atlas_core::device::active_sm_count);
+    let grid_x = padded_rows.min(sm_count.saturating_mul(4).max(96)).max(1);
+    KernelLaunch::new(gpu, kernel)
+        .grid([grid_x, 1, 1])
+        .block([block_x, 1, 1])
+        .arg_ptr(hidden)
+        .arg_ptr(src)
+        .arg_ptr(weight.weight)
+        .arg_ptr(residual)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_f32(eps)
+        .arg_u32(rows)
+        .arg_u32(cols)
+        .launch(stream)
+}
+
+/// Native NVFP4×NVFP4 (W4A4) tensor-core GEMM.
+///
+/// Both A and B are pre-quantized to NVFP4 (E2M1 nibbles + FP8 E4M3 per-
+/// group scales + one FP32 per-tensor scale each). The kernel issues
+/// native `mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e2m1.f32`
+/// instructions on SM120/SM121 (GB10).
+///
+/// A: [M, K/2] packed nibbles + [M, K/16] FP8 scales (row-major)
+/// B: [N, K/2] packed nibbles + [N, K/16] FP8 scales (HuggingFace layout)
+/// C: [M, N] BF16 output (row-major)
+///
+/// `scale2_ab = A_scale2 * B_scale2` (product of per-tensor second-level
+/// scales).
+///
+/// Kernel: `nvfp4_nvfp4_gemm_t_m64`
+/// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_nvfp4_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    b_packed: DevicePtr,
+    b_scale: DevicePtr,
+    scale2_ab: f32,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_packed)
+        .arg_ptr(b_scale)
+        .arg_f32(scale2_ab)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// K-major M=128 native NVFP4×NVFP4 tensor-core GEMM.
+///
+/// Numerically mirrors [`nvfp4_nvfp4_gemm`], but consumes Flux's existing
+/// transposed weight buffers:
+///
+/// - `B_packed_t`: `[K/2, N]`
+/// - `B_scale_t`: `[K/16, N]`
+///
+/// Eight warps own one 16-row fragment each, allowing one staged B tile to
+/// serve 128 prompt rows. The caller must require `N % 128 == 0` and
+/// `K % 64 == 0`; those constraints also guarantee that logical `N` is the
+/// transform's physical leading dimension.
+///
+/// Kernel: `nvfp4_nvfp4_gemm_kmajor_m128`
+/// Grid: `(N / 128, ceil(M / 128), 1)`  Block: `(256, 1, 1)`
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_nvfp4_gemm_kmajor_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    b_packed_t: DevicePtr,
+    b_scale_t: DevicePtr,
+    scale2_ab: f32,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(kernel.0 != 0, "K-major W4A4 kernel handle is missing");
+    ensure!(m > 0, "K-major W4A4 requires M > 0");
+    ensure!(
+        n >= 128 && n.is_multiple_of(128),
+        "K-major W4A4 requires N >= 128 and N % 128 == 0; got {n}"
+    );
+    ensure!(
+        k >= 64 && k.is_multiple_of(64),
+        "K-major W4A4 requires K >= 64 and K % 64 == 0; got {k}"
+    );
+    ensure!(
+        !a_packed.is_null()
+            && !a_scale.is_null()
+            && !b_packed_t.is_null()
+            && !b_scale_t.is_null()
+            && !output.is_null(),
+        "K-major W4A4 requires non-null activation, weight, scale, and output pointers"
+    );
+    ensure!(
+        scale2_ab.is_finite() && scale2_ab >= 0.0,
+        "K-major W4A4 requires a finite non-negative combined scale; got {scale2_ab}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_packed_t)
+        .arg_ptr(b_scale_t)
+        .arg_f32(scale2_ab)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// K-major M=256 native NVFP4×NVFP4 tensor-core GEMM.
+///
+/// This is the sixteen-warp long-prefill shadow of
+/// [`nvfp4_nvfp4_gemm_kmajor_m128`]. Each warp retains one m16n128 output
+/// fragment, while a single staged K-major weight tile serves all 256 rows.
+/// The caller must use it only for sufficiently large M to keep the reduced
+/// CTA grid saturated; the production dispatch currently starts at M=2048.
+///
+/// Kernel: `nvfp4_nvfp4_gemm_kmajor_m256`
+/// Grid: `(N / 128, ceil(M / 256), 1)`  Block: `(512, 1, 1)`
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_nvfp4_gemm_kmajor_m256(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    b_packed_t: DevicePtr,
+    b_scale_t: DevicePtr,
+    scale2_ab: f32,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(kernel.0 != 0, "K-major M256 W4A4 kernel handle is missing");
+    ensure!(m >= 2048, "K-major M256 W4A4 requires M >= 2048; got {m}");
+    ensure!(
+        n >= 128 && n.is_multiple_of(128),
+        "K-major M256 W4A4 requires N >= 128 and N % 128 == 0; got {n}"
+    );
+    ensure!(
+        k >= 64 && k.is_multiple_of(64),
+        "K-major M256 W4A4 requires K >= 64 and K % 64 == 0; got {k}"
+    );
+    ensure!(
+        !a_packed.is_null()
+            && !a_scale.is_null()
+            && !b_packed_t.is_null()
+            && !b_scale_t.is_null()
+            && !output.is_null(),
+        "K-major M256 W4A4 requires non-null activation, weight, scale, and output pointers"
+    );
+    ensure!(
+        scale2_ab.is_finite() && scale2_ab >= 0.0,
+        "K-major M256 W4A4 requires a finite non-negative combined scale; got {scale2_ab}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 256), 1])
+        .block([512, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_packed_t)
+        .arg_ptr(b_scale_t)
+        .arg_f32(scale2_ab)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Split-K variant of [`nvfp4_nvfp4_gemm`]: partitions the K-axis across
+/// `k_splits` CTAs (along Z), writes FP32 partials to `c_partial`, then
+/// the companion reduce kernel sums + applies `scale2_ab` + casts BF16.
+///
+/// Wins at small K*N (< 25M) where the non-split kernel underutilizes
+/// SMs (per cutlass-widen bench data: 2.75x vs W4A16 at K=N=2048,
+/// 2.17x at K=N=4096; regresses at K*N > 25M because of GMEM bandwidth
+/// pressure during reduce).
+///
+/// Scratch sizing: `c_partial` must hold `k_splits * M * N * 4` bytes (FP32).
+/// Constraint: K must be divisible by `(K_STEP=64) * k_splits` — the kernel
+/// gracefully clamps if not, but allocations and tile math assume even.
+///
+/// Kernel: `nvfp4_nvfp4_gemm_t_m64_splitk` + `nvfp4_splitk_reduce`
+/// Grid (phase 1): (ceil(N/128), ceil(M/64), k_splits)  Block: (128, 1, 1)
+/// Grid (phase 2): (ceil(N/256), M, 1)                  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_nvfp4_gemm_splitk(
+    gpu: &dyn GpuBackend,
+    partial_kernel: KernelHandle,
+    reduce_kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    b_packed: DevicePtr,
+    b_scale: DevicePtr,
+    scale2_ab: f32,
+    c_partial: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    k_splits: u32,
+    stream: u64,
+) -> Result<()> {
+    // Phase 1: partial products. Scale2 deferred to reduce kernel so
+    // partials stay at native MMA magnitudes.
+    KernelLaunch::new(gpu, partial_kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 64), k_splits])
+        .block([128, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_packed)
+        .arg_ptr(b_scale)
+        .arg_ptr(c_partial)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(k_splits)
+        .launch(stream)?;
+    // Phase 2: reduce across K_SPLITS partials + apply scale2_ab + BF16 cast.
+    KernelLaunch::new(gpu, reduce_kernel)
+        .grid([div_ceil(n, 256), m, 1])
+        .block([256, 1, 1])
+        .arg_ptr(c_partial)
+        .arg_ptr(output)
+        .arg_f32(scale2_ab)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k_splits)
+        .launch(stream)
+}
+
+#[cfg(test)]
+mod quantize_grid_tests {
+    use super::quantize_128x4_cta_cap_for_sm;
+
+    #[test]
+    fn atlas_128x4_quantizer_cta_cap_scales_with_sm_count_and_floors_at_96() {
+        assert_eq!(quantize_128x4_cta_cap_for_sm(0), 96);
+        assert_eq!(quantize_128x4_cta_cap_for_sm(48), 96);
+        assert_eq!(quantize_128x4_cta_cap_for_sm(110), 220);
+        assert_eq!(quantize_128x4_cta_cap_for_sm(170), 340);
+        assert_eq!(quantize_128x4_cta_cap_for_sm(188), 376);
+    }
+}

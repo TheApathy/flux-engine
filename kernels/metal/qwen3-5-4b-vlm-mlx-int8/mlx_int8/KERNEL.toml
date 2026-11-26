@@ -1,0 +1,6 @@
+[build]
+# Per-quant overrides: empty; both vision and decoder kernels are
+# inherited from `kernels/metal/common/`.
+extra_metal_flags = []
+
+[modules]

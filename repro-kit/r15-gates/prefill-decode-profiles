@@ -1,0 +1,1535 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Real matched prefill/decode profile gate. See R16_PREFILL_DECODE_PROFILES_DRIVER.md."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+from contextlib import contextmanager
+import hashlib
+import http.client
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+import types
+import urllib.parse
+
+GATE = "prefill-decode-profiles"
+HOST_REFERENCE_SCHEMA = "flux-prefill-decode-host-reference/3"
+# Plan /3 (profile contract /2) pairs with host reference /4 and metrics /4;
+# every cross pair is refused. /3 and /4 share the clocks and host identity.
+HOST_REFERENCE_SCHEMA_V4 = "flux-prefill-decode-host-reference/4"
+METRICS_SCHEMA = "flux-profile-metrics/3"
+METRICS_SCHEMA_V4 = "flux-profile-metrics/4"
+CHUNK_TOKENS = 4096
+NATIVE_CONTEXT = 262_144
+PROFILE_NAMES = ("interactive", "high-prefill")
+PROFILE_CONTEXTS = (8_192, 16_384, 32_768, 65_536, 131_072, 262_080)
+MODES = ("none", "native-mtp-k5")
+DECODE_BUDGET = 256
+HOST_BAND_PERCENT = 5.0
+DECODE_CLOCK = "scheduler-decode-time:completion-tokens-minus-one/v1"
+PREFILL_CLOCK = "client-monotonic-blocking-max-tokens-one/v1"
+MEASUREMENT_CONTRACT = {
+    "decode_clock": DECODE_CLOCK,
+    "prefill_clock": PREFILL_CLOCK,
+    # re-pinned after OSS cleanup (SPDX headers, rustfmt, doc/comment scrub);
+    # completions timing and CLI measurement flags are unchanged.
+    "completions_source_sha256": "3c67e270273a587645777dad3032e3ec982d9f8aeaef258fd8e60745c71d2aa4",
+    "cli_source_sha256": "d6da2e445725c8d45f123e9ffbb17dc1e2b6b401fae849bbcedbe965b5304086",
+}
+PROVENANCE_KEYS = (
+    "source_revision", "source_tree", "source_bundle_manifest_sha256",
+    "checkpoint_id", "checkpoint_revision", "checkpoint_manifest_sha256",
+)
+PROFILE_RECIPES = {
+    "interactive": ("repro-kit/recipes/flux-v9-w4096-interactive.env", "4096", "interactive-w4096"),
+    "high-prefill": ("repro-kit/recipes/flux-v9-max-prefill.env", "16384", "max-prefill"),
+}
+SEED = 0x38_4096
+PASSKEYS = {"ALPHA": "alpha-0731826", "BETA": "beta-0492175", "GAMMA": "gamma-0863204"}
+PASSKEY_DEPTHS = (0.05, 0.50, 0.95)
+HEAD_TEXT = "<|im_start|>user\nSession 0 archive, reference code S00-00000.\n"
+FILLER_TEXT = (
+    " Ordinary archive entry: the warehouse ledger lists shelves, labels, "
+    "crates and loading bays.\n"
+)
+QUESTION_TEXT = (
+    "\nReturn the three audit passkeys, labeled ALPHA, BETA, GAMMA. "
+    "Copy them exactly; no explanation."
+)
+NO_THINKING_FRAME = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+PROMPT_COMPONENT_KEYS = ("head", "filler", "tail", "ALPHA", "BETA", "GAMMA")
+MAX_RESPONSE = 32 * 1024 * 1024
+MAX_STREAM_EVENTS = 100_000
+REQUEST_TIMEOUT = 14400
+READY_TIMEOUT = 1800
+LAUNCH_PID_TIMEOUT = 120.0
+LABEL_PREFIX = "com.theapathy.flux."
+FORBIDDEN_OVERLAY = {
+    "--speculative", "--num-drafts", "--mtp-gate", "--mtp-from-path", "--draft-model",
+    "--dflash", "--dflash-donor-model", "--self-speculative", "--ngram-speculative",
+    "--model-from-path", "--model-name", "--bind", "--port", "--no-tui",
+    "--enable-prefix-caching", "--max-batch-size", "--max-num-seqs", "--kv-cache-dtype",
+}
+EXEC_SUPERVISOR = r'''
+import base64
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+
+def supervise(argv, token):
+    child = descriptor = None
+    forced = False
+    errors = []
+
+    def signal_owned_child(signum):
+        if descriptor is not None:
+            try:
+                signal.pidfd_send_signal(descriptor, signum)
+                return
+            except ProcessLookupError:
+                return
+            except BaseException as error:
+                errors.append(error)
+        # Popen owns its direct child and tracks any successful reaping.
+        try:
+            (child.terminate if signum == signal.SIGTERM else child.kill)()
+        except BaseException as error:
+            errors.append(error)
+
+    try:
+        if os.read(0, 1) != b"G":
+            return 0
+        # Only the small acknowledgement goes to stdout; engine logs keep
+        # streaming through the suite-owned stderr without a host pump thread.
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=2)
+        descriptor = os.pidfd_open(child.pid)
+        while True:
+            ready = select.select([0, descriptor], [], [], None)[0]
+            if descriptor in ready or (0 in ready and not os.read(0, 65536)):
+                break
+    finally:
+        if child is not None:
+            try:
+                try:
+                    running = descriptor is None or not select.select([descriptor], [], [], 0)[0]
+                except BaseException as error:
+                    errors.append(error)
+                    running = True
+                if running:
+                    signal_owned_child(signal.SIGTERM)
+                try:
+                    child.wait(timeout=10)
+                except BaseException as error:
+                    if not isinstance(error, subprocess.TimeoutExpired):
+                        errors.append(error)
+                    forced = True
+                    signal_owned_child(signal.SIGKILL)
+                    child.wait(timeout=5)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        if errors:
+            raise errors[0]
+        print("R16_EXEC_CLEANUP token=" + token + " child_started="
+              + str(child is not None).lower() + " retired=true forced="
+              + str(forced).lower(), flush=True)
+    return 1 if forced else 0
+
+if __name__ == "__main__":
+    argv = json.loads(base64.b64decode(sys.argv[1], validate=True))
+    raise SystemExit(supervise(argv, sys.argv[2]))
+'''
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def geometry_v2(args):
+    """True for sealed plan /3, whose profile contract /2 is per-profile."""
+    return args.launch_plan.get("schema") in (args.suite.PLAN_SCHEMA_V3, args.suite.PLAN_SCHEMA_V4)
+
+
+def profile_chunk(args, profile):
+    """Scheduler chunk of one profile: universal 4096 under plan /2."""
+    return args.suite.profile_contract_chunk(args.launch_plan["performance_profile_contract"], profile)
+
+
+def verify_parent_suite(expected):
+    """Bind the helper pin to the actual sealed suite that launched this gate."""
+    parent = os.getppid()
+    argv = Path(f"/proc/{parent}/cmdline").read_bytes().split(b"\0")
+    candidates = [item for item in argv if re.fullmatch(rb"/proc/self/fd/[0-9]+", item)]
+    require(len(candidates) == 1, "gate must be launched by the sealed release suite")
+    number = int(candidates[0].rsplit(b"/", 1)[1])
+    descriptor = os.open(f"/proc/{parent}/fd/{number}", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        require(
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals == seals,
+            "launching suite bytes are not sealed",
+        )
+        size = os.fstat(descriptor).st_size
+        require(0 < size <= 16 * 1024 * 1024, "launching suite size differs")
+        require(
+            digest(os.pread(descriptor, size + 1, 0)) == expected
+            and os.getppid() == parent,
+            "helper differs from the launching suite",
+        )
+    finally:
+        os.close(descriptor)
+
+
+def read_pinned(path, expected, label, maximum=16 * 1024 * 1024):
+    """Read checked bytes once; never reopen the pathname after hashing."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= maximum,
+            f"{label} size is invalid",
+        )
+        payload = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+        require(
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+            f"{label} changed while reading",
+        )
+        require(digest(payload) == expected, f"{label} hash differs")
+    finally:
+        os.close(descriptor)
+    return payload
+
+
+def load_parent_plan(suite):
+    """Read the actual launching suite's sealed plan, not a caller's pathname."""
+    parent = os.getppid()
+    argv = Path(f"/proc/{parent}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+    require(argv.count(b"--plan-fd") == 1, "launching suite plan descriptor is missing")
+    index = argv.index(b"--plan-fd") + 1
+    require(index < len(argv) and re.fullmatch(rb"[0-9]+", argv[index]) is not None,
+            "launching suite plan descriptor differs")
+    descriptor = os.open(f"/proc/{parent}/fd/{int(argv[index])}", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        plan = suite.load_plan(descriptor)
+        require(os.getppid() == parent, "launching suite changed during plan verification")
+        return plan
+    finally:
+        os.close(descriptor)
+
+
+def load_module(path, expected, name):
+    payload = read_pinned(path, expected, "source dependency")
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    sys.modules[name] = module
+    try:
+        exec(compile(payload, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def docker(arguments):
+    result = subprocess.run(
+        ["docker", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
+    )
+    require(result.returncode == 0, "Docker identity or process query failed")
+    require(len(result.stdout) <= 16 * 1024 * 1024, "Docker response is oversized")
+    return result.stdout
+
+
+def inspect_container(args, suite):
+    document = suite.strict_json_loads(
+        docker(["container", "inspect", "--format", "{{json .}}", args.container_id]),
+        "profile container",
+    )
+    require(
+        type(document) is dict
+        and document.get("Id") == args.container_id
+        and document.get("Image") == args.image_id,
+        "container identity differs",
+    )
+    require(
+        document.get("State", {}).get("Running") is True
+        and document.get("HostConfig", {}).get("ReadonlyRootfs") is True,
+        "container is not running with read-only root",
+    )
+    labels = document.get("Config", {}).get("Labels", {})
+    require(labels.get("org.opencontainers.image.revision") == args.launch_plan["source_revision"]
+            and labels.get(LABEL_PREFIX + "source-tree") == args.launch_plan["source_tree"],
+            "image source provenance differs from the sealed suite plan")
+    plan = {
+        "in_container_binary_path": labels.get(LABEL_PREFIX + "binary-path"),
+        "in_container_recipe_path": labels.get(LABEL_PREFIX + "recipe-path"),
+        "in_container_binary_sha256": labels.get(LABEL_PREFIX + "binary-sha256"),
+        "recipe_sha256": labels.get(LABEL_PREFIX + "recipe-sha256"),
+    }
+    for key, prefix in (
+        ("in_container_binary_path", "/opt/flux/bin/"),
+        ("in_container_recipe_path", "/opt/flux/repro-kit/recipes/"),
+    ):
+        value = plan[key]
+        require(type(value) is str and value.startswith(prefix), "image artifact path differs")
+        suite.normalized_absolute(value, "image artifact")
+    for key in ("in_container_binary_sha256", "recipe_sha256"):
+        suite.exact_hex(plan[key], 64, "image artifact digest")
+        require(plan[key] == args.launch_plan[key], "image artifact differs from sealed suite plan")
+    init_pid = suite.exact_int(
+        document.get("State", {}).get("Pid"), "container init PID", 1, 1 << 31
+    )
+    root = os.open(f"/proc/{init_pid}/root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        descriptor = suite._open_process_file(root, plan["in_container_recipe_path"])
+        try:
+            observed, payload = suite._hash_regular_fd(
+                descriptor, "profile recipe", suite.MAX_PROGRAM_BYTES
+            )
+            require(observed == plan["recipe_sha256"], "image recipe hash differs")
+            environment = {
+                key.decode(): value.decode()
+                for key, value in suite._recipe_environment(payload).items()
+            }
+        finally:
+            os.close(descriptor)
+        if geometry_v2(args):
+            plan["profiles"] = {}
+            for name in PROFILE_NAMES:
+                path = labels.get(LABEL_PREFIX + "performance." + name + ".recipe-path")
+                expected = labels.get(LABEL_PREFIX + "performance." + name + ".recipe-sha256")
+                require(type(path) is str and path.startswith("/opt/flux/repro-kit/recipes/"),
+                        "image performance recipe path differs")
+                suite.normalized_absolute(path, "image performance recipe")
+                suite.exact_hex(expected, 64, "image performance recipe digest")
+                descriptor = suite._open_process_file(root, path)
+                try:
+                    observed, payload = suite._hash_regular_fd(
+                        descriptor, "profile recipe", suite.MAX_PROGRAM_BYTES
+                    )
+                    require(observed == expected, "image performance recipe hash differs")
+                    plan["profiles"][name] = {
+                        "in_container_recipe_path": path,
+                        "recipe_sha256": observed,
+                        "environment": {
+                            key.decode(): value.decode()
+                            for key, value in suite._recipe_environment(payload).items()
+                        },
+                    }
+                finally:
+                    os.close(descriptor)
+    finally:
+        os.close(root)
+    return plan, environment
+
+
+def profile_server_plan(args, plan, profile):
+    """The per-profile broker /2 plan: the profile's own image recipe and chunk."""
+    image = plan["profiles"][profile]
+    return {
+        "in_container_binary_path": plan["in_container_binary_path"],
+        "in_container_binary_sha256": plan["in_container_binary_sha256"],
+        "in_container_recipe_path": image["in_container_recipe_path"],
+        "recipe_sha256": image["recipe_sha256"],
+        "profile": profile,
+        "chunk_tokens": profile_chunk(args, profile),
+    }
+
+
+# --------------------------------------------------------------------------- host reference
+
+def load_host_reference(args):
+    """The pinned host measurement this gate reproduces (decode wall per profile/context)."""
+    raw = read_pinned(args.host_reference, args.host_reference_sha256, "host reference")
+    document = args.suite.strict_json_loads(raw, "host reference")
+    require(raw == args.suite.canonical_bytes(document), "host reference bytes are not canonical")
+    v2 = geometry_v2(args)
+    chunk_key = "profile_chunk_tokens" if v2 else "chunk_tokens"
+    require(
+        type(document) is dict
+        and set(document)
+        == {"schema", chunk_key, "binary_sha256", "decode_budget_tokens", "profiles",
+            "measurement_contract", "provenance"},
+        "host reference keys differ",
+    )
+    require(document["schema"] == (HOST_REFERENCE_SCHEMA_V4 if v2 else HOST_REFERENCE_SCHEMA),
+            "host reference schema differs")
+    require(document["measurement_contract"] == MEASUREMENT_CONTRACT,
+            "host reference clock/source contract differs")
+    require(type(document["provenance"]) is dict
+            and set(document["provenance"]) == set(PROVENANCE_KEYS)
+            and document["provenance"] == {key: args.launch_plan[key] for key in PROVENANCE_KEYS},
+            "host source/checkpoint provenance differs from the sealed suite plan")
+    if v2:
+        require(
+            type(document[chunk_key]) is dict
+            and set(document[chunk_key]) == set(PROFILE_NAMES)
+            and all(type(document[chunk_key][name]) is int
+                    and document[chunk_key][name] == profile_chunk(args, name)
+                    for name in PROFILE_NAMES),
+            "host reference chunk census differs",
+        )
+    else:
+        require(
+            document["chunk_tokens"] == CHUNK_TOKENS and type(document["chunk_tokens"]) is int,
+            "host reference chunk census differs",
+        )
+    require(
+        document["decode_budget_tokens"] == DECODE_BUDGET
+        and type(document["decode_budget_tokens"]) is int,
+        "host reference decode budget differs",
+    )
+    args.suite.exact_hex(document["binary_sha256"], 64, "host reference binary digest")
+    profiles = document["profiles"]
+    require(
+        type(profiles) is dict and set(profiles) == set(PROFILE_NAMES),
+        "host reference profile census differs",
+    )
+    table = {}
+    for name in PROFILE_NAMES:
+        profile = profiles[name]
+        profile_keys = {"argv_overlay", "host_recipe_sha256", "rows"}
+        if v2:
+            # The host measured the same full launch argv the container runs.
+            profile_keys.add("launch_argv_sha256")
+        require(
+            type(profile) is dict and set(profile) == profile_keys,
+            "host reference profile keys differ",
+        )
+        overlay = profile["argv_overlay"]
+        effective = (args.suite.profile_overlay_v2(overlay, profile_chunk(args, name))
+                     if v2 else effective_overlay(overlay))
+        args.suite.exact_hex(profile["host_recipe_sha256"], 64, "host recipe digest")
+        rows = profile["rows"]
+        require(
+            type(rows) is list and len(rows) == len(PROFILE_CONTEXTS),
+            "host reference row census differs",
+        )
+        by_context = {}
+        for row in rows:
+            require(
+                type(row) is dict
+                and set(row)
+                == {
+                    "context_tokens",
+                    "decode_tokens",
+                    "k5_decode_wall_seconds",
+                    "plain_decode_wall_seconds",
+                    "prefill_wall_seconds",
+                    "prompt_sha256",
+                    "k5_usage",
+                    "plain_usage",
+                    "prefill_client_monotonic",
+                },
+                "host reference row keys differ",
+            )
+            context = row["context_tokens"]
+            require(
+                type(context) is int and context in PROFILE_CONTEXTS and context not in by_context,
+                "host reference row context differs",
+            )
+            require(
+                type(row["decode_tokens"]) is int and row["decode_tokens"] == decode_tokens(context),
+                "host reference decode token census differs",
+            )
+            for key in (
+                "k5_decode_wall_seconds",
+                "plain_decode_wall_seconds",
+                "prefill_wall_seconds",
+            ):
+                value = row[key]
+                require(
+                    type(value) is float and math.isfinite(value) and value > 0.0,
+                    "host reference wall is not a positive float",
+                )
+            args.suite.exact_hex(row["prompt_sha256"], 64, "host prompt digest")
+            for mode in ("k5", "plain"):
+                measured = engine_decode(row[mode + "_usage"], context, decode_budget(context))
+                require(row[mode + "_decode_wall_seconds"] == measured["decode_wall_seconds"],
+                        "host decode wall differs from its source-defined usage proof")
+            clock = row["prefill_client_monotonic"]
+            require(type(clock) is dict and set(clock) == {"start", "finish"}
+                    and all(type(clock[key]) is float and math.isfinite(clock[key])
+                            for key in clock)
+                    and clock["finish"] > clock["start"]
+                    and clock["finish"] - clock["start"] == row["prefill_wall_seconds"],
+                    "host prefill wall differs from its client monotonic proof")
+            by_context[context] = row
+        table[name] = {"argv_overlay": list(overlay), "rows": by_context,
+                       "effective_overlay": effective,
+                       "host_recipe_sha256": profile["host_recipe_sha256"]}
+        if v2:
+            table[name]["launch_argv_sha256"] = profile["launch_argv_sha256"]
+    return document, table, digest(raw)
+
+
+def decode_budget(context):
+    return min(DECODE_BUDGET, NATIVE_CONTEXT - context)
+
+
+def decode_tokens(context):
+    """Source-defined scheduler decode census, excluding the first output token."""
+    return decode_budget(context) - 1
+
+
+def effective_overlay(overlay):
+    """Canonicalize only source-known serve selectors, not arbitrary CLI text."""
+    allowed = {"--max-prefill-tokens", "--max-seq-len", "--scheduling-policy", "--tbt-deadline-ms"}
+    require(type(overlay) is list and len(overlay) % 2 == 0
+            and all(type(item) is str and item and "\x00" not in item for item in overlay),
+            "host reference argv overlay is not a plain serving overlay")
+    values = {}
+    for key, value in zip(overlay[::2], overlay[1::2]):
+        require(key in allowed and key not in values, "unsupported or repeated profile selector")
+        values[key] = value
+    for key, expected in (("--max-prefill-tokens", CHUNK_TOKENS), ("--max-seq-len", NATIVE_CONTEXT)):
+        require(key in values and re.fullmatch(r"[0-9]+", values[key]) is not None
+                and int(values[key]) == expected, "profile chunk/context selector differs")
+        values[key] = int(values[key])
+    policy = values.setdefault("--scheduling-policy", "fifo")
+    require(policy in ("fifo", "slai"), "unsupported scheduling policy")
+    deadline = values.get("--tbt-deadline-ms", "100")
+    require(re.fullmatch(r"[0-9]+", deadline) is not None
+            and 0 <= int(deadline) <= (1 << 64) - 1, "invalid scheduling deadline")
+    # CLI default is FIFO. Its TBT deadline is unused by FifoPolicy.
+    values["--tbt-deadline-ms"] = int(deadline) if policy == "slai" else None
+    return values
+
+
+def verify_profile_contract_v2(args, table, plan):
+    """Contract /2: each profile runs its own recipe, bound by sha in the image."""
+    contract = args.launch_plan["performance_profile_contract"]
+    require(type(contract) is dict and contract.get("schema") == "flux-performance-profile-contract/2",
+            "performance profile contract /2 is required by plan /3")
+    for name in PROFILE_NAMES:
+        binding = contract["profiles"][name]
+        path, wide, mode = PROFILE_RECIPES[name]
+        require(binding["recipe_relpath"] == path and wide == str(binding["chunk_tokens"]),
+                "profile recipe is not its source-defined recipe")
+        raw = read_pinned(Path(args.launch_plan["source_root_path"]) / path,
+                          binding["recipe_sha256"], "source profile recipe")
+        environment = args.suite._recipe_environment(raw)
+        require(all(environment.get(key.encode()) == wide.encode()
+                    for key in ("FLUX_QWEN4_PREFILL_WIDE", "ATLAS_QWEN4_PREFILL_WIDE"))
+                and environment.get(b"FLUX_MODE") == mode.encode()
+                and b"ATLAS_MAX_BATCH_TOKENS" not in environment
+                and b"FLUX_MAX_BATCH_TOKENS" not in environment,
+                "source profile recipe semantics differ")
+        require(binding["argv_overlay"] == table[name]["argv_overlay"]
+                and binding["recipe_sha256"] == table[name]["host_recipe_sha256"]
+                and binding["launch_argv_sha256"] == table[name]["launch_argv_sha256"],
+                "host profile is not bound to the source recipe/configuration")
+        for launch_mode in MODES:
+            template = server_argv(plan, launch_mode, args.suite.PROFILE_LAUNCH_MODEL,
+                                   args.suite.PROFILE_LAUNCH_PORT, binding["argv_overlay"])
+            require(digest(args.suite.canonical_bytes(template))
+                    == binding["launch_argv_sha256"][launch_mode],
+                    "profile launch argv differs from its sealed full-argv binding")
+        image = plan["profiles"][name]
+        require(image["in_container_recipe_path"] == binding["in_container_recipe_path"]
+                and image["recipe_sha256"] == binding["recipe_sha256"],
+                "image does not carry this profile's recipe")
+    return contract
+
+
+def verify_profile_contract(args, table, plan):
+    """Names/policies alone cannot qualify the two source-defined recipes."""
+    if geometry_v2(args):
+        return verify_profile_contract_v2(args, table, plan)
+    contract = args.launch_plan.get("performance_profile_contract")
+    require(type(contract) is dict and set(contract) == {"schema", "profiles"}
+            and contract["schema"] == "flux-performance-profile-contract/1",
+            "HOLD: sealed suite plan has no reviewed performance profile contract")
+    require(type(contract["profiles"]) is dict and set(contract["profiles"]) == set(PROFILE_NAMES),
+            "performance profile contract census differs")
+    for name in PROFILE_NAMES:
+        binding = contract["profiles"][name]
+        require(type(binding) is dict
+                and set(binding) == {"recipe_relpath", "recipe_sha256", "argv_overlay"},
+                "performance profile binding differs")
+        path, wide, mode = PROFILE_RECIPES[name]
+        require(binding["recipe_relpath"] == path, "profile recipe is not its source-defined recipe")
+        args.suite.exact_hex(binding["recipe_sha256"], 64, "profile recipe digest")
+        raw = read_pinned(Path(args.launch_plan["source_root_path"]) / path,
+                          binding["recipe_sha256"], "source profile recipe")
+        environment = args.suite._recipe_environment(raw)
+        require(all(environment.get(key.encode()) == wide.encode()
+                    for key in ("FLUX_QWEN4_PREFILL_WIDE", "ATLAS_QWEN4_PREFILL_WIDE"))
+                and environment.get(b"FLUX_MODE") == mode.encode(),
+                "source profile recipe semantics differ")
+        require(effective_overlay(binding["argv_overlay"]) == table[name]["effective_overlay"]
+                and binding["recipe_sha256"] == table[name]["host_recipe_sha256"],
+                "host profile is not bound to the source recipe/configuration")
+        require(binding["recipe_sha256"] == plan["recipe_sha256"],
+                "HOLD: immutable image/broker cannot serve both source-defined profile recipes")
+    return contract
+
+
+# --------------------------------------------------------------------------- HTTP
+
+def request(args, method, route, body=None, *, timeout=REQUEST_TIMEOUT):
+    parsed = urllib.parse.urlsplit(args.base_url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        payload = None if body is None else args.suite.canonical_bytes(body)
+        connection.request(
+            method,
+            route,
+            body=payload,
+            headers={"Content-Type": "application/json", "Connection": "close"},
+        )
+        response = connection.getresponse()
+        raw = response.read(MAX_RESPONSE + 1)
+        if route == "/health" and response.status != 200:
+            raise ConnectionError("server is not ready")
+        require(
+            len(raw) <= MAX_RESPONSE and response.status == 200,
+            "endpoint status or response bound differs",
+        )
+        return raw
+    finally:
+        connection.close()
+
+
+def stream_request(args, route, body, *, timeout=REQUEST_TIMEOUT):
+    """POST an SSE request; return [(monotonic_seconds, event_bytes)] up to [DONE]."""
+    parsed = urllib.parse.urlsplit(args.base_url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    events = []
+    try:
+        connection.request(
+            "POST",
+            route,
+            body=args.suite.canonical_bytes(body),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "Connection": "close",
+            },
+        )
+        response = connection.getresponse()
+        require(response.status == 200, "stream endpoint status differs")
+        buffer = b""
+        total = 0
+        while True:
+            chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            require(total <= MAX_RESPONSE, "stream exceeds the response bound")
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                stamp = time.monotonic()
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    return events
+                events.append((stamp, data))
+                require(len(events) <= MAX_STREAM_EVENTS, "stream event census is oversized")
+        raise ValueError("stream ended without the [DONE] terminator")
+    finally:
+        connection.close()
+
+
+def process_executable(pid):
+    try:
+        return os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        return ""
+
+
+def find_pid(args, model, plan):
+    """Locate the one process executing the release binary for this arm's model.
+
+    The launch supervisor also carries the model name in its command line, so the
+    match is bound to the executable basename; uniqueness is still required.
+    """
+    expected = os.path.basename(plan["in_container_binary_path"])
+    require(bool(expected), "release binary path has no basename")
+    raw = docker(["container", "top", args.container_id, "-eo", "pid,args"]).decode("utf-8", "strict")
+    rows = []
+    for line in raw.splitlines()[1:]:
+        columns = line.strip().split(None, 1)
+        if len(columns) != 2 or model not in columns[1].split():
+            continue
+        pid = int(columns[0])
+        if process_executable(pid) != expected:
+            continue
+        rows.append(pid)
+    require(len(rows) <= 1, "server process identity is ambiguous")
+    return None if not rows else rows[0]
+
+
+def claim_pid(args, pid, plan):
+    """Bind cleanup to our exact container/executable before taking ownership."""
+    descriptor = os.pidfd_open(pid)
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_bytes()
+        require(
+            re.search(rb"(?<![0-9a-f])" + args.container_id.encode() + rb"(?![0-9a-f])", cgroup)
+            is not None,
+            "server is outside the launch container",
+        )
+        executable = os.open(f"/proc/{pid}/exe", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            observed, _ = args.suite._hash_regular_fd(
+                executable, "profile executable", 2 * 1024 * 1024 * 1024
+            )
+            require(observed == plan["in_container_binary_sha256"], "server executable hash differs")
+        finally:
+            os.close(executable)
+        require(not select.select([descriptor], [], [], 0)[0], "server exited before ownership")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def server_argv(plan, mode, model, port, overlay):
+    """Canonical launch: plain = kill switch only; K5 = --speculative --num-drafts 4."""
+    argv = [
+        plan["in_container_binary_path"],
+        "serve",
+        "--no-tui",
+        "--model-from-path",
+        "/models",
+        "--model-name",
+        model,
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--max-batch-size",
+        "1",
+        "--max-num-seqs",
+        "1",
+        "--kv-cache-dtype",
+        "bf16",
+        "--enable-prefix-caching",
+        "false",
+        *overlay,
+    ]
+    if mode == "native-mtp-k5":
+        argv += ["--speculative", "--num-drafts", "4"]
+    return argv
+
+
+def verify_live_argv(pid, pidfd, argv):
+    """Bind the intended selectors to this still-live pidfd-owned process."""
+    expected = b"\0".join(item.encode("utf-8") for item in argv) + b"\0"
+    require(not select.select([pidfd], [], [], 0)[0], "server exited before argv proof")
+    observed = Path(f"/proc/{pid}/cmdline").read_bytes()
+    require(observed == expected, "live server argv differs from the exact profile launch")
+    require(not select.select([pidfd], [], [], 0)[0], "server exited during argv proof")
+
+
+def finish_server(process, pidfd, token, launched):
+    errors = []
+
+    def attempt(operation):
+        try:
+            return operation()
+        except BaseException as error:
+            errors.append(error)
+            return None
+
+    try:
+        if process is not None:
+            try:
+                if pidfd is not None:
+                    if not select.select([pidfd], [], [], 0)[0]:
+                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                    if not select.select([pidfd], [], [], 10)[0]:
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        require(bool(select.select([pidfd], [], [], 5)[0]), "server survived forced cleanup")
+                        errors.append(ValueError("server required forced cleanup"))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                attempt(process.stdin.close)
+                if not process.stdin.closed:
+                    attempt(process.stdin.close)
+                status = attempt(lambda: process.wait(timeout=20))
+                if process.poll() is None:
+                    errors.append(ValueError("supervisor cleanup was not acknowledged"))
+                    attempt(process.kill)
+                    attempt(lambda: process.wait(timeout=5))
+                elif status != 0:
+                    errors.append(ValueError("server supervisor exited unsuccessfully"))
+            if not errors:
+                expected = ("R16_EXEC_CLEANUP token=" + token + " child_started="
+                            + str(launched).lower() + " retired=true forced=false\n").encode("ascii")
+                observed = attempt(lambda: process.stdout.read(1025))
+                if observed != expected:
+                    errors.append(ValueError("supervisor cleanup was not acknowledged"))
+    finally:
+        if process is not None and process.stdout is not None:
+            attempt(process.stdout.close)
+        if pidfd is not None:
+            attempt(lambda: os.close(pidfd))
+    if errors:
+        raise ValueError("server cleanup failed: " + str(errors[0])) from errors[0]
+
+
+def live_request(plan, mode, pid):
+    """Broker /2 names the profile whose recipe the server must run."""
+    if "profile" in plan:
+        return {"schema": "flux-r16-live-process-request/2", "profile": plan["profile"],
+                "mode": mode, "host_pid": pid}
+    return {"schema": "flux-r15-live-process-request/1", "mode": mode, "host_pid": pid}
+
+
+@contextmanager
+def server(args, mode, plan, recipe, overlay):
+    model = "flux-profile-" + GATE + "-" + secrets.token_hex(16)
+    environment = dict(recipe)
+    environment["ATLAS_DISABLE_SPECULATION"] = "1" if mode == "none" else "0"
+    argv = server_argv(plan, mode, model, args.container_port, overlay)
+    token = secrets.token_hex(32)
+    command = [
+        "docker",
+        "exec",
+        "-i",
+        args.container_id,
+        "/usr/bin/env",
+        *[key + "=" + value for key, value in sorted(environment.items())],
+        "/usr/bin/python3",
+        "-c",
+        EXEC_SUPERVISOR,
+        base64.b64encode(json.dumps(argv).encode("utf-8")).decode("ascii"),
+        token,
+    ]
+    process = None
+    launched = False
+    pid = pidfd = None
+    proof = None
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        launched = True
+        require(process.stdin.write(b"G") == 1, "server launch control short write")
+        process.stdin.flush()
+        deadline = time.monotonic() + READY_TIMEOUT
+        launch_deadline = time.monotonic() + LAUNCH_PID_TIMEOUT
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "server launcher exited before readiness")
+            if pid is None:
+                pid = find_pid(args, model, plan)
+                if pid is not None:
+                    pidfd = claim_pid(args, pid, plan)
+                elif time.monotonic() > launch_deadline:
+                    raise ValueError("server process never appeared")
+            else:
+                require(
+                    not select.select([pidfd], [], [], 0)[0],
+                    "server exited before readiness",
+                )
+                try:
+                    request(args, "GET", "/health", timeout=2)
+                    request(args, "GET", "/health", timeout=2)
+                    verify_live_argv(pid, pidfd, argv)
+                    proof = args.suite.verify_live_server(
+                        live_request(plan, mode, pid),
+                        plan,
+                        args.identities,
+                    )
+                    break
+                except (ConnectionError, TimeoutError, OSError, http.client.HTTPException):
+                    pass
+            time.sleep(0.1)
+        require(proof is not None, "fresh server readiness deadline expired")
+        yield model, proof, pidfd
+        verify_live_argv(pid, pidfd, argv)
+        final = args.suite.verify_live_server(
+            live_request(plan, mode, pid),
+            plan,
+            args.identities,
+        )
+        require(final == proof, "server identity changed during the profile arm")
+    finally:
+        finish_server(process, pidfd, token, launched)
+
+
+# --------------------------------------------------------------------------- prompts
+
+def workload_texts():
+    texts = {"head": HEAD_TEXT, "filler": FILLER_TEXT, "tail": QUESTION_TEXT + NO_THINKING_FRAME}
+    texts.update({name: f"\nAudit passkey {name}: {passkey}\n" for name, passkey in PASSKEYS.items()})
+    return texts
+
+
+def validate_token_vector(value, label):
+    require(type(value) is list and bool(value), f"{label} token vector is empty")
+    require(
+        all(type(token) is int and 0 <= token <= 0xFFFF_FFFF for token in value),
+        f"{label} contains a non-u32 token",
+    )
+    return value
+
+
+def tokenize_components(args, model):
+    components = {}
+    texts = workload_texts()
+    for label in PROMPT_COMPONENT_KEYS:
+        raw = request(args, "POST", "/tokenize", {"model": model, "prompt": texts[label]})
+        value = args.suite.strict_json_loads(raw, "tokenize response")
+        require(type(value) is dict and type(value.get("tokens")) is list, "/tokenize shape differs")
+        components[label] = validate_token_vector(value["tokens"], label)
+    return components
+
+
+def repeated(tokens, length):
+    repeats, tail = divmod(length, len(tokens))
+    return tokens * repeats + tokens[:tail]
+
+
+def assemble_prompt(target, components):
+    """Framed no-thinking prompt of exactly `target` ids with three needles at pinned depths."""
+    require(target in PROFILE_CONTEXTS, "target is outside the profile context grid")
+    require(tuple(components) == PROMPT_COMPONENT_KEYS, "component token map has wrong keys")
+    for label, tokens in components.items():
+        validate_token_vector(tokens, label)
+    needles = sum(len(components[name]) for name in PASSKEYS)
+    body_len = target - len(components["head"]) - len(components["tail"])
+    require(body_len > needles + len(components["filler"]), "target is too short for the framed prompt")
+    body = repeated(components["filler"], body_len - needles)
+    for depth, name in reversed(list(zip(PASSKEY_DEPTHS, PASSKEYS))):
+        at = int(len(body) * depth)
+        body[at:at] = components[name]
+    prompt = components["head"] + body + components["tail"]
+    require(len(prompt) == target, "exact prompt assembly drifted")
+    positions = {}
+    for name in PASSKEYS:
+        needle = components[name]
+        matches = [
+            index
+            for index in range(len(prompt) - len(needle) + 1)
+            if prompt[index : index + len(needle)] == needle
+        ]
+        require(len(matches) == 1, f"{name} needle occurrence count differs")
+        positions[name] = matches[0]
+    return prompt, positions
+
+
+def prompt_sha256(tokens):
+    value = hashlib.sha256()
+    for token in tokens:
+        value.update(token.to_bytes(4, "little"))
+    return value.hexdigest()
+
+
+def completion_body(model, prompt, max_tokens, *, stream, return_token_ids):
+    body = {
+        "model": model,
+        "prompt": "",
+        "prompt_token_ids": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "stream": stream,
+        "stop": [],
+        "seed": SEED,
+        "ignore_eos": True,
+    }
+    if return_token_ids:
+        body["return_token_ids"] = True
+    if stream:
+        body["stream_options"] = {"include_usage": True, "continuous_usage_stats": False}
+    return body
+
+
+# --------------------------------------------------------------------------- measurements
+
+def validate_usage(value, prompt_tokens, requested, *, exact):
+    require(type(value) is dict, "completion response must be an object")
+    usage = value.get("usage")
+    choices = value.get("choices")
+    require(type(usage) is dict and type(choices) is list and len(choices) == 1, "completion shape differs")
+    require(usage.get("prompt_tokens") == prompt_tokens and type(usage["prompt_tokens"]) is int,
+            "server prompt token accounting differs from the exact request")
+    completion = usage.get("completion_tokens")
+    require(type(completion) is int and (completion == requested if exact else 1 <= completion <= requested),
+            "completion token count differs from the ignore_eos budget")
+    require(usage.get("total_tokens") == prompt_tokens + completion, "total token accounting differs")
+    details = usage.get("prompt_tokens_details")
+    require(type(details) is dict and details.get("cached_tokens") == 0 and type(details["cached_tokens"]) is int,
+            "prefix cache reuse is unsupported for profile qualification")
+    choice = choices[0]
+    require(type(choice) is dict and type(choice.get("text")) is str, "completion choice differs")
+    return usage, choice
+
+
+def exact_measurement(response, prompt_tokens, requested):
+    """Blocking ignore_eos request with scheduler-owned token IDs: identity + passkeys."""
+    usage, choice = validate_usage(response, prompt_tokens, requested, exact=True)
+    require(choice.get("finish_reason") == "length", "completion finish reason differs from ignore_eos budget")
+    tokens = validate_token_vector(choice.get("token_ids"), "scheduler-owned completion")
+    require(len(tokens) == requested, "scheduler-owned completion token IDs differ from the budget")
+    text = choice["text"]
+    retrieved = {name: passkey in text for name, passkey in PASSKEYS.items()}
+    return {
+        "completion_tokens": requested,
+        "finish_reason": choice.get("finish_reason"),
+        "text_sha256": digest(text.encode()),
+        "token_ids_sha256": prompt_sha256(tokens),
+        "passkeys_retrieved": retrieved,
+        "accuracy_pass": all(retrieved.values()),
+        "time_to_first_token_ms": usage.get("time_to_first_token_ms"),
+    }
+
+
+def ttft_measurement(response, prompt_tokens, wall_seconds, *, client_monotonic):
+    """Request-wall prompt rate/TTFT proxy, not engine-only prefill throughput."""
+    usage, choice = validate_usage(response, prompt_tokens, 1, exact=True)
+    require(choice.get("finish_reason") == "length", "first-token finish reason differs from ignore_eos budget")
+    tokens = validate_token_vector(choice.get("token_ids"), "first token")
+    require(len(tokens) == 1, "first-token request returned more than one token")
+    require(type(wall_seconds) is float and math.isfinite(wall_seconds) and wall_seconds > 0.0,
+            "prefill wall is not a positive float")
+    require(type(client_monotonic) is dict and set(client_monotonic) == {"start", "finish"}
+            and all(type(value) is float and math.isfinite(value) for value in client_monotonic.values())
+            and client_monotonic["finish"] > client_monotonic["start"]
+            and client_monotonic["finish"] - client_monotonic["start"] == wall_seconds,
+            "request-wall monotonic proof differs")
+    server_ms = usage.get("time_to_first_token_ms")
+    require(
+        (type(server_ms) is float or type(server_ms) is int)
+        and math.isfinite(float(server_ms))
+        and 0.0 < float(server_ms) <= wall_seconds * 1000.0 + 1.0,
+        "engine TTFT is missing or exceeds the client prefill wall",
+    )
+    return {
+        "prefill_prompt_tokens": prompt_tokens,
+        "prefill_ttft_seconds": wall_seconds,
+        "client_request_wall_prompt_tokens_per_second": prompt_tokens / wall_seconds,
+        "prefill_clock": PREFILL_CLOCK,
+        "client_monotonic": client_monotonic,
+        "server_time_to_first_token_ms": float(server_ms),
+        "first_token_id": tokens[0],
+    }
+
+
+def stream_measurement(events, prompt_tokens, requested, suite):
+    """Use scheduler decode time, never infer token boundaries from text events."""
+    first = last = None
+    previous = None
+    text = []
+    usage = None
+    identity = None
+    for stamp, data in events:
+        require(type(stamp) is float and math.isfinite(stamp)
+                and (previous is None or stamp >= previous), "stream event clock differs")
+        previous = stamp
+        value = suite.strict_json_loads(data, "stream event")
+        require(type(value) is dict and "error" not in value, "stream event is not a completion")
+        require(usage is None, "stream event followed terminal usage")
+        require(type(value.get("id")) is str and bool(value["id"])
+                and (identity is None or identity == value["id"]), "stream response identity differs")
+        identity = value["id"]
+        choices = value.get("choices")
+        require(type(choices) is list and len(choices) == 1
+                and type(choices[0]) is dict and type(choices[0].get("index")) is int
+                and choices[0]["index"] == 0 and type(choices[0].get("text")) is str,
+                "stream choice geometry differs")
+        if type(value.get("usage")) is dict:
+            usage = value["usage"]
+            require(choices[0].get("finish_reason") == "length" and choices[0]["text"] == "",
+                    "stream terminal finish geometry differs")
+        else:
+            require(choices[0].get("finish_reason") is None, "stream finished before terminal usage")
+        for choice in choices:
+            piece = choice.get("text") if type(choice) is dict else None
+            if type(piece) is str and piece:
+                if first is None:
+                    first = stamp
+                last = stamp
+                text.append(piece)
+    require(first is not None and last is not None, "stream carried no completion text")
+    require(type(usage) is dict, "stream terminal usage is missing")
+    require(
+        len(text) <= requested,
+        "stream carried more text events than the output token budget",
+    )
+    return {
+        **engine_decode(usage, prompt_tokens, requested),
+        "streamed_text_sha256": digest("".join(text).encode()),
+        "stream_text_events": len(text),
+        "observed_text_event_wall_seconds": last - first,
+        "finish_reason": "length",
+    }
+
+
+def engine_decode(usage, prompt_tokens, requested):
+    """Invert the source-pinned completions.rs terminal rate formula."""
+    validate_usage({"usage": usage, "choices": [{"text": ""}]}, prompt_tokens, requested, exact=True)
+    engine_rate = usage.get("response_token/s")
+    require(
+        (type(engine_rate) is float or type(engine_rate) is int)
+        and math.isfinite(float(engine_rate))
+        and float(engine_rate) > 0.0,
+        "engine decode rate is missing or not positive",
+    )
+    wall = (requested - 1) / float(engine_rate)
+    require(math.isfinite(wall) and wall > 0.0, "engine decode wall is not positive")
+    return {
+        "decode_tokens": requested - 1,
+        "decode_wall_seconds": wall,
+        "decode_clock": DECODE_CLOCK,
+        "engine_decode_tokens_per_second": float(engine_rate),
+        "terminal_usage": usage,
+    }
+
+
+def build_row(profile, context, plain, native, host_row, binding=None):
+    """One validator raw row (exact 12 keys) and its evidence row (exact 7 keys)."""
+    require(plain["exact"]["token_ids_sha256"] == native["exact"]["token_ids_sha256"]
+            and plain["exact"]["text_sha256"] == native["exact"]["text_sha256"]
+            and plain["exact"]["finish_reason"] == native["exact"]["finish_reason"],
+            "plain/native K5 token identity differs")
+    for arm in (plain, native):
+        require(arm["exact"]["text_sha256"] == arm["stream"]["streamed_text_sha256"],
+                "streamed text differs from the exact blocking completion")
+        require(arm["ttft"]["first_token_id"] == arm["first_token_id_exact"],
+                "first token differs between the one-token and the full request")
+    require(plain["ttft"]["first_token_id"] == native["ttft"]["first_token_id"],
+            "plain/native K5 first token differs")
+    accuracy = plain["exact"]["accuracy_pass"] and native["exact"]["accuracy_pass"]
+    require(accuracy, "passkey retrieval failed in a profile arm")
+    host_wall = host_row["k5_decode_wall_seconds"]
+    profile_wall = native["stream"]["decode_wall_seconds"]
+    for arm in (plain, native):
+        require(
+            arm["stream"]["decode_tokens"] == host_row["decode_tokens"],
+            "host decode token census differs",
+        )
+    raw = {
+        "profile": profile,
+        "context_tokens": context,
+        "prefill_prompt_tokens": native["ttft"]["prefill_prompt_tokens"],
+        "prefill_ttft_seconds": native["ttft"]["prefill_ttft_seconds"],
+        "plain_decode_tokens": plain["stream"]["decode_tokens"],
+        "plain_decode_wall_seconds": plain["stream"]["decode_wall_seconds"],
+        "k5_decode_tokens": native["stream"]["decode_tokens"],
+        "k5_decode_wall_seconds": native["stream"]["decode_wall_seconds"],
+        "host_decode_wall_seconds": host_wall,
+        "profile_decode_wall_seconds": profile_wall,
+        "k5_lossless": True,
+        "accuracy_pass": True,
+        **(binding or {}),
+    }
+    delta = 100.0 * (host_wall - profile_wall) / profile_wall
+    plain_delta = (
+        100.0
+        * (host_row["plain_decode_wall_seconds"] - raw["plain_decode_wall_seconds"])
+        / raw["plain_decode_wall_seconds"]
+    )
+    measured_prefill = raw["prefill_ttft_seconds"]
+    prefill_delta = (
+        100.0
+        * (host_row["prefill_wall_seconds"] - measured_prefill)
+        / measured_prefill
+    )
+    evidence = {
+        "profile": profile,
+        "context_tokens": context,
+        "prefill_tokens_per_second": raw["prefill_prompt_tokens"] / raw["prefill_ttft_seconds"],
+        "plain_decode_tokens_per_second": raw["plain_decode_tokens"] / raw["plain_decode_wall_seconds"],
+        "k5_decode_tokens_per_second": raw["k5_decode_tokens"] / raw["k5_decode_wall_seconds"],
+        "k5_lossless": True,
+        "host_delta_percent": delta,
+    }
+    require(math.isfinite(delta) and abs(delta) <= HOST_BAND_PERCENT, "host decode band exceeded")
+    require(
+        math.isfinite(plain_delta) and abs(plain_delta) <= HOST_BAND_PERCENT,
+        "host plain decode band exceeded",
+    )
+    require(
+        math.isfinite(prefill_delta) and abs(prefill_delta) <= HOST_BAND_PERCENT,
+        "host prefill band exceeded",
+    )
+    bands = {
+        "profile": profile,
+        "context_tokens": context,
+        "decode_clock": DECODE_CLOCK,
+        "prefill_clock": PREFILL_CLOCK,
+        "k5_decode_delta_percent": delta,
+        "plain_decode_delta_percent": plain_delta,
+        "prefill_delta_percent": prefill_delta,
+        "host_k5_decode_wall_seconds": host_wall,
+        "host_plain_decode_wall_seconds": host_row["plain_decode_wall_seconds"],
+        "host_client_prefill_wall_seconds": host_row["prefill_wall_seconds"],
+        "measured_k5_decode_wall_seconds": profile_wall,
+        "measured_plain_decode_wall_seconds": raw["plain_decode_wall_seconds"],
+        "measured_client_prefill_wall_seconds": measured_prefill,
+    }
+    return raw, evidence, bands
+
+
+def k5_events(metrics):
+    total = sum(
+        float(value)
+        for value in re.findall(
+            r'^atlas_spec_decode_verify_total\{[^\n}]*\bk="5"[^\n}]*\}\s+([0-9.eE+-]+)\s*$',
+            metrics,
+            re.MULTILINE,
+        )
+    )
+    require(math.isfinite(total) and 0 <= total <= 1_000_000_000_000 and float(total).is_integer(),
+            "native K5 verification counter is malformed")
+    return int(total)
+
+
+def make_directory(suite, runtime, parts):
+    parent = suite.open_directory_chain(runtime, "profile runtime")
+    try:
+        for name in parts:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            os.close(parent)
+            parent = child
+    finally:
+        os.close(parent)
+
+
+# --------------------------------------------------------------------------- run
+
+def measure_arm(args, profile, mode, model, pidfd, prompts, journal, journal_hash, request_ids,
+                binding=None):
+    """Per context: exact blocking (ids + passkeys), one-token TTFT, timed stream."""
+    arm = {}
+    for context in PROFILE_CONTEXTS:
+        prompt = prompts[context]["ids"]
+        budget = decode_budget(context)
+        observations = {}
+        for kind in ("exact", "ttft", "stream"):
+            require(not select.select([pidfd], [], [], 0)[0], "profile server exited")
+            if kind == "stream":
+                body = completion_body(model, prompt, budget, stream=True, return_token_ids=False)
+                started = time.monotonic()
+                events = stream_request(args, "/v1/completions", body)
+                finished = time.monotonic()
+                wall = finished - started
+                record = {"events": [[stamp - started, data.decode("utf-8", "replace")] for stamp, data in events],
+                          "client_wall_seconds": wall,
+                          "client_monotonic": {"start": started, "finish": finished}}
+                observations[kind] = stream_measurement(events, context, budget, args.suite)
+                response_id = None
+                for _stamp, data in events:
+                    value = args.suite.strict_json_loads(data, "stream event")
+                    response_id = value.get("id") if type(value) is dict else response_id
+            else:
+                tokens = 1 if kind == "ttft" else budget
+                body = completion_body(model, prompt, tokens, stream=False, return_token_ids=True)
+                started = time.monotonic()
+                raw = request(args, "POST", "/v1/completions", body)
+                finished = time.monotonic()
+                wall = finished - started
+                response = args.suite.strict_json_loads(raw, "completion response")
+                clock = {"start": started, "finish": finished}
+                record = {"response": response, "client_wall_seconds": wall, "client_monotonic": clock}
+                if kind == "exact":
+                    observations[kind] = exact_measurement(response, context, budget)
+                    choice = response["choices"][0]
+                    observations["first_token_id_exact"] = choice["token_ids"][0]
+                else:
+                    observations[kind] = ttft_measurement(response, context, wall, client_monotonic=clock)
+                response_id = response.get("id") if type(response) is dict else None
+            require(type(response_id) is str and bool(response_id) and response_id not in request_ids,
+                    "response identity is missing or reused")
+            request_ids.add(response_id)
+            entry = args.suite.canonical_bytes(
+                {"profile": profile, "mode": mode, "context_tokens": context, "kind": kind,
+                 "prompt_sha256": prompts[context]["sha256"],
+                 "request": {key: value for key, value in body.items() if key != "prompt_token_ids"},
+                 **(binding or {}),
+                 **record}
+            ) + b"\n"
+            require(os.fstat(journal).st_size + len(entry) <= args.suite.MAX_RAW_LOG_BYTES,
+                    "profile response journal exceeds the release bound")
+            args.suite.write_all(journal, entry)
+            journal_hash.update(entry)
+            require(not select.select([pidfd], [], [], 0)[0], "profile server exited during request")
+        arm[context] = observations
+    metrics = request(args, "GET", "/metrics").decode("utf-8", "strict")
+    events = k5_events(metrics)
+    require(events > 0 if mode == "native-mtp-k5" else events == 0, "native K5 verifier engagement differs")
+    return arm, {"k5_events": events, "metrics_sha256": digest(metrics.encode()), "metrics": metrics}
+
+
+def run(args):
+    suite = args.suite
+    for path, key in (("api/completions.rs", "completions_source_sha256"),
+                      ("cli.rs", "cli_source_sha256")):
+        read_pinned(Path(args.launch_plan["source_root_path"]) / "crates/spark-server/src" / path,
+                    MEASUREMENT_CONTRACT[key], "measurement source")
+    host_document, host_table, host_sha = load_host_reference(args)
+    plan, recipe = inspect_container(args, suite)
+    require(host_document["binary_sha256"] == plan["in_container_binary_sha256"],
+            "host reference was measured on a different binary")
+    # A per-profile host recipe hash is only evidence if it names the recipe the
+    # image actually runs. Otherwise the reference's identity fields are prose.
+    v2 = geometry_v2(args)
+    for profile in PROFILE_NAMES:
+        image_recipe = plan["profiles"][profile]["recipe_sha256"] if v2 else plan["recipe_sha256"]
+        require(
+            host_table[profile]["host_recipe_sha256"] == image_recipe,
+            "host reference profile recipe differs from the image recipe",
+        )
+    profiles_share_argv = (
+        host_table[PROFILE_NAMES[0]]["effective_overlay"]
+        == host_table[PROFILE_NAMES[1]]["effective_overlay"]
+    )
+    if profiles_share_argv:
+        # Two profiles served by one identical argv are not two profiles. This
+        # is a qualification HOLD, not a pass with a disclosed caveat.
+        print(
+            GATE + ": HOLD: profiles_share_argv=true; two-profile parity is not qualified",
+            file=sys.stderr,
+        )
+        raise ValueError("profiles share one argv: two-profile parity is not qualified")
+    profile_contract = verify_profile_contract(args, host_table, plan)
+    profile_identity = {
+        "image_recipe_sha256": plan["recipe_sha256"],
+        "profiles": {
+            name: {
+                **(profile_contract["profiles"][name] if v2 else {}),
+                "host_recipe_sha256": host_table[name]["host_recipe_sha256"],
+                "recipe_relpath": profile_contract["profiles"][name]["recipe_relpath"],
+                "recipe_sha256": profile_contract["profiles"][name]["recipe_sha256"],
+                "source_revision": args.launch_plan["source_revision"],
+                "source_tree": args.launch_plan["source_tree"],
+                "source_bundle_manifest_sha256": args.launch_plan["source_bundle_manifest_sha256"],
+                "argv_overlay": host_table[name]["argv_overlay"],
+                "effective_overlay": host_table[name]["effective_overlay"],
+                "process_proof_sha256": {},
+            }
+            for name in PROFILE_NAMES
+        },
+        "profiles_share_argv": profiles_share_argv,
+    }
+    runtime = suite.normalized_absolute(args.runtime_dir, "profile runtime")
+    runtime_identity = suite.directory_identity_sha256(runtime, "profile runtime")
+    parts = ["performance", GATE]
+    make_directory(suite, runtime, parts)
+    base = "/".join(parts)
+    journal_path = base + "/responses.jsonl"
+    journal = suite.create_beneath(runtime, journal_path, "profile response journal", 0o400)
+    journal_hash = hashlib.sha256()
+    arms, proofs, request_ids, verification = {}, [], set(), []
+    prompts_by_profile = {}
+    try:
+        for profile in PROFILE_NAMES:
+            overlay = host_table[profile]["argv_overlay"]
+            launch_plan = profile_server_plan(args, plan, profile) if v2 else plan
+            launch_recipe = plan["profiles"][profile]["environment"] if v2 else recipe
+            # Every v2 journal record and raw row binds its profile's chunk and recipe.
+            binding = ({"chunk_tokens": profile_chunk(args, profile),
+                        "recipe_sha256": launch_plan["recipe_sha256"]} if v2 else None)
+            for mode in MODES:
+                with server(args, mode, launch_plan, launch_recipe, overlay) as (model, proof, pidfd):
+                    argv = server_argv(launch_plan, mode, model, args.container_port, overlay)
+                    proofs.append({"profile": profile, "mode": mode, "proof": proof,
+                                   "launch_argv": argv,
+                                   "launch_argv_sha256": digest(suite.canonical_bytes(argv))})
+                    profile_identity["profiles"][profile]["process_proof_sha256"][mode] = digest(
+                        suite.canonical_bytes(proof))
+                    components = tokenize_components(args, model)
+                    prompts = {}
+                    for context in PROFILE_CONTEXTS:
+                        ids, positions = assemble_prompt(context, components)
+                        prompts[context] = {"ids": ids, "sha256": prompt_sha256(ids), "positions": positions}
+                        require(prompts[context]["sha256"] == host_table[profile]["rows"][context]["prompt_sha256"],
+                                "host reference prompt differs from the measured workload")
+                    expected = prompts_by_profile.setdefault(
+                        profile, {context: prompts[context]["sha256"] for context in PROFILE_CONTEXTS}
+                    )
+                    require({context: prompts[context]["sha256"] for context in PROFILE_CONTEXTS} == expected,
+                            "tokenized prompt differs between arms")
+                    arm, metrics = measure_arm(args, profile, mode, model, pidfd, prompts,
+                                               journal, journal_hash, request_ids, binding)
+                arms[(profile, mode)] = arm
+                verification.append({"profile": profile, "mode": mode, **metrics})
+        os.fsync(journal)
+        suite.assert_path_identity(runtime, journal_path, journal, "profile response journal")
+        observed_journal, _ = suite._hash_regular_fd(journal, "profile response journal", suite.MAX_RAW_LOG_BYTES)
+        require(observed_journal == journal_hash.hexdigest(), "profile response journal changed")
+        require(suite.directory_identity_sha256(runtime, "profile runtime") == runtime_identity,
+                "profile runtime identity changed")
+        rows_raw, rows_evidence, observations, host_bands = [], [], [], []
+        chunk_census = ({"profile_chunk_tokens": {name: profile_chunk(args, name) for name in PROFILE_NAMES}}
+                        if v2 else {"chunk_tokens": CHUNK_TOKENS})
+        for profile in PROFILE_NAMES:
+            for context in PROFILE_CONTEXTS:
+                plain = arms[(profile, "none")][context]
+                native = arms[(profile, "native-mtp-k5")][context]
+                raw, evidence, bands = build_row(
+                    profile, context, plain, native, host_table[profile]["rows"][context],
+                    ({"chunk_tokens": profile_chunk(args, profile),
+                      "recipe_sha256": profile_contract["profiles"][profile]["recipe_sha256"]}
+                     if v2 else None),
+                )
+                rows_raw.append(raw)
+                rows_evidence.append(evidence)
+                host_bands.append(bands)
+                observations.append({"profile": profile, "context_tokens": context,
+                                     "prompt_sha256": prompts_by_profile[profile][context],
+                                     "plain": plain, "native_k5": native})
+        validator = {
+            "schema": "flux-r15-gate-validator/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "raw": {
+                "measurement_schema": METRICS_SCHEMA_V4 if v2 else METRICS_SCHEMA,
+                "measurement_contract": MEASUREMENT_CONTRACT,
+                "profile_contract": profile_contract,
+                **chunk_census,
+                "rows": rows_raw,
+                "all_host_tolerances_met": True,
+                "all_accuracy_checks_pass": True,
+                "host_reference_sha256": host_sha,
+                "host_reference": host_document,
+                "profile_identity": profile_identity,
+                "host_bands": host_bands,
+                "observations": observations,
+                "response_journal": {"artifact": journal_path, "sha256": journal_hash.hexdigest(),
+                                     "requests": len(request_ids)},
+                "process_bindings": proofs,
+                "verification_metrics": verification,
+            },
+        }
+        validator_raw = suite.canonical_bytes(validator)
+        require(len(validator_raw) <= suite.MAX_GATE_RECEIPT_BYTES, "validator artifact exceeds the release bound")
+        validator_path = base + "/validator.json"
+        target = suite.create_beneath(runtime, validator_path, "profile validator", 0o400)
+        try:
+            suite.write_all(target, validator_raw)
+            os.fsync(target)
+        finally:
+            os.close(target)
+        evidence = {
+            **chunk_census,
+            "contexts": list(PROFILE_CONTEXTS),
+            "profiles": list(PROFILE_NAMES),
+            "rows": rows_evidence,
+            "all_host_tolerances_met": True,
+            "all_accuracy_checks_pass": True,
+            "validator_artifact": validator_path,
+            "validator_receipt_sha256": digest(validator_raw),
+        }
+        receipt = {
+            "schema": "flux-r15-container-gate-receipt/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "execution_scope": "immutable-container",
+            "image_id": args.image_id,
+            "image_digest": args.image_digest,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "evidence": evidence,
+        }
+        suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+        os.fsync(args.receipt_fd)
+        return receipt
+    finally:
+        os.close(journal)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in (
+        "container-id", "image-id", "image-digest", "base-url", "run-id", "receipt-fd", "raw-log-fd",
+        "runtime-dir", "suite-program", "suite-sha256", "host-reference", "host-reference-sha256",
+    ):
+        parser.add_argument("--" + name, required=True, type=int if name.endswith("-fd") else str)
+    parser.add_argument("--container-port", type=int, default=8888)
+    return parser
+
+
+def parse_args(argv=None):
+    args = build_parser().parse_args(argv)
+    parsed = urllib.parse.urlsplit(args.base_url)
+    require(
+        parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port is not None
+        and parsed.path in ("", "/") and not parsed.query and not parsed.fragment and parsed.username is None,
+        "base URL must be explicit HTTP IPv4 loopback",
+    )
+    require(1 <= args.container_port <= 65535, "container port is invalid")
+    require(re.fullmatch(r"[0-9a-f]{64}", args.container_id) is not None, "container ID differs")
+    for value in (args.image_id, args.image_digest):
+        require(re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None, "immutable image identity differs")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.run_id) is not None, "run ID is invalid")
+    for value in (args.suite_sha256, args.host_reference_sha256):
+        require(re.fullmatch(r"[0-9a-f]{64}", value) is not None and set(value) != {"0"},
+                "dependency hash is invalid")
+    verify_parent_suite(args.suite_sha256)
+    args.suite = load_module(args.suite_program, args.suite_sha256, "_r16_suite_" + GATE.replace("-", "_"))
+    args.launch_plan = load_parent_plan(args.suite)
+    require(
+        callable(getattr(args.suite, "_live_listener_identity", None))
+        and callable(getattr(args.suite, "_verify_live_mode", None)),
+        "source-pinned live broker upgrade is required",
+    )
+    args.identities = {
+        name: getattr(args, name) for name in ("container_id", "image_id", "image_digest", "run_id", "base_url")
+    }
+    require(hasattr(signal, "pidfd_send_signal") and hasattr(os, "pidfd_open"), "local Linux pidfd support is required")
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        # Paths, host identifiers, and response text stay in private artifacts.
+        print(GATE + ": qualification failed (" + type(error).__name__ + ")", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

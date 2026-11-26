@@ -1,0 +1,25 @@
+# Flux Engine — Allowed Git SSH Signers (.github/allowed_signers)
+#
+# Used by `.github/workflows/release.yml` and `scripts/verify_release.sh` to
+# cryptographically verify signed release tags (`vX.Y.Z*`) and signed commits:
+#
+#   git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v1.0.3
+#   git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-commit HEAD
+#
+# Format (see `man ssh-keygen`, ALLOWED SIGNERS):
+#   <principal> namespaces="git" <key-type> <base64-public-key>
+#
+# Privacy rule: ALWAYS use the pseudonymous GitHub noreply principal below;
+# NEVER commit personal email addresses or real names into this file.
+#
+# Non-dry-run tag releases in `.github/workflows/release.yml` FAIL CLOSED until
+# at least one active (uncommented) maintainer public key line is registered
+# below. See `SIGNING.md` for full key generation and hardware FIDO2 setup.
+#
+# Example — Option A (Hardware FIDO2 / YubiKey 5 resident key, recommended):
+# 149847121+TheApathy@users.noreply.github.com namespaces="git" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAA...
+#
+# Primary release signing key (Option B — hardened Ed25519; fingerprint SHA256:rQNuiiNhQcVwJoB4oyAr0MKx3cOWzSekkUXyRRTLCEY):
+149847121+TheApathy@users.noreply.github.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIMUQ/GQjrr51jgMdrWLYeXKHenYj4m6jDvfHypgD3/Z
+# Backup release signing key (Option B — hardened Ed25519; fingerprint SHA256:BYCRavG2b6vIi8S3xCRlfHVQMHJyQDjC5zDcKHMuAqw):
+149847121+TheApathy@users.noreply.github.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGHqpI+J467QZcbcJvmT9JLQGfC82MqJlqlaWJfK06bb

@@ -1,0 +1,563 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Skip CUDA/nvcc in build.rs so clippy/check can run on hosts without a GPU.
+  # Emits a stub target_ptx.rs that satisfies the atlas-kernels include.
+  ATLAS_SKIP_BUILD: "1"
+  # Short-circuit cudarc's nvcc probe (format is {major}0{minor}0; 13000 == CUDA 13.0).
+  # Required for `cargo test` on a runner without nvcc.
+  CUDARC_CUDA_VERSION: "13000"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.93.1"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy --tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.93.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Workspace `Cargo.toml` sets `[workspace.lints.clippy] all = "warn"` for
+      # ergonomic local iteration; CI denies all warnings via `-D warnings`.
+      - run: cargo clippy --workspace --tests -- -D warnings
+
+  license-headers:
+    name: SPDX license headers
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: apache/skywalking-eyes/header@a196742f472feaffafea537ce5a2a4c3c53a8de4 # v0.9.0
+        with:
+          config: .licenserc.yaml
+          mode: check
+
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
+
+  hygiene:
+    name: Privacy, secrets, workflow lint & offline Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Privacy & PII leak check
+        run: python3 -B scripts/verify_no_leaks.py --root .
+
+      - name: Verify offline relative Markdown links
+        run: python3 -B scripts/check_markdown_links.py --root .
+
+      - name: Secret scan (gitleaks v8.30.1)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VER="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks detect --config .github/gitleaks.toml --source . --no-git --redact --exit-code 1
+
+      - name: Lint GitHub Actions workflows (actionlint v1.7.12)
+        run: |
+          set -euo pipefail
+          ACTIONLINT_VER="1.7.12"
+          ACTIONLINT_SHA256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VER}/actionlint_${ACTIONLINT_VER}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint
+
+      - name: Syntax-check all shell and Python scripts
+        run: |
+          set -euo pipefail
+          py_extra=()
+          while IFS= read -r f; do
+            if head -n 1 "$f" | grep -qi 'python'; then
+              py_extra+=("$f")
+            else
+              bash -n "$f"
+            fi
+          done < <(git ls-files '*.sh')
+
+          for cli in repro-kit/flux-autodetect repro-kit/flux-bench repro-kit/lil-bench repro-kit/router/flux-router; do
+            if [ -f "$cli" ]; then
+              py_extra+=("$cli")
+            fi
+          done
+
+          python3 -B -c '
+          import py_compile, subprocess, sys
+          files = subprocess.check_output(["git", "ls-files", "*.py"], text=True).splitlines()
+          files.extend(sys.argv[1:])
+          for path in files:
+              py_compile.compile(path, doraise=True)
+          print(f"py_compile: {len(files)} files OK")
+          ' "${py_extra[@]}"
+
+      - name: Verify production Dockerfile AGPL & build-context compliance
+        run: |
+          set -euo pipefail
+          for f in docker/gb10/Dockerfile docker/sm120/Dockerfile docker/gb10/*/nvfp4/Dockerfile; do
+            grep -q 'COPY build-support/ build-support/' "$f"
+            grep -q 'COPY jinja-templates/ jinja-templates/' "$f"
+            grep -q 'SOURCE_AND_LICENSES.md' "$f"
+            grep -q 'THIRD_PARTY_NOTICES.md' "$f"
+            grep -q 'CREDITS.md' "$f"
+            grep -q 'COPY LICENSES/' "$f"
+          done
+          echo "All production Dockerfiles pass AGPL & build-context compliance checks."
+
+      - name: Run offline Python & shell test suites
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet pytest pyyaml
+          PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q \
+            repro-kit/tests \
+            repro/tests \
+            tests/test_indexed_loader_admission_source.py \
+            tests/test_generate_cargo_spdx_sbom.py \
+            tools/recipe_bench/generate_test.py
+          bash tools/recipe_bench/trap_test.sh
+
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+      - name: Generate libcuda.so stub for no-GPU linking
+        # spark-storage, spark-runtime, spark-comm, and atlas-core use raw
+        # `extern "C"` FFI to libcuda. Without libcuda on the runner the linker
+        # fails with `undefined reference to cu*` even though `ATLAS_SKIP_BUILD=1`
+        # avoids nvcc. Every stub symbol returns CUDA_ERROR_NO_DEVICE (100) so
+        # any GPU call fails fast at runtime; GPU tests are `#[ignore]`-gated.
+        run: |
+          set -euo pipefail
+          cat > /tmp/libcuda_stub.c <<'EOF'
+          /* Stub for every CUDA driver API symbol linked by Flux Engine crates.
+           * Each returns CUDA_ERROR_NO_DEVICE (100) so callers fail fast. */
+          /* Init / device / context */
+          int cuInit(unsigned int x) { (void)x; return 100; }
+          int cuDriverGetVersion(int *v) { (void)v; return 100; }
+          int cuDeviceGet(void *a, int b) { (void)a; (void)b; return 100; }
+          int cuDeviceGetCount(int *c) { (void)c; return 100; }
+          int cuDeviceGetAttribute(int *pi, int attrib, int dev) { (void)pi; (void)attrib; (void)dev; return 100; }
+          int cuDeviceGetName(char *name, int len, int dev) { (void)name; (void)len; (void)dev; return 100; }
+          int cuDeviceGraphMemTrim(int dev) { (void)dev; return 100; }
+          int cuCtxCreate(void **a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
+          int cuCtxCreate_v2(void **a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
+          int cuCtxDestroy_v2(void *a) { (void)a; return 100; }
+          int cuCtxGetCurrent(void **a) { (void)a; return 100; }
+          int cuCtxSetCurrent(void *a) { (void)a; return 100; }
+          int cuCtxGetDevice(int *dev) { (void)dev; return 100; }
+          int cuCtxSynchronize(void) { return 100; }
+          /* Errors */
+          int cuGetErrorName(int code, const char **out) { (void)code; (void)out; return 100; }
+          int cuGetErrorString(int code, const char **out) { (void)code; (void)out; return 100; }
+          /* Streams */
+          int cuStreamCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
+          int cuStreamDestroy_v2(void *a) { (void)a; return 100; }
+          int cuStreamSynchronize(void *a) { (void)a; return 100; }
+          int cuStreamQuery(void *a) { (void)a; return 100; }
+          int cuStreamIsCapturing(void *a, int *status) { (void)a; (void)status; return 100; }
+          int cuStreamBeginCapture(void *a, int b) { (void)a; (void)b; return 100; }
+          int cuStreamBeginCapture_v2(void *a, int b) { (void)a; (void)b; return 100; }
+          int cuStreamEndCapture(void *a, void **b) { (void)a; (void)b; return 100; }
+          int cuStreamWaitEvent(void *a, void *b, unsigned int c) { (void)a; (void)b; (void)c; return 100; }
+          int cuStreamWriteValue32_v2(void *s, unsigned long long addr, unsigned int val, unsigned int flags) {
+              (void)s; (void)addr; (void)val; (void)flags; return 100;
+          }
+          /* Modules + launch */
+          int cuModuleLoadData(void **a, const void *b) { (void)a; (void)b; return 100; }
+          int cuModuleUnload(void *a) { (void)a; return 100; }
+          int cuModuleGetFunction(void **a, void *b, const char *c) { (void)a; (void)b; (void)c; return 100; }
+          int cuModuleGetGlobal_v2(unsigned long long *dptr, unsigned long *bytes,
+                                   void *hmod, const char *name) {
+              (void)dptr; (void)bytes; (void)hmod; (void)name; return 100;
+          }
+          int cuFuncGetAttribute(int *pi, int attr, void *f) { (void)pi; (void)attr; (void)f; return 100; }
+          int cuFuncSetAttribute(void *f, int attr, int val) { (void)f; (void)attr; (void)val; return 100; }
+          int cuOccupancyMaxActiveBlocksPerMultiprocessor(int *n, void *f, int bs, unsigned long sm) {
+              (void)n; (void)f; (void)bs; (void)sm; return 100;
+          }
+          int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
+                             unsigned int bx, unsigned int by, unsigned int bz,
+                             unsigned int sm, void *s, void **p, void **e) {
+              (void)f; (void)gx; (void)gy; (void)gz; (void)bx; (void)by; (void)bz;
+              (void)sm; (void)s; (void)p; (void)e; return 100;
+          }
+          int cuLaunchCooperativeKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
+                                        unsigned int bx, unsigned int by, unsigned int bz,
+                                        unsigned int sm, void *s, void **p) {
+              (void)f; (void)gx; (void)gy; (void)gz; (void)bx; (void)by; (void)bz;
+              (void)sm; (void)s; (void)p; return 100;
+          }
+          int cuLaunchKernelEx(const void *cfg, void *f, void **p, void **e) {
+              (void)cfg; (void)f; (void)p; (void)e; return 100;
+          }
+          /* Events */
+          int cuEventCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
+          int cuEventDestroy(void *a) { (void)a; return 100; }
+          int cuEventDestroy_v2(void *a) { (void)a; return 100; }
+          int cuEventQuery(void *a) { (void)a; return 100; }
+          int cuEventRecord(void *a, void *b) { (void)a; (void)b; return 100; }
+          int cuEventSynchronize(void *a) { (void)a; return 100; }
+          int cuEventElapsedTime(float *a, void *b, void *c) { (void)a; (void)b; (void)c; return 100; }
+          /* Memory — device & virtual memory */
+          int cuMemAlloc(unsigned long long *a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemAlloc_v2(unsigned long long *a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemAllocManaged(unsigned long long *a, unsigned long b, unsigned int c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemFree(unsigned long long a) { (void)a; return 100; }
+          int cuMemFree_v2(unsigned long long a) { (void)a; return 100; }
+          int cuMemGetInfo(unsigned long *a, unsigned long *b) { (void)a; (void)b; return 100; }
+          int cuMemGetInfo_v2(unsigned long *a, unsigned long *b) { (void)a; (void)b; return 100; }
+          int cuMemAddressReserve(unsigned long long *ptr, unsigned long size, unsigned long align,
+                                  unsigned long long addr, unsigned long long flags) {
+              (void)ptr; (void)size; (void)align; (void)addr; (void)flags; return 100;
+          }
+          int cuMemAddressFree(unsigned long long ptr, unsigned long size) {
+              (void)ptr; (void)size; return 100;
+          }
+          int cuMemImportFromShareableHandle(unsigned long long *h, void *os_handle, int type) {
+              (void)h; (void)os_handle; (void)type; return 100;
+          }
+          int cuMemMap(unsigned long long ptr, unsigned long size, unsigned long off,
+                       unsigned long long h, unsigned long long flags) {
+              (void)ptr; (void)size; (void)off; (void)h; (void)flags; return 100;
+          }
+          int cuMemUnmap(unsigned long long ptr, unsigned long size) {
+              (void)ptr; (void)size; return 100;
+          }
+          int cuMemRelease(unsigned long long h) { (void)h; return 100; }
+          int cuMemSetAccess(unsigned long long ptr, unsigned long size, const void *desc, unsigned long count) {
+              (void)ptr; (void)size; (void)desc; (void)count; return 100;
+          }
+          /* Memory — host (pinned) */
+          int cuMemAllocHost(void **a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemAllocHost_v2(void **a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemHostAlloc(void **a, unsigned long b, unsigned int flags) {
+              (void)a; (void)b; (void)flags; return 100;
+          }
+          int cuMemHostGetDevicePointer_v2(unsigned long long *pdptr, void *p, unsigned int flags) {
+              (void)pdptr; (void)p; (void)flags; return 100;
+          }
+          int cuMemFreeHost(void *a) { (void)a; return 100; }
+          /* Memcpy / memset */
+          int cuMemcpyHtoD(unsigned long long a, const void *b, unsigned long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemcpyHtoD_v2(unsigned long long a, const void *b, unsigned long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemcpyHtoDAsync(unsigned long long a, const void *b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemcpyHtoDAsync_v2(unsigned long long a, const void *b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemcpyDtoH_v2(void *a, unsigned long long b, unsigned long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemcpyDtoHAsync_v2(void *a, unsigned long long b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemcpyDtoD_v2(unsigned long long a, unsigned long long b, unsigned long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemcpyDtoDAsync_v2(unsigned long long a, unsigned long long b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemsetD8_v2(unsigned long long a, unsigned char b, unsigned long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemsetD8Async(unsigned long long a, unsigned char b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemsetD32Async(unsigned long long a, unsigned int b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          /* Graphs */
+          int cuGraphInstantiateWithFlags(void **a, void *b, unsigned long long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuGraphLaunch(void *a, void *b) { (void)a; (void)b; return 100; }
+          int cuGraphExecDestroy(void *a) { (void)a; return 100; }
+          int cuGraphDestroy(void *a) { (void)a; return 100; }
+          EOF
+          cc -shared -fPIC -nostdlib -Wl,-soname,libcuda.so -o /tmp/libcuda.so /tmp/libcuda_stub.c
+          sudo install -m 0644 /tmp/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
+          sudo mkdir -p /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/x86_64-linux/lib/stubs
+          sudo install -m 0644 /tmp/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so
+          sudo install -m 0644 /tmp/libcuda.so /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so
+      - name: Generate libcublasLt.so and libcudart.so stubs for no-GPU linking
+        # spark-runtime links `-lcublasLt` (cublaslt*.rs) and `-lcudart`
+        # (cudaMemcpy2DAsync in cuda_backend/gpu_impl.rs). Synthesize fail-fast
+        # stubs so CPU-only `cargo test --workspace` links cleanly on runners
+        # without the CUDA toolkit installed.
+        run: |
+          set -euo pipefail
+          cat > /tmp/libcublasLt_stub.c <<'EOF'
+          /* Stub for cuBLASLt symbols linked by spark-runtime::cublaslt.
+           * Version getters return 0; status functions return
+           * CUBLAS_STATUS_NOT_INITIALIZED (1) so callers fail fast. */
+          unsigned long cublasLtGetVersion(void) { return 0; }
+          unsigned long cublasLtGetCudartVersion(void) { return 0; }
+          int cublasLtCreate(void **h) { (void)h; return 1; }
+          int cublasLtDestroy(void *h) { (void)h; return 1; }
+          int cublasLtMatmul(void *h, void *cd, const void *alpha,
+                             const void *a, void *adesc, const void *b, void *bdesc,
+                             const void *beta, const void *c, void *cdesc,
+                             void *d, void *ddesc, const void *algo,
+                             void *ws, unsigned long ws_bytes, void *stream) {
+              (void)h; (void)cd; (void)alpha; (void)a; (void)adesc; (void)b; (void)bdesc;
+              (void)beta; (void)c; (void)cdesc; (void)d; (void)ddesc; (void)algo;
+              (void)ws; (void)ws_bytes; (void)stream; return 1;
+          }
+          int cublasLtMatmulDescCreate(void **desc, int compute, int scale) {
+              (void)desc; (void)compute; (void)scale; return 1;
+          }
+          int cublasLtMatmulDescDestroy(void *desc) { (void)desc; return 1; }
+          int cublasLtMatmulDescSetAttribute(void *desc, int attr, const void *buf, unsigned long sz) {
+              (void)desc; (void)attr; (void)buf; (void)sz; return 1;
+          }
+          int cublasLtMatrixLayoutCreate(void **l, int dt, unsigned long long rows,
+                                         unsigned long long cols, long long ld) {
+              (void)l; (void)dt; (void)rows; (void)cols; (void)ld; return 1;
+          }
+          int cublasLtMatrixLayoutDestroy(void *l) { (void)l; return 1; }
+          int cublasLtMatrixLayoutSetAttribute(void *l, int attr, const void *buf, unsigned long sz) {
+              (void)l; (void)attr; (void)buf; (void)sz; return 1;
+          }
+          int cublasLtMatmulPreferenceCreate(void **pref) { (void)pref; return 1; }
+          int cublasLtMatmulPreferenceDestroy(void *pref) { (void)pref; return 1; }
+          int cublasLtMatmulPreferenceSetAttribute(void *pref, int attr, const void *buf, unsigned long sz) {
+              (void)pref; (void)attr; (void)buf; (void)sz; return 1;
+          }
+          int cublasLtMatmulAlgoGetHeuristic(void *h, void *op, void *a, void *b, void *c, void *d,
+                                             void *pref, int req, void *res, int *ret) {
+              (void)h; (void)op; (void)a; (void)b; (void)c; (void)d;
+              (void)pref; (void)req; (void)res; (void)ret; return 1;
+          }
+          int cublasLtMatmulAlgoInit(void *h, int compute, int scale, int at, int bt, int ct, int dt,
+                                     int algo_id, void *algo) {
+              (void)h; (void)compute; (void)scale; (void)at; (void)bt; (void)ct; (void)dt;
+              (void)algo_id; (void)algo; return 1;
+          }
+          int cublasLtMatmulAlgoCheck(void *h, void *op, void *a, void *b, void *c, void *d,
+                                      const void *algo, void *res) {
+              (void)h; (void)op; (void)a; (void)b; (void)c; (void)d;
+              (void)algo; (void)res; return 1;
+          }
+          int cublasLtMatmulAlgoConfigGetAttribute(const void *algo, int attr, void *buf,
+                                                   unsigned long sz, unsigned long *written) {
+              (void)algo; (void)attr; (void)buf; (void)sz; (void)written; return 1;
+          }
+          int cublasLtMatmulAlgoConfigSetAttribute(void *algo, int attr, const void *buf, unsigned long sz) {
+              (void)algo; (void)attr; (void)buf; (void)sz; return 1;
+          }
+          EOF
+          cc -shared -fPIC -nostdlib -Wl,-soname,libcublasLt.so -o /tmp/libcublasLt.so /tmp/libcublasLt_stub.c
+          sudo install -m 0644 /tmp/libcublasLt.so /usr/lib/x86_64-linux-gnu/libcublasLt.so
+          sudo install -m 0644 /tmp/libcublasLt.so /usr/local/cuda/lib64/libcublasLt.so
+
+          cat > /tmp/libcudart_stub.c <<'EOF'
+          /* Stub for CUDA Runtime API symbols linked by spark-runtime.
+           * Each returns cudaErrorNoDevice (100) so callers fail fast. */
+          int cudaMemcpy2DAsync(void *dst, unsigned long dpitch, const void *src, unsigned long spitch,
+                                unsigned long width, unsigned long height, int kind, void *stream) {
+              (void)dst; (void)dpitch; (void)src; (void)spitch;
+              (void)width; (void)height; (void)kind; (void)stream; return 100;
+          }
+          int cudaGetDeviceCount(int *c) { (void)c; return 100; }
+          int cudaGetLastError(void) { return 100; }
+          int cudaDeviceSynchronize(void) { return 100; }
+          int cudaStreamSynchronize(void *s) { (void)s; return 100; }
+          int cudaMalloc(void **p, unsigned long sz) { (void)p; (void)sz; return 100; }
+          int cudaFree(void *p) { (void)p; return 100; }
+          int cudaMemcpy(void *dst, const void *src, unsigned long sz, int kind) {
+              (void)dst; (void)src; (void)sz; (void)kind; return 100;
+          }
+          int cudaMemcpyAsync(void *dst, const void *src, unsigned long sz, int kind, void *s) {
+              (void)dst; (void)src; (void)sz; (void)kind; (void)s; return 100;
+          }
+          int cudaMemsetAsync(void *p, int v, unsigned long sz, void *s) {
+              (void)p; (void)v; (void)sz; (void)s; return 100;
+          }
+          int cudaRuntimeGetVersion(int *v) { (void)v; return 100; }
+          EOF
+          cc -shared -fPIC -nostdlib -Wl,-soname,libcudart.so -o /tmp/libcudart.so /tmp/libcudart_stub.c
+          sudo install -m 0644 /tmp/libcudart.so /usr/lib/x86_64-linux-gnu/libcudart.so
+          sudo install -m 0644 /tmp/libcudart.so /usr/local/cuda/lib64/libcudart.so
+      - name: Generate libnccl.so stub for no-GPU linking
+        # spark-comm links libnccl directly via `-lnccl`; without the
+        # library installed the test build fails at link time. Same
+        # treatment as libcuda: every nccl symbol returns a non-success
+        # code (2 = ncclSystemError) so any test that actually invokes
+        # NCCL fails-fast at runtime — and those tests are GPU-gated
+        # anyway. Stub purely satisfies the linker.
+        run: |
+          set -euo pipefail
+          cat > /tmp/libnccl_stub.c <<'EOF'
+          /* Stub for NCCL collective-communication symbols spark-comm
+           * links against. Each returns ncclSystemError (2) so any
+           * caller fails-fast; never invoked at runtime in default
+           * `cargo test` because every NCCL test is `#[ignore]`-gated. */
+          int ncclGetVersion(int *version) { (void)version; return 2; }
+          int ncclGetUniqueId(void *uid) { (void)uid; return 2; }
+          const char *ncclGetErrorString(int code) { (void)code; return "no GPU (CI stub)"; }
+          int ncclCommInitRank(void **comm, int n, void *uid, int rank) {
+              (void)comm; (void)n; (void)uid; (void)rank; return 2;
+          }
+          int ncclCommInitRankConfig(void **comm, int n, void *uid, int rank, void *config) {
+              (void)comm; (void)n; (void)uid; (void)rank; (void)config; return 2;
+          }
+          int ncclCommDestroy(void *comm) { (void)comm; return 2; }
+          int ncclCommAbort(void *comm) { (void)comm; return 2; }
+          int ncclCommGetAsyncError(void *comm, int *err) { (void)comm; (void)err; return 2; }
+          int ncclCommRegister(void *comm, void *p, unsigned long n, void **h) {
+              (void)comm; (void)p; (void)n; (void)h; return 2;
+          }
+          int ncclCommDeregister(void *comm, void *h) { (void)comm; (void)h; return 2; }
+          int ncclMemAlloc(void **p, unsigned long n) { (void)p; (void)n; return 2; }
+          int ncclMemFree(void *p) { (void)p; return 2; }
+          int ncclGroupStart(void) { return 2; }
+          int ncclGroupEnd(void) { return 2; }
+          int ncclSend(const void *p, unsigned long n, int dt, int peer, void *comm, void *s) {
+              (void)p; (void)n; (void)dt; (void)peer; (void)comm; (void)s; return 2;
+          }
+          int ncclRecv(void *p, unsigned long n, int dt, int peer, void *comm, void *s) {
+              (void)p; (void)n; (void)dt; (void)peer; (void)comm; (void)s; return 2;
+          }
+          int ncclAllReduce(const void *a, void *b, unsigned long n, int dt, int op, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)op; (void)comm; (void)s; return 2;
+          }
+          int ncclAllGather(const void *a, void *b, unsigned long n, int dt, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)comm; (void)s; return 2;
+          }
+          int ncclReduceScatter(const void *a, void *b, unsigned long n, int dt, int op, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)op; (void)comm; (void)s; return 2;
+          }
+          int ncclBroadcast(const void *a, void *b, unsigned long n, int dt, int root, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)root; (void)comm; (void)s; return 2;
+          }
+          EOF
+          cc -shared -fPIC -nostdlib -Wl,-soname,libnccl.so -o /tmp/libnccl.so /tmp/libnccl_stub.c
+          sudo install -m 0644 /tmp/libnccl.so /usr/lib/x86_64-linux-gnu/libnccl.so
+          sudo ldconfig
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Default `cargo test` skips `#[ignore]`-gated tests, which is
+      # exactly what we want — every test that requires a real GPU
+      # (spark-runtime, spark-storage, atlas-kernels, atlas-spark-bench
+      # correctness, spark-server integration) carries `#[ignore]` and
+      # is run locally on GPU hardware via `-- --ignored`.
+      - run: cargo test --workspace --locked
+
+  test-macos-metal:
+    name: cargo test --features metal (macOS aarch64)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Apple Silicon path: no CUDA toolchain, no nvcc. The `metal`
+      # feature opts out of cudarc workspace-wide and into the Metal
+      # runtime backend (objc2-metal). xcrun + metallib are part of
+      # macOS's built-in Xcode Command Line Tools and don't need a
+      # separate install on macos-14 runners.
+      - name: cargo check spark-server --features metal
+        run: cargo check -p spark-server --no-default-features --features metal
+      - name: cargo check spark-runtime --features metal
+        run: cargo check -p spark-runtime --no-default-features --features metal
+      - name: cargo test -p spark-runtime --features metal
+        env:
+          ATLAS_TARGET_HW: metal
+          ATLAS_TARGET_MODEL: qwen3-5-4b-vlm-mlx-int8
+          ATLAS_TARGET_QUANT: mlx_int8
+        run: |
+          cargo test -p spark-runtime --no-default-features \
+            --features metal --locked metal_backend
+      - name: assert no libcuda linkage in metal binary
+        run: |
+          cargo build -p spark-server --bin spark --no-default-features --features metal
+          if otool -L target/debug/spark | grep -i cuda; then
+            echo "::error::metal-feature spark binary links libcuda"
+            exit 1
+          fi
+          if otool -L target/debug/spark | grep -i nccl; then
+            echo "::error::metal-feature spark binary links libnccl"
+            exit 1
+          fi
+
+  # cargo-deny runs in security.yml with path filters on Cargo.toml / Cargo.lock /
+  # deny.toml plus a weekly cron. Not duplicated here.

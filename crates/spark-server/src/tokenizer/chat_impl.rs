@@ -1,0 +1,727 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! `impl ChatTokenizer` body.
+
+use anyhow::{Context, Result};
+use std::path::Path;
+use tokenizers::Tokenizer;
+
+use super::{ChatTokenizer, StreamingDecoder, normalize_tool_call_arguments};
+
+/// Normalize OpenAI-style effort names to Qwen3.8's checkpoint vocabulary.
+/// Unknown future values are left undefined so the checkpoint can apply its
+/// own default instead of failing template validation.
+fn qwen38_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort {
+        "high" | "xhigh" | "max" => Some("xhigh"),
+        "minimal" | "low" => Some("low"),
+        "medium" => Some("medium"),
+        _ => None,
+    }
+}
+
+fn has_native_qwen_xml_tool_template(model_type: &str, template: &str) -> bool {
+    model_type == "qwen4_exp"
+        && template.contains("if tools and tools is iterable")
+        && template.contains("<tool_call>")
+        && template.contains("<function=example_function_name>")
+}
+
+impl ChatTokenizer {
+    // The Jinja-template override directory constant is defined and used
+    // in `tokenizer/jinja_helpers.rs` as `TEMPLATE_OVERRIDE_DIR`
+    // (`pub(super) const ...`). The duplicate associated constant here was
+    // dead code — kept the helper-module version as the single source of
+    // truth.
+
+    pub fn from_model_dir(
+        model_dir: &Path,
+        eos_token_id: u32,
+        supports_thinking: bool,
+        model_type: &str,
+        repo_root: Option<&Path>,
+    ) -> Result<Self> {
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
+
+        let checkpoint_tmpl = super::jinja_helpers::load_config_template(model_dir)?;
+        let override_tmpl = super::jinja_helpers::load_override_template(model_type, repo_root);
+        let (chat_template, qwen38_reasoning_effort) = super::jinja_helpers::select_chat_template(
+            model_type,
+            override_tmpl,
+            checkpoint_tmpl,
+            supports_thinking,
+        );
+        let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
+
+        // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
+        // This variant gates historical <think> wrappers on enable_thinking, preventing
+        // spontaneous thinking during tool-use when thinking is disabled.
+        let openai_template = super::jinja_helpers::load_openai_template(model_type, repo_root);
+        // qwen4_exp/Flash-Next's checkpoint Jinja renders the complete native
+        // Qwen XML tool contract itself.  Inspect the template the OpenAI path
+        // will actually use, so an override without that contract keeps the
+        // parser-prompt fallback.
+        let native_qwen_xml_tools = has_native_qwen_xml_tool_template(
+            model_type,
+            openai_template.as_deref().unwrap_or(&chat_template),
+        );
+        let openai_jinja_env = openai_template.and_then(|tmpl| {
+            tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
+            super::jinja_helpers::build_jinja_env(&tmpl).ok()
+        });
+
+        let bos_token = super::jinja_helpers::load_bos_token(model_dir);
+        let mut eos_token = super::jinja_helpers::load_eos_token(model_dir);
+        if eos_token.is_empty()
+            && let Some(tok) = tokenizer.id_to_token(eos_token_id)
+        {
+            eos_token = tok;
+        }
+        let vocab_size = tokenizer.get_vocab_size(true);
+        let special_literals = super::special_literals::SpecialLiterals::from_tokenizer(&tokenizer);
+        tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
+        Ok(Self {
+            tokenizer,
+            vocab_size,
+            eos_token_id,
+            supports_thinking,
+            chat_template,
+            jinja_env,
+            openai_jinja_env,
+            qwen38_reasoning_effort,
+            native_qwen_xml_tools,
+            bos_token,
+            eos_token,
+            special_literals,
+            special_tokens_in_content: false,
+            ids_only: super::ids_only::DEFAULT_IDS_ONLY,
+            large_encode_gate: super::large_encode::Gate::default_gate(),
+        })
+    }
+
+    /// `true` restores parsing special-token text in request content as
+    /// control tokens (`--allow-special-tokens-in-content`).
+    pub fn with_special_tokens_in_content(mut self, allow: bool) -> Self {
+        self.special_tokens_in_content = allow;
+        self
+    }
+
+    /// Configure IDs-only fast encoding (`encode_fast(text, false)` when `true`,
+    /// full `encode(text, false)` when `false`). Enabled by default.
+    pub fn with_ids_only(mut self, ids_only: bool) -> Self {
+        self.ids_only = ids_only;
+        self
+    }
+
+    /// Configure the concurrency cap for `>= 1 MiB` prompt encodes (default `2`).
+    pub fn with_large_encode_concurrency(mut self, limit: usize) -> Self {
+        self.large_encode_gate = std::sync::Arc::new(super::large_encode::Gate::new(limit));
+        self
+    }
+
+    /// Returns the cached vocabulary size (including added tokens), avoiding
+    /// `tokenizers::Tokenizer::get_vocab_size(true)` which clones the entire
+    /// vocabulary `HashMap<String, u32>` on every call in `tokenizers 0.23.1`.
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    /// Returns a borrowed reference to the underlying HF tokenizer (for
+    /// callers that need to drive low-level encode/decode directly).
+    pub fn inner(&self) -> &tokenizers::Tokenizer {
+        &self.tokenizer
+    }
+
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let _permit = self.large_encode_gate.acquire(text.len());
+        let encoding = super::ids_only::encode(&self.tokenizer, text, self.ids_only)
+            .map_err(|e| anyhow::anyhow!("Tokenizer encode error: {e}"))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        self.tokenizer
+            .decode(ids, true)
+            .map_err(|e| anyhow::anyhow!("Tokenizer decode error: {e}"))
+    }
+
+    /// Decode without stripping special tokens. Use when tool calling is active —
+    /// some tokenizers register `<tool_call>` as a special token, and skip_special
+    /// would strip it, breaking tool call detection.
+    pub fn decode_with_special(&self, ids: &[u32]) -> Result<String> {
+        self.tokenizer
+            .decode(ids, false)
+            .map_err(|e| anyhow::anyhow!("Tokenizer decode error: {e}"))
+    }
+
+    /// Return the newly stable full-decode bytes for `ids` since the previous
+    /// call.  This follows the same prefix-window scheme as vLLM's incremental
+    /// detokenizer: decoding retains enough left context for context-sensitive
+    /// decoders, while standalone spaces/newlines remain byte-identical to
+    /// `decode(ids)`.
+    ///
+    /// `tokenizers::DecodeStream` is intentionally not the wire source here.
+    /// Tool-eval traces showed whitespace-only boundaries being lost before
+    /// publication.  Deriving each delta from ordinary `decode` makes streaming
+    /// and blocking responses share one detokenization contract.
+    pub fn incremental_decode(
+        &self,
+        ids: &[u32],
+        prefix_offset: &mut usize,
+        read_offset: &mut usize,
+    ) -> Result<String> {
+        if *read_offset > ids.len() || *prefix_offset > *read_offset {
+            *prefix_offset = 0;
+            *read_offset = 0;
+        }
+
+        let prefix = self.decode(&ids[*prefix_offset..*read_offset])?;
+        let decoded = self.decode(&ids[*prefix_offset..])?;
+        if decoded.len() > prefix.len()
+            && !decoded.ends_with('\u{FFFD}')
+            && let Some(delta) = decoded.get(prefix.len()..)
+        {
+            let delta = delta.to_string();
+            *prefix_offset = *read_offset;
+            *read_offset = ids.len();
+            return Ok(delta);
+        }
+        Ok(String::new())
+    }
+
+    /// Drain bytes deliberately withheld by [`Self::incremental_decode`] when
+    /// generation ends.  A max-token cut may leave an incomplete UTF-8 byte
+    /// sequence whose ordinary blocking decode ends in U+FFFD; emitting that
+    /// residual at Done keeps streaming byte-identical to blocking output.
+    pub fn terminal_decode_residual(&self, ids: &[u32], emitted_bytes: usize) -> Result<String> {
+        let full = self.decode(ids)?;
+        full.get(emitted_bytes..)
+            .map(ToString::to_string)
+            .with_context(|| {
+                format!(
+                    "incremental decode offset {emitted_bytes} is not a boundary in {} decoded bytes",
+                    full.len()
+                )
+            })
+    }
+
+    /// Whether this exact checkpoint template, rather than the parser prompt,
+    /// owns native Qwen XML tool-schema rendering.
+    pub fn native_qwen_xml_tools(&self) -> bool {
+        self.native_qwen_xml_tools
+    }
+
+    /// Whether the request's reasoning effort reaches the template as the
+    /// Qwen3.8 `xhigh | medium | low` vocabulary (dense Qwen3.8, Flash-Next).
+    pub fn renders_qwen38_reasoning_effort(&self) -> bool {
+        self.qwen38_reasoning_effort
+    }
+
+    /// Create a stateful streaming decoder wrapper. Each `step(token_id)` returns
+    /// `Ok(Some(chunk))` when enough bytes have accumulated for valid UTF-8,
+    /// or `Ok(None)` for incomplete multi-byte sequences.
+    pub fn streaming_decoder(&self, skip_special_tokens: bool) -> StreamingDecoder<'_> {
+        StreamingDecoder {
+            inner: self.tokenizer.decode_stream(skip_special_tokens),
+        }
+    }
+
+    /// Apply the Jinja chat template and encode to token IDs.
+    ///
+    /// `messages`: Vec of serde_json::Value objects with `role`, `content`,
+    ///             and optionally `tool_calls`, `reasoning_content`.
+    /// `tools`: Optional tool definitions (passed to Jinja context).
+    /// `enable_thinking`: Controls `<think>` generation prompt behavior.
+    pub fn apply_chat_template_jinja(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+    ) -> Result<Vec<u32>> {
+        self.apply_chat_template_jinja_with_options(
+            messages,
+            tools,
+            enable_thinking,
+            disable_tool_steering,
+            None,
+            None,
+        )
+    }
+
+    /// Render with request-scoped Qwen3.8 template controls.  The ordinary
+    /// method above remains the compatibility wrapper for non-HTTP callers.
+    pub fn apply_chat_template_jinja_with_options(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+        requested_reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
+        let tmpl = self
+            .jinja_env
+            .get_template("chat")
+            .context("Failed to get compiled template")?;
+
+        // F76 (2026-04-29): MiniMax's chat template iterates
+        // `tool_call.function.arguments` with `_args.items()`, expecting
+        // a dict. The OpenAI wire format ships `arguments` as a
+        // JSON-encoded *string*, so the template crashes with
+        // "unknown method: map has no method named items" on the
+        // second turn of any tool-use conversation. Pre-parse string
+        // arguments to JSON values before handing to Jinja so the
+        // template's iteration sees a dict. Other templates (Qwen,
+        // Mistral, Hermes) typically wrap with `tojson` and don't
+        // depend on `.items()`, so the parsed dict round-trips fine.
+        let messages_for_render = normalize_tool_call_arguments(messages);
+        let escaped = self.escape_request(&messages_for_render, tools);
+        let messages_val = minijinja::Value::from_serialize(&*escaped.messages);
+        let tools_val = escaped
+            .tools
+            .as_deref()
+            .map(minijinja::Value::from_serialize);
+
+        // Pass enable_thinking as-is to the template. The Qwen3.5 template uses it
+        // to emit <think>\n (thinking) or <think>\n\n</think>\n\n (no thinking).
+        // Mistral template uses reasoning_effort instead.
+        // The api.rs layer controls enable_thinking based on thinking_in_tools MODEL.toml.
+        // Mistral's template defaults `reasoning_effort` to "high" when
+        // undefined, so we must explicitly pass "none" to disable thinking.
+        // Do NOT hardcode "high". That was a Mistral-specific workaround
+        // (its template defaults the field to "high" when undefined) applied
+        // globally, and it breaks every template with a different vocabulary:
+        // Qwen3.8 validates `reasoning_effort not in ('xhigh','medium','low')`
+        // and raises, so EVERY thinking request returned 400.
+        //
+        // Leaving it undefined is strictly better — each template then applies
+        // its own default via `|default(...)`, which yields "high" for Mistral
+        // (unchanged behaviour) and "xhigh" for Qwen3.8 (correct). The
+        // thinking-off path still needs an explicit "none" for Mistral; Qwen's
+        // template only validates the field when thinking is enabled, so
+        // "none" is inert there.
+        //
+        // A request-scoped effort takes precedence for Qwen3.8. Other model
+        // families retain the established ATLAS_REASONING_EFFORT behavior
+        // because their accepted effort vocabularies differ.
+        let reasoning_effort: minijinja::Value = if enable_thinking {
+            if self.qwen38_reasoning_effort
+                && let Some(effort) = requested_reasoning_effort
+            {
+                qwen38_reasoning_effort(effort)
+                    .map(minijinja::Value::from)
+                    .unwrap_or(minijinja::Value::UNDEFINED)
+            } else if let Some(effort) = requested_reasoning_effort {
+                // Mistral's template strictly raises on values outside `['none', 'high']`;
+                // leave undefined so it defaults to `"high"` when enabled. Other templates
+                // (e.g. `glm5_next.jinja`) accept OpenAI effort strings directly.
+                if self
+                    .chat_template
+                    .contains("reasoning_effort must be either")
+                    && effort != "high"
+                    && effort != "none"
+                {
+                    minijinja::Value::UNDEFINED
+                } else {
+                    minijinja::Value::from(effort)
+                }
+            } else {
+                match std::env::var("ATLAS_REASONING_EFFORT") {
+                    Ok(v) if !v.is_empty() => v.into(),
+                    _ => minijinja::Value::UNDEFINED,
+                }
+            }
+        } else {
+            "none".into()
+        };
+        let preserve_thinking = preserve_thinking
+            .map(minijinja::Value::from)
+            .unwrap_or(minijinja::Value::UNDEFINED);
+        let ctx = minijinja::context! {
+            messages => messages_val,
+            tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
+            add_generation_prompt => true,
+            enable_thinking => enable_thinking,
+            reasoning_effort => reasoning_effort,
+            preserve_thinking => preserve_thinking,
+            disable_tool_steering => disable_tool_steering,
+            add_vision_id => false,
+            bos_token => self.bos_token.as_str(),
+            eos_token => self.eos_token.as_str(),
+        };
+
+        let rendered = tmpl.render(ctx).map_err(|e| {
+            tracing::error!("Jinja template error: {e:#}");
+            anyhow::anyhow!("Failed to render Jinja chat template: {e}")
+        })?;
+
+        // Log the tail of short rendered templates at debug level (never INFO,
+        // so raw user prompt text is not emitted to production logs).
+        // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 (e.g. Swedish å ä ö).
+        if rendered.len() < 2000 {
+            let tail_start = rendered.floor_char_boundary(rendered.len().saturating_sub(200));
+            tracing::debug!(
+                "Jinja rendered ({} bytes): {:?}",
+                rendered.len(),
+                &rendered[tail_start..]
+            );
+        }
+
+        self.special_literals.encode(
+            &self.tokenizer,
+            &rendered,
+            &escaped,
+            self.ids_only,
+            &self.large_encode_gate,
+        )
+    }
+
+    /// Escape request values for a renderer outside the Jinja path
+    /// (DeepSeek V4.1's ported encoder); pair with [`Self::encode_rendered`].
+    #[allow(dead_code)] // api::dsv41 is binary-only; the lib target does not call it
+    pub(crate) fn escape_for_render<'a>(
+        &self,
+        values: &'a [serde_json::Value],
+    ) -> super::special_literals::Escaped<'a> {
+        self.escape_request(values, None)
+    }
+
+    /// Encode a prompt rendered from [`Self::escape_for_render`] output.
+    #[allow(dead_code)] // api::dsv41 is binary-only; the lib target does not call it
+    pub(crate) fn encode_rendered(
+        &self,
+        rendered: &str,
+        escaped: &super::special_literals::Escaped<'_>,
+    ) -> Result<Vec<u32>> {
+        self.special_literals.encode(
+            &self.tokenizer,
+            rendered,
+            escaped,
+            self.ids_only,
+            &self.large_encode_gate,
+        )
+    }
+
+    fn escape_request<'a>(
+        &self,
+        messages: &'a [serde_json::Value],
+        tools: Option<&'a [serde_json::Value]>,
+    ) -> super::special_literals::Escaped<'a> {
+        if self.special_tokens_in_content {
+            return super::special_literals::Escaped::unescaped(messages, tools);
+        }
+        let escaped = self.special_literals.escape(messages, tools);
+        if escaped.count() > 0 {
+            // A count only: the request text itself is never logged here.
+            tracing::debug!(
+                neutralized = escaped.count(),
+                "CONTENT_SPECIAL_TOKENS mode=literal neutralized={} special-token spellings in request content",
+                escaped.count()
+            );
+        }
+        escaped
+    }
+
+    /// Apply the OpenAI-variant template (if available), falling back to the default.
+    /// The OpenAI variant gates historical `<think>` wrappers on enable_thinking,
+    /// preventing the model from learning a "always think" pattern during tool use.
+    pub fn apply_chat_template_openai(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+    ) -> Result<Vec<u32>> {
+        self.apply_chat_template_openai_with_options(
+            messages,
+            tools,
+            enable_thinking,
+            disable_tool_steering,
+            None,
+            None,
+        )
+    }
+
+    pub fn apply_chat_template_openai_with_options(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+        requested_reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
+        if let Some(ref env) = self.openai_jinja_env {
+            let tmpl = env
+                .get_template("chat")
+                .context("Failed to get compiled OpenAI template")?;
+            // F76: pre-parse tool_call argument strings into dicts. See
+            // apply_chat_template_jinja above for the failure mode
+            // (`map has no method named items` on the second turn).
+            let messages_for_render = normalize_tool_call_arguments(messages);
+            let escaped = self.escape_request(&messages_for_render, tools);
+            let messages_val = minijinja::Value::from_serialize(&*escaped.messages);
+            let tools_val = escaped
+                .tools
+                .as_deref()
+                .map(minijinja::Value::from_serialize);
+            // Same fix as apply_chat_template_jinja above: undefined lets each
+            // template apply its own default. Hardcoding "high" 400s on Qwen3.8.
+            let reasoning_effort: minijinja::Value = if enable_thinking {
+                if self.qwen38_reasoning_effort
+                    && let Some(effort) = requested_reasoning_effort
+                {
+                    qwen38_reasoning_effort(effort)
+                        .map(minijinja::Value::from)
+                        .unwrap_or(minijinja::Value::UNDEFINED)
+                } else if let Some(effort) = requested_reasoning_effort {
+                    if self
+                        .chat_template
+                        .contains("reasoning_effort must be either")
+                        && effort != "high"
+                        && effort != "none"
+                    {
+                        minijinja::Value::UNDEFINED
+                    } else {
+                        minijinja::Value::from(effort)
+                    }
+                } else {
+                    match std::env::var("ATLAS_REASONING_EFFORT") {
+                        Ok(v) if !v.is_empty() => v.into(),
+                        _ => minijinja::Value::UNDEFINED,
+                    }
+                }
+            } else {
+                "none".into()
+            };
+            let preserve_thinking = preserve_thinking
+                .map(minijinja::Value::from)
+                .unwrap_or(minijinja::Value::UNDEFINED);
+            let ctx = minijinja::context! {
+                messages => messages_val,
+                tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
+                add_generation_prompt => true,
+                enable_thinking => enable_thinking,
+                reasoning_effort => reasoning_effort,
+                preserve_thinking => preserve_thinking,
+                disable_tool_steering => disable_tool_steering,
+                add_vision_id => false,
+                bos_token => self.bos_token.as_str(),
+                eos_token => self.eos_token.as_str(),
+            };
+            let rendered = tmpl
+                .render(ctx)
+                .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
+            self.special_literals.encode(
+                &self.tokenizer,
+                &rendered,
+                &escaped,
+                self.ids_only,
+                &self.large_encode_gate,
+            )
+        } else {
+            self.apply_chat_template_jinja_with_options(
+                messages,
+                tools,
+                enable_thinking,
+                disable_tool_steering,
+                requested_reasoning_effort,
+                preserve_thinking,
+            )
+        }
+    }
+
+    /// Legacy apply_chat_template for callers that pass (role, content) tuples.
+    /// Converts to JSON messages and delegates to apply_chat_template_jinja.
+    pub fn apply_chat_template(
+        &self,
+        messages: &[(String, String)],
+        enable_thinking: bool,
+        _image_pad_counts: &[usize],
+    ) -> Result<Vec<u32>> {
+        let json_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|(role, content)| {
+                serde_json::json!({
+                    "role": role,
+                    "content": content,
+                })
+            })
+            .collect();
+
+        self.apply_chat_template_jinja(&json_messages, None, enable_thinking, false)
+    }
+
+    pub fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    pub fn think_end_token_id(&self) -> Option<u32> {
+        if !self.supports_thinking {
+            return None;
+        }
+        match self.encode("</think>") {
+            Ok(ids) if ids.len() == 1 => Some(ids[0]),
+            _ => None,
+        }
+    }
+
+    pub fn supports_thinking(&self) -> bool {
+        self.supports_thinking
+    }
+
+    /// Encode the `<|image_pad|>` placeholder token and return its ID.
+    /// Returns `None` when the tokenizer doesn't have this token (text-only
+    /// models). Cheap to call repeatedly — the underlying tokenizer caches
+    /// single-token encodes.
+    pub fn image_pad_token_id(&self) -> Option<u32> {
+        self.encode("<|image_pad|>")
+            .ok()
+            .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None })
+    }
+
+    /// Post-process a rendered token sequence to expand `<|image_pad|>`
+    /// placeholders. The Qwen3-VL / Qwen3.6 chat template emits exactly one
+    /// `<|image_pad|>` per image, but the vision encoder produces
+    /// `grid_h * grid_w` patches per image. At embed-injection time the
+    /// server expects one pad token per patch so each patch's embedding
+    /// lands at the right hidden-state position — this helper does the
+    /// fan-out.
+    ///
+    /// `pad_counts[i]` is the number of patches the i-th image produces.
+    /// Extra or missing `<|image_pad|>` occurrences (vs `pad_counts.len()`)
+    /// pass through unchanged, matching counts are replicated in place.
+    pub fn expand_image_pads(&self, tokens: Vec<u32>, pad_counts: &[usize]) -> Vec<u32> {
+        if pad_counts.is_empty() || pad_counts.iter().all(|&c| c <= 1) {
+            return tokens;
+        }
+        let Some(pad_id) = self.image_pad_token_id() else {
+            return tokens;
+        };
+        let extra: usize = pad_counts.iter().map(|c| c.saturating_sub(1)).sum();
+        let mut out = Vec::with_capacity(tokens.len() + extra);
+        let mut img_idx = 0usize;
+        for t in tokens {
+            if t == pad_id {
+                let count = pad_counts.get(img_idx).copied().unwrap_or(1).max(1);
+                for _ in 0..count {
+                    out.push(pad_id);
+                }
+                img_idx += 1;
+            } else {
+                out.push(t);
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod qwen38_template_option_tests {
+    use super::{has_native_qwen_xml_tool_template, qwen38_reasoning_effort};
+
+    #[test]
+    fn effort_aliases_match_the_checkpoint_vocabulary() {
+        assert_eq!(qwen38_reasoning_effort("max"), Some("xhigh"));
+        assert_eq!(qwen38_reasoning_effort("high"), Some("xhigh"));
+        assert_eq!(qwen38_reasoning_effort("xhigh"), Some("xhigh"));
+        assert_eq!(qwen38_reasoning_effort("medium"), Some("medium"));
+        assert_eq!(qwen38_reasoning_effort("minimal"), Some("low"));
+        assert_eq!(qwen38_reasoning_effort("low"), Some("low"));
+        assert_eq!(qwen38_reasoning_effort("future-rung"), None);
+    }
+
+    #[test]
+    fn only_qwen4_exp_with_native_xml_markers_owns_tool_prompt_rendering() {
+        let checkpoint_fragment = r#"
+            {%- if tools and tools is iterable and tools is not mapping %}
+            <tool_call><function=example_function_name></function></tool_call>
+            {%- endif %}
+        "#;
+        assert!(has_native_qwen_xml_tool_template(
+            "qwen4_exp",
+            checkpoint_fragment
+        ));
+        assert!(!has_native_qwen_xml_tool_template(
+            "qwen3_5_moe",
+            checkpoint_fragment
+        ));
+        assert!(!has_native_qwen_xml_tool_template(
+            "qwen4_exp",
+            "{{ messages }}"
+        ));
+    }
+}
+
+/// Tool-prompt key-order probe (ignored; run by hand). Renders a tools request
+/// the way the chat path does (`serde_json::to_value(ToolDefinition)` into the
+/// Jinja template) and writes the prompt ids and text to
+/// `$ATLAS_PROBE_OUT`, for comparison with HF `apply_chat_template`.
+/// Inputs: `ATLAS_PROBE_MODEL_DIR`, `ATLAS_PROBE_MODEL_TYPE`, `ATLAS_PROBE_REQUEST`
+/// (an OpenAI chat body with string contents and `tools`).
+#[cfg(test)]
+mod tool_order_probe {
+    use super::ChatTokenizer;
+
+    #[test]
+    #[ignore]
+    fn render_tools_request_for_hf_comparison() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} unset"));
+        let dir = std::path::PathBuf::from(var("ATLAS_PROBE_MODEL_DIR"));
+        // With ATLAS_PROBE_REPO_ROOT the repo's jinja-templates/ override (what
+        // production serves) is used; without it, the checkpoint's template.
+        let root = std::env::var("ATLAS_PROBE_REPO_ROOT")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let tok = ChatTokenizer::from_model_dir(
+            &dir,
+            0,
+            true,
+            &var("ATLAS_PROBE_MODEL_TYPE"),
+            root.as_deref(),
+        )
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(var("ATLAS_PROBE_REQUEST")).unwrap())
+                .unwrap();
+        // What `serde_json::to_value(ToolDefinition)` produces on the chat path:
+        // {type, function: {name, description?, parameters?}}.
+        let tools: Vec<serde_json::Value> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let f = &t["function"];
+                let mut func = serde_json::Map::new();
+                func.insert("name".into(), f["name"].clone());
+                for k in ["description", "parameters"] {
+                    if let Some(v) = f.get(k) {
+                        func.insert(k.into(), v.clone());
+                    }
+                }
+                serde_json::json!({"type": t["type"], "function": func})
+            })
+            .collect();
+        let messages: Vec<serde_json::Value> =
+            serde_json::from_value(body["messages"].clone()).unwrap();
+        let ids = tok
+            .apply_chat_template_openai_with_options(
+                &messages,
+                Some(&tools),
+                true,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let text = tok.decode_with_special(&ids).unwrap();
+        let out = serde_json::json!({"ids": ids, "text": text});
+        std::fs::write(var("ATLAS_PROBE_OUT"), out.to_string()).unwrap();
+    }
+}

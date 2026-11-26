@@ -1,0 +1,901 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! GPU backend abstraction (SBIO IORouter for GPU operations).
+//!
+//! All CUDA interactions flow through [`GpuBackend`]. Business logic
+//! (model forward pass, KV cache management) never calls cuLaunchKernel
+//! or cuMemAlloc directly.
+
+use anyhow::Result;
+use std::fmt;
+use std::ptr::NonNull;
+
+/// Opaque device pointer wrapping a CUDA CUdeviceptr (u64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DevicePtr(pub u64);
+
+impl DevicePtr {
+    pub const NULL: Self = Self(0);
+
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Byte offset from this pointer.
+    pub fn offset(self, bytes: usize) -> Self {
+        Self(self.0 + bytes as u64)
+    }
+}
+
+/// Handle to a loaded CUDA kernel function.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelHandle(pub u64);
+
+/// Handle to an instantiated CUDA graph (CUgraphExec).
+#[derive(Debug, Clone, Copy)]
+pub struct GraphHandle(pub u64);
+
+/// Typed kernel argument, used by `launch_typed`.
+///
+/// CUDA's `cuLaunchKernel` is type-blind — every arg is `void*` and the
+/// driver interprets bytes by kernel signature. Metal's
+/// `MTLComputeCommandEncoder` is not: buffer arguments require
+/// `setBuffer:offset:atIndex:` (the encoder tracks the resource) while
+/// scalar/struct args require `setBytes:length:atIndex:`. `KernelArg`
+/// preserves that distinction so both backends can dispatch correctly.
+#[derive(Debug, Clone, Copy)]
+pub enum KernelArg<'a> {
+    /// A device buffer at this base GPU address. The metal backend
+    /// resolves it to its owning `MTLBuffer` + offset via the alloc
+    /// registry; the cuda backend forwards the raw `u64` to the driver.
+    Buffer(DevicePtr),
+    /// Inline scalar/struct bytes, e.g. a `u32` count or an `f32` eps.
+    /// Length is forwarded to Metal's `setBytes:length:`; the default CUDA
+    /// `launch_typed_pdl` path supports up to 8 bytes per slot (zero-padded)
+    /// and returns an error for larger slices.
+    Bytes(&'a [u8]),
+}
+
+/// One pageable host-to-device transfer in a stream-ordered blocking group.
+#[derive(Debug, Clone, Copy)]
+pub struct HostToDeviceCopy<'a> {
+    src: &'a [u8],
+    dst: DevicePtr,
+}
+
+impl<'a> HostToDeviceCopy<'a> {
+    pub fn new(src: &'a [u8], dst: DevicePtr) -> Self {
+        Self { src, dst }
+    }
+
+    pub fn src(self) -> &'a [u8] {
+        self.src
+    }
+
+    pub fn dst(self) -> DevicePtr {
+        self.dst
+    }
+}
+
+/// Backing storage for [`PinnedHostBuffer`].
+///
+/// Implementors must guarantee that `ptr()` points to at least `len()` valid,
+/// initialized, uniquely owned bytes for the lifetime of the storage object.
+pub(crate) trait PinnedHostStorage: Send + Sync {
+    fn ptr(&self) -> NonNull<u8>;
+    fn len(&self) -> usize;
+}
+
+/// Owning backend-issued page-locked host allocation.
+///
+/// The backend-specific storage object releases the allocation on drop, so
+/// partially constructed models cannot leak pinned memory on a later error.
+pub struct PinnedHostBuffer {
+    storage: Box<dyn PinnedHostStorage>,
+}
+
+impl PinnedHostBuffer {
+    pub(crate) fn from_storage(storage: Box<dyn PinnedHostStorage>) -> Self {
+        Self { storage }
+    }
+
+    fn heap(bytes: usize) -> Result<Self> {
+        struct HeapStorage {
+            ptr: NonNull<u8>,
+            layout: std::alloc::Layout,
+        }
+
+        // SAFETY: `HeapStorage` uniquely owns its global-allocator buffer and
+        // transfers ownership cleanly across threads, matching `Box<[u8]>`.
+        unsafe impl Send for HeapStorage {}
+        // SAFETY: Shared references to `HeapStorage` only permit immutable reads
+        // of the owned buffer; mutation requires `&mut PinnedHostBuffer`.
+        unsafe impl Sync for HeapStorage {}
+
+        impl PinnedHostStorage for HeapStorage {
+            fn ptr(&self) -> NonNull<u8> {
+                self.ptr
+            }
+
+            fn len(&self) -> usize {
+                self.layout.size()
+            }
+        }
+
+        impl Drop for HeapStorage {
+            fn drop(&mut self) {
+                // SAFETY: `self.ptr` was allocated by `std::alloc::alloc_zeroed`
+                // with `self.layout` and is deallocated exactly once on drop.
+                unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+            }
+        }
+
+        if bytes == 0 {
+            anyhow::bail!("pinned host allocation must be non-empty");
+        }
+        let layout = std::alloc::Layout::from_size_align(bytes, 64)
+            .map_err(|e| anyhow::anyhow!("invalid pinned host layout: {e}"))?;
+        // SAFETY: `bytes > 0`, so `layout.size()` is strictly non-zero as
+        // required by `std::alloc::alloc_zeroed`.
+        let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+            .ok_or_else(|| anyhow::anyhow!("pinned host allocation failed: {bytes} bytes"))?;
+        Ok(Self::from_storage(Box::new(HeapStorage { ptr, layout })))
+    }
+
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.storage.ptr().as_ptr()
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.storage.ptr().as_ptr()
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `&mut self` grants exclusive access; `PinnedHostStorage`
+        // guarantees `self.len()` valid, initialized bytes starting at `self.as_mut_ptr()`.
+        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
+    }
+
+    pub fn pinned_slice(&self, bytes: usize) -> Result<PinnedHostSlice<'_>> {
+        self.pinned_slice_range(0, bytes)
+    }
+
+    /// Borrow a bounded subrange while preserving this owner's page-locked
+    /// provenance. Disjoint ranges let callers keep multiple H2D transfers in
+    /// flight without rewriting bytes that an earlier transfer still reads.
+    pub fn pinned_slice_range(&self, offset: usize, bytes: usize) -> Result<PinnedHostSlice<'_>> {
+        let end = offset
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("pinned host slice range overflow"))?;
+        if end > self.len() {
+            anyhow::bail!(
+                "pinned host slice exceeds allocation: {offset} + {bytes} > {}",
+                self.len()
+            );
+        }
+        // SAFETY: `offset + bytes <= self.len()` was checked above with
+        // `checked_add`, and `PinnedHostStorage` guarantees all `self.len()`
+        // bytes are valid and initialized for the lifetime of `&self`.
+        let bytes = unsafe { std::slice::from_raw_parts(self.as_ptr().add(offset), bytes) };
+        Ok(PinnedHostSlice { bytes })
+    }
+}
+
+/// Borrow of bytes whose page-locked provenance is guaranteed by
+/// [`PinnedHostBuffer`]. It cannot be constructed from an arbitrary slice.
+#[derive(Clone, Copy)]
+pub struct PinnedHostSlice<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> PinnedHostSlice<'a> {
+    pub fn len(self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub(crate) fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+/// GPU backend trait — SBIO IORouter for all CUDA operations.
+///
+/// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
+pub trait GpuBackend: Send + Sync {
+    /// Stable identity of the exact backend implementation and loaded kernel
+    /// byte stream. Persistent transform caches must fail closed when absent.
+    fn transform_cache_identity(&self) -> Option<&str> {
+        None
+    }
+
+    /// Allocate `bytes` of device memory.
+    fn alloc(&self, bytes: usize) -> Result<DevicePtr>;
+
+    /// Allocate managed (unified) memory. On GB10, this allows over-subscribing
+    /// physical GPU memory — Linux pages overflow to NVMe swap automatically.
+    /// Managed memory is slower than device memory but avoids OOM.
+    fn alloc_managed(&self, bytes: usize) -> Result<DevicePtr>;
+
+    /// Free device memory.
+    fn free(&self, ptr: DevicePtr) -> Result<()>;
+
+    /// Admission capability: unsupported backends fail before any grouped
+    /// allocation, not after allocating the first backing.
+    fn supports_grouped_backing(&self) -> bool {
+        false
+    }
+
+    /// Claim an exact allocation base for an explicit grouped owner. Ordinary
+    /// frees (including interior aliases) and bulk teardown must not bypass it.
+    fn claim_grouped_backing(&self, _base: DevicePtr) -> Result<()> {
+        anyhow::bail!("backend does not support explicit grouped backing ownership")
+    }
+
+    /// Free an explicitly claimed base at a quiescent owner boundary. A failed
+    /// or uncertain free is permanently quarantined, including from bulk free.
+    fn free_grouped_backing(&self, _base: DevicePtr) -> Result<()> {
+        anyhow::bail!("backend does not support quarantined grouped backing frees")
+    }
+
+    /// Free every allocation this backend instance has made via [`Self::alloc`]
+    /// / [`Self::alloc_managed`] and not yet individually freed via
+    /// [`Self::free`]. Returns the number of bytes released.
+    ///
+    /// This exists for exactly one caller: model teardown at the end of a
+    /// hot swap (`TransformerModel::drop`). Model weights (`WeightStore` and
+    /// every per-layer `DenseWeight`/`QuantizedWeight`), the KV cache
+    /// (`PagedKvCache`), the SSM state/snapshot pools, `BufferArena`, and a
+    /// long tail of ad-hoc persistent `DevicePtr` fields on `TransformerModel`
+    /// hold raw, `Copy` device pointers with no destructor of their own — by
+    /// design, because on GB10 unified memory a `cuMemFree` interleaved with
+    /// *other* concurrent allocation or kernel traffic posts an in-band TLB
+    /// invalidation that corrupts neighbouring allocations (BUG #29, see
+    /// `spark-server/src/main_modules/serve_phases/weights.rs`). Every
+    /// existing call site that frees mid-load staging buffers is careful to
+    /// do so only while nothing else is concurrently allocating.
+    ///
+    /// Model teardown during a swap is the one place that is ALSO safe by
+    /// that same rule: it runs only after the scheduler thread has been
+    /// joined (see `main_modules/model_swap.rs`), so nothing else on the GPU
+    /// is allocating or launching kernels concurrently. Call this ONLY from
+    /// a point with that same guarantee — never from a live request path.
+    ///
+    /// Default: a no-op returning `Ok(0)`. Backends that do not (yet) track
+    /// their own outstanding allocations — the mock test backend, Metal —
+    /// simply leak nothing extra beyond what they already do; only the CUDA
+    /// backend overrides this.
+    fn free_all_allocations(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Bytes this backend can lend from device memory outside the system
+    /// pool ([`carveout`]: the GB10 display carveout). Default `0`: no such
+    /// region (mock, Metal, and CUDA started without one).
+    fn carveout_capacity(&self) -> usize {
+        0
+    }
+
+    /// Allocate `bytes` from that region; [`Self::free`] releases it.
+    fn alloc_carveout(&self, bytes: usize) -> Result<DevicePtr> {
+        anyhow::bail!("this GPU backend has no carveout to allocate {bytes} bytes from")
+    }
+
+    /// Copy from host to device.
+    fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()>;
+
+    /// Copy from device to host.
+    fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()>;
+
+    /// Synchronous device-to-host copy ordered after work on `stream`.
+    ///
+    /// The producer stream is drained before the blocking host copy, so the
+    /// returned bytes reflect all prior kernel launches on `stream`.
+    ///
+    /// Required when reading bytes that were just written by kernels on
+    /// a non-default stream — e.g. `high_speed_swap_offload_new_blocks`
+    /// reading WHT+quantize output bytes.
+    fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
+        // Default impl for mocks: sync the caller's stream then fall back to
+        // the backend's blocking D2H implementation.
+        self.synchronize(stream)?;
+        self.copy_d2h(src, dst)
+    }
+
+    /// Copy two device buffers to arbitrary host slices with one producer-
+    /// stream synchronization.
+    ///
+    /// This is the safe coalescing boundary for pageable host storage: drain
+    /// `stream` exactly once, then perform both blocking D2H copies. It avoids
+    /// exposing CUDA async D2H to an unconstrained Rust slice while retaining
+    /// the hot paths' two-copy/one-sync shape.
+    fn copy_d2h_pair_on_stream(
+        &self,
+        first_src: DevicePtr,
+        first_dst: &mut [u8],
+        second_src: DevicePtr,
+        second_dst: &mut [u8],
+        stream: u64,
+    ) -> Result<()> {
+        self.synchronize(stream)?;
+        self.copy_d2h(first_src, first_dst)?;
+        self.copy_d2h(second_src, second_dst)
+    }
+
+    /// Copy a group of arbitrary pageable host slices after draining their
+    /// producer stream exactly once.
+    fn copy_h2d_group_on_stream(&self, copies: &[HostToDeviceCopy<'_>], stream: u64) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        self.synchronize(stream)?;
+        for copy in copies {
+            self.copy_h2d(copy.src, copy.dst)?;
+        }
+        Ok(())
+    }
+
+    /// Copy device to device.
+    fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()>;
+
+    /// Launch a kernel on the given CUDA stream.
+    fn launch(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &mut [*mut std::ffi::c_void],
+    ) -> Result<()>;
+
+    /// Launch a kernel whose implementation performs a grid-wide cooperative sync.
+    /// Backends without CUDA cooperative-grid support reject before enqueue.
+    fn launch_cooperative(
+        &self,
+        _func: KernelHandle,
+        _grid: [u32; 3],
+        _block: [u32; 3],
+        _shared_mem: u32,
+        _stream: u64,
+        _params: &mut [*mut std::ffi::c_void],
+    ) -> Result<()> {
+        anyhow::bail!("cooperative-grid kernel launch is unsupported by this backend")
+    }
+
+    /// Opt a kernel into a dynamic shared-memory allocation above the default limit.
+    /// Unsupported backends reject before mutating function state.
+    fn set_kernel_max_dynamic_shared_memory(&self, _func: KernelHandle, _bytes: u32) -> Result<()> {
+        anyhow::bail!("kernel dynamic shared-memory attributes are unsupported by this backend")
+    }
+
+    /// Launch a kernel on the given CUDA stream, optionally enabling CUDA
+    /// Programmatic Dependent Launch (`PDL`) on backends that support it.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_pdl(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &mut [*mut std::ffi::c_void],
+        _pdl: bool,
+    ) -> Result<()> {
+        self.launch(func, grid, block, shared_mem, stream, params)
+    }
+
+    /// Typed-args kernel launch.
+    ///
+    /// CUDA's default impl packs args into u64 slots and forwards to
+    /// `launch()`. The Metal backend overrides this to map each
+    /// `KernelArg::Buffer` to `setBuffer:offset:atIndex:` and each
+    /// `KernelArg::Bytes` to `setBytes:length:atIndex:`.
+    fn launch_typed(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        args: &[KernelArg<'_>],
+    ) -> Result<()> {
+        self.launch_typed_pdl(func, grid, block, shared_mem, stream, args, false)
+    }
+
+    /// Typed-args kernel launch with optional CUDA PDL hint.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_typed_pdl(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        args: &[KernelArg<'_>],
+        pdl: bool,
+    ) -> Result<()> {
+        const INLINE_CAP: usize = 32;
+        if args.len() <= INLINE_CAP {
+            let mut storage = [0u64; INLINE_CAP];
+            let mut params = [std::ptr::null_mut::<std::ffi::c_void>(); INLINE_CAP];
+            for (dst, arg) in storage.iter_mut().zip(args.iter()) {
+                *dst = match arg {
+                    KernelArg::Buffer(p) => p.0,
+                    KernelArg::Bytes(b) => {
+                        anyhow::ensure!(
+                            b.len() <= 8,
+                            "launch_typed_pdl: KernelArg::Bytes length {} exceeds 8-byte CUDA parameter slot",
+                            b.len()
+                        );
+                        let mut slot = [0u8; 8];
+                        slot[..b.len()].copy_from_slice(b);
+                        u64::from_le_bytes(slot)
+                    }
+                };
+            }
+            for (param, slot) in params.iter_mut().zip(storage.iter()).take(args.len()) {
+                *param = (&raw const *slot).cast_mut().cast();
+            }
+            return self.launch_pdl(
+                func,
+                grid,
+                block,
+                shared_mem,
+                stream,
+                &mut params[..args.len()],
+                pdl,
+            );
+        }
+
+        let mut storage: Vec<u64> = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                KernelArg::Buffer(p) => storage.push(p.0),
+                KernelArg::Bytes(b) => {
+                    anyhow::ensure!(
+                        b.len() <= 8,
+                        "launch_typed_pdl: KernelArg::Bytes length {} exceeds 8-byte CUDA parameter slot",
+                        b.len()
+                    );
+                    let mut slot = [0u8; 8];
+                    slot[..b.len()].copy_from_slice(b);
+                    storage.push(u64::from_le_bytes(slot));
+                }
+            }
+        }
+        let mut params: Vec<*mut std::ffi::c_void> = storage
+            .iter()
+            .map(|v| v as *const u64 as *mut std::ffi::c_void)
+            .collect();
+        self.launch_pdl(func, grid, block, shared_mem, stream, &mut params, pdl)
+    }
+
+    /// True when `stream` is currently being captured into a CUDA graph.
+    /// Eager paths use it to avoid host synchronisation (or pageable copies)
+    /// on a capturing stream — those calls invalidate the capture (CUDA 901).
+    /// Default `false` (backends without capture never capture through this
+    /// trait's eager paths).
+    fn stream_is_capturing(&self, _stream: u64) -> bool {
+        false
+    }
+
+    /// Synchronize a CUDA stream (blocks until all work completes).
+    fn synchronize(&self, stream: u64) -> Result<()>;
+
+    /// Device-wide synchronize: every stream of this context, including the
+    /// legacy stream and helper streams this trait never sees. Diagnostics
+    /// only (`ATLAS_QWEN4_PREFILL_SYNC_DIAG`); the default drains only the
+    /// default stream.
+    fn synchronize_device(&self) -> Result<()> {
+        self.synchronize(self.default_stream())
+    }
+
+    /// Host-to-device copy issued on `stream` from a pageable `src`. CUDA stages the source
+    /// before `cuMemcpyHtoDAsync` returns, so the borrow may end on return, but a pageable
+    /// copy is not truly async (it synchronizes implicitly) and shares the stall class of
+    /// the Flash-Next load hang. Prefer pinned staging. Default: the synchronous copy.
+    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64) -> Result<()> {
+        self.copy_h2d(src, dst)
+    }
+
+    /// Get the default stream handle.
+    fn default_stream(&self) -> u64;
+
+    /// Look up a kernel function by module and function name.
+    ///
+    /// `#[track_caller]` so implementations can hand the DISPATCH SITE to
+    /// [`crate::kernel_audit::record`]. It survives `dyn` dispatch (rustc emits
+    /// a location shim for the vtable entry), which matters because every
+    /// caller here holds a `&dyn GpuBackend`. Without it the audit would report
+    /// the one line inside the backend that every lookup in the tree passes
+    /// through, which is worth nothing.
+    #[track_caller]
+    fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle>;
+
+    /// Async host-to-device copy from backend-owned page-locked storage.
+    ///
+    /// # Safety
+    /// The owner must not mutate or drop the source until `stream` completes.
+    /// If graph capture records the copy, the allocation and address must stay
+    /// valid through every replay, and mutation must not overlap a replay.
+    unsafe fn copy_h2d_pinned_async(
+        &self,
+        src: PinnedHostSlice<'_>,
+        dst: DevicePtr,
+        _stream: u64,
+    ) -> Result<()> {
+        self.copy_h2d(src.as_bytes(), dst)
+    }
+
+    /// Whether this backend runs host transfers in bounded mode
+    /// (`ATLAS_BOUNDED_HOST_COPY=1` as cached by the backend at first use),
+    /// i.e. its host waits are interruptible rather than an unbounded
+    /// `cuStreamSynchronize`. Callers that admit work on that guarantee must
+    /// ask the backend, not re-read the env. Default: not bounded.
+    fn bounded_host_copy(&self) -> bool {
+        false
+    }
+
+    /// Retain an exact owning device allocation before submitting a pinned
+    /// H2D subrange. Async backends must atomically exclude retained allocations
+    /// from both `free` and `free_all_allocations`, validate the base/range and
+    /// implement the matching release hook. No-op defaults are valid only for
+    /// the synchronous `copy_h2d_pinned_async` fallback above.
+    fn retain_h2d_destination(
+        &self,
+        _base: DevicePtr,
+        _offset: usize,
+        _bytes: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release one retained H2D reference only after positive completion.
+    /// Uncertain transfers intentionally keep their reference until teardown.
+    fn release_h2d_destination(&self, _base: DevicePtr) -> Result<()> {
+        Ok(())
+    }
+
+    /// Async device-to-device copy (no stream synchronization).
+    fn copy_d2d_async(
+        &self,
+        src: DevicePtr,
+        dst: DevicePtr,
+        bytes: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        self.copy_d2d(src, dst, bytes)
+    }
+
+    /// Strided device-to-device 2D (pitched) copy: `height` rows of `width_bytes`, source rows
+    /// spaced by `src_pitch`, dest rows by `dst_pitch`. Default = per-row `copy_d2d_async` loop;
+    /// the CUDA backend overrides with ONE `cudaMemcpy2DAsync` (replaces a per-token loop of
+    /// up to num_tokens×num_layers launches/forward — DeepSeek-V4.1's sparse attention uses
+    /// this for the compressed-KV publish). Ported from dsv41/integration.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_d2d_2d_async(
+        &self,
+        src: DevicePtr,
+        src_pitch: usize,
+        dst: DevicePtr,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+        stream: u64,
+    ) -> Result<()> {
+        for r in 0..height {
+            self.copy_d2d_async(
+                src.offset(r * src_pitch),
+                dst.offset(r * dst_pitch),
+                width_bytes,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Begin capturing CUDA operations on `stream` into a graph.
+    ///
+    /// All kernel launches and async copies on this stream between
+    /// `begin_capture` and `end_capture` are recorded (not executed).
+    /// The stream must NOT be the legacy default stream (handle 0).
+    fn begin_capture(&self, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// End capture and return an instantiated graph ready for replay.
+    fn end_capture(&self, _stream: u64) -> Result<GraphHandle> {
+        Ok(GraphHandle(0))
+    }
+
+    /// Replay all operations captured in the graph on `stream`.
+    fn launch_graph(&self, _graph: GraphHandle, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Destroy an instantiated graph, freeing resources.
+    fn destroy_graph(&self, _graph: GraphHandle) -> Result<()> {
+        Ok(())
+    }
+
+    /// Set device memory to a byte value (synchronous — waits for completion).
+    fn memset(&self, ptr: DevicePtr, value: u8, bytes: usize) -> Result<()>;
+
+    /// Set device memory to a byte value on the given stream (async — does not wait).
+    fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, stream: u64) -> Result<()>;
+
+    /// Set `count` 32-bit words at `ptr` to `value` on the given stream (async).
+    /// Used to publish a small device-resident counter that graphed kernels read
+    /// at replay time (a by-value launch arg would freeze at graph capture).
+    ///
+    /// Default: builds the pattern on the host and H2D-copies it -- correct but not a real
+    /// device-side memset, so it costs one small host allocation and one copy per call. Fine
+    /// for the small, infrequent counters this is used for; backends compiled for real GPU
+    /// work (AtlasCudaBackend) override it with a real `cuMemsetD32Async`.
+    fn memset_u32_async(
+        &self,
+        ptr: DevicePtr,
+        value: u32,
+        count: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let bytes: Vec<u8> = value
+            .to_le_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(count * 4)
+            .collect();
+        self.copy_h2d_async(&bytes, ptr, stream)
+    }
+
+    /// Total device memory in bytes.
+    fn total_memory(&self) -> Result<usize>;
+
+    /// Free device memory in bytes.
+    fn free_memory(&self) -> Result<usize>;
+
+    /// Create a new CUDA stream (for overlapping work).
+    fn create_stream(&self) -> Result<u64> {
+        Ok(0) // Default: return legacy stream
+    }
+
+    /// Bind the CUDA context to the current thread.
+    ///
+    /// Must be called on any thread that uses GPU operations (alloc, launch, etc.)
+    /// if it's different from the thread that created the backend.
+    fn bind_to_thread(&self) -> Result<()> {
+        Ok(()) // No-op for mock backend
+    }
+
+    /// Streaming-multiprocessor count of the device, when the backend can
+    /// answer.
+    ///
+    /// Occupancy decisions — split-K slice counts above all — need to know how
+    /// many CTAs it takes to fill the machine. Before this existed, every such
+    /// site hardcoded a literal, and the literals disagreed with each other
+    /// (48 in `layers/mod.rs` and `qwen3_ssm/mod.rs`, 110 in
+    /// `dflash_head/draft_splitk.rs` and `ops/gemm_dense.rs`). Nothing in the
+    /// tree had ever asked the device.
+    ///
+    /// Returns `None` when the backend cannot answer (mock, Metal, or a failed
+    /// driver query). Callers MUST keep working in that case — fall back to
+    /// whatever literal they used before rather than refusing to launch.
+    fn sm_count(&self) -> Option<u32> {
+        None
+    }
+
+    /// Whether the active device shares unified host/device memory (e.g. GB10 UMA).
+    ///
+    /// Defaults to `true` for unified-memory and mock backends; discrete CUDA GPUs
+    /// override this to return `false`.
+    fn is_unified_memory(&self) -> bool {
+        true
+    }
+
+    /// Compute capability `(major, minor)` of the device, when known.
+    fn compute_capability(&self) -> Option<(u32, u32)> {
+        atlas_core::device::active_compute_capability()
+    }
+
+    /// Create a CUDA event (for inter-stream synchronization).
+    fn create_event(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Record an event on a stream (marks a point in the stream's work).
+    fn record_event(&self, _event: u64, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Make a stream wait for an event (GPU-side sync, CPU does not block).
+    fn stream_wait_event(&self, _stream: u64, _event: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Poll whether an event has completed, without blocking.
+    ///
+    /// `Ok(true)` once the work recorded on the event has finished, `Ok(false)`
+    /// while it is still pending. Callers that need a bounded wait poll this
+    /// on a wall-clock deadline instead of calling a blocking driver
+    /// synchronize — see [`GpuBackend::copy_h2d`] for why a blocking call on
+    /// pageable memory can, on rare hardware/driver states, never return.
+    /// Default: always ready (matches the other event stubs' no-op mock
+    /// semantics — nothing was actually recorded).
+    fn poll_event(&self, _event: u64) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Destroy an event.
+    fn destroy_event(&self, _event: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Allocate owning page-locked host memory for efficient async H2D.
+    ///
+    /// On DGX Spark (UMA/LPDDR5X), pinned memory enables true async DMA
+    /// without internal CUDA staging overhead. Small metadata buffers
+    /// should be packed into a single pinned region and copied in one call.
+    ///
+    /// The returned owner releases the backend allocation on drop.
+    fn alloc_host_pinned(&self, bytes: usize) -> Result<PinnedHostBuffer> {
+        PinnedHostBuffer::heap(bytes)
+    }
+
+    /// Copy host bytes into a buffer allocated by [`Self::alloc_managed`].
+    ///
+    /// Default implementation delegates to [`Self::copy_h2d`] so backends whose
+    /// `DevicePtr` is not directly CPU-addressable (e.g. Metal GPU virtual
+    /// addresses or mock handles) remain sound. `AtlasCudaBackend` overrides
+    /// this to write directly to verified CUDA managed memory.
+    fn copy_h2d_managed(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
+        self.copy_h2d(src, dst)
+    }
+}
+
+impl fmt::Display for DevicePtr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DevicePtr(0x{:x})", self.0)
+    }
+}
+
+pub mod carveout;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock;
+
+#[cfg(test)]
+mod tests {
+    use super::mock::MockGpuBackend;
+    use super::*;
+
+    #[test]
+    fn test_mock_alloc_free() {
+        let gpu = MockGpuBackend::new();
+        let ptr = gpu.alloc(1024).unwrap();
+        assert!(!ptr.is_null());
+        assert_eq!(gpu.alloc_count(), 1);
+        gpu.free(ptr).unwrap();
+        assert_eq!(gpu.alloc_count(), 0);
+    }
+
+    #[test]
+    fn test_mock_copy_roundtrip() {
+        let gpu = MockGpuBackend::new();
+        let ptr = gpu.alloc(8).unwrap();
+        let src = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        gpu.copy_h2d(&src, ptr).unwrap();
+        let mut dst = [0u8; 8];
+        gpu.copy_d2h(ptr, &mut dst).unwrap();
+        assert_eq!(src, dst);
+    }
+
+    #[test]
+    fn test_device_ptr_offset() {
+        let ptr = DevicePtr(0x1000);
+        assert_eq!(ptr.offset(256).0, 0x1100);
+    }
+
+    #[test]
+    fn mock_cooperative_launch_fails_closed() {
+        let gpu = MockGpuBackend::new();
+        let mut params = [];
+        let error = gpu
+            .launch_cooperative(KernelHandle(1), [1, 1, 1], [32, 1, 1], 0, 0, &mut params)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
+        assert_eq!(gpu.launch_count(), 0);
+    }
+
+    #[test]
+    fn mock_kernel_shared_memory_attribute_fails_closed() {
+        let gpu = MockGpuBackend::new();
+        let error = gpu
+            .set_kernel_max_dynamic_shared_memory(KernelHandle(1), 90 * 1024)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
+        assert_eq!(gpu.launch_count(), 0);
+    }
+
+    #[test]
+    fn mock_device_property_defaults_preserve_uma_and_none_sm_count() {
+        let gpu = MockGpuBackend::new();
+        assert!(gpu.is_unified_memory());
+        assert_eq!(gpu.sm_count(), None);
+    }
+}
+
+/// Free device memory as it was BEFORE this process loaded anything.
+///
+/// The dashboard's "atlas used" is `baseline - free`, and that subtraction is
+/// the whole reason this has to be captured rather than computed: free memory
+/// alone cannot distinguish weights this process loaded from memory another
+/// process is holding. A figure derived from one reading is not a smaller
+/// truth than one derived from two — it is a different quantity wearing the
+/// same label.
+///
+/// `OnceLock`, so the FIRST caller fixes it. `capture_baseline` is called from
+/// serve start-up before any allocation; if something reads it earlier the
+/// value is still a true pre-load reading, just taken slightly sooner.
+static BASELINE_FREE_BYTES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+/// Record the pre-load free-memory reading. Idempotent: later calls are
+/// ignored, because a "baseline" taken after the weights are resident would
+/// silently turn `baseline - free` into approximately zero.
+pub fn capture_baseline() {
+    let _ = BASELINE_FREE_BYTES.get_or_init(|| {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda_backend::cuda_free_memory_bytes()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    });
+}
+
+/// The captured baseline, or `None` if it was never taken or the query failed.
+///
+/// `None` rather than a fallback to the current free figure: that would make
+/// `baseline - free` read as 0 bytes used, which is a confident wrong answer
+/// where an absent one is honest.
+pub fn baseline_free_bytes() -> Option<usize> {
+    BASELINE_FREE_BYTES.get().copied().flatten()
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    #[test]
+    fn the_baseline_is_fixed_by_the_first_capture_and_never_moves() {
+        super::capture_baseline();
+        let first = super::baseline_free_bytes();
+        // A second capture must NOT overwrite: taken after a load it would be
+        // post-allocation, and `baseline - free` would collapse to ~0.
+        super::capture_baseline();
+        assert_eq!(super::baseline_free_bytes(), first, "capture is idempotent");
+    }
+
+    #[test]
+    fn an_uncaptured_baseline_is_none_not_a_guess() {
+        // Whatever the state, the accessor never invents a number; on a box
+        // with no CUDA it stays None rather than falling back to free memory,
+        // which would render "0 bytes used" on a loaded server.
+        let v = super::baseline_free_bytes();
+        assert!(
+            v.is_none() || v.is_some_and(|b| b > 0),
+            "never a fabricated zero"
+        );
+    }
+}

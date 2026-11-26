@@ -1,0 +1,246 @@
+# Flux / Atlas Hardware Compatibility & Execution Target Matrix
+# Schema Version: 2.0.0
+
+schema_version: "2.0.0"
+generated_at: "2026-10-17T12:35:00Z"
+primary_certification_target: "nvidia_gb10_sm121a"
+
+hardware_targets:
+  - target_id: "nvidia_gb10_sm121a"
+    name: "NVIDIA GB10 (Grace Blackwell Superchip / DGX Spark)"
+    tier: "tier-1-release-qualified"
+    vendor: "NVIDIA"
+    architecture: "Blackwell (GB10)"
+    compute_capability: "12.1"
+    nvcc_arch_flags:
+      - "-gencode arch=compute_121a,code=sm_121a"
+      - "-gencode arch=compute_121f,code=sm_121f"
+    gpu_topology:
+      streaming_multiprocessors: 48
+      max_warps_per_sm: 48
+      max_threads_per_sm: 1536
+      shared_memory_per_sm_kb: 128
+      registers_per_sm: 65536
+      l2_cache_mib: 32
+    cpu_topology:
+      isa: "aarch64 (ARMv9.2-A)"
+      total_cores: 20
+      clusters:
+        - name: "Cortex-X925 (Performance / Big Cores)"
+          count: 10
+          cpulist: "5-9,15-19"
+          role: "Dedicated runtime / tokio worker / CUDA launch & token scheduling threads (pinned via taskset -c 5-9,15-19)"
+        - name: "Cortex-A725 (Efficiency / Little Cores)"
+          count: 10
+          cpulist: "0-4,10-14"
+          role: "OS background tasks, telemetry collection, non-critical I/O"
+    memory_hierarchy:
+      architecture: "Coherent Unified Memory Architecture (UMA) LPDDR5X"
+      physical_capacity_gb: 128.0
+      os_visible_capacity_gib: 119.7
+      theoretical_peak_bandwidth_gbps: 301.0
+      sustained_stream_bandwidth_gbps: 273.0
+      kv_cache_safety_floor_mib: 7072
+      page_cache_policy: "Clean page cache drop or bounded mmap preload required prior to 128K-136K context runs to maintain >= 7 GiB free UMA floor"
+    tensor_core_capabilities:
+      native_instructions:
+        - "mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.Kind::f8f6f4.block_scale.scale_vec::2X (NVFP4 E2M1 + UE4M3 block-16 scales)"
+        - "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 (FP8 E4M3)"
+        - "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 (BF16)"
+      register_backed_mma: true
+      tmem_tcgen05_supported: false
+      notes: >
+        Unlike datacenter SM100 (B200) which uses Tensor Memory (TMEM) and tcgen05.mma,
+        SM121a (GB10) and SM120 (RTX PRO 6000) execute register-backed mma.sync.aligned
+        instructions with hardware block scaling (UE4M3 scale factors per 16 E2M1 elements).
+    runtime_profile:
+      source_ref: "crates/atlas-core/src/capabilities.rs;crates/spark-runtime/src/cuda_backend.rs;kernels/gb10/"
+      use_fp32_residual: false
+      residual_precision: "BF16 (saves 50% residual stream memory bandwidth on 273-301 GB/s LPDDR5X UMA)"
+      default_kv_cache_dtype: "FP8_E4M3 (with per-head/per-tile scaling; BF16 fallback supported)"
+      prefill_chunk_configs:
+        - profile: "w16384 (Peak Throughput)"
+          max_prefill_tokens: 16384
+          peak_16k_prefill_tps: 6076.7
+          peak_16k_certified_burst_tps: 6082.2
+          estonia_136k_prefill_tps: 5400.4
+          uma_free_floor_mib: 7072
+        - profile: "w4096 (Low Memory Footprint / Concurrent Serve)"
+          max_prefill_tokens: 4096
+          peak_8k_prefill_tps: 5266.8
+          peak_16k_prefill_tps: 5164.5
+          uma_free_floor_mib: 11907
+      speculative_decode_profile:
+        method: "Inferact MTP K=5 (1 anchor + 4 draft tokens, 5-token batch verify)"
+        coding_peak_tps_median: 56.5
+        coding_peak_tps_max: 57.4
+        mean_acceptance_length: 3.02
+        estonia_136k_decode_tps: "43.8 avg / 48.2 peak client (48.6 server)"
+      compiled_kernel_inventory:
+        kernel_source_dir: "kernels/gb10"
+        total_cuda_translation_units: 412
+        per_model_target_kernels_min: 162
+        per_model_target_kernels_max: 213
+        verified_targets_manifest: "kernels/gb10/README.md (19 model target directories)"
+    software_stack:
+      os: "Ubuntu 24.04 LTS (aarch64)"
+      linux_kernel: "6.17.0-1014-nvidia"
+      nvidia_driver: "580.126.09"
+      cuda_toolkit: "13.0 (V13.0.88)"
+      cublas: "13.1.0.3"
+    evidence_references:
+      - "docs/verification/BENCHMARK_VERIFICATION.md"
+      - "docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md"
+      - "bench/qwen38-flash-next-gb10/ARTIFACTS.sha256"
+
+  - target_id: "nvidia_rtx6000_blackwell_sm120"
+    name: "NVIDIA RTX PRO 6000 Blackwell Workstation / Server Edition"
+    tier: "tier-1-supported"
+    vendor: "NVIDIA"
+    architecture: "Blackwell Workstation (GB202)"
+    compute_capability: "12.0"
+    nvcc_arch_flags:
+      - "-gencode arch=compute_120,code=sm_120"
+      - "-gencode arch=compute_120a,code=sm_120a"
+    gpu_topology:
+      streaming_multiprocessors: 188
+      max_warps_per_sm: 48
+      max_threads_per_sm: 1536
+      shared_memory_per_sm_kb: 128
+      l2_cache_mib: 96
+    memory_hierarchy:
+      architecture: "Discrete GDDR7 with ECC"
+      physical_capacity_gb: 96.0
+      theoretical_peak_bandwidth_gbps: 1792.0
+    tensor_core_capabilities:
+      native_instructions:
+        - "mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.Kind::f8f6f4.block_scale"
+        - "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"
+      register_backed_mma: true
+      tmem_tcgen05_supported: false
+    runtime_profile:
+      source_ref: "crates/atlas-core/src/capabilities.rs;crates/spark-runtime/src/cuda_backend.rs;kernels/rtx6000/HARDWARE.toml"
+      use_fp32_residual: false
+      residual_precision: "BF16"
+      compiled_kernel_inventory:
+        kernel_source_dir: "kernels/rtx6000"
+        hardware_manifest: "kernels/rtx6000/HARDWARE.toml"
+        shared_sm120_kernel_source_dir: "kernels/gb10"
+      compatibility_notes: >
+        Shares the register-backed block-scaled FP4/FP8 Tensor Core ISA with SM121a (GB10),
+        reusing the shared Blackwell SM12x CUDA kernel library under kernels/gb10/ via
+        kernels/rtx6000/HARDWARE.toml and SM120 runtime dispatch.
+        With ~6x higher memory bandwidth (1,792 GB/s GDDR7 vs 301 GB/s LPDDR5X), memory-bound
+        decode scales proportionally while 96 GB discrete VRAM bounds max context on 80B-class
+        models relative to GB10's 128 GB UMA.
+
+  - target_id: "nvidia_b200_sm100a"
+    name: "NVIDIA B200 / GB200 Datacenter Blackwell"
+    tier: "tier-2-compatible-via-runtime-dispatch"
+    vendor: "NVIDIA"
+    architecture: "Blackwell Datacenter (GB100)"
+    compute_capability: "10.0"
+    nvcc_arch_flags:
+      - "-gencode arch=compute_100a,code=sm_100a"
+    memory_hierarchy:
+      architecture: "HBM3e"
+      physical_capacity_gb: 192.0
+      theoretical_peak_bandwidth_gbps: 8000.0
+    tensor_core_capabilities:
+      native_instructions:
+        - "tcgen05.mma (5th Gen Tensor Core with dedicated Tensor Memory / TMEM)"
+      register_backed_mma: false
+      tmem_tcgen05_supported: true
+    runtime_profile:
+      source_ref: "crates/atlas-core/src/capabilities.rs;crates/spark-runtime/src/cuda_backend.rs"
+      use_fp32_residual: true
+      residual_precision: "FP32 (enabled automatically when compute_capability == (10, 0) since 8 TB/s HBM3e makes FP32 residual bandwidth cost negligible while improving deep-layer numerical accumulation)"
+      compatibility_notes: >
+        Runtime capability detection in crates/atlas-core/src/capabilities.rs and
+        crates/spark-runtime/src/cuda_backend.rs explicitly branches on
+        (major == 10, minor == 0) vs (major == 12, minor == 0|1). On SM100, cuBLASLt FP4/FP8 GEMM and
+        standard FlashAttention paths run natively; custom SM120/SM121 mma.sync.aligned.block_scale PTX
+        kernels require either cublasLt dispatch or tcgen05 TMEM kernel specialization for peak utilization.
+
+  - target_id: "nvidia_hopper_sm90a"
+    name: "NVIDIA H100 / H200 / GH200 Hopper"
+    tier: "tier-2-fp8-bf16-awq-compatible"
+    vendor: "NVIDIA"
+    architecture: "Hopper (GH100)"
+    compute_capability: "9.0"
+    nvcc_arch_flags:
+      - "-gencode arch=compute_90a,code=sm_90a"
+    memory_hierarchy:
+      architecture: "HBM3 / HBM3e"
+      physical_capacity_gb: 80.0
+      theoretical_peak_bandwidth_gbps: 3350.0
+    tensor_core_capabilities:
+      native_instructions:
+        - "wgmma.mma_async.sync.aligned (FP8 E4M3/E5M2, BF16, FP16)"
+      register_backed_mma: false
+      tmem_tcgen05_supported: false
+    runtime_profile:
+      source_ref: "crates/atlas-core/src/capabilities.rs;crates/spark-runtime/src/cuda_backend.rs"
+      use_fp32_residual: true
+      compatibility_notes: >
+        Hopper SM90a supports FP8 E4M3, INT4-AWQ (W4A16/W4A8 via LOP3/LUT dequantization), GGUF, and BF16
+        checkpoints natively. Because SM90 lacks hardware FP4 E2M1 block-scaled Tensor Core instructions,
+        NVFP4 checkpoints require software LUT dequantization to FP8/BF16 prior to WGMMA execution.
+
+  - target_id: "apple_silicon_metal"
+    name: "Apple Silicon M-Series (M2 / M3 / M4 Max & Ultra)"
+    tier: "tier-2-edge-vlm-metal"
+    vendor: "Apple"
+    architecture: "Apple GPU (apple7 / Metal 3.1)"
+    compute_capability: "metal3.1-apple7"
+    nvcc_arch_flags:
+      - "-std=metal3.1 -mios-version-min=16.0 / -mmacosx-version-min=14.0"
+    memory_hierarchy:
+      architecture: "Apple Unified Memory (LPDDR5 / LPDDR5X)"
+      physical_capacity_gb: 64.0
+      theoretical_peak_bandwidth_gbps: 400.0
+    runtime_profile:
+      source_ref: "crates/spark-runtime/src/metal_backend.rs;crates/spark-runtime/src/gpu/;kernels/metal/"
+      use_fp32_residual: false
+      compiled_kernel_inventory:
+        kernel_source_dir: "kernels/metal/common"
+        total_metal_shaders: 30
+        metal_shader_files:
+          - "kernels/metal/common/add_rms_norm.metal"
+          - "kernels/metal/common/argmax_bf16.metal"
+          - "kernels/metal/common/attention_decode.metal"
+          - "kernels/metal/common/attention_full.metal"
+          - "kernels/metal/common/attention_prefill.metal"
+          - "kernels/metal/common/bf16_add.metal"
+          - "kernels/metal/common/causal_conv1d_decode.metal"
+          - "kernels/metal/common/causal_conv1d_update_l2norm.metal"
+          - "kernels/metal/common/conv3d_patch_embed.metal"
+          - "kernels/metal/common/dense_gemm_bf16.metal"
+          - "kernels/metal/common/dense_gemv_bf16.metal"
+          - "kernels/metal/common/embed_lookup.metal"
+          - "kernels/metal/common/gated_delta_rule_decode.metal"
+          - "kernels/metal/common/gdn_helpers.metal"
+          - "kernels/metal/common/gelu.metal"
+          - "kernels/metal/common/kv_cache_append.metal"
+          - "kernels/metal/common/layer_norm.metal"
+          - "kernels/metal/common/mlx_int8_dequant.metal"
+          - "kernels/metal/common/mlx_int8_gemm.metal"
+          - "kernels/metal/common/mlx_int8_gemv.metal"
+          - "kernels/metal/common/mlx_int8_gemv_gate_up.metal"
+          - "kernels/metal/common/mlx_int8_gemv_silu_gate.metal"
+          - "kernels/metal/common/noop_smoke.metal"
+          - "kernels/metal/common/qwen35_qkv_split.metal"
+          - "kernels/metal/common/rms_norm.metal"
+          - "kernels/metal/common/rope_apply.metal"
+          - "kernels/metal/common/selective_scan_decode.metal"
+          - "kernels/metal/common/sigmoid_gate.metal"
+          - "kernels/metal/common/silu_gate.metal"
+          - "kernels/metal/common/softmax_topp.metal"
+        verified_targets_manifest: "kernels/metal/qwen3-5-4b-vlm-mlx-int8/MODEL.toml"
+      compatibility_notes: >
+        Experimental first-party Metal backend with 30 .metal compute shaders under
+        kernels/metal/common/ covering Gated DeltaNet recurrent decode
+        (gated_delta_rule_decode.metal), attention prefill/decode (attention_prefill.metal,
+        attention_decode.metal, attention_full.metal), RoPE (rope_apply.metal), vision
+        Conv3D/GELU/LayerNorm, BF16 dense GEMV/GEMM, and MLX INT8 affine dequant/GEMV/GEMM.
+        Targets compact dense/hybrid VLM checkpoints such as Qwen3.5-4B-VLM-MLX-INT8.

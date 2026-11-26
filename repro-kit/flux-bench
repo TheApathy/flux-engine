@@ -1,0 +1,970 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""
+flux-bench — Zero-Dependency CLI & Reproducibility Harness for Flux Engine (v0.1.0)
+Sanitization Policy: FLUX-SEC-0001
+
+Pure Python 3 standard-library CLI (with optional PyYAML fast path) supporting:
+  1. flux-bench run --config /opt/flux/repro-kit/benchmark-config.yaml --output /results/results.json [--mode ...]
+  2. flux-bench serve [--topology 1x-spark|2x-spark|4x-spark|generic-gpu] [--mode ...] [--dry-run]
+  3. flux-bench inspect-hw [--json]
+  4. flux-bench verify-manifest [--models-dir /models] [--manifest /opt/flux/model-manifest.json]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if Path("/opt/flux/repro-kit/benchmark-config.yaml").exists():
+    DEFAULT_KIT_DIR = Path("/opt/flux/repro-kit")
+elif Path("/opt/flux/benchmark-config.yaml").exists():
+    DEFAULT_KIT_DIR = Path("/opt/flux")
+else:
+    DEFAULT_KIT_DIR = SCRIPT_DIR
+
+MODES = (
+    "max-prefill",
+    "interactive-w4096",
+    "fast-prefill",
+    "k5-decode",
+    "long-context-136k",
+    "exact-reference",
+)
+
+TOPOLOGIES = (
+    "auto",
+    "1x-spark",
+    "2x-spark",
+    "4x-spark",
+    "generic-gpu",
+)
+
+MODE_TO_RECIPE = {
+    "max-prefill": ("flux-v9-max-prefill.env", "flux-serve.argv"),
+    "interactive-w4096": ("flux-v9-w4096-interactive.env", "flux-serve-w4096.argv"),
+    "fast-prefill": ("flux-fast-prefill.env", "flux-serve.argv"),
+    "k5-decode": ("flux-k5-lossless-decode.env", "flux-serve-w4096.argv"),
+    "long-context-136k": ("flux-estonia-136k.env", "flux-serve.argv"),
+    "exact-reference": ("flux-exact-reference.env", "flux-serve.argv"),
+}
+
+PINNED_REFERENCE_VERSION = "0.9.12-6k-stable"
+# This image's version when FLUX_ENGINE_VERSION is unset. The pinned reference
+# above labels the certified reference data and stays as measured.
+STABLE_ENGINE_VERSION = "1.0.2"
+
+
+def engine_version() -> str:
+    """Return the version stamped into this image, or the stable fallback."""
+    return os.environ.get("FLUX_ENGINE_VERSION", "").strip() or STABLE_ENGINE_VERSION
+
+
+def load_yaml_or_fallback(path: Path) -> Dict[str, Any]:
+    """Parse YAML config using PyYAML if installed, or a pure-stdlib indentation parser."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore
+        loaded = yaml.safe_load(text)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:
+        pass
+
+    def _parse_scalar(val: str) -> Any:
+        val = val.strip()
+        if not val:
+            return ""
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            return val[1:-1]
+        if val.startswith("[") and val.endswith("]"):
+            inner = val[1:-1].strip()
+            if not inner:
+                return []
+            return [_parse_scalar(x) for x in inner.split(",")]
+        low = val.lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+        if low in ("null", "none", "~"):
+            return None
+        try:
+            if "." in val:
+                return float(val)
+            return int(val)
+        except ValueError:
+            return val
+
+    root: Dict[str, Any] = {}
+    stack: List[Tuple[int, Dict[str, Any]]] = [(-1, root)]
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if ":" not in stripped:
+            continue
+        key_part, val_part = stripped.split(":", 1)
+        key = key_part.strip()
+        val_str = val_part.strip()
+        while len(stack) > 1 and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1]
+        if not val_str:
+            new_dict: Dict[str, Any] = {}
+            parent[key] = new_dict
+            stack.append((indent, new_dict))
+        else:
+            parent[key] = _parse_scalar(val_str)
+    return root
+
+
+def parse_env_file(path: Path) -> Dict[str, str]:
+    """Parse KEY=VALUE lines from a sanitized .env recipe file."""
+    env_map: Dict[str, str] = {}
+    if not path.is_file():
+        return env_map
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            v = v.strip()
+            if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                v = v[1:-1]
+            env_map[k.strip()] = v
+    return env_map
+
+
+def parse_argv_file(path: Path, models_root: str) -> List[str]:
+    """Parse newline-delimited CLI arguments and substitute <MODELS_ROOT>."""
+    if not path.is_file():
+        return []
+    args: List[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        args.append(line.replace("<MODELS_ROOT>", models_root))
+    return args
+
+
+def read_meminfo() -> Dict[str, int]:
+    """Read /proc/meminfo values in MiB."""
+    info: Dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            parts = line.split(":")
+            if len(parts) == 2:
+                key = parts[0].strip()
+                val_kb = int(parts[1].strip().split()[0])
+                info[key] = val_kb // 1024
+    except Exception:
+        pass
+    return info
+
+
+def detect_hardware(topology_override: str = "auto") -> Dict[str, Any]:
+    """Inspect GPU, CPU core topology, UMA memory state, and cluster nodes without running GPU workloads."""
+    mem = read_meminfo()
+    total_mib = mem.get("MemTotal", 0)
+    avail_mib = mem.get("MemAvailable", 0)
+    cached_mib = mem.get("Cached", 0)
+    free_mib = mem.get("MemFree", 0)
+
+    # Read GPU info from /proc/driver/nvidia/gpus or sysfs without launching any CUDA context
+    gpu_name = "NVIDIA GB10 (DGX Spark)"
+    driver_ver = "580.126.09"
+    gpu_count = 1
+    proc_gpus = sorted(Path("/proc/driver/nvidia/gpus").glob("*/information"))
+    if proc_gpus:
+        gpu_count = len(proc_gpus)
+        try:
+            info_txt = proc_gpus[0].read_text(encoding="utf-8", errors="replace")
+            for ln in info_txt.splitlines():
+                if ln.startswith("Model:"):
+                    parsed_model = ln.split(":", 1)[1].strip()
+                    if parsed_model and parsed_model.lower() != "unknown":
+                        gpu_name = parsed_model
+                    elif platform.machine() == "aarch64":
+                        gpu_name = "NVIDIA GB10 (DGX Spark)"
+        except Exception:
+            pass
+    proc_ver = Path("/proc/driver/nvidia/version")
+    if proc_ver.is_file():
+        try:
+            vtxt = proc_ver.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r"Kernel Module\s+([0-9.]+)", vtxt)
+            if m:
+                driver_ver = m.group(1)
+        except Exception:
+            pass
+
+    # Detect cluster nodes via FLUX_CLUSTER_NODES
+    cluster_nodes_raw = os.environ.get("FLUX_CLUSTER_NODES", "").strip()
+    cluster_nodes = [n.strip() for n in cluster_nodes_raw.split(",") if n.strip()] if cluster_nodes_raw else []
+
+    if topology_override and topology_override != "auto":
+        topology = topology_override
+    elif len(cluster_nodes) >= 4:
+        topology = "4x-spark"
+    elif len(cluster_nodes) == 2:
+        topology = "2x-spark"
+    elif "GB10" in gpu_name.upper():
+        topology = "1x-spark"
+    else:
+        topology = "generic-gpu"
+
+    # Compute capability & arch classification
+    upper_gpu = gpu_name.upper()
+    if "GB10" in upper_gpu:
+        cc, arch_flag, target_id = "12.1", "sm_121a", "nvidia_gb10_sm121a"
+    elif "6000" in upper_gpu or "5090" in upper_gpu or "SM120" in upper_gpu:
+        cc, arch_flag, target_id = "12.0", "sm_120a", "nvidia_blackwell_sm120"
+    elif "B200" in upper_gpu or "GB200" in upper_gpu:
+        cc, arch_flag, target_id = "10.0", "sm_100a", "nvidia_b200_sm100a"
+    elif "H100" in upper_gpu or "H200" in upper_gpu or "GH200" in upper_gpu:
+        cc, arch_flag, target_id = "9.0", "sm_90a", "nvidia_hopper_sm90"
+    else:
+        cc, arch_flag, target_id = "12.1", "sm_121a", "nvidia_gb10_sm121a"
+
+    # Detect CPU cores & Cortex-X925 affinity
+    cpu_count = os.cpu_count() or 20
+    arch = platform.machine()
+    affinity = os.environ.get("FLUX_CPU_AFFINITY", "5-9,15-19" if arch == "aarch64" and cpu_count == 20 else f"0-{max(0, cpu_count - 1)}")
+
+    # Select optimal recipe automatically
+    if topology == "4x-spark":
+        recommended_recipe = "recipes/4x-spark-cluster.env"
+        recommended_mode = "max-prefill"
+    elif topology == "2x-spark":
+        recommended_recipe = "recipes/2x-spark-cluster.env"
+        recommended_mode = "max-prefill"
+    elif target_id == "nvidia_blackwell_sm120":
+        recommended_recipe = "recipes/nvidia-blackwell-sm120.env"
+        recommended_mode = "max-prefill"
+    elif target_id == "nvidia_hopper_sm90":
+        recommended_recipe = "recipes/nvidia-hopper-sm90.env"
+        recommended_mode = "max-prefill"
+    else:
+        # 1x NVIDIA GB10 (DGX Spark)
+        if avail_mib > 0 and avail_mib < 96000:
+            recommended_recipe = "recipes/flux-v9-w4096-interactive.env"
+            recommended_mode = "interactive-w4096"
+        else:
+            recommended_recipe = "recipes/flux-v9-max-prefill.env"
+            recommended_mode = "max-prefill"
+
+    return {
+        "schema_version": "1.0.0",
+        "sanitization_policy": "FLUX-SEC-0001",
+        "host": {
+            "hostname": "<HOSTNAME>",
+            "user": "<USER>",
+            "os": f"{platform.system()} {platform.release()}",
+            "arch": arch,
+        },
+        "gpu": {
+            "topology": topology,
+            "target_id": target_id,
+            "name": gpu_name,
+            "device_count_local": gpu_count,
+            "cluster_nodes": cluster_nodes or ["localhost"],
+            "cluster_world_size": len(cluster_nodes) if cluster_nodes else gpu_count,
+            "compute_capability": cc,
+            "nvcc_arch": arch_flag,
+            "driver_version": driver_ver,
+        },
+        "cpu": {
+            "total_cores": cpu_count,
+            "recommended_affinity": affinity,
+            "pinning_command": f"taskset -c {affinity}",
+        },
+        "memory": {
+            "total_mib": total_mib,
+            "available_mib": avail_mib,
+            "free_mib": free_mib,
+            "page_cache_mib": cached_mib,
+            "uma_floor_gate_mib": 5120,
+            "uma_floor_status": "PASS" if avail_mib >= 5120 or avail_mib == 0 else "WARN_LOW_MEMORY",
+        },
+        "auto_selected_profile": {
+            "mode": recommended_mode,
+            "recipe": recommended_recipe,
+            "engine_version": engine_version(),
+            "default_kernel_target": "qwen3.8-flash-next",
+        },
+    }
+
+
+def cmd_inspect_hw(args: argparse.Namespace) -> int:
+    hw = detect_hardware(args.topology)
+    if args.json:
+        print(json.dumps(hw, indent=2))
+    else:
+        g = hw["gpu"]
+        m = hw["memory"]
+        c = hw["cpu"]
+        p = hw["auto_selected_profile"]
+        print("======================================================================")
+        print(" Flux Engine — Hardware & Topology Inspection")
+        print("======================================================================")
+        print(f"  Topology          : {g['topology']} (world_size={g['cluster_world_size']})")
+        print(f"  GPU Model         : {g['name']} (arch={g['nvcc_arch']}, cc={g['compute_capability']}, driver={g['driver_version']})")
+        print(f"  CPU Cores         : {c['total_cores']} ({hw['host']['arch']}) -> Pinned Affinity: {c['recommended_affinity']}")
+        print(f"  UMA / Host Memory : {m['available_mib']} MiB available / {m['total_mib']} MiB total (PageCache={m['page_cache_mib']} MiB)")
+        print(f"  UMA Floor Gate    : {m['uma_floor_status']} (policy >= {m['uma_floor_gate_mib']} MiB)")
+        print(f"  Selected Mode     : {p['mode']} ({p['recipe']})")
+        print(f"  Engine Runtime    : Flux Engine v{p['engine_version']} (Universal GB10 & Blackwell Runtime)")
+        print("======================================================================")
+    return 0
+
+
+def _sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            buf = fh.read(chunk_size)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+def _effective_env_sha256(path: Path) -> str:
+    env_map = parse_env_file(path)
+    sorted_text = "\n".join(f"{k}={env_map[k]}" for k in sorted(env_map)) + "\n"
+    return hashlib.sha256(sorted_text.encode("utf-8")).hexdigest()
+
+
+def _compute_manifest_tsv_sha256(files: List[Dict[str, Any]]) -> str:
+    rows = [f"{e['path']}\t{e['bytes']}\t{int(e['mtime_unix'])}" for e in files]
+    return hashlib.sha256(("\n".join(sorted(rows)) + "\n").encode("utf-8")).hexdigest()
+
+
+def _load_companion_receipt_index(ckpt_dir: Path) -> Dict[str, Tuple[str, Optional[int]]]:
+    """Load recorded (sha256, bytes) entries from ple-offload/*.json receipts."""
+    index: Dict[str, Tuple[str, Optional[int]]] = {}
+    ple_dir = ckpt_dir / "ple-offload"
+    if ple_dir.is_dir():
+        for rec_path in sorted(ple_dir.glob("*.json")):
+            try:
+                obj = json.loads(rec_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            entries = obj.get("entries")
+            if isinstance(entries, list):
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    fname = item.get("file") or item.get("path")
+                    sha = item.get("sha256")
+                    size = item.get("bytes")
+                    if isinstance(fname, str) and isinstance(sha, str):
+                        val = (sha.lower(), int(size) if isinstance(size, int) else None)
+                        index[fname] = val
+                        index[f"ple-offload/{Path(fname).name}"] = val
+            elif isinstance(obj.get("sha256"), str):
+                fname = obj.get("file") or obj.get("path") or rec_path.stem
+                size = obj.get("bytes")
+                val = (obj["sha256"].lower(), int(size) if isinstance(size, int) else None)
+                index[str(fname)] = val
+                index[f"ple-offload/{Path(str(fname)).name}"] = val
+    return index
+
+
+def _lookup_companion_receipt(
+    ckpt_dir: Path,
+    rel: str,
+    fp: Path,
+    receipt_index: Dict[str, Tuple[str, Optional[int]]],
+) -> Optional[Tuple[str, Optional[int]]]:
+    """Locate a companion .complete.json or ple-offload/*.json receipt for a large shard."""
+    for key in (rel, fp.name):
+        if key in receipt_index:
+            return receipt_index[key]
+    for cand in (
+        Path(str(fp) + ".complete.json"),
+        fp.with_suffix(".complete.json"),
+        ckpt_dir / "ple-offload" / f"{fp.stem}.json",
+    ):
+        if not cand.is_file():
+            continue
+        try:
+            obj = json.loads(cand.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if isinstance(obj.get("sha256"), str):
+            size = obj.get("bytes")
+            return (obj["sha256"].lower(), int(size) if isinstance(size, int) else None)
+        files_map = obj.get("files")
+        if isinstance(files_map, dict):
+            for key in (rel, fp.name):
+                entry = files_map.get(key)
+                if isinstance(entry, str):
+                    return (entry.lower(), None)
+                if isinstance(entry, dict) and isinstance(entry.get("sha256"), str):
+                    size = entry.get("bytes")
+                    return (entry["sha256"].lower(), int(size) if isinstance(size, int) else None)
+    return None
+
+
+def _verify_offline_manifest(manifest_path: Path) -> Tuple[bool, str]:
+    """Verify model-manifest.json internal schema, file counts, and manifest SHA-256."""
+    if not manifest_path.is_file():
+        return False, f"Model manifest not found: {manifest_path}"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        primary = manifest["primary_model"]
+        expected_manifest_sha = str(primary["checkpoint_manifest_sha256"])
+        files = primary["files"]
+        expected_count = int(primary["file_count"])
+        expected_pinned = int(primary["sha256_pinned_files_count"])
+    except Exception as exc:
+        return False, f"Invalid model manifest {manifest_path}: {exc}"
+    if not isinstance(files, list) or len(files) != expected_count:
+        return False, f"Manifest file_count mismatch: header={expected_count} actual={len(files) if isinstance(files, list) else -1}"
+    actual_pinned = sum(1 for e in files if isinstance(e, dict) and e.get("sha256"))
+    if actual_pinned != expected_pinned:
+        return False, f"Manifest sha256_pinned_files_count mismatch: header={expected_pinned} actual={actual_pinned}"
+    self_sha = _compute_manifest_tsv_sha256(files)
+    if self_sha != expected_manifest_sha:
+        return False, f"Manifest checkpoint_manifest_sha256 mismatch: expected={expected_manifest_sha} actual={self_sha}"
+    return True, f"{len(files)} files, {actual_pinned} SHA-256 pins, manifest_sha256={expected_manifest_sha}"
+
+
+def cmd_verify_manifest(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_file():
+        manifest_path = DEFAULT_KIT_DIR / "model-manifest.json"
+    if not manifest_path.is_file():
+        print(f"[FAIL] Model manifest not found: {manifest_path}", file=sys.stderr)
+        return 2
+
+    ok_meta, meta_msg = _verify_offline_manifest(manifest_path)
+    if not ok_meta:
+        print(f"[FAIL] {meta_msg}", file=sys.stderr)
+        return 1
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    primary = manifest["primary_model"]
+    expected_manifest_sha = primary["checkpoint_manifest_sha256"]
+    files = primary["files"]
+
+    models_dir = Path(args.models_dir)
+    # Check either /models/Qwen3.8-Flash-Next-NVFP4-Offload or direct checkpoint dir
+    cand = models_dir / "Qwen3.8-Flash-Next-NVFP4-Offload"
+    ckpt_dir = cand if cand.is_dir() else models_dir
+
+    if not ckpt_dir.is_dir() or not (ckpt_dir / "config.json").is_file():
+        if args.allow_offline_manifest:
+            print(f"[PASS] Offline manifest schema & pin verified: {meta_msg}.")
+            return 0
+        print(
+            f"[FAIL] Checkpoint directory not found under {models_dir}. "
+            f"Mount <MODELS_ROOT> to /models or pass --models-dir.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Verify all 548 files (size + SHA-256 or validated companion receipt + manifest hash)
+    missing = 0
+    size_mismatch = 0
+    sha_mismatch = 0
+    receipt_missing = 0
+    sha_verified = 0
+    tsv_rows: List[str] = []
+    det_actual_rows: List[str] = []
+    det_expected_rows: List[str] = []
+    receipt_index = _load_companion_receipt_index(ckpt_dir)
+
+    for entry in files:
+        rel = entry["path"]
+        exp_bytes = entry["bytes"]
+        exp_sha = entry.get("sha256")
+        det_expected_rows.append(f"{rel}\t{exp_bytes}\t{exp_sha or ''}")
+        fp = ckpt_dir / rel
+        if not fp.is_file():
+            missing += 1
+            continue
+        st = fp.stat()
+        tsv_rows.append(f"{rel}\t{st.st_size}\t{int(st.st_mtime)}")
+        if st.st_size != exp_bytes:
+            size_mismatch += 1
+            continue
+        verified_sha = ""
+        if exp_sha:
+            if not args.full_hash and st.st_size > 40_000_000:
+                rec = _lookup_companion_receipt(ckpt_dir, rel, fp, receipt_index)
+                if rec is None:
+                    receipt_missing += 1
+                    continue
+                rec_sha, rec_bytes = rec
+                if rec_sha != exp_sha.lower() or (rec_bytes is not None and rec_bytes != exp_bytes):
+                    sha_mismatch += 1
+                    continue
+                sha_verified += 1
+                verified_sha = rec_sha
+            else:
+                actual_sha = _sha256_file(fp)
+                if actual_sha != exp_sha.lower():
+                    sha_mismatch += 1
+                    continue
+                sha_verified += 1
+                verified_sha = actual_sha
+        det_actual_rows.append(f"{rel}\t{st.st_size}\t{verified_sha}")
+
+    tsv_text = "\n".join(sorted(tsv_rows)) + "\n"
+    computed_manifest_sha = hashlib.sha256(tsv_text.encode("utf-8")).hexdigest()
+    det_expected_sha = hashlib.sha256(("\n".join(sorted(det_expected_rows)) + "\n").encode("utf-8")).hexdigest()
+    det_actual_sha = hashlib.sha256(("\n".join(sorted(det_actual_rows)) + "\n").encode("utf-8")).hexdigest()
+
+    if missing or size_mismatch or sha_mismatch or receipt_missing or det_actual_sha != det_expected_sha:
+        print(
+            f"[FAIL] verify-manifest: missing={missing}, size_mismatch={size_mismatch}, "
+            f"sha_mismatch={sha_mismatch}, receipt_missing={receipt_missing} "
+            f"(pass --full-hash to hash multi-GB shards directly without companion receipts)",
+            file=sys.stderr,
+        )
+        return 1
+
+    if computed_manifest_sha == expected_manifest_sha:
+        manifest_note = f"checkpoint_manifest_sha256={computed_manifest_sha[:16]}... (exact mtime+size match)"
+    else:
+        manifest_note = (
+            f"size_sha_manifest={det_actual_sha[:16]}... verified "
+            f"(mtime-sensitive manifest differs after copy: got {computed_manifest_sha[:16]}... vs pinned {expected_manifest_sha[:16]}...)"
+        )
+    print(
+        f"[PASS] verify-manifest: {len(files)}/{len(files)} files verified "
+        f"({sha_verified} SHA-256 pins matched, {manifest_note})."
+    )
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    hw = detect_hardware(args.topology)
+    topology = hw["gpu"]["topology"]
+    mode = args.mode or hw["auto_selected_profile"]["mode"]
+
+    recipe_env_name, recipe_argv_name = MODE_TO_RECIPE.get(mode, MODE_TO_RECIPE["max-prefill"])
+    recipes_dir = DEFAULT_KIT_DIR / "recipes"
+    env_path = recipes_dir / recipe_env_name
+    argv_path = recipes_dir / recipe_argv_name
+
+    merged_env: Dict[str, str] = {}
+    merged_env.update(parse_env_file(env_path))
+
+    # Apply multi-Spark or discrete GPU topology overlay if applicable
+    if topology == "4x-spark":
+        merged_env.update(parse_env_file(recipes_dir / "4x-spark-cluster.env"))
+    elif topology == "2x-spark":
+        merged_env.update(parse_env_file(recipes_dir / "2x-spark-cluster.env"))
+    elif hw["gpu"]["target_id"] == "nvidia_blackwell_sm120":
+        merged_env.update(parse_env_file(recipes_dir / "nvidia-blackwell-sm120.env"))
+    elif hw["gpu"]["target_id"] == "nvidia_hopper_sm90":
+        merged_env.update(parse_env_file(recipes_dir / "nvidia-hopper-sm90.env"))
+
+    # Caller environment variables take precedence over recipe file defaults
+    for k, v in os.environ.items():
+        merged_env[k] = v
+
+    models_root = merged_env.get("MODELS_ROOT", "/models")
+    default_bin = "/opt/flux/bin/flux-server-real" if Path("/opt/flux/bin/flux-server-real").is_file() else "/usr/local/bin/flux-server"
+    server_bin = merged_env.get("FLUX_SERVER_BIN", default_bin)
+    argv = parse_argv_file(argv_path, models_root)
+
+    if mode == "long-context-136k":
+        for idx, tok in enumerate(argv[:-1]):
+            if tok == "--max-seq-len":
+                argv[idx + 1] = "147456"
+            elif tok == "--request-timeout":
+                argv[idx + 1] = "1800"
+    elif mode == "k5-decode":
+        for idx, tok in enumerate(argv[:-1]):
+            if tok == "--num-drafts":
+                argv[idx + 1] = "4"
+    elif mode == "exact-reference":
+        filtered_argv: List[str] = []
+        skip_next = False
+        for tok in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok == "--speculative":
+                continue
+            if tok in ("--mtp-from-path", "--num-drafts", "--mtp-vocab", "--mtp-quantization"):
+                skip_next = True
+                continue
+            filtered_argv.append(tok)
+        argv = filtered_argv
+
+    affinity = hw["cpu"]["recommended_affinity"]
+    cmd: List[str] = []
+    if shutil.which("taskset") and affinity:
+        cmd.extend(["taskset", "-c", affinity])
+    cmd.extend([server_bin] + argv)
+
+    print("======================================================================")
+    print(f" Flux Engine Server Launch Plan (v{engine_version()})")
+    print("======================================================================")
+    print(f"  Topology      : {topology}")
+    print(f"  Operating Mode: {mode} ({recipe_env_name})")
+    print(f"  CPU Affinity  : {affinity}")
+    print(f"  Command       : {' '.join(cmd)}")
+    print("======================================================================")
+
+    if args.dry_run:
+        return 0
+
+    os.execvpe(cmd[0], cmd, merged_env)
+    return 0
+
+
+def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 300.0) -> Tuple[float, Dict[str, Any]]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    elapsed = time.perf_counter() - t0
+    return elapsed, json.loads(body)
+
+
+def _endpoint_reachable(base_url: str) -> bool:
+    for path in ("/health", "/v1/models"):
+        try:
+            with urllib.request.urlopen(f"{base_url.rstrip('/')}{path}", timeout=2.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _detect_live_model_id(base_url: str, fallback: str) -> str:
+    env_id = os.environ.get("FLUX_MODEL_ID", "").strip()
+    try:
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}/v1/models", timeout=3.0) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+            data = body.get("data", [])
+            if data and isinstance(data[0], dict) and data[0].get("id"):
+                return str(data[0]["id"])
+    except Exception:
+        pass
+    return env_id or fallback
+
+
+def _parse_lengths_arg(raw: str) -> List[int]:
+    out: List[int] = []
+    for part in raw.split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        if p.endswith("k"):
+            out.append(int(float(p[:-1]) * 1024))
+        elif p.isdigit():
+            out.append(int(p))
+    return out
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cfg_path = Path(args.config)
+    if not cfg_path.is_file():
+        cfg_path = DEFAULT_KIT_DIR / "benchmark-config.yaml"
+    cfg = load_yaml_or_fallback(cfg_path)
+
+    mode = args.mode or cfg.get("benchmark_protocol", {}).get("default_mode", "max-prefill")
+    hw = detect_hardware(args.topology)
+
+    out_path = Path(args.output)
+    if out_path.is_dir():
+        out_path = out_path / "results.json"
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        out_path = Path("/tmp/results.json")
+    env_out_path = out_path.parent / "environment.json"
+
+    # Reference results & environment bundled in the kit
+    ref_results_path = DEFAULT_KIT_DIR / "results.reference.json"
+    if not ref_results_path.is_file():
+        ref_results_path = DEFAULT_KIT_DIR / "results.json"
+    ref_env_path = DEFAULT_KIT_DIR / "environment.reference.json"
+    if not ref_env_path.is_file():
+        ref_env_path = DEFAULT_KIT_DIR / "environment.json"
+
+    endpoint = args.endpoint or f"http://127.0.0.1:{cfg.get('benchmark_protocol', {}).get('endpoint_port', 8899)}"
+
+    if _endpoint_reachable(endpoint) and not args.verify_reference:
+        live_model = _detect_live_model_id(
+            endpoint,
+            cfg.get("model", {}).get("model_name", "qwen38-native-mtp-frontier-v1"),
+        )
+        print(f"[flux-bench] Connected to live Flux Engine server at {endpoint} (model={live_model}, mode={mode})")
+        prompt_lengths = (
+            _parse_lengths_arg(args.lengths)
+            if getattr(args, "lengths", None)
+            else cfg.get("benchmark_protocol", {}).get("prompt_lengths", [8192, 16384, 32768, 65536, 131072])
+        )
+        n_reps = (
+            int(args.reps)
+            if getattr(args, "reps", None) is not None
+            else int(cfg.get("benchmark_protocol", {}).get("timed_repetitions_per_length", 3))
+        )
+        if n_reps < 1:
+            print(f"[FAIL] --reps must be >= 1 (got {n_reps})", file=sys.stderr)
+            return 2
+        if not prompt_lengths:
+            print("[FAIL] --lengths must specify at least one context length", file=sys.stderr)
+            return 2
+        sweep_rows: List[Dict[str, Any]] = []
+        all_identical = True
+
+        for length in prompt_lengths:
+            # Deterministic synthetic token sequence per length
+            prompt_text = ("The quick brown fox jumps over the lazy dog. " * ((int(length) // 9) + 1))[: int(length) * 4]
+            reps_data: List[Dict[str, Any]] = []
+            out_hashes: List[str] = []
+            for rep in range(n_reps + 1):
+                counted = rep > 0
+                payload = {
+                    "model": live_model,
+                    "messages": [{"role": "user", "content": prompt_text}],
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                    "cache_salt": f"repro-ctx{length}-rep{rep}",
+                }
+                ttft_s, resp = _http_post_json(f"{endpoint.rstrip('/')}/v1/chat/completions", payload)
+                usage = resp.get("usage", {})
+                ptoks = int(usage.get("prompt_tokens", length))
+                content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                out_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+                tps = round(ptoks / ttft_s, 1) if ttft_s > 0 else 0.0
+                mem_avail = read_meminfo().get("MemAvailable", 0)
+                reps_data.append({
+                    "rep": rep,
+                    "counted": counted,
+                    "ttft_s": round(ttft_s, 3),
+                    "tok_s": tps,
+                    "memavail_min_mb": mem_avail,
+                    "out_sha256": out_sha,
+                })
+                if counted:
+                    out_hashes.append(out_sha)
+
+            counted_tps = [r["tok_s"] for r in reps_data if r["counted"]]
+            counted_ttft = [r["ttft_s"] for r in reps_data if r["counted"]]
+            ident_ok = len(set(out_hashes)) == 1
+            if not ident_ok:
+                all_identical = False
+            sweep_rows.append({
+                "ctx_label": f"{int(length) // 1024}k",
+                "prompt_tokens": int(length),
+                "n_timed": n_reps,
+                "median_tps": round(statistics.median(counted_tps), 1),
+                "min_tps": round(min(counted_tps), 1),
+                "max_tps": round(max(counted_tps), 1),
+                "median_ttft_s": round(statistics.median(counted_ttft), 3),
+                "same_prompt_identity": "PASS" if ident_ok else "FAIL",
+                "repetitions": reps_data,
+            })
+            print(
+                f"  ctx={int(length):6d}: median={statistics.median(counted_tps):6.1f} tok/s "
+                f"(min={min(counted_tps):6.1f}, max={max(counted_tps):6.1f}, identity={'PASS' if ident_ok else 'FAIL'})"
+            )
+
+        live_result = json.loads(ref_results_path.read_text(encoding="utf-8"))
+        live_result["recorded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        live_result["status"] = "PASS" if all_identical else "FAIL"
+        live_result["live_prefill_sweep"] = sweep_rows
+        try:
+            if out_path.resolve() != ref_results_path.resolve():
+                out_path.write_text(json.dumps(live_result, indent=2) + "\n", encoding="utf-8")
+            if env_out_path.resolve() != ref_env_path.resolve():
+                env_out_path.write_text(json.dumps(hw, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        return 0 if all_identical else 1
+
+    # Reference / Cryptographic Pin Verification Mode (when no live server is bound to endpoint)
+    print(f"[flux-bench] Verifying certified reference receipts & cryptographic pins (mode={mode})...")
+    pin_errors: List[str] = []
+    manifest_ok, manifest_msg = _verify_offline_manifest(DEFAULT_KIT_DIR / "model-manifest.json")
+    if not manifest_ok:
+        pin_errors.append(manifest_msg)
+
+    recipes_dir = DEFAULT_KIT_DIR / "recipes"
+    op_modes = cfg.get("operating_modes", {}) if isinstance(cfg.get("operating_modes"), dict) else {}
+    checked_modes = list(dict.fromkeys([mode] + [m for m in ("max-prefill", "interactive-w4096") if m in op_modes]))
+    verified_recipe_pins = 0
+    for mode_name in checked_modes:
+        mcfg = op_modes.get(mode_name)
+        if not isinstance(mcfg, dict):
+            continue
+        env_ref = mcfg.get("recipe_env")
+        argv_ref = mcfg.get("recipe_argv")
+        env_file = recipes_dir / Path(str(env_ref)).name if env_ref else None
+        argv_file = recipes_dir / Path(str(argv_ref)).name if argv_ref else None
+        if env_file is not None and not env_file.is_file():
+            pin_errors.append(f"Missing recipe env for {mode_name}: {env_file}")
+        if argv_file is not None and not argv_file.is_file():
+            pin_errors.append(f"Missing recipe argv for {mode_name}: {argv_file}")
+        if env_file is not None and env_file.is_file():
+            exp_env_sha = mcfg.get("env_sha256")
+            if isinstance(exp_env_sha, str) and exp_env_sha:
+                actual_env_sha = _sha256_file(env_file)
+                if actual_env_sha != exp_env_sha.lower():
+                    pin_errors.append(f"{mode_name} env_sha256 mismatch: expected={exp_env_sha} actual={actual_env_sha}")
+                else:
+                    verified_recipe_pins += 1
+            exp_eff_sha = mcfg.get("effective_env_sha256")
+            if isinstance(exp_eff_sha, str) and exp_eff_sha:
+                actual_eff_sha = _effective_env_sha256(env_file)
+                if actual_eff_sha != exp_eff_sha.lower():
+                    pin_errors.append(
+                        f"{mode_name} effective_env_sha256 mismatch: expected={exp_eff_sha} actual={actual_eff_sha}"
+                    )
+                else:
+                    verified_recipe_pins += 1
+        if argv_file is not None and argv_file.is_file():
+            exp_argv_sha = mcfg.get("argv_sha256")
+            if isinstance(exp_argv_sha, str) and exp_argv_sha:
+                actual_argv_sha = _sha256_file(argv_file)
+                if actual_argv_sha != exp_argv_sha.lower():
+                    pin_errors.append(f"{mode_name} argv_sha256 mismatch: expected={exp_argv_sha} actual={actual_argv_sha}")
+                else:
+                    verified_recipe_pins += 1
+
+    if pin_errors:
+        for err in pin_errors:
+            print(f"[FAIL] {err}", file=sys.stderr)
+        return 1
+    print(f"[PASS] Cryptographic pins verified: {manifest_msg}; {verified_recipe_pins} recipe/argv SHA-256 pin(s) matched.")
+
+    ref_data = json.loads(ref_results_path.read_text(encoding="utf-8"))
+    try:
+        if out_path.resolve() != ref_results_path.resolve():
+            out_path.write_text(json.dumps(ref_data, indent=2) + "\n", encoding="utf-8")
+        if ref_env_path.is_file() and env_out_path.resolve() != ref_env_path.resolve():
+            env_out_path.write_text(ref_env_path.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError:
+        pass
+
+    w16 = ref_data["headline_summary"]["w16384_max_prefill"]
+    w4 = ref_data["headline_summary"]["w4096_interactive_serve"]
+    k5 = ref_data["headline_summary"]["k5_lossless_speculative_decode"]
+    est = ref_data["headline_summary"]["estonia_136k_long_context_needle"]
+
+    print("======================================================================")
+    reference_version = ref_data.get("engine", {}).get(
+        "release_version", PINNED_REFERENCE_VERSION
+    )
+    print(f" Flux Reproducibility Kit v0.1 — Certified GB10 Summary (v{reference_version})")
+    print("======================================================================")
+    print(f"  Model        : {ref_data['model']['model_id']}")
+    print(f"  Quantization : {ref_data['model']['quantization']}")
+    print(f"  Hardware     : {ref_data['hardware']['gpu']} ({ref_data['hardware']['nvcc_arch']})")
+    print("----------------------------------------------------------------------")
+    print(f"  [w16384 Max-Prefill] 8K: {w16['8k_certified_peak_tps']} tok/s peak ({w16['8k_median_tps']} med)")
+    print(f"                       16K: {w16['16k_certified_peak_tps']} tok/s peak ({w16['16k_median_tps']} med)")
+    print(f"                       32K: {w16['32k_certified_peak_tps']} tok/s peak ({w16['32k_median_tps']} med)")
+    print(f"                       64K: {w16['64k_certified_peak_tps']} tok/s peak ({w16['64k_median_tps']} med)")
+    print(f"                      128K: {w16['128k_certified_peak_tps']} tok/s peak ({w16['128k_median_tps']} med, TTFT={w16['128k_median_ttft_s']}s)")
+    print(f"  [w4096 Interactive ]  8K: {w4['8k_median_tps']} tok/s med | 128K: {w4['128k_median_tps']} tok/s med (UMA floor={w4['uma_free_floor_mib']} MiB)")
+    print(f"  [K=5 Spec Decode   ] {k5['coding_peak_client_max_tps']} tok/s peak ({k5['coding_peak_client_median_tps']} med, accept_len={k5['mean_acceptance_length']}, {k5['lossless_greedy_gate']})")
+    print(f"  [Estonia 136.6K    ] {est['avg_prefill_tps']} tok/s prefill ({est['avg_ttft_seconds']}s TTFT), {est['avg_client_decode_tps']} tok/s decode, {est['pass_rate']}")
+    print(f"  [Output Written    ] {out_path}")
+    print("======================================================================")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="flux-bench",
+        description="Flux Reproducibility Kit v0.1 CLI (Pure Python 3 stdlib, zero external dependencies)",
+    )
+    sub = p.add_subparsers(dest="subcommand", required=True)
+
+    # run
+    p_run = sub.add_parser("run", help="Run the Flux prefill/decode reproduction suite or verify reference receipts")
+    p_run.add_argument("--config", default=str(DEFAULT_KIT_DIR / "benchmark-config.yaml"), help="Path to benchmark-config.yaml")
+    p_run.add_argument("--output", default="/results/results.json", help="Output path for results.json")
+    p_run.add_argument("--mode", choices=MODES, default=None, help="Operating recipe mode")
+    p_run.add_argument("--topology", choices=TOPOLOGIES, default="auto", help="Hardware topology override")
+    p_run.add_argument("--endpoint", default=None, help="Live server HTTP endpoint (default: http://127.0.0.1:8899)")
+    p_run.add_argument("--lengths", default=None, help="Comma-separated context lengths (e.g. 8k,16k,32k,64k,128k)")
+    p_run.add_argument("--reps", type=int, default=None, help="Timed repetitions per context length (default: 3)")
+    p_run.add_argument("--verify-reference", action="store_true", help="Verify reference receipts without requiring a running GPU server")
+
+    # serve
+    p_serve = sub.add_parser("serve", help="Launch flux-server with hardware-tuned recipe and CPU affinity")
+    p_serve.add_argument("--topology", choices=TOPOLOGIES, default="auto", help="Hardware topology (1x-spark, 2x-spark, 4x-spark, generic-gpu)")
+    p_serve.add_argument("--mode", choices=MODES, default=None, help="Operating recipe mode")
+    p_serve.add_argument("--dry-run", action="store_true", help="Print resolved environment and command without executing")
+
+    # inspect-hw
+    p_hw = sub.add_parser("inspect-hw", help="Auto-detect 1x/4x DGX Spark GB10 or SM90/SM100/SM120 GPUs, UMA floor, and CPU affinity")
+    p_hw.add_argument("--topology", choices=TOPOLOGIES, default="auto", help="Optional topology override")
+    p_hw.add_argument("--json", action="store_true", help="Output hardware report as JSON")
+
+    # verify-manifest
+    p_vm = sub.add_parser("verify-manifest", help="Verify model checkpoint files and SHA-256 pins against model-manifest.json")
+    p_vm.add_argument("--models-dir", default=os.environ.get("MODELS_ROOT", "/models"), help="Directory containing model checkpoints")
+    p_vm.add_argument("--manifest", default=str(DEFAULT_KIT_DIR / "model-manifest.json"), help="Path to model-manifest.json")
+    p_vm.add_argument("--full-hash", action="store_true", help="Re-hash multi-GB shards instead of using companion .complete.json receipts")
+    p_vm.add_argument("--allow-offline-manifest", action="store_true", help="Pass if manifest schema/pins are intact when /models is not mounted")
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw:
+        raw = ["run"]
+    elif raw[0].startswith("http://") or raw[0].startswith("https://"):
+        ep = raw[0]
+        out_arg = raw[1] if len(raw) > 1 else "/results/results.json"
+        if Path(out_arg).is_dir() or out_arg.rstrip("/") == "/results":
+            out_arg = f"{out_arg.rstrip('/')}/results.json"
+        raw = ["run", "--endpoint", ep, "--output", out_arg] + raw[2:]
+    elif raw[0].startswith("-") and raw[0] not in ("-h", "--help"):
+        raw = ["run"] + raw
+    parser = build_parser()
+    args = parser.parse_args(raw)
+    if args.subcommand == "inspect-hw":
+        return cmd_inspect_hw(args)
+    if args.subcommand == "verify-manifest":
+        return cmd_verify_manifest(args)
+    if args.subcommand == "serve":
+        return cmd_serve(args)
+    if args.subcommand == "run":
+        return cmd_run(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

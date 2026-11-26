@@ -1,0 +1,849 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Auto-extracted from `ops.rs` during refactor wave 4a.
+
+#![allow(unused_imports)]
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+use crate::layers::moe;
+use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight};
+
+use super::*;
+
+/// Gated delta rule decode (recurrent SSM update, supports batched sequences).
+///
+/// Kernel: `gated_delta_rule_decode(h_state, query, key, value,
+///          gate, beta, output, batch_size, num_k_heads, num_v_heads,
+///          k_dim, v_dim)`
+/// Grid: (num_v_heads, batch_size, 1)  Block: (128, 1, 1)
+///
+/// For batch_size > 1, h_state layout: [batch, num_v_heads, k_dim, v_dim].
+pub fn gdn_decode(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .launch(stream)
+}
+
+/// Multi-sequence gated delta rule decode — advances `num_seqs`
+/// independent SSM states in a single launch.
+///
+/// Kernel: `gated_delta_rule_decode_multi_seq(h_state_ptrs, query, key,
+///          value, gate, beta, output, num_seqs, num_k_heads,
+///          num_v_heads, k_dim, v_dim, gate_beta_stride, qk_stride,
+///          v_in_stride, v_out_stride)`
+/// Grid: (num_v_heads, num_seqs, 1)  Block: (128, 1, 1)
+///
+/// `h_state_ptrs` is a device array of `num_seqs × u64` per-seq state
+/// pointers. All other pointers are interpreted via explicit per-seq
+/// strides (BF16 elements for q/k/v/output, FP32 elements for
+/// gate/beta).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_multi_seq(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state_ptrs: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    num_seqs: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    gate_beta_stride: u32,
+    qk_stride: u32,
+    v_in_stride: u32,
+    v_out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, num_seqs, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state_ptrs)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(num_seqs)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(qk_stride)
+        .arg_u32(v_in_stride)
+        .arg_u32(v_out_stride)
+        .launch(stream)
+}
+
+/// FP32-output multi-seq gated delta rule decode.
+///
+/// Same signature as `gdn_decode_multi_seq` but writes FP32 output
+/// instead of BF16. Used in the production AEON-Q36-27B decode path
+/// where the downstream gated_rms_norm consumes FP32 to maintain
+/// recurrent-path precision (Stuffed-Mamba mitigation).
+///
+/// `v_out_stride` is in FP32 ELEMENTS between successive sequences.
+///
+/// Kernel: `gated_delta_rule_decode_f32_multi_seq(h_state_ptrs, query,
+///          key, value, gate, beta, output, num_seqs, num_k_heads,
+///          num_v_heads, k_dim, v_dim, gate_beta_stride, qk_stride,
+///          v_in_stride, v_out_stride)`
+/// Grid: (num_v_heads, num_seqs, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_multi_seq(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state_ptrs: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    num_seqs: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    gate_beta_stride: u32,
+    qk_stride: u32,
+    v_in_stride: u32,
+    v_out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, num_seqs, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state_ptrs)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(num_seqs)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(qk_stride)
+        .arg_u32(v_in_stride)
+        .arg_u32(v_out_stride)
+        .launch(stream)
+}
+
+/// Exact flat-chain FP32 GDN recurrence for one multi-row verify window.
+///
+/// The kernel advances rows in order inside each value-head CTA and stores a
+/// complete post-row H snapshot in `h_state_inter`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_sequence(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter: DevicePtr,
+    rows: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gate_beta_stride: u32,
+    output_stride: u32,
+    inter_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter)
+        .arg_u32(rows)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(output_stride)
+        .arg_u32(inter_stride)
+        .launch(stream)
+}
+
+/// Register-resident counterpart of [`gdn_decode_f32_sequence`].
+///
+/// Identical FP32 arithmetic order (single-accumulator hk_dot/q_dot, unroll-4,
+/// --fmad=false) but the per-head H column stays in registers for the whole
+/// token loop instead of being re-read from global 3x per token. Bit-exact vs
+/// `gated_delta_rule_decode_f32_sequence` by construction; only the memory
+/// location of the recurrent state changes.
+///
+/// Grid: (num_v_heads, 1, 1)  Block: (128, 1, 1)
+/// Shared: 2 * k_dim * 4 bytes (k + q buffers).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_sequence_persistent(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter: DevicePtr,
+    rows: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gate_beta_stride: u32,
+    output_stride: u32,
+    inter_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, 1, 1])
+        .block([128, 1, 1])
+        .shared_mem(2 * k_dim * 4) // k + q buffers
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter)
+        .arg_u32(rows)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(output_stride)
+        .arg_u32(inter_stride)
+        .launch(stream)
+}
+
+/// Split-V (`grid=(num_v_heads, 4, 1)`, `block=(32, 1, 1)`) bit-exact twin of
+/// [`gdn_decode_f32_sequence_persistent`] / `lazyfinal` for wide-SM GPUs.
+///
+/// Each CTA owns 32 contiguous V-columns (`sv*32..sv*32+32`), fielding 192 CTAs
+/// across 48 value heads (100% of 188-SM RTX PRO 6000) with zero atomics, zero
+/// extra scratch, and 0-ULP identical arithmetic order to `lazyfinal`/`nosnap`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches CUDA kernel ABI directly"
+)]
+pub fn gdn_decode_f32_sequence_persistent_splitv4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter: DevicePtr,
+    rows: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gate_beta_stride: u32,
+    output_stride: u32,
+    inter_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, 4, 1])
+        .block([32, 1, 1])
+        .shared_mem(2 * k_dim * 4)
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter)
+        .arg_u32(rows)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(output_stride)
+        .arg_u32(inter_stride)
+        .launch(stream)
+}
+
+/// Gated delta rule prefill (multi-token, sequential SSM update within kernel).
+///
+/// Processes `seq_len` tokens sequentially per (batch, head) pair.
+/// Supports strided access: Q/K/V/gate/beta may have different strides
+/// between tokens (e.g., from conv1d output with interleaved Q|K|V layout).
+///
+/// Kernel: `gated_delta_rule_prefill(h_state, query, key, value,
+///          gate, beta, output, batch_size, seq_len, num_k_heads,
+///          num_v_heads, k_dim, v_dim, qk_stride, v_stride, gb_stride)`
+/// Grid: (num_v_heads, batch, 1)  Block: (128, 1, 1)
+/// Shared memory: `max(k_dim * v_dim + 2 * k_dim, 4 * k_dim) * 4` bytes,
+/// covering both the common SMEM-staged kernel (`H_smem[k_dim * v_dim] +
+/// smem_k[k_dim] + smem_q[k_dim]`, 66,560 B for 128x128) and the
+/// register-tiled model-specific override (`4 * k_dim` floats = 2,048 B).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    let common_floats = u64::from(k_dim)
+        .checked_mul(u64::from(v_dim))
+        .and_then(|hv| hv.checked_add(u64::from(k_dim).saturating_mul(2)))
+        .ok_or_else(|| anyhow::anyhow!("gdn_prefill shared-memory size overflow"))?;
+    let smem_floats = common_floats.max(u64::from(k_dim).saturating_mul(4));
+    let smem_bytes = u32::try_from(
+        smem_floats
+            .checked_mul(4u64)
+            .ok_or_else(|| anyhow::anyhow!("gdn_prefill shared-memory byte size overflow"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("gdn_prefill shared-memory size exceeds u32::MAX"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .shared_mem(smem_bytes)
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(seq_len)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// Split-v_dim prefill: 2 CTAs per v-head, 64 threads each.
+///
+/// Kernel: `gated_delta_rule_prefill_split(h_state, query, key, value,
+///          gate, beta, output, batch_size, seq_len, num_k_heads,
+///          num_v_heads, k_dim, v_dim, qk_stride, v_stride, gb_stride)`
+/// Grid: (num_v_heads * 2, batch, 1)  Block: (64, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_split(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads * 2, batch_size, 1])
+        .block([64, 1, 1])
+        .shared_mem(4 * k_dim * 4) // double-buffered k[K_DIM]+q[K_DIM] × 2 buffers × 4 bytes
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(seq_len)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// 4-way split prefill: 4 CTAs per v-head, 32 threads each (128 total CTAs).
+///
+/// Kernel: `gated_delta_rule_prefill_split4(h_state, query, key, value,
+///          gate, beta, output, batch_size, seq_len, num_k_heads,
+///          num_v_heads, k_dim, v_dim, qk_stride, v_stride, gb_stride)`
+/// Grid: (num_v_heads * 4, batch, 1)  Block: (32, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_split4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads * 4, batch_size, 1])
+        .block([32, 1, 1])
+        .shared_mem(4 * k_dim * 4) // double-buffered k[K_DIM]+q[K_DIM] × 2 buffers × 4 bytes
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(seq_len)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// Persistent GDN prefill — h_state stays in shared memory for entire sequence.
+///
+/// Same parameters as gdn_prefill_split4 but uses persistent CTAs with
+/// 128 threads and 67 KB shared memory. Each CTA processes ALL tokens for
+/// one v_head, keeping h_state in shared memory (never written to global
+/// until the end). Targets L2 bandwidth (~3 TB/s) instead of LPDDR5X (273 GB/s).
+///
+/// Grid: (num_v_heads, batch, 1)  Block: (128, 1, 1)
+/// Shared: k_dim*v_dim*4 + 4*k_dim*4 bytes
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_persistent(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    let smem = k_dim * v_dim * 4 + 4 * k_dim * 4; // h_state + double-buffered k/q
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .shared_mem(smem)
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(seq_len)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// Persistent GDN prefill with explicit shared memory size.
+/// Used for WY4-persistent variant which needs more shared memory.
+///
+/// Launches at the historical 128-thread block width. Every caller that existed
+/// before the K-split port routes through here and is unchanged by it.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_persistent_smem(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    smem: u32,
+    stream: u64,
+) -> Result<()> {
+    gdn_prefill_persistent_smem_blocked(
+        gpu,
+        kernel,
+        h_state,
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        output,
+        batch_size,
+        seq_len,
+        num_k_heads,
+        num_v_heads,
+        k_dim,
+        v_dim,
+        qk_stride,
+        v_stride,
+        gb_stride,
+        smem,
+        GDN_PREFILL_BLOCK_X,
+        stream,
+    )
+}
+
+/// Historical GDN prefill block width: one thread per V column.
+pub const GDN_PREFILL_BLOCK_X: u32 = 128;
+
+/// As [`gdn_prefill_persistent_smem`], but with an explicit block width.
+///
+/// Kept as a separate entry point rather than adding a parameter to the original so
+/// that no existing call site changes behaviour.
+///
+/// WARNING, before wiring any kernel here at a width other than
+/// [`GDN_PREFILL_BLOCK_X`]: the only kernel that ever did was the WY32 gate-cache
+/// K-split, and it was REJECTED ON NUMERICS, not on speed. It was +4.6% and
+/// receipted, but cost +8.62% legal-domain NLL against a +3.22% precedent, with
+/// argmax agreement 95-96% where every banked result in this campaign is 100%.
+/// Attribution was closed with a same-ELF control. A harness receipt is not a
+/// quality gate: reassociating the j-sums looks like a 1-ulp effect per call and
+/// compounds through a 48-layer recurrence. Any new wide-block kernel needs a fresh
+/// PER-DOMAIN gate before it goes behind this parameter.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_persistent_smem_blocked(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    smem: u32,
+    block_x: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([block_x, 1, 1])
+        .shared_mem(smem)
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(batch_size)
+        .arg_u32(seq_len)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// Fused 2-token GDN decode (speculative verification).
+///
+/// Processes exactly 2 tokens through GDN in a single kernel launch.
+/// Saves intermediate H_1 state for rollback on draft rejection.
+/// Reads H_0 once, computes both outputs and H_2 in 3 passes (vs 4 for
+/// 2× sequential decode), with H_1 intermediate staying in L2 cache.
+///
+/// Q/K/V/gate/beta are accessed via stride params (in elements, not bytes)
+/// to support layouts where tokens are interleaved with other data.
+///
+/// Kernel: `gated_delta_rule_chunk2(h_state, query, key, value, gate, beta,
+///          output, h_state_intermediate, batch_size, num_k_heads,
+///          num_v_heads, k_dim, v_dim, qk_stride, v_stride, gb_stride)`
+/// Grid: (num_v_heads, batch, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_chunk2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_intermediate: DevicePtr,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_intermediate)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// One-shot FP32 -> FP16 conversion of one layer's SSM h-state
+/// (`ATLAS_SSM_H_FP16`). `n` is the FP32 ELEMENT count, derived from the
+/// pool's byte size — never a duplicated shape literal.
+///
+/// Kernel: `ssm_h_state_f32_to_f16(src, dst, n)`. Grid-stride; `src` and `dst`
+/// must not alias (a narrowing compaction in place is a data race).
+pub fn ssm_h_state_f32_to_f16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    n: u64,
+    stream: u64,
+) -> Result<()> {
+    const BLOCK: u32 = 256;
+    let blocks = n.div_ceil(u64::from(BLOCK)).clamp(1, 4096) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks, 1, 1])
+        .block([BLOCK, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u64(n)
+        .launch(stream)
+}
+
+/// One-shot FP16 -> FP32 widening of one layer's SSM h-state
+/// (`ATLAS_SSM_H_FP16`). `n` is the FP32 ELEMENT count of the destination.
+///
+/// Kernel: `ssm_h_state_f16_to_f32(src, dst, n)`. Grid-stride; `src` and `dst`
+/// must not alias.
+pub fn ssm_h_state_f16_to_f32(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    n: u64,
+    stream: u64,
+) -> Result<()> {
+    const BLOCK: u32 = 256;
+    let blocks = n.div_ceil(u64::from(BLOCK)).clamp(1, 4096) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks, 1, 1])
+        .block([BLOCK, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u64(n)
+        .launch(stream)
+}
+
+/// Cross-sequence twin of [`gdn_decode_f32_sequence_persistent`] (and, with
+/// the lazyfinal kernel, of its lazy-commit twin): one launch, grid
+/// `(num_v_heads, num_seqs)`, every sequence reading its own pointers from
+/// device tables of `num_seqs` u64 entries. Sequence `s` uses
+/// `rows_ptrs[s]` as `[q | k | v | out]` FP32 rows (`key_offset`,
+/// `value_offset`, `output_offset` in elements) and `gate_ptrs[s]` as
+/// `[gate | beta]` (`beta_offset` in elements).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_sequence_multi(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_ptrs: DevicePtr,
+    rows_ptrs: DevicePtr,
+    gate_ptrs: DevicePtr,
+    inter_ptrs: DevicePtr,
+    num_seqs: u32,
+    rows: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    key_offset: u32,
+    value_offset: u32,
+    output_offset: u32,
+    beta_offset: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gate_beta_stride: u32,
+    output_stride: u32,
+    inter_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, num_seqs, 1])
+        .block([128, 1, 1])
+        .shared_mem(2 * k_dim * 4)
+        .arg_ptr(h_ptrs)
+        .arg_ptr(rows_ptrs)
+        .arg_ptr(gate_ptrs)
+        .arg_ptr(inter_ptrs)
+        .arg_u32(rows)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(key_offset)
+        .arg_u32(value_offset)
+        .arg_u32(output_offset)
+        .arg_u32(beta_offset)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(output_stride)
+        .arg_u32(inter_stride)
+        .launch(stream)
+}

@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""R15 tool-api-streaming-blocking gate driver, launched only by the sealed R15 suite.
+
+The driver starts one fresh, owned, target-only server in the immutable release container. That server runs
+the sealed tool-call launch contract: C1, interactive w4096 chunking, BF16 KV, no speculation, the
+`qwen3_coder` tool parser and the checkpoint-native chat template. The driver proves that process with the
+suite's `verify_live_server` before and after the requests. Against it, it sends the sealed
+`tool_eval_runaway_microgate` case to `/v1/chat/completions`, as real SSE and then real blocking requests.
+
+Every wire check is the microgate's own code, loaded by pinned SHA-256 and called unchanged: request
+construction, HTTP capture, the strict SSE parser with tool-call delta assembly, the blocking parser, the
+privacy and wire-shape validation, the stream-versus-blocking comparison, and the server-rendered prompt
+digest. The driver adds the runtime binding that the microgate's own live mode deliberately leaves unproven.
+It never ingests a prior report, never accepts a PASS flag, and never synthesizes a missing proof.
+See R16_TOOL_API_GATE_DRIVER.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import hashlib
+import http.client
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+import types
+import urllib.parse
+
+GATE = "tool-api-streaming-blocking"
+BASE = "tool-api"
+GATE_RECEIPT_SCHEMA = "flux-r15-container-gate-receipt/1"
+GATE_VALIDATOR_SCHEMA = "flux-r15-gate-validator/1"
+FAILURE_SCHEMA = "flux-r16-tool-api-gate-failure/1"
+# Tracked helpers, executed only from their verified bytes.
+LIFECYCLE_SHA256 = "dfae597a00c668ee5e3b2f02042c39df6035fa48cbb887cea53a3cb50a41b032"  # r15-gates/mmlu-pro
+MICROGATE_SHA256 = "649050eed8a7da789b5fdc75e07227b046c5196b2d9f4ae5f185140864b77f31"  # tool_eval_runaway_microgate.py
+MANIFEST_SHA256 = "e4e34779eac6d0c5a224cb8122ca34d75dcae0f35eb49cdbd45592ce6bfce0b4"  # examples/tool-eval-runaway-manifest.example.json
+CHAT_ROUTE = "/v1/chat/completions"
+READY_SECONDS = 1800
+MAX_MANIFEST_BYTES = 1024 * 1024
+THINK_MARKERS = ("<think>", "</think>")
+# The live process must run exactly the sealed launch contract (microgate validate_launch_contract).
+LIVE_ARGV_CONTRACT = (
+    (b"--kv-cache-dtype", b"bf16"),
+    (b"--max-batch-size", b"1"),
+    (b"--max-num-seqs", b"1"),
+    (b"--max-prefill-tokens", b"4096"),
+    (b"--tool-call-parser", b"qwen3_coder"),
+    (b"--kernel-target", b"qwen3.8-flash-next"),
+    (b"--enable-prefix-caching", b"false"),
+    (b"--ssm-cache-slots", b"0"),
+    (b"--world-size", b"1"),
+    (b"--tp-size", b"1"),
+    (b"--ep-size", b"1"),
+    (b"--mtp-vocab", b"0"),
+    (b"--mtp-quantization", b"bf16"),
+)
+# Speculation, template overrides and model swaps would change the sealed contract.
+LIVE_FORBIDDEN_OPTIONS = frozenset(
+    {
+        b"--speculative",
+        b"--num-drafts",
+        b"--self-speculative",
+        b"--ngram-speculative",
+        b"--dflash",
+        b"--mtp-from-path",
+        b"--draft-model",
+        b"--default-chat-template-kwargs",
+        b"--chat-template",
+    }
+)
+
+
+class GateFailure(ValueError):
+    """The live endpoint answered, but the sealed tool-call contract did not pass."""
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def load_checked(path, expected, name):
+    """Execute exactly the verified bytes, without pathname-based imports."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * 1024 * 1024,
+            "helper is not a bounded regular file",
+        )
+        payload = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+
+        def identity(value):
+            return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+        require(
+            identity(before) == identity(after) and digest(payload) == expected,
+            "source helper hash or identity differs",
+        )
+    finally:
+        os.close(descriptor)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    sys.modules[name] = module
+    try:
+        exec(compile(payload, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def load_sealed_manifest(path, microgate):
+    """The sealed tool case: exact tracked bytes, strict JSON, microgate manifest validation."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MAX_MANIFEST_BYTES,
+            "tool manifest is not a bounded regular file",
+        )
+        raw = os.pread(descriptor, info.st_size + 1, 0)
+    finally:
+        os.close(descriptor)
+    require(digest(raw) == MANIFEST_SHA256, "sealed tool manifest hash differs")
+    value = microgate.strict_json_loads(raw.decode("utf-8", "strict"), "tool manifest")
+    return value, microgate.validate_manifest(value)
+
+
+# ----------------------------------------------------------------------------- launch contract
+def server_argv(binary, model, port):
+    """Canonical interactive w4096 serving argv (recipes/flux-serve-w4096.argv), target-only."""
+    return [
+        binary,
+        "serve",
+        "--no-tui",
+        "--model-from-path",
+        "/models",
+        "--model-name",
+        model,
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--kernel-target",
+        "qwen3.8-flash-next",
+        "--world-size",
+        "1",
+        "--tp-size",
+        "1",
+        "--ep-size",
+        "1",
+        "--mtp-vocab",
+        "0",
+        "--mtp-quantization",
+        "bf16",
+        "--gpu-memory-utilization",
+        "0.85",
+        "--kv-cache-dtype",
+        "bf16",
+        "--block-size",
+        "16",
+        "--max-seq-len",
+        "135168",
+        "--max-prefill-tokens",
+        "4096",
+        "--max-batch-size",
+        "1",
+        "--max-num-seqs",
+        "1",
+        "--ssm-cache-slots",
+        "0",
+        "--qwen4-qsa",
+        "--oom-guard-mb",
+        "4096",
+        "--request-timeout",
+        "300",
+        "--disable-simhash-watchdog",
+        "--enable-prefix-caching",
+        "false",
+        "--tool-call-parser",
+        "qwen3_coder",
+    ]
+
+
+def cli_values(argv, option):
+    """Every value of `option`, in either `--opt value` or `--opt=value` form."""
+    values = []
+    for index, item in enumerate(argv):
+        if item == option and index + 1 < len(argv):
+            values.append(argv[index + 1])
+        elif item.startswith(option + b"="):
+            values.append(item[len(option) + 1 :])
+    return values
+
+
+def check_live_controls(argv, environ, model):
+    """The live process argv/environment must be exactly the sealed tool launch contract."""
+    require(environ.endswith(b"\0"), "live environment is truncated")
+    environment = {}
+    for entry in environ.split(b"\0")[:-1]:
+        key, separator, value = entry.partition(b"=")
+        require(separator and key not in environment, "live environment is ambiguous")
+        environment[key] = value
+    for option, expected in LIVE_ARGV_CONTRACT + ((b"--model-name", model.encode()),):
+        require(cli_values(argv, option) == [expected], "live tool launch contract differs")
+    ports = cli_values(argv, b"--port")
+    require(len(ports) == 1 and re.fullmatch(rb"[0-9]{1,5}", ports[0])
+            and 1 <= int(ports[0]) <= 65535, "live tool port is ambiguous")
+    require(argv == [value.encode() for value in server_argv(argv[0].decode("utf-8", "strict"),
+                                                           model, int(ports[0]))],
+            "live tool argv differs from the complete explicit launch")
+    require(argv.count(b"--no-tui") == 1, "live process must refuse model swaps")
+    require(
+        not {item.split(b"=", 1)[0] for item in argv} & LIVE_FORBIDDEN_OPTIONS,
+        "live process is not the target-only checkpoint-template contract",
+    )
+
+    def effective(key):
+        return environment.get(b"ATLAS_" + key, environment.get(b"FLUX_" + key))
+
+    require(effective(b"DISABLE_SPECULATION") == b"1", "live process may speculate")
+    require_tool_recipe({key.decode("utf-8", "strict"): value.decode("utf-8", "strict")
+                         for key, value in environment.items()})
+    return {
+        "argv_sha256": digest(b"\0".join(argv)),
+        "environment_sha256": digest(environ),
+        "contract": {option.decode(): value.decode() for option, value in LIVE_ARGV_CONTRACT},
+        "model": model,
+        "speculation": "disabled",
+    }
+
+
+def live_controls(args, proof, model):
+    suite = args.suite
+    proc = Path(f"/proc/{proof['host_pid']}")
+    environ = suite._read_process_bytes(proc / "environ", "tool-api environment", 4 * 1024 * 1024)
+    argv = suite._read_process_bytes(proc / "cmdline", "tool-api argv", 4 * 1024 * 1024).split(b"\0")[:-1]
+    return check_live_controls(argv, environ, model)
+
+
+def require_tool_recipe(recipe):
+    """A W16384/default recipe must never masquerade as the fixed W4096 tool arm."""
+    require(type(recipe) is dict and recipe.get("FLUX_MODE") == "interactive-w4096"
+            and recipe.get("ATLAS_QWEN4_PREFILL_WIDE") == recipe.get("FLUX_QWEN4_PREFILL_WIDE") == "4096",
+            "tool gate requires the bound interactive W4096 recipe")
+    for key in ("ATLAS_TARGET_LMHEAD_VOCAB", "FLUX_TARGET_LMHEAD_VOCAB"):
+        require(recipe.get(key) in (None, "0", "248077"), "tool recipe caps the target vocabulary")
+
+
+@contextmanager
+def server(args, plan, recipe, model):
+    """One fresh owned target-only server, using the pinned lifecycle's ownership model."""
+    lifecycle = args.lifecycle
+    require_tool_recipe(recipe)
+    environment = dict(recipe)
+    environment["ATLAS_DISABLE_SPECULATION"] = "1"
+    command = [
+        "docker",
+        "exec",
+        args.container_id,
+        "/usr/bin/env",
+        *[key + "=" + value for key, value in sorted(environment.items())],
+        *server_argv(plan["in_container_binary_path"], model, args.container_port),
+    ]
+    # The suite owns this driver's stdout/stderr and frames them into the raw log.
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+    pid = pidfd = proof = None
+    live_request = None
+    try:
+        deadline = time.monotonic() + READY_SECONDS
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "server launcher exited before readiness")
+            if pid is None:
+                pid = lifecycle.find_pid(args, model)
+                if pid is not None:
+                    pidfd = lifecycle.claim_pid(args, pid, plan)
+            if pid is not None:
+                try:
+                    lifecycle.request(args, "GET", "/health", timeout=2)
+                    lifecycle.request(args, "GET", "/health", timeout=2)
+                    live_request = {
+                        "schema": "flux-r15-live-process-request/1",
+                        "mode": "none",
+                        "host_pid": pid,
+                    }
+                    proof = args.suite.verify_live_server(live_request, plan, args.identities)
+                    break
+                except (ConnectionError, TimeoutError, OSError, http.client.HTTPException):
+                    pass
+            time.sleep(0.1)
+        require(proof is not None, "fresh server readiness deadline expired")
+        yield proof, pidfd
+        require(
+            args.suite.verify_live_server(live_request, plan, args.identities) == proof,
+            "server identity changed during the gate",
+        )
+    finally:
+        try:
+            if pidfd is None:
+                candidate = lifecycle.find_pid(args, model)
+                if candidate is not None:
+                    pidfd = lifecycle.claim_pid(args, candidate, plan)
+            if pidfd is not None:
+                if not select.select([pidfd], [], [], 0)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                if not select.select([pidfd], [], [], 10)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    require(bool(select.select([pidfd], [], [], 5)[0]), "server survived cleanup")
+                    raise ValueError("server required forced cleanup")
+            process.wait(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if pidfd is not None:
+                os.close(pidfd)
+
+
+# ----------------------------------------------------------------------------- requests and evaluation
+def exchange(microgate, validated, endpoint, alive=lambda: None):
+    """SSE then blocking, the microgate's exact nonced pair under one shared deadline."""
+    pair = microgate.request_bodies(validated)
+    started = time.monotonic()
+    deadline = started + validated["timeout_seconds"]
+    alive()
+    stream = microgate.http_post(endpoint, pair.stream, None, deadline, stream=True)
+    alive()
+    blocking = microgate.http_post(endpoint, pair.blocking, None, deadline, stream=False)
+    alive()
+    return pair, stream, blocking, (time.monotonic() - started) * 1000.0
+
+
+def evaluate(microgate, validated, pair, stream, blocking, pair_elapsed_ms):
+    """The microgate's checks, called unchanged, in evaluate_captures' order.
+
+    `evaluate_captures` itself is not called: its live mode needs a git runner identity and operator-declared
+    provenance, and it labels the runtime unbound. Here the runtime is observed by the driver instead.
+    Parser rejections propagate before any response bytes are persisted.
+    """
+    errors = []
+    content_types = {
+        "stream": microgate._normalize_content_type(stream.content_type, "text/event-stream", "stream"),
+        "blocking": microgate._normalize_content_type(blocking.content_type, "application/json", "blocking"),
+    }
+    if pair_elapsed_ms > validated["timeout_seconds"] * 1000.0:
+        errors.append("paired requests exceeded the sealed deadline")
+    for label, capture in (("stream", stream), ("blocking", blocking)):
+        if capture.status != 200:
+            errors.append(f"{label} HTTP status is {capture.status}, expected 200")
+    summaries = {
+        "stream": microgate.parse_sse(stream.raw, expected_nonce=pair.stream_nonce),
+        "blocking": microgate.parse_blocking(blocking.raw, expected_nonce=pair.blocking_nonce),
+    }
+    for label, summary in summaries.items():
+        microgate._bind_summary_to_manifest(summary, label, validated)
+    errors.extend(microgate.compare_summaries(summaries["stream"], summaries["blocking"], validated))
+    expected_prompt = microgate.expected_rendered_prompt(validated["request"])
+    audit = microgate.validate_rendered_prompt(expected_prompt, validated["request"])
+    prompt_sha256 = microgate.sha256_bytes(expected_prompt.encode("utf-8"))
+    rendered = {}
+    for label, summary in summaries.items():
+        rendered[label] = summary["rendered_prompt_evidence"]["prompt_sha256"] == prompt_sha256
+        if not rendered[label]:
+            errors.append(f"{label} server-rendered prompt digest differs from the exact request envelope")
+    return {
+        "summaries": summaries,
+        "errors": errors,
+        "content_types": content_types,
+        "rendered_prompt_sha256": prompt_sha256,
+        "rendered_prompt_exact": rendered,
+        "rendered_prompt_audit": audit,
+    }
+
+
+def gate_case(phase, summary, validated, rendered_exact, sealed_arguments):
+    """One wrapper case: exactly the eight keys `_recompute_tool_evidence` accepts."""
+    calls = summary["tool_calls"]
+    expected_names = list(validated["expected_tool_names"])
+    finish = summary["finish_reason"]
+    texts = [summary["content"]["utf8"], summary["emitted_text"]["utf8"]]
+    texts += [call["arguments"]["utf8"] for call in calls]
+    return {
+        "phase": phase,
+        # parallel_tool_calls=false and one expected tool: exactly one call per arm.
+        "tool_calls_expected": len(expected_names),
+        "tool_calls_observed": len(calls),
+        "exact_arguments": len(calls) == len(expected_names)
+        and all(
+            call["name"] == name and call["parsed_arguments"] == sealed_arguments[name]
+            for call, name in zip(calls, expected_names)
+        ),
+        "finish_reason": finish,
+        "no_blank_line_runaway": summary["max_consecutive_blank_lines"] < 4
+        and finish != "length"
+        and summary["usage"]["completion_tokens"] < validated["token_cap"],
+        "no_all_tools_runaway": len(calls) <= len(expected_names)
+        and all(call["name"] in expected_names for call in calls),
+        # The server rendered exactly the sealed enable_thinking=false envelope, emitted no reasoning, and
+        # leaked no thinking markup into visible text or tool arguments.
+        "thinking_spacing_valid": rendered_exact
+        and summary["reasoning_content"]["bytes"] == 0
+        and not any(marker in text for text in texts for marker in THINK_MARKERS),
+    }
+
+
+def capture_record(capture, artifact):
+    return {
+        "artifact": artifact,
+        "status": capture.status,
+        "content_type": capture.content_type,
+        "bytes": len(capture.raw),
+        "sha256": digest(capture.raw),
+        "elapsed_ms": capture.elapsed_ms,
+        "first_body_byte_ms": capture.first_body_byte_ms,
+        "lines": len(capture.line_timings_ms),
+    }
+
+
+def first_tool_delta_ms(capture):
+    """Arrival of the first SSE line carrying a tool_calls delta (-1.0 when none)."""
+    lines = capture.raw.splitlines(keepends=True)
+    if len(lines) != len(capture.line_timings_ms):
+        return -1.0
+    for line, offset in zip(lines, capture.line_timings_ms):
+        if b'"tool_calls"' in line:
+            return offset
+    return -1.0
+
+
+def qualify(microgate, manifest_value, validated, pair, stream, blocking, pair_elapsed_ms):
+    """Every PASS condition; raises GateFailure otherwise. Returns (cases, raw core)."""
+    result = evaluate(microgate, validated, pair, stream, blocking, pair_elapsed_ms)
+    summaries = result["summaries"]
+    cases = [
+        gate_case(phase, summaries[label], validated, result["rendered_prompt_exact"][label],
+                  microgate.SEALED_TOOL_ARGUMENTS)
+        for phase, label in (("blocking", "blocking"), ("streaming", "stream"))
+    ]
+    stream_calls = [microgate._semantic_tool_view(tool) for tool in summaries["stream"]["tool_calls"]]
+    blocking_calls = [microgate._semantic_tool_view(tool) for tool in summaries["blocking"]["tool_calls"]]
+    consistency = {
+        "tool_calls_identical": stream_calls == blocking_calls,
+        "finish_reason_identical": summaries["stream"]["finish_reason"] == summaries["blocking"]["finish_reason"],
+        "content_bytes_identical": summaries["stream"]["content"]["utf8_hex"]
+        == summaries["blocking"]["content"]["utf8_hex"],
+        "terminal_token_ids_identical": summaries["stream"]["terminal_token_ids"]
+        == summaries["blocking"]["terminal_token_ids"],
+        "rendered_prompt_identical": summaries["stream"]["rendered_prompt_evidence"]["prompt_sha256"]
+        == summaries["blocking"]["rendered_prompt_evidence"]["prompt_sha256"],
+    }
+    failed = list(result["errors"])
+    failed += [f"case {case['phase']} {key} is false" for case in cases for key in
+               ("exact_arguments", "no_blank_line_runaway", "no_all_tools_runaway", "thinking_spacing_valid")
+               if case[key] is not True]
+    failed += [f"case {case['phase']} finish_reason={case['finish_reason']!r}" for case in cases
+               if case["finish_reason"] != "tool_calls"]
+    failed += [f"case {case['phase']} observed {case['tool_calls_observed']} calls" for case in cases
+               if case["tool_calls_observed"] != case["tool_calls_expected"]]
+    failed += [f"stream/blocking {key} is false" for key, ok in consistency.items() if ok is not True]
+    if failed:
+        raise GateFailure(f"{len(failed)} tool-call contract check(s) failed", failed)
+    core = {
+        "cases": cases,
+        "consistency": consistency,
+        "tool_calls": {"stream": stream_calls, "blocking": blocking_calls},
+        "finish_reasons": {label: summaries[label]["finish_reason"] for label in ("stream", "blocking")},
+        "usage": {label: summaries[label]["usage"] for label in ("stream", "blocking")},
+        "terminal_token_ids": summaries["blocking"]["terminal_token_ids"],
+        "stream_events": summaries["stream"]["event_count"],
+        "stream_tool_fragments": summaries["stream"]["tool_fragments"],
+        "stream_done_seen": summaries["stream"]["done_seen"],
+        "response_ids": {label: summaries[label]["response_id"] for label in ("stream", "blocking")},
+        "rendered_prompt": {
+            "sha256": result["rendered_prompt_sha256"],
+            "exact": result["rendered_prompt_exact"],
+            "audit": result["rendered_prompt_audit"],
+        },
+        "interventions": {label: summaries[label]["interventions"] for label in ("stream", "blocking")},
+        "content_types": result["content_types"],
+        "requests": {
+            "stream_sha256": digest(microgate.canonical_bytes(pair.stream)),
+            "blocking_sha256": digest(microgate.canonical_bytes(pair.blocking)),
+        },
+        "timings": {
+            "pair_elapsed_ms": pair_elapsed_ms,
+            "stream_elapsed_ms": stream.elapsed_ms,
+            "stream_first_body_byte_ms": stream.first_body_byte_ms,
+            "stream_first_tool_delta_ms": first_tool_delta_ms(stream),
+            "blocking_elapsed_ms": blocking.elapsed_ms,
+            "blocking_first_body_byte_ms": blocking.first_body_byte_ms,
+        },
+        "manifest_sha256": MANIFEST_SHA256,
+        "manifest_canonical_sha256": digest(microgate.canonical_bytes(manifest_value)),
+        "microgate_sha256": MICROGATE_SHA256,
+    }
+    return cases, core
+
+
+def documents(cases, core, artifacts, extra, container_id, run_id, image_id, image_digest, canonical_bytes):
+    """Validator document, its locator/sha, the 11-key evidence and the gate receipt."""
+    raw = {**core, **extra, "artifacts": artifacts}
+    validator = {
+        "schema": GATE_VALIDATOR_SCHEMA,
+        "gate": GATE,
+        "status": "PASS",
+        "release_qualified": True,
+        "container_id": container_id,
+        "run_id": run_id,
+        "raw": raw,
+    }
+    validator_raw = canonical_bytes(validator)
+    locator = BASE + "/validator.json"
+    blocking = [case for case in cases if case["phase"] == "blocking"]
+    streaming = [case for case in cases if case["phase"] == "streaming"]
+    evidence = {
+        "blocking_cases": len(blocking),
+        "streaming_cases": len(streaming),
+        "tool_calls_expected": sum(case["tool_calls_expected"] for case in cases),
+        "tool_calls_observed": sum(case["tool_calls_observed"] for case in cases),
+        "exact_arguments": all(case["exact_arguments"] for case in cases),
+        "finish_reasons_valid": all(case["finish_reason"] == "tool_calls" for case in cases),
+        "no_blank_line_runaway": all(case["no_blank_line_runaway"] for case in cases),
+        "no_all_tools_runaway": all(case["no_all_tools_runaway"] for case in cases),
+        "thinking_spacing_valid": all(case["thinking_spacing_valid"] for case in cases),
+        "validator_artifact": locator,
+        "validator_receipt_sha256": digest(validator_raw),
+    }
+    receipt = {
+        "schema": GATE_RECEIPT_SCHEMA,
+        "gate": GATE,
+        "status": "PASS",
+        "release_qualified": True,
+        "execution_scope": "immutable-container",
+        "image_id": image_id,
+        "image_digest": image_digest,
+        "container_id": container_id,
+        "run_id": run_id,
+        "evidence": evidence,
+    }
+    return validator_raw, locator, evidence, receipt
+
+
+# ----------------------------------------------------------------------------- driver
+def write_artifact(suite, runtime, path, payload, label):
+    descriptor = suite.create_beneath(runtime, path, label, 0o400)
+    try:
+        suite.write_all(descriptor, payload)
+        os.fsync(descriptor)
+        suite.assert_path_identity(runtime, path, descriptor, label)
+    finally:
+        os.close(descriptor)
+    return {"artifact": path, "sha256": digest(payload), "bytes": len(payload)}
+
+
+def run(args):
+    suite, lifecycle, microgate = args.suite, args.lifecycle, args.microgate
+    suite.validate_inherited_receipt_fd(args.receipt_fd)
+    require(args.receipt_fd != args.raw_log_fd and args.raw_log_fd >= 3, "inherited FDs alias")
+    plan, recipe = lifecycle.inspect_container(args, suite)
+    runtime = suite.normalized_absolute(args.runtime_dir, "tool-api runtime")
+    info = runtime.stat()
+    require(info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, "runtime is not private")
+    runtime_identity = suite.directory_identity_sha256(runtime, "tool-api runtime")
+    lifecycle.make_directory(suite, runtime, [BASE])
+    manifest_value, validated = args.manifest_value, args.validated
+    model = validated["request"]["model"]
+    endpoint = args.base_url + CHAT_ROUTE
+    try:
+        with server(args, plan, recipe, model) as (proof, pidfd):
+            controls = live_controls(args, proof, model)
+
+            def alive():
+                require(not select.select([pidfd], [], [], 0)[0], "tool-api server exited")
+
+            pair, stream, blocking, pair_elapsed_ms = exchange(microgate, validated, endpoint, alive)
+            require(live_controls(args, proof, model) == controls, "tool-api controls changed during requests")
+        require(lifecycle.inspect_container(args, suite) == (plan, recipe), "container release inputs changed")
+        cases, core = qualify(microgate, manifest_value, validated, pair, stream, blocking, pair_elapsed_ms)
+    except Exception as error:
+        failure = {
+            "schema": FAILURE_SCHEMA,
+            "gate": GATE,
+            "error_class": type(error).__name__,
+            # Messages can carry response-controlled text; only their count and digest are persisted.
+            "failed_checks": len(error.args[1]) if isinstance(error, GateFailure) else None,
+            "failed_checks_sha256": digest(suite.canonical_bytes(error.args[1]))
+            if isinstance(error, GateFailure) else None,
+        }
+        write_artifact(suite, runtime, BASE + "/failure.json", suite.canonical_bytes(failure), "tool-api failure")
+        raise
+    # Raw captures are persisted only after the microgate's privacy-safe parsers accepted them.
+    artifacts = {
+        "request_stream": write_artifact(suite, runtime, BASE + "/request-stream.json",
+                                         suite.canonical_bytes(pair.stream), "tool-api stream request"),
+        "request_blocking": write_artifact(suite, runtime, BASE + "/request-blocking.json",
+                                           suite.canonical_bytes(pair.blocking), "tool-api blocking request"),
+        "response_stream": {**write_artifact(suite, runtime, BASE + "/response-stream.sse", stream.raw,
+                                             "tool-api stream response"),
+                            **capture_record(stream, BASE + "/response-stream.sse")},
+        "response_blocking": {**write_artifact(suite, runtime, BASE + "/response-blocking.json", blocking.raw,
+                                               "tool-api blocking response"),
+                              **capture_record(blocking, BASE + "/response-blocking.json")},
+    }
+    require(
+        suite.directory_identity_sha256(runtime, "tool-api runtime") == runtime_identity,
+        "tool-api runtime identity changed",
+    )
+    extra = {
+        "process_bindings": [proof],
+        "live_controls": controls,
+        "lifecycle_sha256": LIFECYCLE_SHA256,
+        "endpoint_route": CHAT_ROUTE,
+        "model": model,
+    }
+    validator_raw, locator, _evidence, receipt = documents(
+        cases, core, artifacts, extra, args.container_id, args.run_id, args.image_id, args.image_digest,
+        suite.canonical_bytes,
+    )
+    require(len(validator_raw) <= suite.MAX_GATE_RECEIPT_BYTES, "tool-api validator exceeds its bound")
+    write_artifact(suite, runtime, locator, validator_raw, "tool-api validator")
+    suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+    os.fsync(args.receipt_fd)
+    return receipt
+
+
+def check_identities(args):
+    require(re.fullmatch(r"[0-9a-f]{64}", args.container_id) is not None, "container ID differs")
+    for value in (args.image_id, args.image_digest):
+        require(re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None, "immutable image identity differs")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.run_id) is not None, "run ID differs")
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.suite_sha256) is not None and set(args.suite_sha256) != {"0"},
+        "suite hash differs",
+    )
+    require(1 <= args.container_port <= 65535, "container port differs")
+    parsed = urllib.parse.urlsplit(args.base_url)
+    require(
+        parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port is not None
+        and parsed.path == "" and not parsed.query and not parsed.fragment and parsed.username is None,
+        "base URL must be an explicit HTTP IPv4 loopback origin",
+    )
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in (
+        "container-id",
+        "image-id",
+        "image-digest",
+        "base-url",
+        "run-id",
+        "receipt-fd",
+        "raw-log-fd",
+        "runtime-dir",
+        "suite-program",
+        "suite-sha256",
+        "lifecycle-program",
+        "microgate-program",
+        "tool-manifest",
+    ):
+        parser.add_argument("--" + name, required=True, type=int if name.endswith("-fd") else str)
+    parser.add_argument("--container-port", type=int, default=8888)
+    args = parser.parse_args(argv)
+    check_identities(args)
+    args.lifecycle = load_checked(args.lifecycle_program, LIFECYCLE_SHA256, "_r16_tool_api_lifecycle")
+    args.lifecycle.verify_parent_suite(args.suite_sha256)
+    args.suite = args.lifecycle.load_module(args.suite_program, args.suite_sha256, "_r16_tool_api_suite")
+    args.base_url = args.suite.validate_base_url(args.base_url)
+    require(callable(getattr(args.suite, "_live_listener_identity", None)), "live listener broker required")
+    require(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"), "local Linux pidfds are required")
+    args.microgate = load_checked(args.microgate_program, MICROGATE_SHA256, "_r16_tool_api_microgate")
+    args.manifest_value, args.validated = load_sealed_manifest(args.tool_manifest, args.microgate)
+    args.identities = {
+        name: getattr(args, name) for name in ("container_id", "image_id", "image_digest", "base_url", "run_id")
+    }
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        print(GATE + ": qualification failed (" + type(error).__name__ + ")", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

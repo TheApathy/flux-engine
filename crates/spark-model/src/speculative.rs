@@ -1,0 +1,756 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Speculative decoding abstraction (SDD).
+//!
+//! Defines the [`DraftProposer`] trait for speculative decoding strategies.
+//! MTP implements this first; EAGLE-3 can implement later without engine changes.
+
+use std::any::Any;
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use crate::layer::ForwardContext;
+
+/// Runtime override for the DFlash drafter's effective γ, in draft tokens.
+///
+/// 0 (the default) means "no override — use `ATLAS_DFLASH_DRAFT_CAP` if set,
+/// otherwise the drafter's own γ". Any other value caps γ for the NEXT
+/// propose, which shrinks the drafter's noise block and therefore its forward
+/// cost, not merely the number of drafts returned (see
+/// `layers::dflash_head::forward_block`).
+///
+/// This exists so the scheduler's speculation gate can offer a γ-capped arm
+/// alongside the full-γ arm without rebuilding the model. It is a process
+/// global rather than a model field because the drafter's `forward_block`
+/// reads it deep inside the propose path where no `&Model` is in scope, which
+/// is also where the `ATLAS_DFLASH_DRAFT_CAP` getenv it replaces already sat.
+///
+/// ⚠️ A runtime cap is NOT equivalent to serving with `--dflash-gamma N`.
+/// The launch flag also sizes construction-time state — `dflash_kgamma`, the
+/// DDTree verify capacity, and the SSM intermediate pools (`impl_a1.rs`) — and
+/// none of those can change after startup. Expect a runtime cap to recover the
+/// drafter-forward and verify-width share of the win, not the memory or the
+/// pool-sizing share.
+static DFLASH_GAMMA_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the runtime γ cap. 0 clears the override.
+pub fn set_dflash_gamma_override(gamma: usize) {
+    DFLASH_GAMMA_OVERRIDE.store(gamma, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The runtime γ cap, or `None` when unset.
+pub fn dflash_gamma_override() -> Option<usize> {
+    match DFLASH_GAMMA_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Per-sequence state owned by a [`DraftProposer`].
+///
+/// Stores KV cache, hidden states, or whatever the proposer needs
+/// across decode steps. Follows the same downcasting pattern as `LayerState`.
+pub trait ProposerState: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetTokenAuthority {
+    /// Normal serving policy may transform the target's raw argmax.
+    ServingPolicy,
+    /// Every proposed frame requires an exact raw-target-argmax receipt.
+    ExactRawArgmax,
+}
+
+/// Borrowed target-fed prefix plus the newly emitted token that has not yet
+/// been fed back through the target. The split mirrors the proposal ABI and
+/// avoids cloning a potentially million-token sequence on every frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalCommittedPrefix<'a> {
+    pub fed_tokens: &'a [u32],
+    pub pending_token: u32,
+    pub position: usize,
+    pub prompt_len: usize,
+}
+
+impl CanonicalCommittedPrefix<'_> {
+    pub fn validate(self) -> Result<()> {
+        validate_canonical_prefix_lengths(self.position, self.fed_tokens.len(), self.prompt_len)
+    }
+}
+
+fn validate_canonical_prefix_lengths(
+    position: usize,
+    fed_tokens_len: usize,
+    prompt_len: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        position == fed_tokens_len,
+        "canonical prefix position {} != target-fed length {}",
+        position,
+        fed_tokens_len
+    );
+    anyhow::ensure!(
+        prompt_len <= position,
+        "canonical prefix prompt length exceeds position"
+    );
+    position
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("canonical prefix logical length overflow"))?;
+    Ok(())
+}
+
+/// Construction identity of an installed draft proposer.
+///
+/// Scheduler admission must not infer an arm's implementation from the active
+/// arm or from CLI flags: DFlash/native-MTP dual builds carry both at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftProposerKind {
+    Other,
+    Qwen4NativeMtp,
+    DFlash,
+}
+
+/// A draft token proposer for speculative decoding.
+///
+/// The engine calls `propose()` after each target decode to get draft tokens,
+/// then verifies them with the target model. `after_verify()` lets the
+/// proposer trim state (e.g., KV cache) based on how many drafts were accepted.
+pub trait DraftProposer: Send + Sync {
+    /// Allocate per-sequence proposer state.
+    fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>>;
+
+    /// Stable construction identity used by fail-closed serving admission.
+    fn kind(&self) -> DraftProposerKind {
+        DraftProposerKind::Other
+    }
+
+    /// True when this proposer is the DFlash γ-block drafter.
+    ///
+    /// DFlash's block argmax is GPU-side and ignores the `grammar_bitmask`
+    /// argument to [`Self::propose`], so the scheduler must gate (or
+    /// verify-side mask) speculative drafting for grammar-constrained
+    /// sequences — see `ATLAS_DFLASH_GRAMMAR_MODE` in spark-server. MTP and
+    /// ngram proposers honor the mask and keep the default `false`.
+    fn is_dflash(&self) -> bool {
+        false
+    }
+
+    /// Configured DFlash draft-token selection contract. Non-DFlash and
+    /// default DFlash proposers are greedy; `BlockDiffusionDraftHead` enables
+    /// `Probabilistic` drafting when constructed with
+    /// `probabilistic_qualification_enabled` so sparse `q` is preserved
+    /// through target acceptance.
+    fn dflash_draft_sample_method(&self) -> crate::dflash_sampling::DflashDraftSampleMethod {
+        crate::dflash_sampling::DflashDraftSampleMethod::Greedy
+    }
+
+    /// Exact number of neural flat drafts the next sampled DFlash proposal
+    /// will produce for `requested`.  The selector request must be sized from
+    /// this authority rather than re-reading runtime env in the scheduler.
+    fn dflash_sampled_proposal_width(&self, _requested: usize) -> Result<usize> {
+        anyhow::bail!("proposer does not implement sampled DFlash width planning")
+    }
+
+    /// Stage exactly one selector-sampling request on this sequence. The next
+    /// `propose` consumes it even on failure; defaults reject so a proposer
+    /// cannot silently ignore a probabilistic request.
+    fn stage_dflash_sampling_request(
+        &self,
+        state: &mut dyn ProposerState,
+        request: crate::dflash_sampling::DflashDraftSamplingRequest,
+    ) -> Result<()> {
+        let _ = (state, request);
+        anyhow::bail!("proposer does not implement sampled DFlash requests")
+    }
+
+    /// Drain the sampled-q frame paired with the most recent proposal.
+    /// Implementations must clear the producer slot on every call.
+    fn take_pending_sampled_proposal(
+        &self,
+        state: &mut dyn ProposerState,
+    ) -> Option<crate::dflash_sampling::DflashSampledProposalFrame> {
+        let _ = state;
+        None
+    }
+
+    /// Whether this proposer is allowed to run only under a raw-target-argmax
+    /// scheduler receipt. Existing proposers preserve normal serving policy.
+    fn target_token_authority(&self) -> TargetTokenAuthority {
+        TargetTokenAuthority::ServingPolicy
+    }
+
+    /// Synchronize an exact-authority proposer's private model to the target's
+    /// canonical committed boundary. Called only for `ExactRawArgmax`; the
+    /// default rejects so a new exact-authority proposer cannot accidentally
+    /// run without implementing canonical synchronization.
+    fn sync_committed_prefix(
+        &self,
+        prefix: CanonicalCommittedPrefix<'_>,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let _ = (prefix, state, ctx, stream);
+        anyhow::bail!("exact-authority proposer did not implement canonical prefix sync")
+    }
+
+    /// Physical target-verify token capacity, including the bonus/root row.
+    ///
+    /// `None` means this proposer does not use the DFlash verify ABI. DFlash
+    /// implementations must return the exact model allocation they were
+    /// constructed against, never a fresh environment/config derivation.
+    fn physical_verify_k(&self) -> Option<usize> {
+        None
+    }
+
+    /// Synchronize target runtime configuration (such as Qwen4 extended YaRN
+    /// frequencies) into an external drafter when installed on the model.
+    fn sync_target_config(
+        &mut self,
+        target_config: &atlas_core::config::ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        let _ = (target_config, gpu);
+        Ok(())
+    }
+
+    /// Propose up to `num_drafts` tokens autoregressively.
+    ///
+    /// # Arguments
+    /// * `last_token` - The last verified token (target model output)
+    /// * `target_hidden` - Target model's hidden states after final norm [1, hidden_size] BF16
+    /// * `position` - Current sequence position (for RoPE)
+    /// * `num_drafts` - Maximum number of draft tokens to produce
+    /// * `state` - Per-sequence proposer state
+    /// * `ctx` - Shared forward context (buffers, gpu, config)
+    /// * `stream` - CUDA stream handle
+    /// * `draft_embed_target` - Optional device destination for deferred
+    ///   draft-token embedding / GPU-resident draft token ID handoff (`None`
+    ///   for standard host-returned drafts).
+    /// * `grammar_bitmask` - Optional XGrammar bitmask (ceil(vocab_size/32) i32
+    ///   words). When `Some`, drafts are constrained to tokens the grammar
+    ///   accepts at the current matcher position; bit `tok` set ⇒ allowed.
+    ///   `None` preserves the unconstrained fast path.
+    /// * `target_hidden_stack` - Optional pointer to a contiguous buffer of
+    ///   `target_layer_ids.len() × capture_width × bf16` containing the
+    ///   most-recently-decoded token's hidden states captured at the drafter's
+    ///   target layers (consumed by DFlash and Qwen4 native MTP). Layout
+    ///   matches `combine_hidden_states`: shallow-to-deep concatenation along
+    ///   the feature axis.
+    fn propose(
+        &self,
+        last_token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+        draft_embed_target: Option<DevicePtr>,
+        grammar_bitmask: Option<&[i32]>,
+        target_hidden_stack: Option<DevicePtr>,
+    ) -> Result<Vec<u32>>;
+
+    /// Cross-sequence batched proposal for `last_tokens.len()` sequences
+    /// sharing the same requested `num_drafts` and unconstrained greedy/confidence
+    /// policy. Returns `Ok(None)` when this proposer does not implement
+    /// cross-sequence batching or the cohort is ineligible, leaving all states
+    /// untouched so the caller can fall back to per-sequence [`Self::propose`].
+    #[allow(clippy::too_many_arguments)]
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        target_hiddens: &[DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+        ctx: &ForwardContext,
+        stream: u64,
+        target_hidden_stacks: &[Option<DevicePtr>],
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        let _ = (
+            last_tokens,
+            target_hiddens,
+            positions,
+            num_drafts,
+            states,
+            ctx,
+            stream,
+            target_hidden_stacks,
+        );
+        Ok(None)
+    }
+
+    /// Read the draft token ID stored on GPU by the last `propose()` call
+    /// that used `draft_embed_target = Some(...)`. Returns 0 if not supported.
+    fn read_deferred_draft_token(&self, gpu: &dyn GpuBackend) -> Result<u32> {
+        let _ = gpu;
+        Ok(0)
+    }
+
+    /// Called after target verification to trim proposer state.
+    ///
+    /// `num_accepted` indicates how many draft tokens were accepted.
+    /// The proposer should trim its KV cache / state to match.
+    fn after_verify(
+        &self,
+        num_accepted: usize,
+        state: &mut dyn ProposerState,
+        stream: u64,
+    ) -> Result<()>;
+
+    /// Free per-sequence proposer state (KV cache blocks, etc.).
+    ///
+    /// Must be called when a sequence is finished to avoid resource leaks.
+    fn free_state(&self, state: &mut dyn ProposerState) -> Result<()> {
+        let _ = state;
+        Ok(())
+    }
+
+    /// `SeqStateBlob` export: this sequence's exact proposer state at a
+    /// quiescent position, or `None` when the proposer cannot capture it (the
+    /// caller then refuses the blob rather than resuming without it).
+    fn seqstate_export(
+        &self,
+        state: &dyn ProposerState,
+    ) -> Result<Option<crate::model::seqstate::ProposerSeqState>> {
+        let _ = state;
+        Ok(None)
+    }
+
+    /// `SeqStateBlob` import into a freshly allocated proposer state: claims
+    /// `meta.num_blocks` cache blocks and returns the destination ranges in
+    /// the same order `seqstate_export` produced. `None` = unsupported. On a
+    /// later failure the caller releases the claim with `free_state`.
+    fn seqstate_import(
+        &self,
+        state: &mut dyn ProposerState,
+        meta: &crate::model::seqstate::ProposerSeqMeta,
+    ) -> Result<Option<Vec<crate::model::seqstate::StateRegion>>> {
+        let _ = (state, meta);
+        Ok(None)
+    }
+
+    /// ATLAS_DFLASH_ASYNC (task #20): collect the real drafts of an async
+    /// (second-stream) propose previously launched for this sequence.
+    ///
+    /// Returns `Ok(None)` when nothing is pending (the universal default);
+    /// `Ok(Some(drafts))` with the real chain to replace the placeholder;
+    /// `Ok(Some(vec![]))` when the placeholder was orphaned — the caller
+    /// clears its pending drafts and falls back to the bootstrap decode
+    /// (lossless: drafts only ever propose).
+    fn collect_async_drafts(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+    ) -> Result<Option<Vec<u32>>> {
+        let _ = (gpu, state);
+        Ok(None)
+    }
+
+    /// ATLAS_DFLASH_ASYNC: resolve (sync + discard) any in-flight async
+    /// propose. Must be called before per-sequence device buffers the
+    /// in-flight kernels may read are freed (`free_sequence`). Default no-op.
+    fn resolve_async_inflight(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: Option<&mut dyn ProposerState>,
+    ) -> Result<()> {
+        let _ = (gpu, state);
+        Ok(())
+    }
+
+    /// ATLAS_DFLASH_FUSED=1: record the propose-ordering CUDA event immediately
+    /// after the target verify returns (before commit kernels are enqueued).
+    /// Default no-op; only `BlockDiffusionDraftHead` overrides.
+    fn arm_propose_overlap(&self, gpu: &dyn GpuBackend, default_stream: u64) -> Result<()> {
+        let _ = (gpu, default_stream);
+        Ok(())
+    }
+
+    /// Drain any pending DDTree payload built by the most recent `propose()`
+    /// call. Default returns `None` (flat MTP / ngram / flat DFlash).
+    /// DDTree-capable drafters override to return + clear the payload stashed
+    /// on per-seq state. Caller assigns to `ActiveSeq.pending_tree_payload`
+    /// for the next-step verifier.
+    fn take_pending_tree_payload(
+        &self,
+        state: &mut dyn ProposerState,
+    ) -> Option<crate::layers::DDTreePayload> {
+        let _ = state;
+        None
+    }
+
+    /// Sequentially populate the proposer's per-sequence KV cache for the last
+    /// `k` prompt-tail positions before the first decode step.
+    ///
+    /// Without this, MTP's self-attention starts with an empty KV cache and
+    /// predicts long-context drafts off zero historical context — empirically
+    /// drops draft accept rate 1.83 → 0.92 (target_seq=5085 vs mtp_seq=423 at
+    /// 4K prompt + 1K decode). Calling this after target prefill lets the
+    /// drafter see the recent prompt tail (where attention mass concentrates),
+    /// restoring most of the lost accept.
+    ///
+    /// # Arguments
+    /// * `tokens` — slice of `k` prompt token IDs at absolute positions
+    ///   `[base_position - k + 1 .. base_position]`. `tokens[i]` is the token
+    ///   at absolute position `base_position - k + 1 + i`.
+    /// * `target_hiddens` — device pointer to a contiguous BF16/FP32 buffer
+    ///   of shape `[k, hidden_size]`. Row `i` is the target's last-layer
+    ///   hidden state for the input token at the same absolute position as
+    ///   `tokens[i]`. Step `i` reads row `i`; which token it pairs with is
+    ///   [`mtp_replay_pairs`] (decode pairs row p with the token at p+1).
+    /// * `base_position` — absolute position of the LAST captured token
+    ///   (`prompt_len - 1`). Step `i` uses position `base_position - k + 2 + i`
+    ///   for RoPE (the position the proposer is predicting INTO).
+    /// * `state` — per-sequence proposer state; KV cache is grown in-place.
+    /// * `ctx` — shared forward context (buffers, gpu, config).
+    /// * `stream` — CUDA stream handle.
+    ///
+    /// Default: no-op (proposers without prefill support skip silently).
+    fn prefill_last_k(
+        &self,
+        tokens: &[u32],
+        target_hiddens: DevicePtr,
+        base_position: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let _ = (tokens, target_hiddens, base_position, state, ctx, stream);
+        Ok(())
+    }
+
+    /// `ATLAS_MTP_LASTK_DEFER` (K9 item X): a sequence whose deferred
+    /// [`DraftProposer::prefill_last_k`] of `rows` replay steps never runs (it ended on
+    /// its first token) takes, host side only, the cache blocks those steps would have
+    /// allocated from an empty proposer state, so the `free_state` that follows returns
+    /// the same blocks in the same order and the next sequence's allocations equal the
+    /// undeferred order's. Returns the number of blocks taken. No device work.
+    ///
+    /// Default: nothing (proposers whose replay allocates nothing, or that have none).
+    fn reserve_prompt_replay_blocks(
+        &self,
+        rows: usize,
+        state: &mut dyn ProposerState,
+    ) -> Result<usize> {
+        let _ = (rows, state);
+        Ok(0)
+    }
+
+    /// Bind the model-owned shared GPU `(q_cand_ids, q_probs)` scratch buffers
+    /// used by probabilistic DFlash2 proposal and GPU maximal-coupling
+    /// rejection verification. Default is a no-op for proposers that do not
+    /// emit GPU draft distributions.
+    fn bind_rejection_q_scratch(
+        &mut self,
+        _q_ids: DevicePtr,
+        _q_probs: DevicePtr,
+        _row_cap: usize,
+        _q_stride: usize,
+    ) {
+    }
+
+    /// Destroy any proposer-owned CUDA graphs and device allocations that
+    /// reference the shared rejection scratch before the parent model frees
+    /// its rejection buffers in `Drop`. Default is a no-op.
+    fn release_rejection_resources(&self, _gpu: &dyn GpuBackend) {}
+}
+
+/// `ATLAS_MTP_REPLAY_NEXT=1` (default off): MTP last-K prompt replays pair
+/// target hidden row i with `tokens[i + 1]`, as decode does; see
+/// [`mtp_replay_pairs`]. Read by the Qwen4 native MTP and the generic MTP head.
+pub(crate) fn mtp_replay_next_token() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("ATLAS_MTP_REPLAY_NEXT").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "MTP_REPLAY_NEXT_ENGAGED selector=ATLAS_MTP_REPLAY_NEXT pairing=hidden[p]+token[p+1] rows=K-1"
+            );
+        }
+        on
+    })
+}
+
+/// (hidden row, token) pairs of an MTP last-K prompt replay over
+/// `tokens = prompt[start..=end]` and target hidden rows `start..=end`; pair
+/// `(i, t)` runs at predict-into position `start + 1 + i`. Decode feeds the
+/// target hidden of position p with the token at p+1 at position p+1
+/// (`propose(last_token, target_hidden, p + 1)`). Legacy (`next_token`
+/// false): row i with `tokens[i]`, K pairs, the last at the first propose's
+/// position. Next: row i with `tokens[i + 1]`, K-1 pairs; row K-1's pair is
+/// the first decode propose.
+pub(crate) fn mtp_replay_pairs(tokens: &[u32], next_token: bool) -> Vec<(usize, u32)> {
+    if next_token {
+        tokens.iter().copied().skip(1).enumerate().collect()
+    } else {
+        tokens.iter().copied().enumerate().collect()
+    }
+}
+
+/// Validate the immutable DFlash proposer/model verify-capacity contract before
+/// installing the proposer into a model.
+///
+/// This deliberately accepts already-read values so the check has no hidden
+/// environment/config dependency. Callers must pass the proposer's stored
+/// physical K and the model's actual persistent verify allocation.
+pub(crate) fn validate_dflash_install_capacity(
+    proposer_is_dflash: bool,
+    proposer_k: Option<usize>,
+    model_k: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        proposer_is_dflash,
+        "set_dflash_proposer: proposer does not implement the DFlash ABI"
+    );
+    let proposer_k = proposer_k.ok_or_else(|| {
+        anyhow::anyhow!("set_dflash_proposer: DFlash proposer omitted its physical verify K")
+    })?;
+    anyhow::ensure!(
+        model_k > 0,
+        "set_dflash_proposer: model has no physical DFlash verify capacity"
+    );
+    anyhow::ensure!(
+        proposer_k == model_k,
+        "set_dflash_proposer: proposer physical verify K {proposer_k} != model capacity {model_k}"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mtp_replay_pairs_legacy_pairs_row_with_same_token() {
+        assert_eq!(
+            mtp_replay_pairs(&[10, 11, 12], false),
+            vec![(0, 10), (1, 11), (2, 12)]
+        );
+    }
+
+    #[test]
+    fn mtp_replay_pairs_next_pairs_row_with_following_token() {
+        assert_eq!(
+            mtp_replay_pairs(&[10, 11, 12], true),
+            vec![(0, 11), (1, 12)]
+        );
+        assert!(mtp_replay_pairs(&[10], true).is_empty());
+        assert!(mtp_replay_pairs(&[], true).is_empty());
+    }
+
+    struct MockProposerState {
+        tokens_proposed: Vec<u32>,
+    }
+
+    impl ProposerState for MockProposerState {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct MockProposer;
+
+    impl DraftProposer for MockProposer {
+        fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
+            Ok(Box::new(MockProposerState {
+                tokens_proposed: Vec::new(),
+            }))
+        }
+
+        fn propose(
+            &self,
+            _last_token: u32,
+            _target_hidden: DevicePtr,
+            _position: usize,
+            _num_drafts: usize,
+            _state: &mut dyn ProposerState,
+            _ctx: &ForwardContext,
+            _stream: u64,
+            _draft_embed_target: Option<DevicePtr>,
+            _grammar_bitmask: Option<&[i32]>,
+            _target_hidden_stack: Option<DevicePtr>,
+        ) -> Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+
+        fn after_verify(
+            &self,
+            _num_accepted: usize,
+            _state: &mut dyn ProposerState,
+            _stream: u64,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_proposer_state_downcast() {
+        let state: Box<dyn ProposerState> = Box::new(MockProposerState {
+            tokens_proposed: vec![42, 99],
+        });
+        let mock = state.as_any().downcast_ref::<MockProposerState>().unwrap();
+        assert_eq!(mock.tokens_proposed, vec![42, 99]);
+    }
+
+    #[test]
+    fn test_proposer_state_downcast_mut() {
+        let mut state: Box<dyn ProposerState> = Box::new(MockProposerState {
+            tokens_proposed: vec![],
+        });
+        let mock = state
+            .as_any_mut()
+            .downcast_mut::<MockProposerState>()
+            .unwrap();
+        mock.tokens_proposed.push(7);
+        assert_eq!(mock.tokens_proposed, vec![7]);
+    }
+
+    #[test]
+    fn non_dflash_proposer_has_no_physical_verify_capacity() {
+        let proposer: &dyn DraftProposer = &MockProposer;
+        assert_eq!(proposer.physical_verify_k(), None);
+        assert_eq!(
+            proposer.target_token_authority(),
+            TargetTokenAuthority::ServingPolicy
+        );
+    }
+
+    #[test]
+    fn canonical_prefix_is_borrowed_exact_and_overflow_checked() {
+        let tokens = [1, 2, 3, 4];
+        let valid = CanonicalCommittedPrefix {
+            fed_tokens: &tokens,
+            pending_token: 5,
+            position: tokens.len(),
+            prompt_len: 3,
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(valid.fed_tokens.as_ptr(), tokens.as_ptr());
+        assert_eq!(valid.pending_token, 5);
+
+        assert!(
+            CanonicalCommittedPrefix {
+                position: tokens.len() - 1,
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CanonicalCommittedPrefix {
+                prompt_len: tokens.len() + 1,
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(validate_canonical_prefix_lengths(usize::MAX, usize::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn default_canonical_prefix_sync_fails_closed() {
+        let source = include_str!("speculative.rs");
+        let hook = source.find("fn sync_committed_prefix(").unwrap();
+        let next_method = source[hook..]
+            .find("fn physical_verify_k(")
+            .map(|offset| hook + offset)
+            .unwrap();
+        let body = &source[hook..next_method];
+        assert!(body.contains("anyhow::bail!"));
+        assert!(!body.contains("Ok(())"));
+    }
+
+    #[test]
+    fn model_authority_defaults_and_forwards_from_active_proposer() {
+        let model_trait = include_str!("traits/model.rs");
+        let default = model_trait
+            .split("fn proposer_target_token_authority(")
+            .nth(1)
+            .unwrap()
+            .split("fn dflash_verify_capacity_k(")
+            .next()
+            .unwrap();
+        assert!(default.contains("TargetTokenAuthority::ServingPolicy"));
+
+        let transformer = include_str!("model/trait_impl/mod.rs");
+        let forwarding = transformer
+            .split("fn proposer_target_token_authority(")
+            .nth(1)
+            .unwrap()
+            .split("fn dflash_verify_capacity_k(")
+            .next()
+            .unwrap();
+        assert!(forwarding.contains("self.active_proposer()"));
+        assert!(forwarding.contains("TargetTokenAuthority::ServingPolicy"));
+        assert!(forwarding.contains("p.target_token_authority()"));
+        assert!(!forwarding.contains("p.is_dflash()"));
+    }
+
+    #[test]
+    fn exact_prefix_sync_precedes_token_mirror_and_propose() {
+        let source = include_str!("model/impl_b3.rs");
+        let authority = source.find("let target_token_authority =").unwrap();
+        let early_exit = source[authority..]
+            .find("if Self::early_exit_enabled()")
+            .map(|offset| authority + offset)
+            .unwrap();
+        let early_exit_reject = source[early_exit..]
+            .find("target_token_authority == TargetTokenAuthority::ServingPolicy")
+            .map(|offset| early_exit + offset)
+            .unwrap();
+        let early_exit_return = source[early_exit_reject..]
+            .find("return self.early_exit_propose(")
+            .map(|offset| early_exit_reject + offset)
+            .unwrap();
+        let branch = source[early_exit_return..]
+            .find("TargetTokenAuthority::ExactRawArgmax")
+            .map(|offset| early_exit_return + offset)
+            .unwrap();
+        let sync = source[branch..]
+            .find("proposer.sync_committed_prefix(")
+            .map(|offset| branch + offset)
+            .unwrap();
+        let mirror = source[sync..]
+            .find("let want_token_mirror =")
+            .map(|offset| sync + offset)
+            .unwrap();
+        let propose = source[mirror..]
+            .find("proposer.propose(")
+            .map(|offset| mirror + offset)
+            .unwrap();
+        assert!(
+            authority < early_exit
+                && early_exit < early_exit_reject
+                && early_exit_reject < early_exit_return
+                && early_exit_return < branch
+                && branch < sync
+                && sync < mirror
+                && mirror < propose
+        );
+        let sync_call = &source[sync..mirror];
+        assert!(sync_call.contains("prop_state.as_mut(), &ctx, stream)?;"));
+        let sync_body = &source[branch..mirror];
+        assert!(sync_body.contains("fed_tokens: &seq.tokens"));
+        assert!(!sync_body.contains("to_vec("));
+        assert!(!sync_body.contains("clone("));
+        assert!(!sync_body.contains("collect("));
+    }
+
+    #[test]
+    fn dflash_install_capacity_must_match_actual_model_allocation() {
+        assert!(validate_dflash_install_capacity(true, Some(17), 17).is_ok());
+        assert!(validate_dflash_install_capacity(false, Some(17), 17).is_err());
+        assert!(validate_dflash_install_capacity(true, None, 17).is_err());
+        assert!(validate_dflash_install_capacity(true, Some(17), 0).is_err());
+        assert!(validate_dflash_install_capacity(true, Some(17), 32).is_err());
+    }
+}

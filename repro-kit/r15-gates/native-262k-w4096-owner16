@@ -1,0 +1,1254 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Required W4096/owner16 native-262K gate, additional to W16384.
+
+Requires explicit registration in a reviewed sealed successor suite.
+Source preparation alone is not a runtime or release receipt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from contextlib import contextmanager
+import hashlib
+import http.client
+import os
+from pathlib import Path
+import re
+import secrets
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+import types
+import urllib.parse
+
+GATE = "native-262k-w4096-owner16"
+RECIPE_SHA256 = "28c21eb3d42f7b643e0a556129a23cd0a5d6d7c6f61ab78ce318cbc0252d4718"
+ENGAGEMENT_SHA256 = "31145e6a6eed07030e42ab349cdd0bf81d236fcce5071eccc60020547d754403"
+LIFECYCLE_SHA256 = "dfae597a00c668ee5e3b2f02042c39df6035fa48cbb887cea53a3cb50a41b032"
+ENDPOINT_SHA256 = "81d336c6bc477b6efafeb100e8e72b78c8e8b7cffc54c8880a77227c3fa84832"
+TOKENIZER_SHA256 = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+TARGETS = (258000, 261888, 262080)
+CONTEXT = 262144
+CHUNK = 4096
+EXPECTED_PROMPT_SHA256 = {
+    258000: "05d689a3149f158b2af5047421a152f03cc93c78f5377712801bf0d0f50ca2ad",
+    261888: "9692378175dbb8126e65d7e4ee022d7150ffe8a06608fb9c936159c05ba4e806",
+    262080: "a664d90f8924cc85fd3862c7617b9f9894a4c22b031757c93fd22d8aac00c3c0",
+}
+PASSKEYS = {"ALPHA": "alpha-0731826", "BETA": "beta-0492175", "GAMMA": "gamma-0863204"}
+TEXTS = {
+    "head": "<|im_start|>user\nSession 0 archive, reference code S00-00000.\n",
+    "filler": " Ordinary archive entry: the warehouse ledger lists shelves, labels, crates and loading bays.\n",
+    "tail": "\nReturn the three audit passkeys, labeled ALPHA, BETA, GAMMA. Copy them exactly; no explanation.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    **{name: f"\nAudit passkey {name}: {value}\n" for name, value in PASSKEYS.items()},
+}
+MAX_BODY = 64 * 1024 * 1024
+MAX_STREAM = 256 * 1024 * 1024
+LEDGER = {"schema": "atlas.interventions.v1", "policy": "report_only", "events": []}
+ANSWER_PAIR = re.compile(
+    r"(?<![\w-])(?:[-*][ \t]+)?(?:\*\*)?(ALPHA|BETA|GAMMA)(?:\*\*)?"
+    r"(?:[ \t]*[:=][ \t]*|[ \t]+)[`\"']?([A-Za-z0-9_-]+)[`\"']?(?![\w-])"
+)
+FATAL_PATTERN = re.compile(
+    r"\bcuda[-_: ]*fatal\b|\billegal[-_: ]*memory[-_: ]*access\b|"
+    r"\bout[-_: ]*of[-_: ]*memory\b|\boom(?:[-_: ]*kill(?:er)?)?\b|"
+    r"\b(?:CUDA_ERROR_(?:OUT_OF_MEMORY|ILLEGAL_ADDRESS)|"
+    r"cudaError(?:MemoryAllocation|IllegalAddress))\b|\bkilled\s+process\s+[0-9]+\b|"
+    r"\b(?:allocat(?:or|ion)[^\r\n]*(?:warn(?:ing)?|fail(?:ed|ure)?)|"
+    r"(?:warn(?:ing)?|fail(?:ed|ure)?)[^\r\n]*allocat(?:or|ion)|"
+    r"NVRM|Xid|KV cache exhausted|context overflow truncated)\b",
+    re.IGNORECASE,
+)
+QSA_RECEIPT = re.compile(
+    r"QWEN4_PREFILL_QSA_CHUNK_RECEIPT selector=(\S+) "
+    r"start=([0-9]+) rows=([0-9]+) end=([0-9]+) "
+    r"chunk_rows=([0-9]+) tile_rows=([0-9]+) core=(\S+)[ \t]*$"
+)
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def passkey_answers(text):
+    """Reject partial identifiers, wrong labels, duplicate answers and extra text."""
+    answers, cursor = {}, 0
+    for match in ANSWER_PAIR.finditer(text):
+        require(
+            re.fullmatch(r"[\s,;]*", text[cursor : match.start()]) is not None,
+            "retrieval answer contains unparsed text",
+        )
+        label, value = match.groups()
+        require(
+            label not in answers and value == PASSKEYS[label],
+            "retrieval labeled passkey differs or is duplicated",
+        )
+        answers[label], cursor = value, match.end()
+    require(
+        set(answers) == set(PASSKEYS)
+        and re.fullmatch(r"[\s,;]*", text[cursor:]) is not None,
+        "retrieval labeled passkeys missing or extra text present",
+    )
+    return [answers[label] for label in PASSKEYS]
+
+
+def current_boot():
+    value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    require(
+        re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value),
+        "current kernel boot identity is unavailable",
+    )
+    return value.replace("-", "")
+
+
+def kernel_command(arguments, target):
+    completed = subprocess.run(
+        ["journalctl", "--dmesg", "--boot", "--no-pager", "--output=json", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=target,
+        stderr=subprocess.PIPE,
+        timeout=45,
+        check=False,
+    )
+    require(
+        completed.returncode == 0 and not completed.stderr,
+        "complete current-boot kernel journal is unavailable",
+    )
+    require(os.fstat(target).st_size <= MAX_STREAM, "kernel journal exceeds bound")
+
+
+def kernel_records(args, descriptor):
+    raw = args.suite.read_fd(descriptor, "native262 kernel journal", MAX_STREAM, nlink=1)
+    records = [
+        args.suite.strict_json_loads(line, "native262 kernel event")
+        for line in raw.splitlines()
+    ]
+    require(
+        records
+        and all(
+            type(row) is dict
+            and type(row.get("__CURSOR")) is str
+            and row["__CURSOR"]
+            and type(row.get("_BOOT_ID")) is str
+            and re.fullmatch(r"[0-9a-f]{32}", row["_BOOT_ID"])
+            and type(row.get("MESSAGE")) is str
+            for row in records
+        ),
+        "kernel cursor records are unavailable",
+    )
+    return records, raw
+
+
+@contextmanager
+def kernel_window(args, runtime, base):
+    """Measure the current host kernel across native startup, requests and cleanup."""
+    suite, descriptors, result = args.suite, {}, {}
+    names = ("kernel-start.jsonl", "kernel-full.jsonl", "kernel-measured.log")
+    try:
+        for name in names:
+            descriptors[name] = suite.create_beneath(
+                runtime, f"{base}/{name}", "native262 kernel artifact", 0o400
+            )
+        boot = current_boot()
+        kernel_command(["--lines=1"], descriptors[names[0]])
+        baseline, baseline_raw = kernel_records(args, descriptors[names[0]])
+        require(
+            len(baseline) == 1 and baseline[0]["_BOOT_ID"] == boot,
+            "kernel baseline does not match current boot",
+        )
+        cursor = baseline[0]["__CURSOR"]
+        started = time.monotonic_ns()
+        try:
+            yield result
+        finally:
+            kernel_command(["--cursor=" + cursor], descriptors[names[1]])
+            records, records_raw = kernel_records(args, descriptors[names[1]])
+            require(
+                records[0] == baseline[0]
+                and all(row["_BOOT_ID"] == boot for row in records)
+                and current_boot() == boot,
+                "kernel baseline cursor was lost or current boot changed",
+            )
+            require(
+                len({row["__CURSOR"] for row in records}) == len(records),
+                "kernel event cursor was repeated",
+            )
+            measured = b"".join(
+                row["MESSAGE"].encode("utf-8") + b"\n" for row in records[1:]
+            )
+            require(len(measured) <= MAX_STREAM, "measured kernel log exceeds bound")
+            suite.write_all(descriptors[names[2]], measured)
+            require(
+                FATAL_PATTERN.search(measured.decode("utf-8", "strict")) is None,
+                "unsafe current-boot kernel log marker",
+            )
+            consumed = dict(zip(names, (baseline_raw, records_raw, measured)))
+            artifacts = []
+            for name, descriptor in descriptors.items():
+                os.fsync(descriptor)
+                locator = f"{base}/{name}"
+                suite.assert_path_identity(
+                    runtime, locator, descriptor, "native262 kernel artifact"
+                )
+                raw = suite.read_fd(
+                    descriptor, "native262 kernel artifact", MAX_STREAM, nlink=1
+                )
+                require(
+                    raw == consumed[name],
+                    "kernel artifact differs from the bytes consumed by validation",
+                )
+                artifacts.append(
+                    {
+                        "artifact": locator,
+                        "sha256": digest(consumed[name]),
+                        "bytes": len(consumed[name]),
+                    }
+                )
+            result.update(
+                {
+                    "source": "current-boot-kernel-journal",
+                    "boot_id": boot,
+                    "baseline_cursor": cursor,
+                    "measured_events": len(records) - 1,
+                    "start_monotonic_ns": started,
+                    "end_monotonic_ns": time.monotonic_ns(),
+                    "fatal_events": 0,
+                    "artifacts": artifacts,
+                }
+            )
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def load_checked(path, expected, name):
+    """Execute exactly the verified bytes, without pathname-based imports."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * 1024 * 1024,
+            "helper is not a bounded regular file",
+        )
+        payload = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+
+        def identity(value):
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        require(
+            identity(before) == identity(after) and digest(payload) == expected,
+            "source helper hash or identity differs",
+        )
+    finally:
+        os.close(descriptor)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    sys.modules[name] = module
+    try:
+        exec(compile(payload, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def tokens(value):
+    require(
+        type(value) is list
+        and 0 < len(value) <= CONTEXT
+        and all(type(item) is int and 0 <= item < 1 << 32 for item in value),
+        "nonempty exact u32 token vector required",
+    )
+    return value
+
+
+def token_hash(value):
+    return digest(b"".join(item.to_bytes(4, "little") for item in tokens(value)))
+
+
+def repeated(value, length):
+    tokens(value)
+    count, tail = divmod(length, len(value))
+    return value * count + value[:tail]
+
+
+def assemble(target, components):
+    """Preserve the calibrated native qualifier's exact token construction."""
+    require(
+        target in TARGETS and tuple(components) == tuple(TEXTS),
+        "calibrated prompt component contract differs",
+    )
+    for value in components.values():
+        tokens(value)
+    body_len = target - len(components["head"]) - len(components["tail"])
+    require(body_len > 0, "prompt frame exceeds its target")
+    body = repeated(components["filler"], body_len)
+    for depth, name in reversed(list(zip((0.05, 0.50, 0.95), PASSKEYS))):
+        offset = int(len(body) * depth)
+        body[offset:offset] = components[name]
+    prompt = components["head"] + body[:body_len] + components["tail"]
+    require(len(prompt) == target, "exact prompt length differs")
+    positions = {}
+    for name in PASSKEYS:
+        needle = components[name]
+        found = [
+            index
+            for index in range(len(prompt) - len(needle) + 1)
+            if prompt[index : index + len(needle)] == needle
+        ]
+        require(len(found) == 1, "passkey token occurrence census differs")
+        positions[name] = found[0]
+    return prompt, positions
+
+
+def boundary_prompt(prompt, components):
+    require(len(tokens(prompt)) == 262080, "boundary control length differs")
+    tail = tokens(components["tail"])
+    require(prompt[-len(tail) :] == tail, "boundary control chat frame differs")
+    return prompt[: -len(tail)] + repeated(components["filler"], 63) + tail
+
+
+def completion_body(model, prompt, budget, forced=False):
+    tokens(prompt)
+    require(
+        type(model) is str and model and type(budget) is int and budget > 0,
+        "invalid completion request",
+    )
+    return {
+        "model": model,
+        "prompt": "",
+        "prompt_token_ids": prompt,
+        "max_tokens": budget,
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "top_n_sigma": 0.0,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "stream": False,
+        "stop": [],
+        "seed": 0x38_262_144,
+        "ignore_eos": forced,
+        "return_token_ids": True,
+        "report_interventions": True,
+    }
+
+
+class Journal:
+    def __init__(self, args, runtime, base):
+        self.args, self.suite, self.runtime = args, args.suite, runtime
+        self.path = base + "/responses.jsonl"
+        self.fd = self.suite.create_beneath(
+            runtime, self.path, "native262 journal", 0o400
+        )
+        self.sha = hashlib.sha256()
+        self.count = 0
+
+    def append(self, value):
+        raw = self.suite.canonical_bytes(value) + b"\n"
+        require(
+            os.fstat(self.fd).st_size + len(raw) <= self.suite.MAX_RAW_LOG_BYTES,
+            "native262 journal exceeds its bound",
+        )
+        self.suite.write_all(self.fd, raw)
+        self.sha.update(raw)
+        self.count += 1
+        os.fsync(self.fd)
+
+    def seal(self):
+        self.suite.assert_path_identity(
+            self.runtime, self.path, self.fd, "native262 journal"
+        )
+        observed, _ = self.suite._hash_regular_fd(
+            self.fd, "native262 journal", self.suite.MAX_RAW_LOG_BYTES
+        )
+        require(observed == self.sha.hexdigest(), "native262 journal changed")
+        return {"artifact": self.path, "sha256": observed, "observations": self.count}
+
+
+def observed(args, journal, label, method, route, body=None, request_id=None):
+    parsed = urllib.parse.urlsplit(args.base_url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=14400)
+    request_raw = b"" if body is None else args.suite.canonical_bytes(body)
+    headers = {"Connection": "close", "Content-Type": "application/json"}
+    if request_id is not None:
+        headers["x-request-id"] = request_id
+    journal.append(
+        {
+            "event": "request",
+            "label": label,
+            "method": method,
+            "route": route,
+            "request": body,
+            "request_sha256": digest(request_raw),
+            "request_id": request_id,
+        }
+    )
+    try:
+        connection.request(
+            method,
+            route,
+            body=request_raw if body is not None else None,
+            headers=headers,
+        )
+        response = connection.getresponse()
+        raw = response.read(MAX_BODY + 1)
+        response_headers = response.getheaders()
+        journal.append(
+            {
+                "event": "response",
+                "label": label,
+                "method": method,
+                "route": route,
+                "request": body,
+                "request_sha256": digest(request_raw),
+                "request_id": request_id,
+                "status": response.status,
+                "headers": response_headers,
+                "body_base64": base64.b64encode(raw).decode("ascii"),
+                "body_sha256": digest(raw),
+            }
+        )
+        require(len(raw) <= MAX_BODY, "HTTP body is oversized")
+        lengths = [
+            value
+            for name, value in response_headers
+            if name.lower() == "content-length"
+        ]
+        require(
+            not lengths
+            or (
+                len(lengths) == 1
+                and lengths[0].isdigit()
+                and int(lengths[0]) == len(raw)
+            ),
+            "HTTP body was truncated or has ambiguous length",
+        )
+        return response.status, raw, response_headers
+    finally:
+        connection.close()
+
+
+def measurement(args, value, model, prompt, budget, forced=False):
+    require(
+        type(value) is dict and value.get("model") == model, "completion model differs"
+    )
+    require(type(value.get("id")) is str and value["id"], "response identity missing")
+    require(
+        value.get("interventions") == LEDGER, "missing or nonempty intervention ledger"
+    )
+    choices, usage = value.get("choices"), value.get("usage")
+    require(
+        type(choices) is list
+        and len(choices) == 1
+        and type(choices[0]) is dict
+        and type(usage) is dict,
+        "completion shape differs",
+    )
+    choice = choices[0]
+    require(
+        type(choice.get("index")) is int
+        and choice["index"] == 0
+        and type(choice.get("text")) is str
+        and choice["text"].strip(),
+        "completion answer is empty or choice index differs",
+    )
+    ids = tokens(choice.get("token_ids"))
+    require(
+        type(usage.get("prompt_tokens")) is int
+        and usage["prompt_tokens"] == len(prompt)
+        and type(usage.get("completion_tokens")) is int
+        and usage["completion_tokens"] == len(ids)
+        and 0 < len(ids) <= budget
+        and type(usage.get("total_tokens")) is int
+        and usage["total_tokens"] == len(prompt) + len(ids),
+        "exact usage differs",
+    )
+    cache = usage.get("prompt_tokens_details")
+    require(
+        type(cache) is dict
+        and type(cache.get("cached_tokens")) is int
+        and cache["cached_tokens"] == 0,
+        "explicit zero cache required",
+    )
+    require(
+        choice.get("finish_reason") == ("length" if forced else "stop")
+        and (not forced or len(ids) == budget),
+        "completion finish/budget differs",
+    )
+    return {
+        "response_id": value["id"],
+        "prompt_tokens": len(prompt),
+        "completion_tokens": len(ids),
+        "total_tokens": usage["total_tokens"],
+        "text": choice["text"],
+        "token_ids": ids,
+        "token_ids_sha256": token_hash(ids),
+        "finish_reason": choice["finish_reason"],
+        "cached_tokens": 0,
+        "interventions": LEDGER,
+    }
+
+
+class Streams:
+    """Hold/read the suite-captured gate streams, never the read-only raw FD."""
+
+    def __init__(self, descriptors=(1, 2)):
+        self.streams = []
+        seen = set()
+        try:
+            for descriptor in descriptors:
+                copy = os.dup(descriptor)
+                info = os.fstat(copy)
+                if not stat.S_ISREG(info.st_mode):
+                    os.close(copy)
+                    raise ValueError("gate output is not captured in regular files")
+                identity = info.st_dev, info.st_ino
+                if identity in seen:
+                    os.close(copy)
+                    continue
+                seen.add(identity)
+                self.streams.append((copy, info.st_size))
+        except BaseException:
+            self.close()
+            raise
+
+    def snapshot(self):
+        result = []
+        for descriptor, start in self.streams:
+            info = os.fstat(descriptor)
+            require(
+                start <= info.st_size <= start + MAX_STREAM,
+                "server log exceeds its bound",
+            )
+            raw = os.pread(descriptor, info.st_size - start + 1, start)
+            require(len(raw) == info.st_size - start, "server log changed during read")
+            result.append(raw)
+        return result
+
+    def close(self):
+        for descriptor, _ in self.streams:
+            os.close(descriptor)
+        self.streams = []
+
+
+def native_process(args, proof):
+    suite = args.suite
+    pid = proof["host_pid"]
+    proc = Path(f"/proc/{pid}")
+    environ = suite._read_process_bytes(
+        proc / "environ", "native262 environment", 4 * 1024 * 1024
+    )
+    environment = {}
+    require(environ.endswith(b"\0"), "live environment is truncated")
+    for entry in environ.split(b"\0")[:-1]:
+        key, separator, value = entry.partition(b"=")
+        require(separator and key not in environment, "live environment is ambiguous")
+        environment[key] = value
+    argv = suite._read_process_bytes(
+        proc / "cmdline", "native262 argv", 4 * 1024 * 1024
+    ).split(b"\0")[:-1]
+    for option, expected in (
+        (b"--max-seq-len", b"262144"),
+        (b"--kv-cache-dtype", b"bf16"),
+        (b"--max-num-seqs", b"1"),
+        (b"--max-batch-size", b"1"),
+        (b"--max-prefill-tokens", b"4096"),
+        (b"--block-size", b"16"),
+        (b"--enable-prefix-caching", b"false"),
+        (b"--ssm-cache-slots", b"0"),
+        (b"--swap-space-gb", b"0"),
+        (b"--kernel-target", b"qwen3.8-flash-next"),
+    ):
+        require(
+            suite._live_cli_values(argv, option) == [expected],
+            "live native262 CLI differs",
+        )
+    require(argv.count(b"--qwen4-qsa") == 1, "physical QSA CLI selector missing")
+    forbidden = {
+        b"--prefix-caching",
+        b"--rope-yarn-factor",
+        b"--rope-theta-override",
+        b"--high-speed-swap",
+        b"--auto-compact",
+    }
+    require(
+        not {item.split(b"=", 1)[0] for item in argv} & forbidden,
+        "native context extension/cache/swap is unsupported",
+    )
+    required = {
+        "QWEN4_PREFILL_WIDE": "4096",
+        "QWEN4_PREFILL_MULTI_CHUNK": "1",
+        "QWEN4_PREFILL_QSA": "1",
+        "QWEN4_PREFILL_QSA_FP8": "0",
+        "CTX_OVERFLOW_TRUNCATE": "0",
+        "DISABLE_SPECULATION": "1",
+        "FAST_LOAD_ROUTED_GROUPS": "1",
+        "FAST_LOAD_ROUTED_GROUPS_EAGER": "1",
+        "QWEN4_BOUNDED_TRANSPOSE_OWNERS": "1",
+        "QWEN4_BOUNDED_TRANSPOSE_OWNER_CAP_MIB": "16",
+    }
+    for key, expected in required.items():
+        require(
+            environment.get(
+                ("ATLAS_" + key).encode(), environment.get(("FLUX_" + key).encode())
+            )
+            == expected.encode(),
+            "live native262 environment differs",
+        )
+    for key in (
+        "QWEN4_PREFILL_WIDE",
+        "QWEN4_PREFILL_QSA_FP8",
+        "CTX_OVERFLOW_TRUNCATE",
+        "FAST_LOAD_ROUTED_GROUPS",
+        "FAST_LOAD_ROUTED_GROUPS_EAGER",
+        "QWEN4_BOUNDED_TRANSPOSE_OWNERS",
+        "QWEN4_BOUNDED_TRANSPOSE_OWNER_CAP_MIB",
+    ):
+        for prefix in ("ATLAS_", "FLUX_"):
+            require(
+                environment.get((prefix + key).encode()) == required[key].encode(),
+                "both live selector aliases must equal the successor contract",
+            )
+    for key in (
+        "ROPE_YARN_FACTOR",
+        "ROPE_THETA_OVERRIDE",
+        "PREFIX_CACHE",
+        "HIGH_SPEED_SWAP",
+    ):
+        require(
+            environment.get(
+                ("ATLAS_" + key).encode(), environment.get(("FLUX_" + key).encode())
+            )
+            in (None, b"0"),
+            "native context extension/cache/swap is enabled",
+        )
+    root = os.open(proc / "root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        tokenizer = suite._open_process_file(root, "/models/tokenizer.json")
+        try:
+            observed_hash, _ = suite._hash_regular_fd(
+                tokenizer, "native262 tokenizer", MAX_STREAM
+            )
+            require(
+                observed_hash == TOKENIZER_SHA256, "mounted tokenizer oracle differs"
+            )
+        finally:
+            os.close(tokenizer)
+    finally:
+        os.close(root)
+    return {
+        "tokenizer_sha256": observed_hash,
+        "controls": required,
+        "argv_sha256": digest(b"\0".join(argv)),
+        "environment_sha256": digest(environ),
+    }
+
+
+def engagement_snapshot(parts):
+    """Preserve original stream bytes and reject partial records before joining."""
+    require(
+        type(parts) is list
+        and 1 <= len(parts) <= 2
+        and all(type(part) is bytes and (not part or part.endswith(b"\n")) for part in parts),
+        "complete original server streams required for owner16 census",
+    )
+    require(
+        0 < sum(len(part) for part in parts) <= 32 * 1024 * 1024,
+        "owner16 complete server streams exceed the frozen census bound",
+    )
+    return b"".join(parts)
+
+
+@contextmanager
+def server(args, plan, recipe):
+    """Use the pinned lifecycle's ownership model with the exact QSA launch."""
+    lifecycle = args.lifecycle
+    model = "flux-native262k-" + secrets.token_hex(16)
+    environment = dict(recipe)
+    environment["ATLAS_DISABLE_SPECULATION"] = "1"
+    argv = [
+        plan["in_container_binary_path"],
+        "serve",
+        "--no-tui",
+        "--model-from-path",
+        "/models",
+        "--model-name",
+        model,
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        str(args.container_port),
+        "--kernel-target",
+        "qwen3.8-flash-next",
+        "--qwen4-qsa",
+        "--max-seq-len",
+        "262144",
+        "--max-prefill-tokens",
+        "4096",
+        "--kv-cache-dtype",
+        "bf16",
+        "--max-batch-size",
+        "1",
+        "--max-num-seqs",
+        "1",
+        "--block-size",
+        "16",
+        "--enable-prefix-caching",
+        "false",
+        "--ssm-cache-slots",
+        "0",
+        "--swap-space-gb",
+        "0",
+    ]
+    command = [
+        "docker",
+        "exec",
+        args.container_id,
+        "/usr/bin/env",
+        *[key + "=" + value for key, value in sorted(environment.items())],
+        *argv,
+    ]
+    # The suite owns these captured streams; engine output must never disappear.
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+    pid = pidfd = proof = None
+    try:
+        deadline = time.monotonic() + 1800
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "server launcher exited before readiness")
+            if pid is None:
+                pid = lifecycle.find_pid(args, model)
+                if pid is not None:
+                    pidfd = lifecycle.claim_pid(args, pid, plan)
+            if pid is not None:
+                try:
+                    lifecycle.request(args, "GET", "/health", timeout=2)
+                    lifecycle.request(args, "GET", "/health", timeout=2)
+                    proof = args.suite.verify_live_server(
+                        args.suite.native_context_request(plan, GATE, pid),
+                        plan,
+                        args.identities,
+                    )
+                    break
+                except (
+                    ConnectionError,
+                    TimeoutError,
+                    OSError,
+                    http.client.HTTPException,
+                ):
+                    pass
+            time.sleep(0.1)
+        require(proof is not None, "fresh server readiness deadline expired")
+        yield model, proof, pidfd
+        require(
+            args.suite.verify_live_server(
+                args.suite.native_context_request(plan, GATE, pid),
+                plan,
+                args.identities,
+            )
+            == proof,
+            "server identity changed during the arm",
+        )
+    finally:
+        try:
+            if pidfd is None:
+                candidate = lifecycle.find_pid(args, model)
+                if candidate is not None:
+                    pidfd = lifecycle.claim_pid(args, candidate, plan)
+            if pidfd is not None:
+                if not select.select([pidfd], [], [], 0)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                if not select.select([pidfd], [], [], 10)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    require(
+                        bool(select.select([pidfd], [], [], 5)[0]),
+                        "server survived cleanup",
+                    )
+                    raise ValueError("server required forced cleanup")
+            process.wait(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if pidfd is not None:
+                os.close(pidfd)
+
+
+def validate_logs(endpoint, raw, expected):
+    logs = raw.decode("utf-8", "strict")
+    require(
+        "Qwen4 QSA physical side cache initialized" in logs,
+        "physical QSA side cache was not engaged",
+    )
+    terminal_chunks = set()
+    for line in logs.splitlines():
+        if "QWEN4_PREFILL_QSA_CHUNK_RECEIPT" not in line:
+            continue
+        match = QSA_RECEIPT.search(line)
+        require(match is not None, "malformed BF16 QSA chunk receipt")
+        selector, start, rows, end, chunk, tile, core = match.groups()
+        start, rows, end, chunk, tile = map(int, (start, rows, end, chunk, tile))
+        require(
+            selector == "ATLAS_QWEN4_PREFILL_QSA"
+            and chunk == CHUNK
+            and tile == 10
+            and core == "qsa_sparse_bf16_non_bit_exact"
+            and start % CHUNK == 0
+            and 0 < rows < CHUNK
+            and end == start + rows
+            and end <= CONTEXT,
+            "BF16 QSA chunk receipt geometry or core differs",
+        )
+        terminal_chunks.add((start, rows, end))
+    for target in (*TARGETS, 262143):
+        require(
+            (
+                ((target - 1) // CHUNK) * CHUNK,
+                target - ((target - 1) // CHUNK) * CHUNK,
+                target,
+            ) in terminal_chunks,
+            "terminal BF16 QSA receipt missing",
+        )
+    require(
+        "core=qsa_sparse_e4m3_" not in logs, "quantized sparse-QSA operands observed"
+    )
+    require(
+        FATAL_PATTERN.search(logs) is None,
+        "unsafe server log marker",
+    )
+    return endpoint.validate_final_dispatch_census(
+        logs, expected, rejected_prompt_tokens=CONTEXT
+    )
+
+
+def run(args):
+    suite, lifecycle, endpoint = args.suite, args.lifecycle, args.endpoint
+    suite.validate_inherited_receipt_fd(args.receipt_fd)
+    require(
+        args.receipt_fd != args.raw_log_fd and args.raw_log_fd >= 3,
+        "inherited FDs alias",
+    )
+    image_snapshot = lifecycle.inspect_container(args, suite)
+    plan, recipe = suite.load_native_context_recipe(args, image_snapshot[0], GATE)
+    require(plan["recipe_sha256"] == RECIPE_SHA256, "successor recipe hash differs")
+    runtime = suite.normalized_absolute(args.runtime_dir, "native262 runtime")
+    info = runtime.stat()
+    require(
+        info.st_uid == os.getuid() and info.st_mode & 0o077 == 0,
+        "runtime is not private",
+    )
+    runtime_identity = suite.directory_identity_sha256(runtime, "native262 runtime")
+    lifecycle.make_directory(suite, runtime, ["native262k-w4096-owner16"])
+    base = "native262k-w4096-owner16"
+    private = suite.open_directory_chain(runtime / base, "native262 private artifacts")
+    try:
+        metadata = os.fstat(private)
+        require(
+            metadata.st_uid == os.getuid() and metadata.st_mode & 0o077 == 0,
+            "native262 artifact directory is not private",
+        )
+    finally:
+        os.close(private)
+    streams = Streams()
+    try:
+        journal = Journal(args, runtime, base)
+    except BaseException:
+        streams.close()
+        raise
+    proofs, cases, expected_counts, seen = [], [], {}, set()
+    stream_artifacts = []
+    result = None
+    try:
+        with (
+            kernel_window(args, runtime, base) as kernel,
+            server(args, plan, recipe) as (model, proof, pidfd),
+        ):
+            proofs.append(proof)
+            controls = native_process(args, proof)
+            engagement_before = args.engagement.engagement_census(
+                engagement_snapshot(streams.snapshot())
+            )
+
+            def call(label, method, route, body=None, request_id=None):
+                require(
+                    not select.select([pidfd], [], [], 0)[0], "native262 server exited"
+                )
+                reply = observed(args, journal, label, method, route, body, request_id)
+                require(
+                    not select.select([pidfd], [], [], 0)[0],
+                    "native262 server exited during request",
+                )
+                return reply
+
+            def json_call(label, route, body):
+                status, raw, _ = call(label, "POST", route, body)
+                require(status == 200, "native262 request failed")
+                return suite.strict_json_loads(raw, "native262 response")
+
+            components = {}
+            for name, text in TEXTS.items():
+                value = json_call("tokenize." + name, "/tokenize", {"prompt": text})
+                require(
+                    type(value) is dict and set(value) == {"tokens", "count"},
+                    "tokenize shape differs",
+                )
+                vector = tokens(value["tokens"])
+                require(
+                    type(value["count"]) is int and value["count"] == len(vector),
+                    "tokenize count differs",
+                )
+                components[name] = vector
+            prompts, retrievals = {}, []
+
+            def complete(label, prompt, budget, forced=False):
+                body = completion_body(model, prompt, budget, forced)
+                value = json_call(label, "/v1/completions", body)
+                row = measurement(args, value, model, prompt, budget, forced)
+                require(row["response_id"] not in seen, "response ID reused")
+                seen.add(row["response_id"])
+                expected_counts[len(prompt)] = expected_counts.get(len(prompt), 0) + 1
+                cases.append(
+                    {"case": label, "request_prompt_sha256": token_hash(prompt), **row}
+                )
+                return row
+
+            for target in TARGETS:
+                prompt, positions = assemble(target, components)
+                require(
+                    token_hash(prompt) == EXPECTED_PROMPT_SHA256[target],
+                    "calibrated prompt hash differs",
+                )
+                prompts[target] = prompt
+                row = complete(
+                    f"retrieval-{target}", prompt, 64 if target == 262080 else 96
+                )
+                require(
+                    row["completion_tokens"] >= 2, "retrieval did not exercise decode"
+                )
+                answers = passkey_answers(row["text"])
+                retrievals.append(
+                    {
+                        "prompt_tokens": target,
+                        "answers": answers,
+                        "expected": list(PASSKEYS.values()),
+                    }
+                )
+                cases[-1]["needle_positions"] = positions
+            prompt = prompts[262080]
+            repeat = complete("retrieval-262080-repeat", prompt, 64)
+            for key in ("text", "token_ids", "finish_reason", "completion_tokens"):
+                require(
+                    repeat[key] == cases[2][key], "repeated greedy retrieval changed"
+                )
+            fill = complete("262080-plus-64", prompt, 64, True)
+            require(
+                fill["total_tokens"] == CONTEXT
+                and passkey_answers(fill["text"]) == list(PASSKEYS.values()),
+                "forced native endpoint fill lost retrieval or geometry",
+            )
+            control = complete("262080-plus-1", prompt, 1, True)
+            boundary = boundary_prompt(prompt, components)
+            accepted = complete("262143-plus-1", boundary, 1, True)
+            require(
+                accepted["total_tokens"] == CONTEXT
+                and accepted["token_ids"] == control["token_ids"],
+                "native boundary output differs from control",
+            )
+            overflow = boundary + [components["filler"][0]]
+            require(len(overflow) == CONTEXT, "overflow prompt geometry differs")
+
+            def metrics(label):
+                status, raw, _ = call(label, "GET", "/metrics")
+                require(status == 200, "metrics endpoint failed")
+                return {
+                    "http_status": status,
+                    "values": endpoint.parse_prometheus_integer_metrics(raw),
+                    "body_sha256": digest(raw),
+                    "body_bytes": len(raw),
+                }
+
+            before = metrics("overflow.metrics.before")
+            offsets = streams.snapshot()
+            request_id = "qualify_overflow_" + secrets.token_hex(16)
+            status, raw, headers = call(
+                "262144-plus-1-rejection",
+                "POST",
+                "/v1/completions",
+                completion_body(model, overflow, 1, True),
+                request_id,
+            )
+            rejected = endpoint.validate_context_length_rejection(
+                status, suite.strict_json_loads(raw, "overflow"), CONTEXT, 1, CONTEXT
+            )
+            endpoint.validate_correlated_request_id(headers, request_id)
+            time.sleep(0.02)
+            after = metrics("overflow.metrics.after")
+            current = streams.snapshot()
+            delta = b"\n".join(
+                right[len(left) :] for left, right in zip(offsets, current)
+            )
+            no_dispatch = endpoint.validate_no_scheduler_dispatch(
+                delta.decode("utf-8", "strict"), before, after, request_id
+            )
+            status, _, _ = call("post-overflow.health", "GET", "/health")
+            require(status == 200, "post-overflow health failed")
+            canary = complete("post-overflow-262080-plus-1", prompt, 1, True)
+            require(
+                canary["token_ids"] == control["token_ids"],
+                "post-overflow control output changed",
+            )
+            recovered = endpoint.validate_post_canary_metrics(
+                after,
+                metrics("overflow.metrics.recovered"),
+                prompt_tokens=262080,
+                prefill_chunks=64,
+            )
+            require(
+                native_process(args, proof) == controls,
+                "native262 controls changed during requests",
+            )
+        logs = streams.snapshot()
+        census = validate_logs(endpoint, b"\n".join(logs), expected_counts)
+        engagement_after = args.engagement.engagement_census(engagement_snapshot(logs))
+        require(
+            engagement_before["receipt_fields"] == engagement_after["receipt_fields"]
+            and engagement_before["destination_owners"] == engagement_after["destination_owners"],
+            "owner16 engagement geometry changed",
+        )
+        current_image = lifecycle.inspect_container(args, suite)
+        require(current_image == image_snapshot, "container release inputs changed")
+        require(
+            suite.load_native_context_recipe(args, current_image[0], GATE) == (plan, recipe),
+            "selected native recipe inputs changed",
+        )
+        require(
+            suite.directory_identity_sha256(runtime, "native262 runtime")
+            == runtime_identity,
+            "native262 runtime identity changed",
+        )
+        result = {
+            "kv_dtype": "bf16",
+            "max_seq_len": CONTEXT,
+            "prefill_chunk_tokens": CHUNK,
+            "owner16_engagement": {
+                "helper_sha256": ENGAGEMENT_SHA256,
+                "before_generation": engagement_before,
+                "after_cleanup": engagement_after,
+            },
+            "passkeys_per_prompt": 3,
+            "retrievals": retrievals,
+            "boundary": {"prompt_tokens": 262143, "admitted": True},
+            "overflow": {"prompt_tokens": CONTEXT, "admitted": False},
+            "qsa_terminal_chunks_exact": True,
+            "cases": cases,
+            "process_bindings": proofs,
+            "live_controls": controls,
+            "overflow_rejection": rejected,
+            "overflow_no_dispatch": no_dispatch,
+            "post_rejection_metrics": recovered,
+            "final_dispatch_census": census,
+            "lifecycle_sha256": LIFECYCLE_SHA256,
+            "endpoint_helper_sha256": ENDPOINT_SHA256,
+            "kernel_window": kernel,
+        }
+    finally:
+        try:
+            final_streams = streams.snapshot()
+            if result is not None:
+                require(
+                    final_streams == logs, "server streams changed after final census"
+                )
+            for index, raw in enumerate(final_streams):
+                path = f"{base}/server-stream-{index}.log"
+                descriptor = suite.create_beneath(
+                    runtime, path, "native262 complete server stream", 0o400
+                )
+                try:
+                    suite.write_all(descriptor, raw)
+                    os.fsync(descriptor)
+                    suite.assert_path_identity(
+                        runtime, path, descriptor, "native262 complete server stream"
+                    )
+                finally:
+                    os.close(descriptor)
+                stream_artifacts.append(
+                    {"artifact": path, "sha256": digest(raw), "bytes": len(raw)}
+                )
+        finally:
+            streams.close()
+            os.fsync(journal.fd)
+            os.close(journal.fd)
+    # Reopen and validate the sealed journal only after exact server cleanup.
+    journal.fd = suite.open_beneath(
+        runtime,
+        journal.path,
+        "native262 journal",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        result["response_journal"] = journal.seal()
+    finally:
+        os.close(journal.fd)
+    result["server_streams"] = stream_artifacts
+    validator = {
+        "schema": "flux-r15-gate-validator/1",
+        "gate": GATE,
+        "status": "PASS",
+        "release_qualified": True,
+        "container_id": args.container_id,
+        "run_id": args.run_id,
+        "raw": result,
+    }
+    raw = suite.canonical_bytes(validator)
+    require(
+        len(raw) <= suite.MAX_GATE_RECEIPT_BYTES,
+        "native262 validator exceeds its bound",
+    )
+    path = base + "/validator.json"
+    descriptor = suite.create_beneath(runtime, path, "native262 validator", 0o400)
+    try:
+        suite.write_all(descriptor, raw)
+        os.fsync(descriptor)
+        suite.assert_path_identity(runtime, path, descriptor, "native262 validator")
+    finally:
+        os.close(descriptor)
+    evidence = {
+        "kv_dtype": "bf16",
+        "max_seq_len": CONTEXT,
+        "retrieval_prompt_tokens": list(TARGETS),
+        "boundary_prompt_tokens": 262143,
+        "overflow_prompt_tokens": CONTEXT,
+        "passkeys_per_prompt": 3,
+        "all_retrieval_answers_exact": True,
+        "boundary_admission_pass": True,
+        "overflow_rejection_pass": True,
+        "qsa_terminal_chunks_exact": True,
+        "prefill_chunk_tokens": CHUNK,
+        "destination_owner_cap_mib": 16,
+        "source_group_cap_mib": 64,
+        "owner16_engagement_exact": True,
+        "engagement_helper_sha256": ENGAGEMENT_SHA256,
+        "validator_artifact": path,
+        "validator_receipt_sha256": digest(raw),
+    }
+    receipt = {
+        "schema": "flux-r15-container-gate-receipt/1",
+        "gate": GATE,
+        "status": "PASS",
+        "release_qualified": True,
+        "execution_scope": "immutable-container",
+        "image_id": args.image_id,
+        "image_digest": args.image_digest,
+        "container_id": args.container_id,
+        "run_id": args.run_id,
+        "evidence": evidence,
+    }
+    suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+    os.fsync(args.receipt_fd)
+    return receipt
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in (
+        "container-id",
+        "image-id",
+        "image-digest",
+        "base-url",
+        "run-id",
+        "receipt-fd",
+        "raw-log-fd",
+        "runtime-dir",
+        "suite-program",
+        "suite-sha256",
+        "lifecycle-program",
+        "endpoint-program",
+        "engagement-program",
+    ):
+        parser.add_argument(
+            "--" + name, required=True, type=int if name.endswith("-fd") else str
+        )
+    parser.add_argument("--container-port", type=int, default=8888)
+    args = parser.parse_args(argv)
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.container_id) is not None,
+        "container ID differs",
+    )
+    for value in (args.image_id, args.image_digest):
+        require(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None,
+            "immutable image identity differs",
+        )
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.run_id) is not None,
+        "run ID differs",
+    )
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.suite_sha256) is not None
+        and set(args.suite_sha256) != {"0"},
+        "suite hash differs",
+    )
+    require(1 <= args.container_port <= 65535, "container port differs")
+    args.lifecycle = load_checked(
+        args.lifecycle_program, LIFECYCLE_SHA256, "_r16_native262_lifecycle"
+    )
+    args.lifecycle.verify_parent_suite(args.suite_sha256)
+    args.suite = args.lifecycle.load_module(
+        args.suite_program, args.suite_sha256, "_r16_native262_suite"
+    )
+    require(
+        type(getattr(args.suite, "REQUIRED_GATES", None)) is tuple
+        and GATE in args.suite.REQUIRED_GATES,
+        "successor gate requires explicit sealed-suite registration",
+    )
+    args.base_url = args.suite.validate_base_url(args.base_url)
+    require(
+        callable(getattr(args.suite, "_live_listener_identity", None)),
+        "live listener broker required",
+    )
+    args.endpoint = load_checked(
+        args.endpoint_program, ENDPOINT_SHA256, "_r16_native262_endpoint"
+    )
+    args.engagement = load_checked(
+        args.engagement_program, ENGAGEMENT_SHA256, "_native262_w4096_owner16_engagement"
+    )
+    args.identities = {
+        name: getattr(args, name)
+        for name in ("container_id", "image_id", "image_digest", "base_url", "run_id")
+    }
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        print(
+            GATE + ": qualification failed (" + type(error).__name__ + ")",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

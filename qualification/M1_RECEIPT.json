@@ -1,0 +1,81 @@
+{
+  "milestone": "Milestone 1 \u2014 True Concurrency (R3) Live Qualification & Telemetry Attestation",
+  "verdict": "PASS",
+  "timestamp_utc": "2026-10-24T12:35:59.149284+00:00",
+  "hardware": "NVIDIA DGX Spark (GB10, SM121a, 128 GB unified memory)",
+  "model": "Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+  "binary": "target/release/flux-server",
+  "recipe": "flux-qwen4-native-concurrency-c8-owner16.env",
+  "artifacts": {
+    "server_log": "qualification/concurrency/server.log",
+    "server_log_sha256": "538923a6637fe1d0c1449228b492a2d708a5b609210b209eb8411b21ec5aada9",
+    "report_json": "qualification/concurrency/report.json",
+    "report_json_sha256": "7f4ff510de69318e2c71efbbd1e45a496bce410b69c208213c89903c978aa4e6",
+    "memory_samples_csv": "qualification/concurrency/memory_samples.csv",
+    "memory_samples_sha256": "5f36a96d04aca45e1934b8a2c81552895184576d2b98bb93115928d5222ae945"
+  },
+  "parity_summary": {
+    "c1_repeat_parity": true,
+    "c2_same_parity": true,
+    "c2_diff_parity": true,
+    "c4_parity": true,
+    "c8_parity": true,
+    "cancel_reuse_parity": true,
+    "post_cancel_c1_sanity": true
+  },
+  "throughput_table": {
+    "C1": {
+      "mean_ttft_s": 0.3008916199905798,
+      "max_ttft_s": 0.3008916199905798,
+      "mean_per_req_decode_tok_s": 45.45876524457266,
+      "sum_per_req_decode_tok_s": 45.45876524457266,
+      "agg_decode_tok_s": 45.81670827799449,
+      "agg_tok_s": 41.36194195709206,
+      "parity": true
+    },
+    "C2": {
+      "mean_ttft_s": 0.5557618714519776,
+      "max_ttft_s": 0.6150742459576577,
+      "mean_per_req_decode_tok_s": 26.331677147398047,
+      "sum_per_req_decode_tok_s": 52.66335429479609,
+      "agg_decode_tok_s": 49.245498483658345,
+      "agg_tok_s": 44.95254726188998,
+      "parity": true
+    },
+    "C4": {
+      "mean_ttft_s": 1.1098666500183754,
+      "max_ttft_s": 1.2306619150331244,
+      "mean_per_req_decode_tok_s": 14.03270544438815,
+      "sum_per_req_decode_tok_s": 56.1308217775526,
+      "agg_decode_tok_s": 52.63150650909729,
+      "agg_tok_s": 47.77142703955386,
+      "parity": true
+    },
+    "C8": {
+      "mean_ttft_s": 2.1082967774855206,
+      "max_ttft_s": 3.1563654630444944,
+      "mean_per_req_decode_tok_s": 6.781777743536745,
+      "sum_per_req_decode_tok_s": 54.25422194829396,
+      "agg_decode_tok_s": 49.9021382520574,
+      "agg_tok_s": 46.13600743864222,
+      "parity": true
+    }
+  },
+  "telemetry": {
+    "bounded_transpose_owners_ready_count": 48,
+    "expected_bounded_transpose_owners_ready_count": 48,
+    "batched_k5_verify_frame_count": 560,
+    "batched_k5_refused_count": 0,
+    "serial_fallback_count": 0,
+    "serial_batch_frame_count": 0,
+    "serial_frame_first_count": 0,
+    "qwen4_batched_k5_engaged": true,
+    "qwen4_batch_plan_route": "\u001b[2m2026-10-24T12:32:49.648922Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mflux_server::main_modules::qwen4_concurrency\u001b[0m\u001b[2m:\u001b[0m QWEN4_BATCH_PLAN widths=C2-C8 route=serial reason=target_only: native Qwen4 decode is target-only; disable speculative decoding; to batch natively, disable speculative decoding"
+  },
+  "memory_compliance": {
+    "measured_floor_mib": 9712,
+    "required_floor_mib": 6656,
+    "compliance": true,
+    "watchdog_kills": 0
+  }
+}

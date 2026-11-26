@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""
+lil-bench — Built-in Local-Inference-Lab (llm-inference-bench v0.7.9) Runner & Card Generator for Flux Engine.
+
+Supports:
+  1. Presets replicating the exact Flux Engine evaluation suites:
+     - lil-bench matrix      : All-context prefill + decode matrix (0,8k,16k,32k,64k,128k) at C=1 (or custom --concurrency)
+     - lil-bench concurrency : Multi-stream concurrency sweep (default C=1,2,4,8 across 0,8k,32k with --show-capacity-limited-values)
+     - lil-bench estonia     : Estonia 136.6K long-context needle-in-a-haystack & coherent synthesis test (--test-profile estonia)
+     - lil-bench prefill     : Dedicated long-context prefill sweep (8k,16k,32k,64k,128k)
+     - lil-bench coding      : Coding peak generation throughput benchmark (--coding-peak, 5 runs x 2000 tokens)
+     - lil-bench accuracy    : Accuracy suite (gsm8k, mmlu-pro, gpqa-diamond; gpqa-diamond skipped in 'all' when HF_HUB_OFFLINE=1 unless locally cached)
+     - lil-bench suite       : Full unified evaluation (matrix + coding + concurrency + estonia + visual & markdown cards)
+     - lil-bench card        : Generate dark-mode SVG/PNG benchmark card + Markdown MODEL_CARD.md from any lil-bench JSON output(s)
+  2. Direct pass-through of any raw llm_decode_bench.py flags (e.g. `lil-bench --test-profile estonia --concurrency 1,2,4`).
+  3. Privacy-First defaults & opt-in/opt-out controls (default: FLUX_OPT_OUT=all):
+     - FLUX_OPT_OUT=all|telemetry|host|logs|none (default: all)
+     - --opt-out-telemetry / --no-upload (0 outbound calls; all runs are 100% air-gapped local)
+     - --opt-out-host-info (enabled by default; redacts host/GPU/fabric diagnostics & server URL from outputs & cards)
+     - --opt-out-prompt-logs (enabled by default; redacts prompt/completion text from JSON artifacts)
+     - --include-host-info / FLUX_INCLUDE_HOST_INFO=1 (opt-in to retain raw host/GPU diagnostics)
+     - --include-prompt-logs / FLUX_INCLUDE_PROMPT_LOGS=1 (opt-in to retain raw prompt/completion text)
+"""
+
+import datetime as dt
+import glob
+import html
+import json
+import math
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+def _resolve_lil_root() -> Path:
+    env_dir = os.environ.get("LIL_BENCH_DIR", "")
+    if env_dir and Path(env_dir).is_dir():
+        return Path(env_dir)
+    for cand in (
+        Path("/opt/flux/llm-inference-bench"),
+        Path(__file__).resolve().parent / "llm-inference-bench",
+        Path("/opt/flux/repro-kit/llm-inference-bench"),
+    ):
+        if (cand / "llm_decode_bench.py").is_file():
+            return cand
+    return Path(env_dir or "/opt/flux/llm-inference-bench")
+
+
+def _resolve_out_path(path_s: str) -> Path:
+    p = Path(path_s)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if os.access(p.parent, os.W_OK):
+            return p
+    except OSError:
+        pass
+    fallback = Path("/tmp/flux-results") / p.name
+    fallback.parent.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+LIL_ROOT = _resolve_lil_root()
+LIL_SCRIPT = LIL_ROOT / "llm_decode_bench.py"
+os.environ.setdefault("LLM_BENCH_NO_UPDATE_CHECK", "1")
+
+STABLE_ENGINE_VERSION = "1.0.2"
+
+
+def engine_version() -> str:
+    """Return the version stamped into this image, or the stable fallback."""
+    return os.environ.get("FLUX_ENGINE_VERSION", "").strip() or STABLE_ENGINE_VERSION
+
+
+def get_opt_outs(argv: List[str]) -> Tuple[Dict[str, bool], List[str]]:
+    # Privacy-First by Default: telemetry, host identifiers, and prompt logs are all opted-out/redacted by default
+    env_raw = os.environ.get("FLUX_OPT_OUT", "all").lower()
+    tokens = {t.strip() for t in env_raw.replace(";", ",").split(",") if t.strip()}
+    none_out = ("none" in tokens) or ("0" in tokens) or ("false" in tokens)
+    all_out = (not none_out) and (("all" in tokens) or ("1" in tokens) or ("true" in tokens) or not tokens)
+    opts = {
+        "telemetry": True,  # Always 100% air-gapped local execution
+        "host": all_out or ("host" in tokens) or ("host-info" in tokens),
+        "logs": all_out or ("logs" in tokens) or ("prompts" in tokens) or ("prompt-logs" in tokens),
+    }
+    if os.environ.get("FLUX_INCLUDE_HOST_INFO", "") == "1":
+        opts["host"] = False
+    if os.environ.get("FLUX_INCLUDE_PROMPT_LOGS", "") == "1":
+        opts["logs"] = False
+    cleaned: List[str] = []
+    for arg in argv:
+        if arg in ("--opt-out-telemetry", "--no-upload", "--offline"):
+            opts["telemetry"] = True
+        elif arg == "--opt-out-host-info":
+            opts["host"] = True
+        elif arg == "--opt-out-prompt-logs":
+            opts["logs"] = True
+        elif arg in ("--opt-out-all", "--privacy-first"):
+            opts["telemetry"] = True
+            opts["host"] = True
+            opts["logs"] = True
+        elif arg == "--include-host-info":
+            opts["host"] = False
+        elif arg == "--include-prompt-logs":
+            opts["logs"] = False
+        else:
+            cleaned.append(arg)
+    return opts, cleaned
+
+
+def auto_detect_live_model(host: str, port: str) -> str:
+    env_model = os.environ.get("FLUX_MODEL_ID", "")
+    if env_model:
+        return env_model
+    try:
+        url = f"http://{host}:{port}/v1/models"
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            models = data.get("data", [])
+            if models and isinstance(models[0], dict) and models[0].get("id"):
+                return str(models[0]["id"])
+    except Exception:
+        pass
+    # No reachable /v1/models and no FLUX_MODEL_ID: let the server pick its single served
+    # model instead of sending (and labelling cards with) an unrelated hardcoded id.
+    return "default"
+
+
+ACCURACY_MAX_TOKENS_CAP = 131072
+ACCURACY_PROMPT_HEADROOM = 4096
+
+
+def _server_context_len(host: str, port: str) -> Optional[int]:
+    """Best-effort max context of the served model from /v1/models (max_model_len /
+    context_length / max_seq_len), else FLUX_MAX_SEQ_LEN."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/v1/models", timeout=3.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        for m in data.get("data", []) or []:
+            for key in ("max_model_len", "context_length", "max_seq_len", "max_context_length"):
+                if isinstance(m, dict) and isinstance(m.get(key), int) and m[key] > 0:
+                    return int(m[key])
+    except Exception:
+        pass
+    env = os.environ.get("FLUX_MAX_SEQ_LEN", "")
+    return int(env) if env.isdigit() and int(env) > 0 else None
+
+
+def _accuracy_max_tokens(host: str, port: str) -> int:
+    """Generation budget for accuracy suites: the server context minus prompt headroom,
+    capped at ACCURACY_MAX_TOKENS_CAP, so requests are not rejected as too long."""
+    ctx = _server_context_len(host, port)
+    if ctx is None:
+        return ACCURACY_MAX_TOKENS_CAP
+    return max(1024, min(ACCURACY_MAX_TOKENS_CAP, ctx - ACCURACY_PROMPT_HEADROOM))
+
+
+_LOG_TEXT_KEYS = (
+    "output_excerpt",
+    "content_preview",
+    "content",
+    "reasoning",
+    "reasoning_content",
+    "final_answer",
+    "prompt",
+    "question",
+    "response",
+    "response_text",
+    "raw_response",
+    "extracted_answer",
+)
+_SAFE_DIAG_ARG_KEYS = (
+    "max_tokens",
+    "kv_budget",
+    "duration",
+    "concurrency",
+    "contexts",
+    "token_targeting",
+    "test_profile",
+)
+
+
+def _scrub_text_fields(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        for k in _LOG_TEXT_KEYS:
+            if k in obj and obj[k] is not None:
+                obj[k] = "[REDACTED_BY_OPT_OUT_PROMPT_LOGS]"
+    return obj
+
+
+def sanitize_json_file(path: Path, opts: Dict[str, bool]) -> None:
+    if not path.is_file():
+        return
+    if not (opts.get("host") or opts.get("logs")):
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        if opts.get("host") and isinstance(data, dict):
+            if "hardware" in data and isinstance(data["hardware"], dict):
+                data["hardware"]["hostname"] = "REDACTED"
+                data["hardware"]["driver_version"] = "REDACTED"
+            if "system_info" in data and isinstance(data["system_info"], dict):
+                data["system_info"] = {"redacted": True}
+            if "startup_diagnostics" in data and isinstance(data["startup_diagnostics"], dict):
+                raw_args = data["startup_diagnostics"].get("args")
+                safe_args = (
+                    {k: raw_args[k] for k in _SAFE_DIAG_ARG_KEYS if k in raw_args}
+                    if isinstance(raw_args, dict)
+                    else {}
+                )
+                data["startup_diagnostics"] = {"redacted": True, "args": safe_args}
+            for host_key in ("hardware_run_summary", "p2pmark", "amd_fabric", "nvidia_p2p_override"):
+                if host_key in data:
+                    data[host_key] = {"redacted": True}
+            if isinstance(data.get("metadata"), dict):
+                if "server" in data["metadata"]:
+                    data["metadata"]["server"] = "REDACTED"
+                if data["metadata"].get("dataset_path"):
+                    data["metadata"]["dataset_path"] = Path(str(data["metadata"]["dataset_path"])).name
+            if isinstance(data.get("prefill"), dict):
+                for cell in data["prefill"].values():
+                    if isinstance(cell, dict) and "hardware_summary" in cell:
+                        cell["hardware_summary"] = {"redacted": True}
+        if opts.get("logs") and isinstance(data, dict):
+            for key in ("raw_responses", "samples", "prompts", "completions"):
+                if key in data:
+                    data[key] = "[REDACTED_BY_OPT_OUT_PROMPT_LOGS]"
+            if "estonia_profile" in data and isinstance(data["estonia_profile"], dict):
+                if "response_text" in data["estonia_profile"]:
+                    data["estonia_profile"]["response_text"] = "[REDACTED_BY_OPT_OUT_PROMPT_LOGS]"
+            if isinstance(data.get("coding_peak"), dict):
+                cp = data["coding_peak"]
+                if "prompt" in cp:
+                    cp["prompt"] = "[REDACTED_BY_OPT_OUT_PROMPT_LOGS]"
+                if isinstance(cp.get("samples"), list):
+                    for sample in cp["samples"]:
+                        _scrub_text_fields(sample)
+            if isinstance(data.get("runs"), list):
+                for run_entry in data["runs"]:
+                    _scrub_text_fields(run_entry)
+            if isinstance(data.get("wrong_runs"), list):
+                scrubbed_wrong = []
+                for item in data["wrong_runs"]:
+                    if isinstance(item, dict):
+                        scrubbed_wrong.append(_scrub_text_fields(item))
+                    else:
+                        scrubbed_wrong.append("[REDACTED_BY_OPT_OUT_PROMPT_LOGS]")
+                data["wrong_runs"] = scrubbed_wrong
+            if isinstance(data.get("prefill_scout"), dict):
+                _scrub_text_fields(data["prefill_scout"])
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SVG / PNG & Markdown Card Generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_run(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Map llm-inference-bench v0.7.x JSON (metadata / prefill{ctx} / results[].aggregate_tps)
+    onto the legacy keys the card renderer reads. Keys already present are left untouched."""
+    meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+    diag = d.get("startup_diagnostics") if isinstance(d.get("startup_diagnostics"), dict) else {}
+    args = diag.get("args") if isinstance(diag.get("args"), dict) else {}
+    for key, src in (("model", meta.get("model")), ("benchmark_version", meta.get("version")),
+                     ("timestamp", meta.get("timestamp")), ("duration_s", meta.get("duration_per_test") or args.get("duration")),
+                     ("max_tokens", args.get("max_tokens")), ("kv_budget", args.get("kv_budget"))):
+        if d.get(key) is None and src is not None:
+            d[key] = src
+    if "prefill_Load_Sweep" not in d and isinstance(d.get("prefill"), dict):
+        rows = []
+        for ctx, v in d["prefill"].items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                c = int(ctx)
+            except (TypeError, ValueError):
+                continue
+            rows.append({"target_context": c, "actual_prompt_tokens": v.get("prompt_tokens", c),
+                         "prefill_tok_s": v.get("tok_per_sec"), "ttft_s": v.get("ttft_seconds"),
+                         "cold_ttft_s": v.get("cold_ttft_seconds")})
+        d["prefill_Load_Sweep"] = rows
+    if d.get("decode_prompt_mode") is None:
+        # Benches without the distinct-prompt patch sent one prompt to every stream.
+        multi = any(isinstance(r, dict) and int(r.get("concurrency", 1) or 1) > 1 for r in d.get("results", []) or [])
+        d["decode_prompt_mode"] = meta.get("decode_prompt_mode") or ("shared" if multi else None)
+    for row in d.get("results", []) or []:
+        if not isinstance(row, dict) or "context" in row or "context_tokens" not in row:
+            continue
+        row["context"] = row["context_tokens"]
+        tps = row.get("aggregate_tps")
+        failed = bool(row.get("failure_reason")) or (isinstance(tps, (int, float)) and tps < 0)
+        row["throughput_tok_s"] = None if failed or tps is None else tps
+        row.setdefault("avg_latency_s", row.get("ttft_avg"))
+        row.setdefault("prompt_tokens", row.get("input_seq_len_avg"))
+        row["cell_status"] = (row.get("failure_reason") or "failed") if failed else "ok"
+    if "hardware" not in d:
+        smi = (diag.get("nvidia_smi_query") or {}).get("stdout", "") if isinstance(diag.get("nvidia_smi_query"), dict) else ""
+        parts = [x.strip() for x in str(smi).splitlines()[0].split(",")] if smi else []
+        if len(parts) >= 3:
+            d["hardware"] = {"gpus": [{"name": parts[1]}], "driver_version": parts[2]}
+    return d
+
+
+def _load_runs(paths: List[Path]) -> List[Dict[str, Any]]:
+    runs = []
+    for p in paths:
+        if p.is_file():
+            try:
+                runs.append(_normalize_run(json.loads(p.read_text(encoding="utf-8", errors="replace"))))
+            except Exception:
+                pass
+    return runs
+
+
+def _aggregate_prefill(runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_ctx: Dict[int, List[Dict[str, Any]]] = {}
+    for r in runs:
+        for row in r.get("prefill_Load_Sweep", []) or []:
+            c = int(row.get("target_context", 0))
+            by_ctx.setdefault(c, []).append(row)
+    out = []
+    for c in sorted(by_ctx):
+        rows = by_ctx[c]
+        vals = [x["prefill_tok_s"] for x in rows if x.get("prefill_tok_s") is not None]
+        ttfts = [x["ttft_s"] for x in rows if x.get("ttft_s") is not None]
+        colds = [x["cold_ttft_s"] for x in rows if x.get("cold_ttft_s") is not None]
+        if not vals:
+            continue
+        mean = sum(vals) / len(vals)
+        sd = (sum((v - mean) ** 2 for v in vals) / max(1, len(vals) - 1)) ** 0.5 if len(vals) > 1 else 0.0
+        out.append({
+            "context": c,
+            "actual_prompt_tokens": rows[0].get("actual_prompt_tokens", c),
+            "mean_tok_s": mean,
+            "sd_tok_s": sd,
+            "min_tok_s": min(vals),
+            "max_tok_s": max(vals),
+            "mean_ttft_s": sum(ttfts) / len(ttfts) if ttfts else None,
+            "mean_cold_ttft_s": sum(colds) / len(colds) if colds else None,
+            "n": len(vals),
+        })
+    return out
+
+
+def _aggregate_decode(runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_cell: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    for r in runs:
+        for row in r.get("results", []) or []:
+            key = (int(row.get("concurrency", 1)), int(row.get("context", 0)))
+            by_cell.setdefault(key, []).append(row)
+    out = []
+    for (conc, ctx) in sorted(by_cell):
+        rows = by_cell[(conc, ctx)]
+        vals = [x["throughput_tok_s"] for x in rows if x.get("throughput_tok_s") is not None]
+        lat = [x["avg_latency_s"] for x in rows if x.get("avg_latency_s") is not None]
+        prompts = [x["prompt_tokens"] for x in rows if x.get("prompt_tokens") is not None]
+        status = rows[0].get("cell_status", "ok")
+        if not vals:
+            out.append({
+                "concurrency": conc,
+                "context": ctx,
+                "mean_tok_s": None,
+                "sd_tok_s": None,
+                "mean_lat_s": None,
+                "prompt_tokens": prompts[0] if prompts else ctx,
+                "status": status,
+                "n": len(rows),
+            })
+            continue
+        mean = sum(vals) / len(vals)
+        sd = (sum((v - mean) ** 2 for v in vals) / max(1, len(vals) - 1)) ** 0.5 if len(vals) > 1 else 0.0
+        out.append({
+            "concurrency": conc,
+            "context": ctx,
+            "mean_tok_s": mean,
+            "sd_tok_s": sd,
+            "min_tok_s": min(vals),
+            "max_tok_s": max(vals),
+            "mean_lat_s": sum(lat) / len(lat) if lat else None,
+            "prompt_tokens": prompts[0] if prompts else ctx,
+            "status": status,
+            "n": len(vals),
+        })
+    return out
+
+
+def _fmt_ctx(c: int) -> str:
+    if c == 0:
+        return "0"
+    if c >= 1024 and c % 1024 == 0:
+        return f"{c // 1024}k"
+    if c >= 1000 and c % 1000 == 0:
+        return f"{c // 1000}k"
+    return str(c)
+
+
+def _heat_color(val: Optional[float], vmin: float, vmax: float) -> str:
+    if val is None or math.isnan(val):
+        return "#1f2430"
+    if vmax <= vmin:
+        t = 0.5
+    else:
+        t = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+    stops = [
+        (0.0, (0x1E, 0x3A, 0x5F)),
+        (0.5, (0x0E, 0x74, 0x90)),
+        (1.0, (0x10, 0xB9, 0x81)),
+    ]
+    for i in range(len(stops) - 1):
+        t0, c0 = stops[i]
+        t1, c1 = stops[i + 1]
+        if t0 <= t <= t1:
+            u = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            r = int(c0[0] + u * (c1[0] - c0[0]))
+            g = int(c0[1] + u * (c1[1] - c0[1]))
+            b = int(c0[2] + u * (c1[2] - c0[2]))
+            return f"#{r:02x}{g:02x}{b:02x}"
+    return "#10b981"
+
+
+def generate_cards(out_prefix: Path, json_paths: List[Path], opts: Dict[str, bool], title_override: str = "") -> Dict[str, str]:
+    runs = _load_runs(json_paths)
+    if not runs:
+        print("[lil-bench] No valid JSON files found to generate card.", file=sys.stderr)
+        return {}
+
+    built_version = engine_version()
+    prefill = _aggregate_prefill(runs)
+    decode = _aggregate_decode(runs)
+    r0 = runs[0]
+    model = title_override or r0.get("model") or os.environ.get("FLUX_MODEL_ID") or "unknown model"
+    bench_ver = r0.get("benchmark_version", "0.7.9")
+    hw = r0.get("hardware", {}) or {}
+    gpus = hw.get("gpus") or [{}]
+    gpu_name = "REDACTED-GPU" if opts.get("host") else gpus[0].get("name", "NVIDIA GB10")
+    gpu_mem_mb = gpus[0].get("memory_total_mb", 122880)
+    driver = "REDACTED" if opts.get("host") else hw.get("driver_version", "580.126.09")
+    kv_budget = r0.get("kv_budget")
+    token_Scroll = r0.get("token_targeting", "exact")
+    duration = r0.get("duration_s", 30)
+    max_tokens = r0.get("max_tokens", 2048)
+    prompt_modes = sorted({str(r.get("decode_prompt_mode")) for r in runs if r.get("decode_prompt_mode")})
+    prompt_mode = ",".join(prompt_modes) or "n/a"
+    ts = r0.get("timestamp", dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    coding_peaks: List[float] = []
+    for r in runs:
+        cp = r.get("coding_peak")
+        if not isinstance(cp, dict):
+            continue
+        summary = cp.get("summary") if isinstance(cp.get("summary"), dict) else {}
+        peak = summary.get("max_generation_tok_s")
+        if not isinstance(peak, (int, float)) or peak <= 0:
+            peak = cp.get("peak_tok_s")
+        if isinstance(peak, (int, float)) and peak > 0:
+            coding_peaks.append(float(peak))
+    estonia_runs = []
+    for r in runs:
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if (
+            r.get("estonia_profile")
+            or r.get("estonia")
+            or r.get("test_profile") == "estonia"
+            or meta.get("test_profile") == "estonia"
+        ):
+            estonia_runs.append(r.get("estonia_profile") or r.get("estonia") or r)
+
+    concs = sorted({d["concurrency"] for d in decode}) if decode else [1]
+    ctxs = sorted({d["context"] for d in decode}) if decode else [0]
+    cell_map = {(d["concurrency"], d["context"]): d for d in decode}
+
+    W = 1280
+    prefill_rows_h = max(1, len(prefill)) * 34 + 60
+    matrix_rows_h = max(1, len(concs)) * 48 + 80
+    H = 260 + prefill_rows_h + matrix_rows_h + 150
+
+    pf_vals = [p["mean_tok_s"] for p in prefill] or [0, 1]
+    pf_min, pf_max = min(pf_vals), max(pf_vals)
+    dc_vals = [d["mean_tok_s"] for d in decode if d["mean_tok_s"] is not None] or [0, 1]
+    dc_min, dc_max = min(dc_vals), max(dc_vals)
+
+    peak_pf = max(pf_vals) if prefill else 0.0
+    peak_pf_ctx = next((p["context"] for p in prefill if p["mean_tok_s"] == peak_pf), 0)
+    peak_dc = max(dc_vals) if dc_vals else 0.0
+    peak_dc_cell = next(
+        ((d["concurrency"], d["context"]) for d in decode if d["mean_tok_s"] == peak_dc),
+        (1, 0),
+    )
+
+    lines: List[str] = []
+    lines.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">')
+    lines.append("""<defs>
+      <style>
+        .bg { fill: #0b0f17; }
+        .panel { fill: #121826; stroke: #1f2937; stroke-width: 1; }
+        .title { font: 700 22px 'DejaVu Sans', 'Inter', sans-serif; fill: #f9fafb; }
+        .sub { font: 400 13px 'DejaVu Sans', 'Inter', sans-serif; fill: #9ca3af; }
+        .kpi-label { font: 600 11px 'DejaVu Sans', sans-serif; fill: #9ca3af; letter-spacing: 0.8px; }
+        .kpi-val { font: 700 24px 'DejaVu Sans Mono', monospace; fill: #10b981; }
+        .kpi-sub { font: 400 11px 'DejaVu Sans', sans-serif; fill: #6b7280; }
+        .sec { font: 700 14px 'DejaVu Sans', sans-serif; fill: #e5e7eb; letter-spacing: 0.6px; }
+        .th { font: 600 12px 'DejaVu Sans', sans-serif; fill: #9ca3af; }
+        .td { font: 600 13px 'DejaVu Sans Mono', monospace; fill: #f3f4f6; }
+        .td-sub { font: 400 10px 'DejaVu Sans Mono', monospace; fill: #cbd5e1; }
+        .foot { font: 400 11px 'DejaVu Sans Mono', monospace; fill: #6b7280; }
+      </style>
+    </defs>""")
+    lines.append(f'<rect class="bg" x="0" y="0" width="{W}" height="{H}" rx="14"/>')
+    lines.append(f'<rect class="panel" x="24" y="20" width="{W-48}" height="104" rx="10"/>')
+    lines.append(f'<text class="title" x="44" y="54">{html.escape(str(model))}</text>')
+    lines.append(
+        f'<text class="sub" x="44" y="78">Flux Engine v{html.escape(built_version)}  ·  llm-inference-bench v{html.escape(str(bench_ver))}  ·  '
+        f'{html.escape(str(gpu_name))} ({gpu_mem_mb // 1024} GB, driver {html.escape(str(driver))})  ·  n={len(runs)} rep(s)</text>'
+    )
+    mode_label = os.environ.get("FLUX_MODE", "auto")
+    lines.append(
+        f'<text class="sub" x="44" y="100">FLUX_MODE={html.escape(mode_label)}  ·  token-targeting={html.escape(str(token_Scroll))}  ·  '
+        f'kv-budget={kv_budget}  ·  duration={duration}s/cell  ·  max-tokens={max_tokens}  ·  '
+        f'prompts={html.escape(prompt_mode)}</text>'
+    )
+
+    kpi_w = 270
+    kpi_x0 = W - 44 - kpi_w * 2 - 14
+    lines.append(f'<rect x="{kpi_x0}" y="32" width="{kpi_w}" height="80" rx="8" fill="#0f172a" stroke="#1e293b"/>')
+    lines.append(f'<text class="kpi-label" x="{kpi_x0+16}" y="52">PEAK PREFILL</text>')
+    if prefill:
+        lines.append(f'<text class="kpi-val" x="{kpi_x0+16}" y="82">{peak_pf:,.1f} tok/s</text>')
+        lines.append(f'<text class="kpi-sub" x="{kpi_x0+16}" y="100">@ {_fmt_ctx(peak_pf_ctx)} context</text>')
+    else:
+        lines.append(f'<text class="kpi-val" x="{kpi_x0+16}" y="82">n/a</text>')
+        lines.append(f'<text class="kpi-sub" x="{kpi_x0+16}" y="100">no prefill cells in this run</text>')
+
+    kpi_x1 = kpi_x0 + kpi_w + 14
+    lines.append(f'<rect x="{kpi_x1}" y="32" width="{kpi_w}" height="80" rx="8" fill="#0f172a" stroke="#1e293b"/>')
+    lines.append(f'<text class="kpi-label" x="{kpi_x1+16}" y="52">PEAK DECODE</text>')
+    lines.append(f'<text class="kpi-val" x="{kpi_x1+16}" y="82">{peak_dc:,.1f} tok/s</text>')
+    lines.append(f'<text class="kpi-sub" x="{kpi_x1+16}" y="100">@ C={peak_dc_cell[0]}, ctx={_fmt_ctx(peak_dc_cell[1])}</text>')
+
+    # Prefill Section
+    pf_y = 140
+    lines.append(f'<rect class="panel" x="24" y="{pf_y}" width="{W-48}" height="{prefill_rows_h}" rx="10"/>')
+    lines.append(f'<text class="sec" x="44" y="{pf_y+28}">PREFILL THROUGHPUT SWEEP (PROMPT PROCESSING)</text>')
+    lines.append(f'<text class="th" x="44" y="{pf_y+50}">CONTEXT</text>')
+    lines.append(f'<text class="th" x="150" y="{pf_y+50}">PROMPT TOK</text>')
+    lines.append(f'<text class="th" x="290" y="{pf_y+50}">PREFILL TOK/S (MEAN ± SD)</text>')
+    lines.append(f'<text class="th" x="540" y="{pf_y+50}">TTFT (s)</text>')
+
+    bar_x0 = 650
+    bar_max_w = W - 48 - bar_x0 - 30
+    for idx, p in enumerate(prefill):
+        ry = pf_y + 74 + idx * 32
+        col = _heat_color(p["mean_tok_s"], pf_min, pf_max)
+        bw = int(bar_max_w * (p["mean_tok_s"] / peak_pf)) if peak_pf > 0 else 0
+        lines.append(f'<text class="td" x="44" y="{ry}">{_fmt_ctx(p["context"])}</text>')
+        lines.append(f'<text class="td-sub" x="150" y="{ry}">{p["actual_prompt_tokens"]:,}</text>')
+        sd_str = f' ± {p["sd_tok_s"]:.1f}' if p["n"] > 1 else ""
+        lines.append(f'<text class="td" x="290" y="{ry}">{p["mean_tok_s"]:,.1f}{sd_str}</text>')
+        ttft_str = f'{p["mean_ttft_s"]:.2f}s' if p["mean_ttft_s"] is not None else "—"
+        lines.append(f'<text class="td-sub" x="540" y="{ry}">{ttft_str}</text>')
+        lines.append(f'<rect x="{bar_x0}" y="{ry-14}" width="{max(4, bw)}" height="18" rx="4" fill="{col}"/>')
+
+    # Decode Section
+    mx_y = pf_y + prefill_rows_h + 16
+    lines.append(f'<rect class="panel" x="24" y="{mx_y}" width="{W-48}" height="{matrix_rows_h}" rx="10"/>')
+    lines.append(f'<text class="sec" x="44" y="{mx_y+28}">DECODE THROUGHPUT MATRIX — AGGREGATE TOK/S (CONCURRENCY × CONTEXT DEPTH)</text>')
+
+    grid_x0 = 140
+    avail_w = W - 48 - grid_x0 - 30
+    cell_w = max(90, avail_w // max(1, len(ctxs)))
+    cell_h = 42
+
+    for j, c in enumerate(ctxs):
+        cx = grid_x0 + j * cell_w + cell_w // 2
+        lines.append(f'<text class="th" x="{cx}" y="{mx_y+56}" text-anchor="middle">ctx {_fmt_ctx(c)}</text>')
+
+    for i, conc in enumerate(concs):
+        ry = mx_y + 68 + i * (cell_h + 6)
+        lines.append(f'<text class="th" x="44" y="{ry + 26}">C = {conc}</text>')
+        for j, c in enumerate(ctxs):
+            cx = grid_x0 + j * cell_w
+            cell = cell_map.get((conc, c))
+            val = cell["mean_tok_s"] if cell else None
+            col = _heat_color(val, dc_min, dc_max)
+            lines.append(f'<rect x="{cx}" y="{ry}" width="{cell_w-8}" height="{cell_h}" rx="6" fill="{col}" stroke="#1f2937"/>')
+            if val is not None:
+                sd_s = f"±{cell['sd_tok_s']:.1f}" if cell and cell["n"] > 1 else ""
+                lines.append(f'<text class="td" x="{cx + (cell_w-8)//2}" y="{ry+20}" text-anchor="middle">{val:,.1f}</text>')
+                sub_txt = sd_s if sd_s else (f"{cell['mean_lat_s']:.1f}s" if cell.get("mean_lat_s") else "tok/s")
+                lines.append(f'<text class="td-sub" x="{cx + (cell_w-8)//2}" y="{ry+34}" text-anchor="middle">{sub_txt}</text>')
+            else:
+                st = (cell.get("status") if cell else "n/a") or "skip"
+                lines.append(f'<text class="td-sub" x="{cx + (cell_w-8)//2}" y="{ry+25}" text-anchor="middle">{html.escape(str(st)[:14])}</text>')
+
+    foot_y = mx_y + matrix_rows_h + 28
+    lines.append(
+        f'<text class="foot" x="44" y="{foot_y}">Generated by Flux Engine lil-bench ({ts})  ·  '
+        f'100% Local Execution (Zero External Telemetry)</text>'
+    )
+    lines.append("</svg>")
+
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    svg_path = out_prefix.with_suffix(".svg")
+    png_path = out_prefix.with_suffix(".png")
+    md_path = out_prefix.parent / "MODEL_CARD.md"
+    summary_path = out_prefix.parent / "summary.md"
+
+    svg_path.write_text("\n".join(lines), encoding="utf-8")
+    rendered_png = False
+    if shutil.which("rsvg-convert"):
+        try:
+            subprocess.run(["rsvg-convert", "-o", str(png_path), str(svg_path)], check=True)
+            rendered_png = True
+        except Exception:
+            pass
+
+    # Write comprehensive Markdown Model Card
+    md: List[str] = [
+        f"# Flux Engine Model Card — `{model}`",
+        "",
+        "## 1. Runtime & Hardware Configuration",
+        "",
+        "| Field | Value |",
+        "| :--- | :--- |",
+        f"| **Engine Version** | `flux-engine v{built_version}` |",
+        f"| **Model** | `{model}` |",
+        f"| **Execution Mode (`FLUX_MODE`)** | `{mode_label}` |",
+        f"| **Benchmark Suite** | `local-inference-lab/llm-inference-bench v{bench_ver}` (`n={len(runs)}` run(s)) |",
+        f"| **Hardware** | `{gpu_name}` (`{gpu_mem_mb // 1024} GB`, driver `{driver}`) |",
+        f"| **KV Budget / Token Targeting** | `kv_budget={kv_budget}`, `token_targeting={token_Scroll}` |",
+        f"| **Decode Prompts (C>1)** | `{prompt_mode}` |",
+        f"| **Timestamp (UTC)** | `{ts}` |",
+        "",
+    ]
+
+    if prefill:
+        md.extend([
+            "## 2. Prefill Throughput Sweep",
+            "",
+            "| Target Context | Actual Prompt Tokens | Mean Prefill (tok/s) | SD (tok/s) | Min / Max (tok/s) | Mean TTFT (s) | Cold TTFT (s) |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for p in prefill:
+            ttft_s = f"{p['mean_ttft_s']:.2f}" if p["mean_ttft_s"] is not None else "—"
+            cold_s = f"{p['mean_cold_ttft_s']:.2f}" if p.get("mean_cold_ttft_s") is not None else "—"
+            md.append(
+                f"| {_fmt_ctx(p['context'])} | {p['actual_prompt_tokens']:,} | **{p['mean_tok_s']:,.2f}** | "
+                f"{p['sd_tok_s']:.2f} | {p['min_tok_s']:,.1f} / {p['max_tok_s']:,.1f} | {ttft_s} | {cold_s} |"
+            )
+        md.append("")
+
+    if decode:
+        md.extend([
+            "## 3. Decode Throughput Matrix (Aggregate tok/s)",
+            "",
+            "| Concurrency | " + " | ".join(_fmt_ctx(c) for c in ctxs) + " |",
+            "| ---: | " + " | ".join("---:" for _ in ctxs) + " |",
+        ])
+        for conc in concs:
+            row_cells = []
+            for c in ctxs:
+                cell = cell_map.get((conc, c))
+                if cell and cell["mean_tok_s"] is not None:
+                    if conc > 1:
+                        per_stream = cell["mean_tok_s"] / conc
+                        row_cells.append(f"**{cell['mean_tok_s']:,.2f}** ({per_stream:,.1f}/s)")
+                    else:
+                        row_cells.append(f"**{cell['mean_tok_s']:,.2f}** ± {cell['sd_tok_s']:.2f}")
+                else:
+                    row_cells.append(f"_{cell.get('status', 'n/a') if cell else 'n/a'}_")
+            md.append(f"| **C={conc}** | " + " | ".join(row_cells) + " |")
+        md.append("")
+
+    if coding_peaks:
+        md.extend([
+            "## 4. Coding Peak Throughput",
+            "",
+            f"- **Peak Single-Stream Coding Decode**: **{max(coding_peaks):,.2f} tok/s** (mean across runs: `{sum(coding_peaks)/len(coding_peaks):,.2f} tok/s`)",
+            "",
+        ])
+
+    if estonia_runs:
+        md.extend([
+            "## 5. Estonia 136.6K Long-Context Needle & Coherent Synthesis",
+            "",
+            "- **Profile**: `--test-profile estonia` (~105,650 words / ~136,645 prompt tokens)",
+            f"- **Recorded Runs**: `{len(estonia_runs)}`",
+            "",
+        ])
+
+    md.extend([
+        "## 6. Visual Benchmark Cards",
+        "",
+        f"- **SVG Card**: `{svg_path.name}`",
+        f"- **PNG Card**: `{png_path.name if rendered_png else '(install librsvg2-bin for PNG)'}`",
+        "",
+    ])
+
+    md_text = "\n".join(md) + "\n"
+    md_path.write_text(md_text, encoding="utf-8")
+    summary_path.write_text(md_text, encoding="utf-8")
+
+    result = {"svg": str(svg_path), "markdown": str(md_path), "summary": str(summary_path)}
+    if rendered_png:
+        result["png"] = str(png_path)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main CLI Dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_help() -> None:
+    print("""Usage:
+  lil-bench <preset-or-llm_decode_bench-flags> [options]
+
+Built-in Presets (replicates our exact evaluation & model card pipeline):
+  lil-bench matrix [--concurrency 1] [--contexts 0,8k,16k,32k,64k,128k] [--reps 1] [--output /results/repetition-1.json]
+      Runs the standard all-context prefill + decode matrix (exact token targeting, seed 20261011)
+      and automatically generates /results/card.svg, /results/card.png, and /results/MODEL_CARD.md.
+
+  lil-bench concurrency [1,2,4,8] [--contexts 0,8k,32k] [--decode-only] [--output /results/concurrency-sweep.json]
+      Runs a multi-stream concurrency sweep across C=1,2,4,8 (or any comma-separated list you pass)
+      with --show-capacity-limited-values and generates a concurrency matrix card.
+      Each stream gets its own prompt at the same token length; pass --shared-decode-prompt
+      to send one identical prompt to every stream (upstream v0.7.9 behaviour).
+      Prefill rows come after one unmeasured same-length request per context; the cold
+      TTFT is kept as prefill[ctx].cold_ttft_seconds (--no-prefill-context-warmup to disable).
+
+  lil-bench estonia [--concurrency 1] [--stall-timeout 600] [--output /results/estonia-results.json]
+      Runs the 136.6K-token Estonia history & needle-in-a-haystack stress benchmark (--test-profile estonia).
+
+  lil-bench coding [--runs 5] [--output /results/coding-peak.json]
+      Runs the 5x2000-token coding peak generation benchmark (--coding-peak).
+
+  lil-bench prefill [--prefill-contexts 8k,16k,32k,64k,128k] [--output /results/prefill-sweep.json]
+      Runs a dedicated prefill-only sweep across all context depths.
+
+  lil-bench accuracy [gsm8k|mmlu-pro|gpqa-diamond|all] [--concurrency 1] [--output /results/accuracy-{suite}.json]
+      Runs the built-in standardized accuracy evaluation suite (default output: /results/accuracy-{suite}.json,
+      expanding to accuracy-<profile>.json per profile when suite=all). In air-gapped mode (HF_HUB_OFFLINE=1),
+      'accuracy all' automatically skips gpqa-diamond unless gpqa_diamond.jsonl is locally cached.
+
+  lil-bench suite [--output-dir /results]
+      Runs the complete evaluation suite (matrix + coding peak + concurrency C=1,2,4,8 + estonia)
+      and emits /results/MODEL_CARD.md, /results/card.svg, and /results/card.png.
+
+  lil-bench card [/results/card] [/results/repetition-*.json ...]
+      Renders dark-mode SVG/PNG cards + MODEL_CARD.md from existing lil-bench JSON output files.
+
+  lil-bench <any llm_decode_bench.py flags>
+      Direct pass-through to /opt/flux/llm-inference-bench/llm_decode_bench.py.
+
+Privacy-First Defaults & Controls (default: FLUX_OPT_OUT=all; set FLUX_OPT_OUT=none to disable):
+  --opt-out-telemetry / --no-upload   Ensure zero external network reporting (default: 100% offline)
+  --opt-out-host-info                 Enforce redaction of host/GPU/fabric diagnostics & server URL (default: ON)
+  --opt-out-prompt-logs               Enforce redaction of prompt and completion text from JSON artifacts (default: ON)
+  --opt-out-all / --privacy-first     Enable all privacy redactions (default)
+  --include-host-info                 Opt-in: keep raw host/GPU diagnostics in JSON & cards (or FLUX_INCLUDE_HOST_INFO=1)
+  --include-prompt-logs               Opt-in: keep raw prompt/completion text in JSON artifacts (or FLUX_INCLUDE_PROMPT_LOGS=1)
+""")
+
+
+def extract_flag(args: List[str], flag: str, default: Optional[str] = None) -> Tuple[Optional[str], List[str]]:
+    out: List[str] = []
+    val = default
+    i = 0
+    while i < len(args):
+        if args[i] == flag and i + 1 < len(args):
+            val = args[i + 1]
+            i += 2
+        elif args[i].startswith(flag + "="):
+            val = args[i].split("=", 1)[1]
+            i += 1
+        else:
+            out.append(args[i])
+            i += 1
+    return val, out
+
+
+def extract_bool_flag(args: List[str], flag: str) -> Tuple[bool, List[str]]:
+    found = False
+    out: List[str] = []
+    for a in args:
+        if a == flag:
+            found = True
+        else:
+            out.append(a)
+    return found, out
+
+
+def run_lil_cmd(cmd: List[str], out_json: Optional[Path], opts: Dict[str, bool]) -> int:
+    print(f"[lil-bench] Executing: {' '.join(cmd)}", flush=True)
+    environment = os.environ.copy()
+    environment["LLM_BENCH_NO_UPDATE_CHECK"] = "1"
+    proc = subprocess.run(cmd, env=environment)
+    if out_json and out_json.is_file():
+        sanitize_json_file(out_json, opts)
+    return proc.returncode
+
+
+def main() -> int:
+    opts, args = get_opt_outs(sys.argv[1:])
+    if not args or args[0] in ("-h", "--help", "help"):
+        print_help()
+        if args and args[0] in ("-h", "--help"):
+            print("\n--- Underlying llm_decode_bench.py options ---")
+            subprocess.run([sys.executable, str(LIL_SCRIPT), "--help"])
+        return 0
+
+    host = os.environ.get("FLUX_BENCH_HOST", "127.0.0.1")
+    port = os.environ.get("FLUX_PORT", "8899")
+    host, args = extract_flag(args, "--host", host)
+    port, args = extract_flag(args, "--port", port)
+    model_arg, args = extract_flag(args, "--model", None)
+    model = model_arg or auto_detect_live_model(host, port)
+    kv_budget_default = os.environ.get("FLUX_MAX_SEQ_LEN", "131072")
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub == "card":
+        if not rest:
+            json_files = sorted(Path("/results").glob("*.json"))
+            out_prefix = Path("/results/card")
+        else:
+            first = Path(rest[0])
+            if first.suffix == ".json":
+                out_prefix = first.parent / "card"
+                json_files = [Path(p) for p in rest]
+            else:
+                out_prefix = first
+                json_files = [Path(p) for p in rest[1:]] if len(rest) > 1 else sorted(first.parent.glob("*.json"))
+        json_files = [p for p in json_files if p.is_file() and p.name not in ("environment.json", "flux-diagnostics.json")]
+        cards = generate_cards(out_prefix, json_files, opts)
+        print(json.dumps({"status": "ok", "cards": cards}, indent=2))
+        return 0
+
+    if sub == "matrix":
+        conc, rest = extract_flag(rest, "--concurrency", "1")
+        ctxs, rest = extract_flag(rest, "--contexts", "0,8k,16k,32k,64k,128k")
+        reps_s, rest = extract_flag(rest, "--reps", "1")
+        dur, rest = extract_flag(rest, "--duration", "30")
+        max_tok, rest = extract_flag(rest, "--max-tokens", "2048")
+        kv_b, rest = extract_flag(rest, "--kv-budget", kv_budget_default)
+        out_path_s, rest = extract_flag(rest, "--output", "/results/repetition-1.json")
+        no_card, rest = extract_bool_flag(rest, "--no-card")
+        reps = max(1, int(reps_s or "1"))
+        produced: List[Path] = []
+        rc = 0
+        for r in range(1, reps + 1):
+            raw_out = str(Path(out_path_s) if reps == 1 else Path(out_path_s).parent / f"repetition-{r}.json")
+            out_p = _resolve_out_path(raw_out)
+            cmd = [
+                sys.executable, str(LIL_SCRIPT),
+                "--host", str(host), "--port", str(port),
+                "--model", str(model),
+                "--dcp-size", "1",
+                "--temperature", "0",
+                "--request-seed", "20261011",
+                "--token-targeting", "exact",
+                "--display-mode", "plain",
+                "--no-hw-monitor",
+                "--concurrency", str(conc),
+                "--contexts", str(ctxs),
+                "--max-tokens", str(max_tok),
+                "--duration", str(dur),
+                "--decode-warmup-seconds", "5",
+                "--cell-warmup-timeout-seconds", "900",
+                "--no-resume",
+                "--output", str(out_p),
+            ]
+            max_c = max(int(x) for x in str(conc).split(",") if x.strip().isdigit()) if conc else 1
+            if max_c == 1 and kv_b:
+                cmd.extend(["--kv-budget", str(kv_b)])
+            else:
+                cmd.append("--show-capacity-limited-values")
+            cmd.extend(rest)
+            step_rc = run_lil_cmd(cmd, out_p, opts)
+            rc = rc or step_rc
+            if out_p.is_file():
+                produced.append(out_p)
+        if produced and not no_card:
+            cards = generate_cards(produced[0].parent / "card", produced, opts, title_override=model)
+            print(f"[lil-bench] Generated Model Card & Visual Cards: {json.dumps(cards)}")
+        return rc
+
+    if sub in ("concurrency", "sweep"):
+        # Support `lil-bench concurrency 1,2,4,8` or `lil-bench concurrency --concurrency 1,2,4,8`
+        conc_default = "1,2,4,8"
+        if rest and not rest[0].startswith("-"):
+            conc_default = rest[0]
+            rest = rest[1:]
+        conc, rest = extract_flag(rest, "--concurrency", conc_default)
+        ctxs, rest = extract_flag(rest, "--contexts", "0,8k,32k")
+        dur, rest = extract_flag(rest, "--duration", "30")
+        max_tok, rest = extract_flag(rest, "--max-tokens", "2048")
+        decode_only, rest = extract_bool_flag(rest, "--decode-only")
+        no_card, rest = extract_bool_flag(rest, "--no-card")
+        out_path_s, rest = extract_flag(rest, "--output", "/results/concurrency-sweep.json")
+        out_p = _resolve_out_path(out_path_s)
+        cmd = [
+            sys.executable, str(LIL_SCRIPT),
+            "--host", str(host), "--port", str(port),
+            "--model", str(model),
+            "--dcp-size", "1",
+            "--temperature", "0",
+            "--request-seed", "20261011",
+            "--token-targeting", "exact",
+            "--display-mode", "plain",
+            "--no-hw-monitor",
+            "--concurrency", str(conc),
+            "--contexts", str(ctxs),
+            "--max-tokens", str(max_tok),
+            "--duration", str(dur),
+            "--decode-warmup-seconds", "5",
+            # Distinct per-stream prompts prefill C prompts in the cell warmup.
+            "--cell-warmup-timeout-seconds", "120",
+            "--show-capacity-limited-values",
+            "--no-resume",
+            "--output", str(out_p),
+        ]
+        if decode_only:
+            cmd.append("--skip-prefill")
+        cmd.extend(rest)
+        rc = run_lil_cmd(cmd, out_p, opts)
+        if out_p.is_file() and not no_card:
+            cards = generate_cards(out_p.parent / "concurrency-card", [out_p], opts, title_override=f"{model} (Concurrency {conc})")
+            print(f"[lil-bench] Generated Concurrency Card: {json.dumps(cards)}")
+        return rc
+
+    if sub == "estonia":
+        conc, rest = extract_flag(rest, "--concurrency", "1")
+        stall, rest = extract_flag(rest, "--stall-timeout", "600")
+        out_path_s, rest = extract_flag(rest, "--output", "/results/estonia-results.json")
+        out_p = _resolve_out_path(out_path_s)
+        cmd = [
+            sys.executable, str(LIL_SCRIPT),
+            "--host", str(host), "--port", str(port),
+            "--model", str(model),
+            "--test-profile", "estonia",
+            "--concurrency", str(conc),
+            "--completion-stats-stall-timeout", str(stall),
+            "--display-mode", "plain",
+            "--no-hw-monitor",
+            "--no-resume",
+            "--output", str(out_p),
+        ]
+        cmd.extend(rest)
+        return run_lil_cmd(cmd, out_p, opts)
+
+    if sub == "coding":
+        runs_n, rest = extract_flag(rest, "--runs", "5")
+        out_path_s, rest = extract_flag(rest, "--output", "/results/coding-peak.json")
+        out_p = _resolve_out_path(out_path_s)
+        cmd = [
+            sys.executable, str(LIL_SCRIPT),
+            "--host", str(host), "--port", str(port),
+            "--model", str(model),
+            "--no-hw-monitor",
+            "--display-mode", "plain",
+            "--no-resume",
+            "--skip-prefill",
+            "--contexts", "0",
+            "--concurrency", "1",
+            "--duration", "15",
+            "--max-tokens", "2048",
+            "--coding-peak",
+            "--coding-peak-runs", str(runs_n),
+            "--coding-peak-max-tokens", "2000",
+            "--temperature", "0",
+            "--coding-peak-temperature", "0",
+            "--request-seed", "20261011",
+            "--output", str(out_p),
+        ]
+        cmd.extend(rest)
+        return run_lil_cmd(cmd, out_p, opts)
+
+    if sub == "prefill":
+        pf_ctxs, rest = extract_flag(rest, "--prefill-contexts", "8k,16k,32k,64k,128k")
+        out_path_s, rest = extract_flag(rest, "--output", "/results/prefill-sweep.json")
+        out_p = _resolve_out_path(out_path_s)
+        cmd = [
+            sys.executable, str(LIL_SCRIPT),
+            "--host", str(host), "--port", str(port),
+            "--model", str(model),
+            "--prefill-only",
+            "--prefill-contexts", str(pf_ctxs),
+            "--token-targeting", "exact",
+            "--request-seed", "20261011",
+            "--display-mode", "plain",
+            "--no-hw-monitor",
+            "--no-resume",
+            "--output", str(out_p),
+        ]
+        cmd.extend(rest)
+        return run_lil_cmd(cmd, out_p, opts)
+
+    if sub == "accuracy":
+        suite = "all"
+        if rest and not rest[0].startswith("-"):
+            suite = rest[0]
+            rest = rest[1:]
+        conc, rest = extract_flag(rest, "--concurrency", "1")
+        aliases = {
+            "gsm-8k": "gsm8k",
+            "gsm8k": "gsm8k",
+            "mmlupro": "mmlu-pro",
+            "mmlu-pro": "mmlu-pro",
+            "mmlu-pro-1000": "mmlu-pro",
+            "gpqa": "gpqa-diamond",
+            "gpqa-diamond": "gpqa-diamond",
+        }
+        if suite == "all":
+            profiles = ["gsm8k", "mmlu-pro", "gpqa-diamond"]
+            offline = (
+                os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in ("1", "true", "yes")
+                or os.environ.get("TRANSFORMERS_OFFLINE", "").strip().lower() in ("1", "true", "yes")
+            )
+            gpqa_local = LIL_ROOT / "data" / "gpqa_diamond.jsonl"
+            gpqa_cache = Path.home() / ".cache" / "llm_decode_bench" / "datasets" / "gpqa_diamond.jsonl"
+            if offline and not gpqa_local.is_file() and not gpqa_cache.is_file():
+                profiles = ["gsm8k", "mmlu-pro"]
+                print(
+                    "[lil-bench] NOTE: Skipping gpqa-diamond in offline mode (HF_HUB_OFFLINE=1) "
+                    "because gpqa_diamond.jsonl is not locally cached. Place gpqa_diamond.jsonl under "
+                    f"{gpqa_local.parent} or {gpqa_cache.parent}, or run 'lil-bench accuracy gpqa-diamond' online.",
+                    file=sys.stderr,
+                )
+        elif suite in aliases:
+            profiles = [aliases[suite]]
+        else:
+            print(f"[lil-bench] ERROR: unknown accuracy profile {suite!r}", file=sys.stderr)
+            return 2
+        out_path_s, rest = extract_flag(rest, "--output", f"/results/accuracy-{suite}.json")
+        requested_output = Path(str(out_path_s))
+        profile_runs = {"gsm8k": "1319", "mmlu-pro": "1000", "gpqa-diamond": "198"}
+        acc_max_tokens, rest = extract_flag(rest, "--max-tokens", None)
+        if acc_max_tokens is None:
+            acc_max_tokens = str(_accuracy_max_tokens(host, port))
+        rc = 0
+        for profile in profiles:
+            if len(profiles) == 1:
+                raw_output = requested_output
+            else:
+                stem = requested_output.stem.removesuffix("-all")
+                raw_output = requested_output.with_name(f"{stem}-{profile}.json")
+            out_p = _resolve_out_path(str(raw_output))
+            cmd = [
+                sys.executable, str(LIL_SCRIPT),
+                "--host", str(host), "--port", str(port),
+                "--model", str(model),
+                "--test-profile", profile,
+                "--profile-concurrency", str(conc),
+                "--profile-runs", profile_runs[profile],
+                "--completion-stats-temperature", "0",
+                "--completion-stats-top-p", "1",
+                "--completion-stats-seed", "20261018",
+                "--completion-stats-stall-timeout", "600",
+                "--completion-stats-request-timeout", "3600",
+                "--max-tokens", str(acc_max_tokens),
+                "--display-mode", "plain",
+                "--no-hw-monitor",
+                "--no-resume",
+                "--output", str(out_p),
+            ]
+            cmd.extend(rest)
+            rc = run_lil_cmd(cmd, out_p, opts) or rc
+        return rc
+
+    if sub == "suite":
+        out_dir_s, rest = extract_flag(rest, "--output-dir", "/results")
+        out_dir = _resolve_out_path(str(Path(out_dir_s) / "repetition-1.json")).parent
+        privacy_flags = [
+            "--opt-out-host-info" if opts.get("host") else "--include-host-info",
+            "--opt-out-prompt-logs" if opts.get("logs") else "--include-prompt-logs",
+        ]
+        common_flags = ["--host", host, "--port", port, "--model", model] + privacy_flags + rest
+        print(f"[lil-bench] Running unified suite in {out_dir}...")
+        rep_json = out_dir / "repetition-1.json"
+        coding_json = out_dir / "coding-peak.json"
+        conc_json = out_dir / "concurrency-sweep.json"
+        estonia_json = out_dir / "estonia-results.json"
+        rc1 = subprocess.call([sys.executable, __file__, "matrix", "--no-card", "--output", str(rep_json)] + common_flags)
+        rc2 = subprocess.call([sys.executable, __file__, "coding", "--output", str(coding_json)] + common_flags)
+        rc3 = subprocess.call([sys.executable, __file__, "concurrency", "1,2,4,8", "--no-card", "--output", str(conc_json)] + common_flags)
+        rc4 = subprocess.call([sys.executable, __file__, "estonia", "--output", str(estonia_json)] + common_flags)
+        suite_jsons = [rep_json, coding_json, conc_json, estonia_json]
+        cards = generate_cards(out_dir / "card", suite_jsons, opts, title_override=model)
+        print(f"[lil-bench] Suite complete. Cards written: {json.dumps(cards)}")
+        return rc1 or rc2 or rc3 or rc4
+
+    # Direct pass-through to llm_decode_bench.py
+    out_flag, _ = extract_flag(args, "--output", None)
+    pass_cmd = [
+        sys.executable,
+        str(LIL_SCRIPT),
+        "--host",
+        str(host),
+        "--port",
+        str(port),
+        "--model",
+        str(model),
+    ] + args
+    rc = run_lil_cmd(pass_cmd, Path(out_flag) if out_flag else None, opts)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

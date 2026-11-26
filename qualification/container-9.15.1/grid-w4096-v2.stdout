@@ -1,0 +1,26 @@
+# fn grid (container-9.15.1-w4096-v2) url=http://127.0.0.1:18951 max_ctx=135168 prompt_mode=prompt_token_ids (exact)
+
+Prefill tok/s
+| ctx | tokens | TTFT s | tok/s | N |
+|---:|---:|---:|---:|---:|
+| 8k | 8192 | 1.498 | 5467.2 | 2 |
+| 16k | 16384 | 3.042 | 5385.8 | 2 |
+| 32k | 32768 | 6.152 | 5326.8 | 2 |
+| 64k | 65536 | 12.671 | 5172.2 | 2 |
+| 128k | - | - | ERR | 2 |
+
+Aggregate decode tok/s (incl. prefix prefill): not run (--no-decode)
+
+Decode-only tok/s (excl. prefix prefill): not run (--no-decode)
+
+MTP-normalized decode steps/s (accept len): not run (--no-decode)
+
+Coding peak cc1 probe: not run
+Same-prompt identity: 5 groups, 14 requests: all identical
+
+Notes:
+[1] Prompt mode: prompt_token_ids (exact); pool 395923 tokens of on-disk code/license/prose text tokenized by the server; prefill N excludes 1 dropped request(s) per size plus 1 warmup after start.
+[2] Decode cells not run (--no-decode).
+[3] ERR cells: prefill 128k: ['Inference error: Request timed out during prefill']
+
+Results saved to fn-grid-container-9.15.1-w4096-v2.json

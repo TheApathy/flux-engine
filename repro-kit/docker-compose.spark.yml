@@ -1,0 +1,156 @@
+# ==============================================================================
+# Flux Reproducibility Kit v0.1 — Multi-Topology Docker Compose Specification
+# Supports:
+#   1. Single NVIDIA DGX Spark (1x GB10 / 128 GB UMA):
+#      docker compose -f docker-compose.spark.yml --profile 1x-spark up
+#   2. Benchmark Reproduction Gate (Reviewer One-Command Equivalent):
+#      docker compose -f docker-compose.spark.yml --profile benchmark run --rm flux-bench
+#   3. 2x / 4x NVIDIA DGX Spark Cluster (200GbE QSFP56 ConnectX-7 RoCEv2):
+#      FLUX_NODE_RANK=0 FLUX_MASTER_ADDR=<SPARK_MASTER_HOST> \
+#        docker compose -f docker-compose.spark.yml --profile 4x-spark up
+# ==============================================================================
+
+name: flux-repro-kit
+
+x-common-gpu: &common-gpu
+  image: ${FLUX_IMAGE:-ghcr.io/theapathy/flux-engine:v1.0.3}
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  ipc: host
+  shm_size: "16gb"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. Reviewer Benchmark Harness (Default 1x Spark / Generic GPU)
+  # ----------------------------------------------------------------------------
+  flux-bench:
+    <<: *common-gpu
+    profiles: ["benchmark"]
+    network_mode: host
+    environment:
+      - FLUX_MODE=${FLUX_MODE:-max-prefill}
+      - FLUX_TOPOLOGY=${FLUX_TOPOLOGY:-auto}
+      - FLUX_CPU_AFFINITY=${FLUX_CPU_AFFINITY:-5-9,15-19}
+      - MODELS_ROOT=/models
+      - RESULTS_DIR=/results
+    volumes:
+      - ${MODELS_ROOT:-/models}:/models:ro
+      - ${RESULTS_DIR:-./results}:/results:rw
+    command:
+      - flux-bench
+      - run
+      - --config
+      - /opt/flux/repro-kit/benchmark-config.yaml
+      - --output
+      - /results/results.json
+
+  # ----------------------------------------------------------------------------
+  # 2. Single DGX Spark Production Server (1x GB10, Pinned 6K+ Prefill + K=5 MTP)
+  # ----------------------------------------------------------------------------
+  flux-spark-1x:
+    <<: *common-gpu
+    profiles: ["1x-spark"]
+    network_mode: host
+    env_file:
+      - ./recipes/flux-nextgen-max-prefill-decode.env
+    environment:
+      - FLUX_TOPOLOGY=1x-spark
+      - FLUX_MODE=${FLUX_MODE:-nextgen}
+      - FLUX_CPU_AFFINITY=5-9,15-19
+      - MODELS_ROOT=/models
+    volumes:
+      - ${MODELS_ROOT:-/models}:/models:ro
+    command:
+      - flux
+      - serve
+      - --mode
+      - ${FLUX_MODE:-nextgen}
+
+  # ----------------------------------------------------------------------------
+  # 3a. Dual DGX Spark Cluster Node (2x GB10, 256 GB UMA, TP=2/EP=2, up to 1M BF16)
+  # ----------------------------------------------------------------------------
+  flux-spark-2x:
+    <<: *common-gpu
+    profiles: ["2x-spark"]
+    network_mode: host
+    cap_add:
+      - IPC_LOCK
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    env_file:
+      - ./recipes/2x-spark-tp2-disagg.env
+    environment:
+      - FLUX_TOPOLOGY=2x-spark
+      - FLUX_MODE=${FLUX_MODE:-2x-spark-1m}
+      - FLUX_MASTER_ADDR=${FLUX_MASTER_ADDR:-spark-node-0.local}
+      - FLUX_MASTER_PORT=${FLUX_MASTER_PORT:-29500}
+      - FLUX_NODE_RANK=${FLUX_NODE_RANK:-0}
+      - FLUX_CLUSTER_WORLD_SIZE=2
+      - FLUX_TP_SIZE=2
+      - FLUX_EP_SIZE=2
+      - MODELS_ROOT=/models
+    volumes:
+      - ${MODELS_ROOT:-/models}:/models:ro
+    command:
+      - flux
+      - serve
+      - --mode
+      - ${FLUX_MODE:-2x-spark-1m}
+
+  # ----------------------------------------------------------------------------
+  # 3b. 4x Multi-Spark Cluster Node (4x DGX Spark via ConnectX-7 200GbE RoCEv2)
+  # ----------------------------------------------------------------------------
+  flux-spark-cluster:
+    <<: *common-gpu
+    profiles: ["4x-spark"]
+    network_mode: host
+    cap_add:
+      - IPC_LOCK
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    env_file:
+      - ./recipes/flux-v9-max-prefill.env
+      - ./recipes/4x-spark-cluster.env
+    environment:
+      - FLUX_TOPOLOGY=${FLUX_TOPOLOGY:-4x-spark}
+      - FLUX_MODE=${FLUX_MODE:-max-prefill}
+      - FLUX_CLUSTER_NODES=${FLUX_CLUSTER_NODES:-spark-node-0.local,spark-node-1.local,spark-node-2.local,spark-node-3.local}
+      - FLUX_MASTER_ADDR=${FLUX_MASTER_ADDR:-spark-node-0.local}
+      - FLUX_MASTER_PORT=${FLUX_MASTER_PORT:-29500}
+      - FLUX_NODE_RANK=${FLUX_NODE_RANK:-0}
+      - FLUX_CLUSTER_WORLD_SIZE=${FLUX_CLUSTER_WORLD_SIZE:-4}
+      - MODELS_ROOT=/models
+    volumes:
+      - ${MODELS_ROOT:-/models}:/models:ro
+    command:
+      - flux-bench
+      - serve
+      - --topology
+      - ${FLUX_TOPOLOGY:-4x-spark}
+      - --mode
+      - ${FLUX_MODE:-max-prefill}
+
+  # ----------------------------------------------------------------------------
+  # 4. Multi-Spark Data-Parallel / Disagg Front-Door Router (HAProxy 2.8 + Lua)
+  # ----------------------------------------------------------------------------
+  flux-router:
+    image: ${FLUX_ROUTER_IMAGE:-flux-router:local}
+    build:
+      context: ./router
+      dockerfile: Dockerfile
+    profiles: ["router", "2x-spark-dp", "3x-spark-dp"]
+    network_mode: host
+    environment:
+      - FLUX_ROUTER_BACKENDS=${FLUX_ROUTER_BACKENDS:-127.0.0.1:8899=128}
+      - FLUX_ROUTER_QUEUE_TIMEOUT_S=${FLUX_ROUTER_QUEUE_TIMEOUT_S:-120}
+    command:
+      - --port
+      - ${FLUX_ROUTER_PORT:-8888}

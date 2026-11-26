@@ -1,0 +1,646 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Auto-extracted from `ops.rs` during refactor wave 4a.
+
+#![allow(unused_imports)]
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+use crate::layers::moe;
+use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight};
+
+use super::*;
+
+/// FP8×FP8 GEMM: A [M, K] FP8 × B [N, K] FP8 → C [M, N] BF16.
+///
+/// Both A (activations) and B (weights) are pre-converted FP8 E4M3.
+/// No BF16→FP8 conversion in inner loop — pure MMA throughput.
+/// Grid: (ceil(N/128), ceil(M/64))  Block: (128, 1, 1)
+pub fn fp8_fp8_gemm_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_fp8: DevicePtr,
+    b_fp8: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(a_fp8)
+        .arg_ptr(b_fp8)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// M128 variant of fp8_gemm_n128: halves B re-reads for large M (ISL > 128).
+///
+/// Each CTA covers 128 rows of A, loading B once for both 64-row halves.
+/// ~2× speedup on out_proj (K=value_dim, N=h) at ISL≥128.
+///
+/// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_n128_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    b_fp8: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(b_fp8)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// M128 variant of fp8_fp8_gemm_n128: halves B re-reads for large M (ISL > 128).
+///
+/// Each CTA covers 128 rows of A, loading B once for both 64-row halves.
+/// ~2× speedup on Q/K/V projections (FP8 activations × FP8 weights) at ISL≥128.
+/// Compact FP8 A smem → 6 blocks/SM vs 3 for fp8_gemm_t_m128.
+///
+/// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_fp8_gemm_n128_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_fp8: DevicePtr,
+    b_fp8: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([128, 1, 1])
+        .arg_ptr(a_fp8)
+        .arg_ptr(b_fp8)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Dense BF16 GEMV (M=1): C = A @ B^T for single-row activations.
+///
+/// A: [1, K] BF16, B: [N, K] BF16, C: [1, N] BF16.
+/// 4 outputs/block, 64 threads (2 warps) per output. Cross-warp smem reduction.
+///
+/// Kernel: `dense_gemv_bf16(A, B, C, N, K)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+pub fn dense_gemv(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Dense BF16 GEMV, batched over 2 rows (M=2): one pass over the weight
+/// produces both output rows, halving weight bandwidth vs two `dense_gemv`
+/// launches. Bit-identical to two M=1 `dense_gemv` calls — each row's
+/// accumulator follows the same K-iteration/reduction order.
+///
+/// `input`: `[2, K]` BF16 (contiguous); `output`: two rows at
+/// `output + t * out_stride` (BF16 elements). Used by the K=2 MTP verify
+/// path for the GDN `in_proj_qkvz` (dequant-to-BF16 on FP8 checkpoints),
+/// which otherwise re-read the full projection weight once per verify token.
+///
+/// Kernel: `dense_gemv_bf16_batch2(A, B, C, N, K, out_stride)`
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batch2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(out_stride)
+        .launch(stream)
+}
+
+/// K=3 batched dense BF16 GEMV: C[3, N] = A[3, K] @ B[N, K]^T.
+///
+/// Collapses 3 per-token `dense_gemv` launches into a single launch. B
+/// (weights) is read once per N-tile and dotted against all 3 activation
+/// rows — same B bandwidth as the unbatched call, 3× the A bandwidth (A
+/// fits in L1/L2 for the SSM BA case where K=hidden=5120 → 30 KiB).
+///
+/// Used by the SSM BA projection on the K=3 verify path (48 SSM layers ×
+/// 3 launches/layer = 144 launches/verify collapses to 48). The actual
+/// math (N=64 outputs × K=5120) is tiny — the loop is launch-overhead
+/// bound, ~24μs/launch on GB10.
+///
+/// A: `[3, K]` BF16 contiguous (rows are token-0, token-1, token-2).
+/// B: `[N, K]` BF16 weights.
+/// C: `[3, N]` BF16 contiguous (same row order as A).
+///
+/// Kernel: `dense_gemv_bf16_batch3(A, B, C, N, K)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+pub fn dense_gemv_batch3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// General batched dense BF16 GEMV: C[num_tokens, N] = A[num_tokens, K] @ B[N, K]^T.
+///
+/// Each `grid.y` block tiles up to 25 tokens (`row_off = blockIdx.y * 25`) —
+/// every token executes EXACTLY the `dense_gemv_bf16` body on `A + t*K` /
+/// `C + t*N` (same lane→kv mapping, same accumulation order, same
+/// warp-shuffle + smem reduce), so the output is BIT-IDENTICAL to
+/// `num_tokens` separate `dense_gemv` launches. Collapses the DFlash
+/// K=γ verify's per-token `ssm_ba_proj_loop` (17 launches × 48 SSM layers)
+/// into 1 launch per layer. The BA weight is L2-resident across y-blocks
+/// so DRAM weight traffic stays ~1×.
+///
+/// Kernel: `dense_gemv_bf16_batchn(A, B, C, N, K, num_tokens)`
+/// Grid: (ceil(N/4), ceil(num_tokens/25), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batchn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    num_tokens: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), div_ceil(num_tokens, 25), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// Token-fastest twin of [`dense_gemv_batchn`]: identical per-row arithmetic
+/// (bit-identical to `dense_gemv_bf16` on every row), grid `(ceil(num_tokens/25),
+/// ceil(N/4), 1)` (25 tokens per `grid.x` tile block) so consecutive blocks
+/// share weight rows through L2.
+///
+/// Kernel: `dense_gemv_bf16_batchn_tf(A, B, C, N, K, num_tokens)`
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batchn_tf(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    num_tokens: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_tokens, 25), div_ceil(n, 4), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// Dense FP8-weight GEMV (M=1): C = A @ (dequant(B_fp8) * row_scale).
+///
+/// A: `[1, K]` BF16, B: `[N, K]` FP8 E4M3, row_scale: `[N]` f32, C: `[1, N]` BF16.
+/// Halves weight bandwidth vs dense_gemv (1 byte/weight instead of 2).
+/// 4 outputs/block, 64 threads (2 warps) per output.
+///
+/// Kernel: `dense_gemv_fp8w(A, B, row_scale, C, N, K)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+pub fn dense_gemv_fp8w(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &Fp8DenseWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Small-M row-scaled FP8-weight GEMM for DFlash / DSpark drafter projections:
+/// `C[m, n] = bf16((A[m, :] · fp8_e4m3(B[n, :])) * row_scale[n])`.
+///
+/// Kernel: `fp8_gemm_t_m16_n64_rowscale(A, B, row_scale, C, M, N, K)`
+/// Grid: `(ceil(N/64), ceil(M/16), 1)`  Block: `(128, 1, 1)`
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_dflash_rowscale(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &Fp8DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 16), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W8A16 GEMV (M=1): C = A @ dequant_lut(B_fp8) * row_scale for FP8 E4M3 weights.
+///
+/// A: `[1, K]` BF16, B: `[N, K]` FP8 E4M3 bytes, row_scale: `[N]` f32, C: `[1, N]` BF16.
+/// Uses a 256-entry E4M3 LUT in shared memory for branchless dequant (no hardware
+/// FP4/FP8 conversion PTX needed — works on SM121 without `cvt.rn.satfinite`).
+/// 4 outputs/block, 64 threads (2 warps) per output. Cross-warp smem reduction.
+///
+/// Kernel: `w8a16_gemv(A, B, row_scale, C, N, K)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemv(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    row_scale: DevicePtr,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(row_scale)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W8A16 GEMM (M>1): `C[M,N] = A[M,K] @ dequant(B[N,K])` for prefill.
+///
+/// Uses 256-entry E4M3 LUT + BF16 2D block scales.
+/// Grid: (ceil(N/64), ceil(M/64), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Fused gate GEMV + topK softmax for M=1 decode.
+///
+/// Single kernel that computes `gate[num_experts] = A[K] @ B_gate[num_experts, K]`
+/// then extracts top-K indices + softmax weights. Saves 1 launch vs separate
+/// gate GEMV + topK kernels.
+///
+/// Grid: (1, 1, 1)  Block: (256, 1, 1) — single CTA, uses shared memory reduction
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_topk_fused(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate_weight: &QuantizedWeight,
+    expert_indices: DevicePtr,
+    expert_weights: DevicePtr,
+    num_experts: u32,
+    k: u32,
+    top_k: u32,
+    normalize: u32,
+    stream: u64,
+) -> Result<()> {
+    // Dynamic shared memory: K BF16 values for input broadcast
+    let smem_bytes = k as usize * 2;
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([256, 1, 1])
+        .shared_mem(smem_bytes as u32)
+        .arg_ptr(input)
+        .arg_ptr(gate_weight.weight)
+        .arg_ptr(gate_weight.weight_scale)
+        .arg_f32(gate_weight.weight_scale_2)
+        .arg_ptr(expert_indices)
+        .arg_ptr(expert_weights)
+        .arg_u32(num_experts)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(normalize)
+        .launch(stream)
+}
+
+/// FP8 grouped GEMM for sorted MoE prefill.
+///
+/// BF16 activations × FP8 E4M3 block-scaled expert weights via pointer table.
+/// Grid: (ceil(N/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp8_grouped_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,            // [total_tokens, K] BF16
+    weight_ptrs: DevicePtr,      // [num_experts] → [N, K] FP8
+    scale_ptrs: DevicePtr,       // [num_experts] → [N/128, K/128] BF16
+    output: DevicePtr,           // [total_expanded, N] BF16
+    expert_offsets: DevicePtr,   // [num_experts + 1]
+    sorted_token_ids: DevicePtr, // [total_expanded]
+    num_experts: u32,
+    n: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), max_m_tiles, num_experts])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(output)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W8A16 Transposed GEMM: `C[M,N] = A[M,K] @ dequant(B_t[K,N])` with coalesced reads.
+///
+/// Uses transposed FP8 weights `B_t[K,N]` and `block_scale_t[K/128, N/128]` for
+/// coalesced N-dimension reads. ~14x faster than non-transposed w8a16_gemm at long M.
+/// Grid: (ceil(N/64), ceil(M/64), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemm_t(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight_t: DevicePtr,      // [K, N] FP8 transposed
+    block_scale_t: DevicePtr, // [K/128, N/128] BF16 transposed
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_t)
+        .arg_ptr(block_scale_t)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Transpose FP8 weight matrix on GPU: `B[N,K]` → `B_t[K,N]`.
+/// Grid: (ceil(N*K/256), 1, 1)  Block: (256, 1, 1)
+pub fn transpose_fp8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr, // [N, K]
+    dst: DevicePtr, // [K, N]
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let total = u64::from(n) * u64::from(k);
+    let grid_x = u32::try_from(total.div_ceil(256))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([grid_x, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Transpose block scales: [N/128, K/128] → [K/128, N/128].
+pub fn transpose_block_scale(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    n_blocks: u32,
+    k_blocks: u32,
+    stream: u64,
+) -> Result<()> {
+    let total = n_blocks * k_blocks;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u32(n_blocks)
+        .arg_u32(k_blocks)
+        .launch(stream)
+}
+
+// ── Unified quantization dispatch ────────────────────────────────────
+//
+// These wrappers select the correct kernel based on the QuantWeight
+// variant. Adding a new quant format requires only a new match arm here.
+
+/// Cast `n_elems` BF16 activations to e4m3 bytes using exactly the conversion
+/// the prefill MMAs perform internally (`cvt.f32.bf16` then
+/// `cvt.rn.satfinite.e4m3x2.f32`, no scaling). `n_elems` must be a multiple of 4.
+///
+/// This exists so a library GEMM can be handed the identical operands the
+/// hand-written kernels already feed to `mma.sync...e4m3.e4m3`.
+pub fn cast_bf16_to_e4m3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    output: DevicePtr,
+    n_elems: u64,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        n_elems.is_multiple_of(4),
+        "cast_bf16_to_e4m3 requires a multiple of 4 elements, got {n_elems}"
+    );
+    let groups = n_elems / 4;
+    let blocks = groups.div_ceil(256).min(4096) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks.max(1), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(output)
+        .arg_u64(groups)
+        .launch(stream)
+}
+
+/// One-time materialisation of NVFP4 weights as the exact e4m3 bytes the
+/// W4A16 prefill MMA would have produced, laid out `[N, K]` row-major for a
+/// cuBLASLt TN FP8 GEMM. Grid is (N/128, K/32); block 128.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_nvfp4_to_e4m3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    b_packed: DevicePtr,
+    b_scale: DevicePtr,
+    out: DevicePtr,
+    scale2: f32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        n.is_multiple_of(128),
+        "dequant_nvfp4_to_e4m3 needs N % 128 == 0, got {n}"
+    );
+    anyhow::ensure!(
+        k.is_multiple_of(32),
+        "dequant_nvfp4_to_e4m3 needs K % 32 == 0, got {k}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, k / 32, 1])
+        .block([128, 1, 1])
+        .arg_ptr(b_packed)
+        .arg_ptr(b_scale)
+        .arg_ptr(out)
+        .arg_f32(scale2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// One-time materialisation of NVFP4 attention weights as the exact BF16 the
+/// W4A16 prefill kernel builds internally, laid out `[N, K]` row-major for a
+/// cuBLASLt TN BF16 GEMM.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_nvfp4_to_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    b_packed: DevicePtr,
+    b_scale: DevicePtr,
+    out: DevicePtr,
+    scale2: f32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        k.is_multiple_of(16),
+        "dequant_nvfp4_to_bf16 needs K % 16 == 0, got {k}"
+    );
+    let groups = (n as u64 * (k as u64 / 2)).div_ceil(256).min(8192) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([groups.max(1), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(b_packed)
+        .arg_ptr(b_scale)
+        .arg_ptr(out)
+        .arg_f32(scale2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}

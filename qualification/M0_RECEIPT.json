@@ -1,0 +1,65 @@
+{
+  "milestone": "M0",
+  "name": "Worktree & Integration Foundation",
+  "timestamp": "2026-10-24T11:05:35Z",
+  "base_commit": "295a6aaa1d4d1766ccacf5c8e5c6fd9916cfe371",
+  "head_commit": "90ce7ffa261c816f9c2ba9faeb36672b136d07ed",
+  "worktree": ".",
+  "target_dir": ".-target",
+  "binary_path": "target/release/flux-server",
+  "binary_size_bytes": 92208544,
+  "binary_sha256": "3ad909084080a530195cf920388025e64a824f428a13fbe3ba3e0f4163fd043d",
+  "build_lock": "$FLUX_BUILD_LOCK_FILE",
+  "cargo_build_jobs": 2,
+  "features": [
+    {
+      "id": 1,
+      "name": "Worktree Creation",
+      "status": "PASS",
+      "branch": "release",
+      "base": "295a6aaa"
+    },
+    {
+      "id": 2,
+      "name": "Repro Dockerfile Fix",
+      "status": "PASS",
+      "commit": "c53c1091",
+      "patch": "dfb43612 (cuda-cudart-13-0)"
+    },
+    {
+      "id": 3,
+      "name": "Answer Prefix Whitespace Fix",
+      "status": "PASS",
+      "source_verified": "chat_blocking.rs line 344 without trim_start (integrated in 8f2b8840)"
+    },
+    {
+      "id": 4,
+      "name": "Engine Compiler Fixes",
+      "status": "PASS",
+      "files_patched": [
+        "crates/spark-model/src/model/trait_impl/async_chkpt.rs",
+        "crates/spark-model/src/model/trait_impl/sequence.rs",
+        "crates/spark-model/src/model/trait_impl/speculative.rs",
+        "crates/spark-model/src/model/verify_batch_frame.rs",
+        "crates/spark-model/src/layers/qwen4_mtp_rows.rs",
+        "crates/spark-model/src/traits/verify_batch_owner.rs"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Prefill Budget Wide Override Fix",
+      "status": "PASS",
+      "file": "crates/spark-server/src/main_modules/serve_phases/kv_cache.rs",
+      "description": "ATLAS_QWEN4_PREFILL_WIDE honors explicit wide (4096, 8192, 16384, 32768) and skips auto-clamping to 1024"
+    },
+    {
+      "id": 6,
+      "name": "Host flux-server Release Build",
+      "status": "PASS",
+      "compiler": "rustc 1.93.1-nightly (aarch64)",
+      "cuda_version": 13000,
+      "kernels_target0": 173,
+      "kernels_target1": 203
+    }
+  ]
+}

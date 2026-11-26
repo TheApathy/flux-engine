@@ -1,0 +1,66 @@
+# cargo-deny configuration for Flux Engine
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisory database.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# Ignored advisories — only `unmaintained` notices on transitive deps
+# we don't directly control. None of these are actual vulnerabilities;
+# each entry must include the RUSTSEC-ID, the dep that pulls it in, and
+# the reason for ignoring. Re-evaluate if any become real vulnerabilities.
+ignore = [
+    # `paste` — proc-macro for token pasting (1.0.15 in Cargo.lock).
+    # Feature-complete and pulled in by transitive deps we don't control.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; proc-macro is feature-complete and pulled in by transitive deps we don't control" },
+]
+
+[licenses]
+# Allowed SPDX expressions for third-party dependencies. Flux Engine itself
+# is AGPL-3.0-only (see LICENSE + per-file SPDX headers).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    # Flux Engine workspace crates carry AGPL-3.0-only. Keeping it here
+    # covers workspace crates regardless of individual `publish` flags;
+    # zero external crates.io dependencies in Cargo.lock use AGPL/GPL.
+    "AGPL-3.0-only",
+    # CDLA-Permissive-2.0 covers the `webpki-roots` Mozilla CA bundle
+    # (permissive open-data license compatible with AGPL-3.0-only).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+# Skip license checks for internal workspace crates marked `publish = false`.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# `wildcards = "warn"` — workspace crates reference each other via path deps
+# that resolve to `*` in `Cargo.lock` when `publish` is unset. Exact versions
+# of all external crates remain pinned in `Cargo.lock` and audited via
+# `[advisories]` and `[sources]`.
+wildcards = "warn"
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

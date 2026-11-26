@@ -1,0 +1,7 @@
+# GPQA asks that the dataset plaintext never be republished online
+# (anti-contamination). It is cached under ~/.cache/llm_decode_bench/ instead;
+# never commit a local copy.
+data/gpqa_diamond.jsonl
+__pycache__/
+tools/amd_fabric/llm_amd_fabric
+tools/p2pmark/llm_p2pmark

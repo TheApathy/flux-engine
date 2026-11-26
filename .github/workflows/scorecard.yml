@@ -1,0 +1,61 @@
+name: OpenSSF Scorecard
+
+# Weekly and main-branch supply-chain security health analysis via OpenSSF
+# Scorecard. Publishes results to the Scorecard REST API (backing the README
+# badge) and uploads SARIF alerts to GitHub Code Scanning.
+
+on:
+  branch_protection_rule:
+  schedule:
+    # Weekly Monday 05:17 UTC (offset minute avoids top-of-hour runner congestion).
+    - cron: '17 5 * * 1'
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Declare top-level empty permissions so Scorecard's Token-Permissions check
+# awards full credit; grant only the minimum required scopes on the job below.
+permissions: {}
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analysis:
+    name: Scorecard Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Needed to upload SARIF results to GitHub Code Scanning.
+      security-events: write
+      # Needed to publish results to the OpenSSF Scorecard API / badge.
+      id-token: write
+      # Read-only repository and workflow metadata for Scorecard checks.
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Run OpenSSF Scorecard analysis
+        uses: ossf/scorecard-action@23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          sarif_file: results.sarif

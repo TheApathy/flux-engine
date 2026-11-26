@@ -1,0 +1,19 @@
+# R8 FI-GDN AOT generator environment
+# Captured 2026-10-18. Python packages are obtained from their normal indexes;
+# the FlashInfer wheel is separately content-pinned below.
+python==3.12.3
+flashinfer-python==0.6.14
+flashinfer-wheel-sha256=d124369346a3d48eac67e31c42f7a3c813bcc0abc10e2e36db413b7b3dfd97df
+torch==2.10.0+cu130
+apache-tvm-ffi==0.1.9
+cuda-bindings==13.0.3
+cuda-pathfinder==1.4.3
+cuda-python==13.0.3
+nvidia-cutlass-dsl==4.6.3
+nvidia-cutlass-dsl-libs-base==4.6.3
+nvidia-cutlass-dsl-libs-core==4.6.3
+nvidia-cutlass-dsl-libs-cu12==4.6.3
+nvidia-cutlass-dsl-libs-cu13==4.6.3
+numpy==2.4.6
+packaging==26.0
+observed-nvidia-driver==580.126.09

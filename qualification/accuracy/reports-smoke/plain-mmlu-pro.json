@@ -1,0 +1,448 @@
+{
+  "metadata": {
+    "version": "0.7.9",
+    "mode": "completion_stats",
+    "interrupted": false,
+    "server": "http://127.0.0.1:8899",
+    "engine": "openai_proxy",
+    "server_version": "",
+    "kv_budget": 0,
+    "kv_source": "",
+    "max_running_requests": 0,
+    "model": "qwen38",
+    "models": [
+      "qwen38"
+    ],
+    "test_profile": "mmlu-pro",
+    "test_profile_description": "MMLU-Pro accuracy benchmark: pinned deterministic stratified 1000-question subset of the TIGER-Lab/MMLU-Pro test split (up to 10 options per question), one different question per request, scored by exact option-letter match. Knowledge/reasoning anchor for quantization comparisons; use with --compare-baseline.",
+    "prompt_source": "dataset:mmlu_pro_1000 (1000 items)",
+    "prompt_chars": 573,
+    "timestamp": "2026-10-25T16:58:34.603174",
+    "max_tokens": 16384,
+    "token_limit_field": "max_tokens",
+    "max_tokens_omitted": false,
+    "fixed_concurrency": 4,
+    "requested_runs": 1,
+    "concurrency_levels_requested": [
+      4
+    ],
+    "min_results": 1,
+    "probe_waves": 1,
+    "auto_stop": true,
+    "min_improvement": 0.03,
+    "patience": 1,
+    "correct_regex": "",
+    "score_source": "final_answer",
+    "profile_scorer": "dataset_mc_letter",
+    "scorer_version": 2,
+    "profile_version": 1,
+    "expected_answer": "",
+    "decoy_answers": [],
+    "approx_tolerance": "",
+    "dataset_rows": "",
+    "dataset_sha256": "a229ed37f28bea012bf08e81d8ae3358dda17ef7370dca360f632952e3bdcaca",
+    "dataset": "mmlu_pro_1000",
+    "dataset_path": "repro-kit/llm-inference-bench/data/mmlu_pro_1000.jsonl",
+    "dataset_source": "TIGER-Lab/MMLU-Pro test split (Apache-2.0), deterministic stratified 1000-question subset (largest-remainder per category, floor-stride by question_id)",
+    "dataset_items_total": 1000,
+    "dataset_items_selected": 1,
+    "prompt_sha256": "",
+    "prompt_sha256_pinned": "",
+    "prefill_scout": false,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "seed_base": 20261018,
+    "stall_timeout_s": 600.0,
+    "request_timeout_s": 3600.0,
+    "reasoning_effort": null,
+    "request_overrides": {
+      "report_interventions": true
+    },
+    "system_prompt": false,
+    "nvidia_p2p_override_effective": false,
+    "p2pmark_status": "not_run",
+    "amd_fabric_status": "not_run"
+  },
+  "nvidia_p2p_override": {
+    "effective": false,
+    "configured": false,
+    "params_path": "/proc/driver/nvidia/params",
+    "params_available": true,
+    "modprobe_path": "/etc/modprobe.d/nvidia-p2p-override.conf",
+    "modprobe_available": false,
+    "runtime": {
+      "ForceP2P": "",
+      "RMForceP2PType": "",
+      "RMPcieP2PType": "",
+      "GrdmaPciTopoCheckOverride": "0",
+      "EnableResizableBar": "0",
+      "DmaRemapPeerMmio": "1"
+    },
+    "expected": {
+      "ForceP2P": "0x11",
+      "RMForceP2PType": "1",
+      "RMPcieP2PType": "2",
+      "GrdmaPciTopoCheckOverride": "1",
+      "EnableResizableBar": "1"
+    },
+    "missing": [
+      "ForceP2P",
+      "RMForceP2PType",
+      "RMPcieP2PType"
+    ],
+    "mismatched": {
+      "GrdmaPciTopoCheckOverride": {
+        "expected": "1",
+        "actual": "0"
+      },
+      "EnableResizableBar": {
+        "expected": "1",
+        "actual": "0"
+      }
+    },
+    "registry_dwords": "",
+    "suggested_modprobe_line": "options nvidia NVreg_RegistryDwords=\"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1\"",
+    "suggested_reload": "stop GPU workloads, then reload NVIDIA modules or reboot; the modprobe file alone is not enough until the nvidia module is reloaded"
+  },
+  "p2pmark": {
+    "status": "not_run"
+  },
+  "amd_fabric": {
+    "status": "not_run"
+  },
+  "prefill_scout": null,
+  "selected_concurrency": 4,
+  "selected_summary": {
+    "attempted": 1,
+    "completed": 1,
+    "errors": 0,
+    "correct": 1,
+    "wrong": 0,
+    "score_counts": {
+      "exact": 1
+    },
+    "exact": 1,
+    "near": 0,
+    "fail": 0,
+    "truncated": 0,
+    "stalled": 0,
+    "timeout": 0,
+    "decoy": 0,
+    "not_stated": 0,
+    "ambiguous": 0,
+    "near_miss": 0,
+    "wrong_checksum": 0,
+    "wrong_facts": 0,
+    "unparseable": 0,
+    "incomplete": 0,
+    "correct_rate": 1.0,
+    "correct_rate_completed": 1.0,
+    "score_available": true,
+    "hit_max_tokens": 0,
+    "estimated_token_runs": 0,
+    "completion_tokens": {
+      "avg": 344.0,
+      "min": 344.0,
+      "max": 344.0,
+      "p50": 344.0,
+      "p90": 344.0,
+      "p99": 344.0,
+      "std": 0.0
+    },
+    "ttft": {
+      "avg": 0.5119933530222625,
+      "min": 0.5119933530222625,
+      "max": 0.5119933530222625,
+      "p50": 0.5119933530222625,
+      "p90": 0.5119933530222625,
+      "p99": 0.5119933530222625,
+      "std": 0.0
+    },
+    "elapsed": {
+      "avg": 10.10115473694168,
+      "min": 10.10115473694168,
+      "max": 10.10115473694168,
+      "p50": 10.10115473694168,
+      "p90": 10.10115473694168,
+      "p99": 10.10115473694168,
+      "std": 0.0
+    },
+    "gen_elapsed": {
+      "avg": 9.588232135865837,
+      "min": 9.588232135865837,
+      "max": 9.588232135865837,
+      "p50": 9.588232135865837,
+      "p90": 9.588232135865837,
+      "p99": 9.588232135865837,
+      "std": 0.0
+    },
+    "gen_tok_s": {
+      "avg": 35.87731243106121,
+      "min": 35.87731243106121,
+      "max": 35.87731243106121,
+      "p50": 35.87731243106121,
+      "p90": 35.87731243106121,
+      "p99": 35.87731243106121,
+      "std": 0.0
+    },
+    "e2e_tok_s": {
+      "avg": 34.055512360575186,
+      "min": 34.055512360575186,
+      "max": 34.055512360575186,
+      "p50": 34.055512360575186,
+      "p90": 34.055512360575186,
+      "p99": 34.055512360575186,
+      "std": 0.0
+    },
+    "aggregate_gen_tok_s": 35.87731243106121,
+    "aggregate_e2e_tok_s": 34.055512360575186
+  },
+  "all_summary": {
+    "attempted": 1,
+    "completed": 1,
+    "errors": 0,
+    "correct": 1,
+    "wrong": 0,
+    "score_counts": {
+      "exact": 1
+    },
+    "exact": 1,
+    "near": 0,
+    "fail": 0,
+    "truncated": 0,
+    "stalled": 0,
+    "timeout": 0,
+    "decoy": 0,
+    "not_stated": 0,
+    "ambiguous": 0,
+    "near_miss": 0,
+    "wrong_checksum": 0,
+    "wrong_facts": 0,
+    "unparseable": 0,
+    "incomplete": 0,
+    "correct_rate": 1.0,
+    "correct_rate_completed": 1.0,
+    "score_available": true,
+    "hit_max_tokens": 0,
+    "estimated_token_runs": 0,
+    "completion_tokens": {
+      "avg": 344.0,
+      "min": 344.0,
+      "max": 344.0,
+      "p50": 344.0,
+      "p90": 344.0,
+      "p99": 344.0,
+      "std": 0.0
+    },
+    "ttft": {
+      "avg": 0.5119933530222625,
+      "min": 0.5119933530222625,
+      "max": 0.5119933530222625,
+      "p50": 0.5119933530222625,
+      "p90": 0.5119933530222625,
+      "p99": 0.5119933530222625,
+      "std": 0.0
+    },
+    "elapsed": {
+      "avg": 10.10115473694168,
+      "min": 10.10115473694168,
+      "max": 10.10115473694168,
+      "p50": 10.10115473694168,
+      "p90": 10.10115473694168,
+      "p99": 10.10115473694168,
+      "std": 0.0
+    },
+    "gen_elapsed": {
+      "avg": 9.588232135865837,
+      "min": 9.588232135865837,
+      "max": 9.588232135865837,
+      "p50": 9.588232135865837,
+      "p90": 9.588232135865837,
+      "p99": 9.588232135865837,
+      "std": 0.0
+    },
+    "gen_tok_s": {
+      "avg": 35.87731243106121,
+      "min": 35.87731243106121,
+      "max": 35.87731243106121,
+      "p50": 35.87731243106121,
+      "p90": 35.87731243106121,
+      "p99": 35.87731243106121,
+      "std": 0.0
+    },
+    "e2e_tok_s": {
+      "avg": 34.055512360575186,
+      "min": 34.055512360575186,
+      "max": 34.055512360575186,
+      "p50": 34.055512360575186,
+      "p90": 34.055512360575186,
+      "p99": 34.055512360575186,
+      "std": 0.0
+    },
+    "aggregate_gen_tok_s": 35.87731243106121,
+    "aggregate_e2e_tok_s": 34.055512360575186
+  },
+  "level_summaries": [
+    {
+      "concurrency": 4,
+      "phase": "profile",
+      "summary": {
+        "attempted": 1,
+        "completed": 1,
+        "errors": 0,
+        "correct": 1,
+        "wrong": 0,
+        "score_counts": {
+          "exact": 1
+        },
+        "exact": 1,
+        "near": 0,
+        "fail": 0,
+        "truncated": 0,
+        "stalled": 0,
+        "timeout": 0,
+        "decoy": 0,
+        "not_stated": 0,
+        "ambiguous": 0,
+        "near_miss": 0,
+        "wrong_checksum": 0,
+        "wrong_facts": 0,
+        "unparseable": 0,
+        "incomplete": 0,
+        "correct_rate": 1.0,
+        "correct_rate_completed": 1.0,
+        "score_available": true,
+        "hit_max_tokens": 0,
+        "estimated_token_runs": 0,
+        "completion_tokens": {
+          "avg": 344.0,
+          "min": 344.0,
+          "max": 344.0,
+          "p50": 344.0,
+          "p90": 344.0,
+          "p99": 344.0,
+          "std": 0.0
+        },
+        "ttft": {
+          "avg": 0.5119933530222625,
+          "min": 0.5119933530222625,
+          "max": 0.5119933530222625,
+          "p50": 0.5119933530222625,
+          "p90": 0.5119933530222625,
+          "p99": 0.5119933530222625,
+          "std": 0.0
+        },
+        "elapsed": {
+          "avg": 10.10115473694168,
+          "min": 10.10115473694168,
+          "max": 10.10115473694168,
+          "p50": 10.10115473694168,
+          "p90": 10.10115473694168,
+          "p99": 10.10115473694168,
+          "std": 0.0
+        },
+        "gen_elapsed": {
+          "avg": 9.588232135865837,
+          "min": 9.588232135865837,
+          "max": 9.588232135865837,
+          "p50": 9.588232135865837,
+          "p90": 9.588232135865837,
+          "p99": 9.588232135865837,
+          "std": 0.0
+        },
+        "gen_tok_s": {
+          "avg": 35.87731243106121,
+          "min": 35.87731243106121,
+          "max": 35.87731243106121,
+          "p50": 35.87731243106121,
+          "p90": 35.87731243106121,
+          "p99": 35.87731243106121,
+          "std": 0.0
+        },
+        "e2e_tok_s": {
+          "avg": 34.055512360575186,
+          "min": 34.055512360575186,
+          "max": 34.055512360575186,
+          "p50": 34.055512360575186,
+          "p90": 34.055512360575186,
+          "p99": 34.055512360575186,
+          "std": 0.0
+        },
+        "aggregate_gen_tok_s": 35.87731243106121,
+        "aggregate_e2e_tok_s": 34.055512360575186
+      },
+      "selected": true,
+      "improved": true
+    }
+  ],
+  "accuracy": {
+    "items_total": 1000,
+    "items_selected": 1,
+    "attempted": 1,
+    "scored": 1,
+    "correct": 1,
+    "accuracy": 1.0,
+    "wilson95_low": 0.2065493117918027,
+    "wilson95_high": 1.0,
+    "unparseable": 0,
+    "truncated_no_answer": 0,
+    "hit_max_tokens": 0,
+    "errors": 0,
+    "dataset_exhausted": false
+  },
+  "category_summaries": [
+    {
+      "category": "biology",
+      "scored": 1,
+      "correct": 1,
+      "accuracy": 1.0
+    }
+  ],
+  "wrong_runs": [],
+  "hardware_run_summary": {},
+  "runs": [
+    {
+      "run_index": 1,
+      "phase": "profile",
+      "concurrency": 4,
+      "ok": true,
+      "correct": true,
+      "completion_tokens": 344,
+      "prompt_tokens": 185,
+      "elapsed": 10.10115473694168,
+      "gen_elapsed": 9.588232135865837,
+      "ttft": 0.5119933530222625,
+      "time_to_second_token": 0.02868946408852935,
+      "gen_tok_s": 35.87731243106121,
+      "e2e_tok_s": 34.055512360575186,
+      "finish_reason": "stop",
+      "final_answer": "B",
+      "score_label": "exact",
+      "score_detail": "exact",
+      "parsed_answer": "B",
+      "output_excerpt": "B",
+      "output_text": "",
+      "reasoning_text": "",
+      "content_text": "",
+      "error": "",
+      "hit_max_tokens": false,
+      "estimated_tokens": false,
+      "cancelled": false,
+      "item_id": "mmlupro-2804",
+      "category": "biology",
+      "expected_answer": "B",
+      "interventions": {
+        "schema": "atlas.interventions.v1",
+        "policy": "report_only",
+        "events": []
+      }
+    }
+  ],
+  "methodology": {
+    "name": "MMLU-Pro accuracy benchmark",
+    "prefill": "Dataset accuracy profiles send a different pinned item prompt per measured request, so a shared prefix-cache scout is disabled by default; prompts are short and prefill cost is negligible.",
+    "adaptive_concurrency": "If --profile-concurrency is set, the benchmark sends exactly the configured number of measured profile requests with that many concurrent workers. Otherwise it probes increasing concurrency levels and keeps the fastest aggregate generation-token throughput, then collects additional runs at the selected concurrency until min_results is reached.",
+    "token_need": "completion_tokens is taken from OpenAI stream usage. If usage is missing, streamed content chunks are used as an estimated fallback and the run is marked estimated_tokens=true.",
+    "correctness": "Each request is scored against its own pinned dataset item. The chosen option letter is extracted from an 'Answer: X' tag on the final line (falling back to a bare final-line letter, then the last answer tag in the visible text) and must match the reference letter. Headline metric is accuracy over scored items with a Wilson 95% interval, plus per-category accuracy. Runs are paired per item across configurations via --compare-baseline."
+  }
+}

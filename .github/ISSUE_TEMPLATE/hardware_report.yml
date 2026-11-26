@@ -1,0 +1,82 @@
+name: Hardware Bring-Up / Benchmark Report
+description: Report GPU bring-up results, measured throughput/latency, or hardware compatibility findings for Flux Engine.
+title: "[hw] "
+labels: ["hardware", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing a hardware bring-up or benchmark report. Accurate
+        hardware, driver, CUDA, model, and command details help verify new GPU
+        configurations and reproduce performance measurements cleanly.
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model, count & VRAM
+      description: Exact GPU SKU(s), card count, interconnect (PCIe / NVLink / RoCE), and total VRAM.
+      placeholder: 1x NVIDIA RTX PRO 6000 Blackwell (96 GB, PCIe Gen5)
+    validations:
+      required: true
+
+  - type: input
+    id: os-arch
+    attributes:
+      label: OS & CPU architecture
+      description: Operating system, kernel version, and architecture (`linux/amd64`, `linux/arm64`, `darwin/arm64`).
+      placeholder: Ubuntu 24.04.2 LTS (kernel 6.8), linux/amd64
+    validations:
+      required: true
+
+  - type: textarea
+    id: cuda-env
+    attributes:
+      label: "`nvidia-smi` and `nvcc --version` output"
+      description: Paste the header of `nvidia-smi` (driver + CUDA version) and the output of `nvcc --version` (or note N/A for Apple Silicon Metal).
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: flux-version
+    attributes:
+      label: Flux Engine version / commit SHA / image digest
+      description: Output of `flux --version`, `git rev-parse HEAD`, or the signed GHCR image digest (`ghcr.io/theapathy/flux-engine@sha256:...`).
+      placeholder: v1.0.3 (ghcr.io/theapathy/flux-engine:v1.0.3-sm120)
+    validations:
+      required: true
+
+  - type: input
+    id: model-quant
+    attributes:
+      label: Model & quantization
+      description: HuggingFace model ID / revision and weight + KV-cache quantization format.
+      placeholder: nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4 (NVFP4 weights, FP8 KV cache)
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact launch command & flags
+      description: Include the full `docker run` or `flux` / `spark serve` command and any non-default environment variables.
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Measured throughput / latency or failure log
+      description: Report prompt/generation tok/s, TTFT, concurrency, context length, or paste the relevant error / startup log if bring-up failed.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy-confirmation
+    attributes:
+      label: Privacy & redaction check
+      description: Public issues are visible to everyone and indexed permanently.
+      options:
+        - label: I confirm this report contains no API keys, tokens, credentials, personal emails, internal hostnames, or sensitive local file paths.
+          required: true

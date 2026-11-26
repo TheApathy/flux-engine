@@ -1,0 +1,340 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+#![allow(unused_imports, dead_code)]
+
+use crate::main_modules::model_host::CurrentModel;
+use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive};
+use axum::response::{IntoResponse, Json, Response, Sse};
+use futures::StreamExt;
+use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use super::chat_stream::chat_completions_stream;
+use super::responses_context_guard::{response_input_contains_image, response_items_contain_image};
+use super::responses_stream::responses_endpoint_stream;
+use super::responses_translate::{
+    build_responses_usage, emit, find_frame_end, translate_chat_response_to_responses,
+};
+use super::stored::extract_assistant_incoming_message;
+use crate::AppState;
+use crate::openai::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CompletionChunk,
+    CompletionRequest, CompletionResponse, ModelInfo, ModelListResponse, Usage,
+};
+use crate::tool_parser;
+
+// Sibling-cluster items hoisted from the original `api.rs`. These uses
+// give every sub-file access to helpers that the un-split file took for
+// granted via single-module visibility.
+use super::chat::chat_completions_inner;
+use super::compact::{compact_messages, openai_error_response, openai_error_response_with_param};
+use super::completions::not_supported;
+use super::failures::{
+    F23ProgressMetrics, F29EnvironmentFact, F37FailureClass, F39FailureCache,
+    F39PermanentFailureMatch, F49DuplicateWrite, append_f7_reminder_to_last_user,
+    build_f7_stall_reminder, bump_f12_tool_call_count, check_loop_watchdog,
+    collect_f7_stall_buckets, f23_build_reminder, f23_normalize_and_hash, f23_refuse_threshold,
+    f23_score_progress, f23_warn_threshold, f28_text_looks_like_error,
+    f29_extract_binary_from_error_line, f29_extract_environment_facts,
+    f29_inject_environment_facts, f31_inject_hard_refusal, f32_reposition_failed_tool_result,
+    f37_classify_failure, f39_build_circuit_breaker_banner, f39_build_failure_cache,
+    f39_class_label, f39_detect_recent_retries, f39_extract_binary_name,
+    f44_check_permanent_failure, f49_build_banner, f49_detect_duplicate_writes,
+    f49_extract_write_path_and_content, f50_append_original_error, f60_disable_mtp_for_request,
+    flush_content_sanitizer, prepend_reminder_to_system, recent_message_is_tool_error,
+    strip_xml_leaks_from_assistant_content,
+};
+use super::inference_impl::{extract_thinking, strip_stop_sequences, tokenize_stop_sequences};
+use super::inference_types::{
+    GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
+};
+use super::sanitizer::{
+    F7_STALL_REFUSE_THRESHOLD, F7_STALL_WARN_THRESHOLD, F7StallBuckets, ToolKind, classify_tool,
+    extract_bash_final_action, primary_arg_for_tool, sanitize_content_chunk,
+};
+use super::strip::strip_thinking_tags;
+
+// Re-export sibling helpers via crate::api::* for short paths.
+use super::failures::*;
+use super::inference_types::*;
+use super::sanitizer::*;
+
+pub async fn responses_endpoint(
+    CurrentModel(state): CurrentModel,
+    req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
+    req: Result<Json<crate::openai::ResponsesRequest>, JsonRejection>,
+) -> Response {
+    let Json(r) = match req {
+        Ok(r) => r,
+        Err(e) => {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request JSON: {e}"),
+            );
+        }
+    };
+    if state.yarn_context && response_input_contains_image(&r.input) {
+        return openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "Static-YaRN long context is currently text-only; image requests require persistent MRoPE position deltas"
+                .to_string(),
+            Some("input"),
+            Some("unsupported_multimodal_context"),
+        );
+    }
+    let metadata = r.metadata.clone();
+    let store_flag = r.store.unwrap_or(true); // Responses API defaults to store=true.
+    let streaming = r.stream;
+
+    // Resolve `conversation` field (2026): either a non-empty string id or
+    // `{"id": "..."}` with a non-empty string `id`. When set, pre-seed the
+    // turn with the stored items AND append the new turn's items back after
+    // completion.
+    let conversation_id: Option<String> = match &r.conversation {
+        None => None,
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(serde_json::Value::Object(o)) => match o.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => Some(s.to_string()),
+            _ => {
+                return openai_error_response_with_param(
+                    StatusCode::BAD_REQUEST,
+                    "`conversation` must be a non-empty string id or an object with a non-empty string `id` field.".into(),
+                    Some("conversation"),
+                    None,
+                );
+            }
+        },
+        Some(_) => {
+            return openai_error_response_with_param(
+                StatusCode::BAD_REQUEST,
+                "`conversation` must be a non-empty string id or an object with a non-empty string `id` field.".into(),
+                Some("conversation"),
+                None,
+            );
+        }
+    };
+    // Preserve the current turn in its original Responses wire shape for
+    // Conversations persistence. Reconstructing these items after lowering
+    // loses `function_call` / `function_call_output` structure and breaks the
+    // next tool-result turn.
+    let conversation_new_items: Vec<serde_json::Value> = if conversation_id.is_some() {
+        match &r.input {
+            serde_json::Value::String(text) => vec![serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            })],
+            serde_json::Value::Array(items) => items.clone(),
+            _ => Vec::new(), // lowering below returns the canonical 400
+        }
+    } else {
+        Vec::new()
+    };
+    let conversation_prefix: Vec<crate::openai::IncomingMessage> = match &conversation_id {
+        None => Vec::new(),
+        Some(cid) => match state.conversation_store.get(cid) {
+            Some(snap) => {
+                if state.yarn_context && response_items_contain_image(&snap.items) {
+                    return openai_error_response_with_param(
+                        StatusCode::BAD_REQUEST,
+                        "Static-YaRN long context is currently text-only; the conversation contains image input that requires persistent MRoPE position deltas"
+                            .to_string(),
+                        Some("conversation"),
+                        Some("unsupported_multimodal_context"),
+                    );
+                }
+                let mut messages = Vec::new();
+                for item in &snap.items {
+                    match crate::openai::IncomingMessage::try_from_responses_input_item(item) {
+                        Ok(Some(message)) => messages.push(message),
+                        Ok(None) => {} // Opaque reasoning is intentionally not replayed.
+                        Err(e) => {
+                            return openai_error_response_with_param(
+                                StatusCode::BAD_REQUEST,
+                                format!("Invalid conversation item: {e}"),
+                                Some("conversation"),
+                                None,
+                            );
+                        }
+                    }
+                }
+                messages
+            }
+            None => {
+                return openai_error_response_with_param(
+                    StatusCode::NOT_FOUND,
+                    format!("Conversation '{cid}' not found."),
+                    Some("conversation"),
+                    Some("conversation_not_found"),
+                );
+            }
+        },
+    };
+
+    // Resolve previous_response_id against the in-memory store. Wrapped in
+    // a closure so lower_responses_to_chat can report a clean 400 when the
+    // id is unknown without us leaking the store ref into openai.rs.
+    let store = state.response_store.clone();
+    let resolve = |prior_id: &str| -> Option<Vec<crate::openai::IncomingMessage>> {
+        store
+            .get(prior_id, crate::response_store::StoredKind::Response)
+            .map(|e| e.messages)
+    };
+
+    let max_output_tokens_set = r.max_output_tokens.is_some();
+    let mut chat_req = match crate::openai::lower_responses_to_chat(r, resolve) {
+        Ok(c) => c,
+        Err(crate::openai::LowerResponsesError::BadRequest(m)) => {
+            return openai_error_response(StatusCode::BAD_REQUEST, m);
+        }
+        Err(crate::openai::LowerResponsesError::PriorNotFound(m)) => {
+            return openai_error_response_with_param(
+                StatusCode::BAD_REQUEST,
+                m,
+                Some("previous_response_id"),
+                Some("response_not_found"),
+            );
+        }
+    };
+
+    // Admission: the one settings snapshot this request resolves from.
+    let defaults = crate::runtime_settings::pin(&mut chat_req, &state.runtime);
+    chat_req.apply_default_max_tokens(max_output_tokens_set, defaults.default_max_tokens);
+
+    // Prepend conversation items (if any) before the lowered input so
+    // the turn sees the full prior history, while keeping any leading
+    // `instructions` system message at index 0 (Qwen3.8 and other strict
+    // Jinja templates reject mid-conversation system messages).
+    prepend_conversation_prefix(&mut chat_req.messages, conversation_prefix);
+
+    if streaming {
+        return responses_endpoint_stream(
+            CurrentModel(state),
+            req_ctx,
+            chat_req,
+            metadata,
+            store_flag,
+            conversation_id,
+            conversation_new_items,
+        )
+        .await;
+    }
+
+    // Capture the input transcript BEFORE moving chat_req into the handler
+    // — we need it for the stored-turn's `messages` field.
+    let input_messages = chat_req.messages.clone();
+
+    // Re-enter the blocking chat-completions handler with the lowered
+    // request. Use the _inner variant because we already have a parsed
+    // struct (`dump_seq = None`; `--dump` capture is not wired on `/v1/responses`).
+    let resp = chat_completions_inner(state.clone(), req_ctx, chat_req, None).await;
+    let conv_pair = conversation_id.map(|cid| {
+        (
+            state.conversation_store.clone(),
+            cid,
+            conversation_new_items,
+        )
+    });
+    translate_chat_response_to_responses(
+        resp,
+        metadata,
+        Some(state.response_store.clone()),
+        input_messages,
+        store_flag,
+        conv_pair,
+    )
+    .await
+}
+
+/// Prepend prior conversation history while preserving any current-turn
+/// leading `system` (`instructions`) message at index 0.
+fn prepend_conversation_prefix(
+    messages: &mut Vec<crate::openai::IncomingMessage>,
+    conversation_prefix: Vec<crate::openai::IncomingMessage>,
+) {
+    if conversation_prefix.is_empty() {
+        return;
+    }
+    let leading_system = if messages.first().is_some_and(|m| m.role == "system") {
+        Some(messages.remove(0))
+    } else {
+        None
+    };
+    let mut combined = Vec::with_capacity(
+        conversation_prefix.len() + messages.len() + usize::from(leading_system.is_some()),
+    );
+    if let Some(sys) = leading_system {
+        combined.push(sys);
+        combined.extend(
+            conversation_prefix
+                .into_iter()
+                .filter(|m| m.role != "system"),
+        );
+    } else {
+        combined.extend(conversation_prefix);
+    }
+    combined.append(messages);
+    *messages = combined;
+}
+
+/// Convert a conversation item into an IncomingMessage for pipeline
+/// replay. Use the same Responses-item lowering as direct request input so
+/// structured `function_call` / `function_call_output` turns survive.
+pub(super) fn conversation_item_to_message(
+    item: &serde_json::Value,
+) -> Option<crate::openai::IncomingMessage> {
+    crate::openai::IncomingMessage::from_responses_input_item(item)
+}
+
+#[cfg(test)]
+mod conversation_tool_replay_tests {
+    use super::{conversation_item_to_message, prepend_conversation_prefix};
+
+    #[test]
+    fn conversation_prefix_keeps_current_instructions_at_index_zero() {
+        let prefix = vec![
+            crate::openai::IncomingMessage::synthetic_system("Old policy".into()),
+            crate::openai::IncomingMessage::synthetic_user_text("Turn 1".into()),
+        ];
+        let mut current = vec![
+            crate::openai::IncomingMessage::synthetic_system("New policy".into()),
+            crate::openai::IncomingMessage::synthetic_user_text("Turn 2".into()),
+        ];
+        prepend_conversation_prefix(&mut current, prefix);
+        assert_eq!(current.len(), 3);
+        assert_eq!(current[0].role, "system");
+        assert_eq!(current[0].content.text, "New policy");
+        assert_eq!(current[1].role, "user");
+        assert_eq!(current[1].content.text, "Turn 1");
+        assert_eq!(current[2].role, "user");
+        assert_eq!(current[2].content.text, "Turn 2");
+    }
+
+    #[test]
+    fn function_call_and_output_remain_structured() {
+        let call = conversation_item_to_message(&serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_weather",
+            "name": "get_weather",
+            "arguments": "{\"location\":\"Paris\"}",
+        }))
+        .expect("function call");
+        assert_eq!(call.role, "assistant");
+        let calls = call.tool_calls.expect("structured tool call");
+        assert_eq!(calls[0].id.as_deref(), Some("call_weather"));
+        assert_eq!(calls[0].function.name, "get_weather");
+
+        let output = conversation_item_to_message(&serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_weather",
+            "output": "18 C and sunny",
+        }))
+        .expect("function output");
+        assert_eq!(output.role, "tool");
+        assert_eq!(output.tool_call_id.as_deref(), Some("call_weather"));
+        assert_eq!(output.content.text, "18 C and sunny");
+    }
+}

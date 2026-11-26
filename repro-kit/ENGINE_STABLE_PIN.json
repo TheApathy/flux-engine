@@ -1,0 +1,97 @@
+{
+  "schema_version": "1.1.0",
+  "engine_release_version": "1.0.2",
+  "oci_release_version": "1.0.2",
+  "release_channel": "stable-ga-v1.0.2",
+  "pinned_at": "2026-11-24T18:20:24Z",
+  "description": "Pinned GA production Flux Engine v1.0.2 (1.0.2) multi-Spark unified release on NVIDIA DGX Spark GB10 sm_121a: (1) full 2x/3x/4x DGX Spark multi-node unlock live-verified on 4x GB10 hardware with 0 errors across 4x TP=4+EP=4+W=8 DFlash2 (Q=6/KV=1 tp_kv_replicate=2, 128 experts/Spark, GDN 4/12, GQA 6:1 sparse QSA, 12-16s cold boot, 40.2 GiB free UMA @ 4M BF16 KV, 7/7 DFlash2 accept, math_4385_ok=True, C=1..16 0 err, 8K needle OK), 2x TP=2+EP=2+W=8 DFlash2 (26s boot, 23.7 GiB free UMA @ 4M BF16 KV, C=1..16 0 err), 3x PP=3+batched K=5 MTP (13-27s boot, 46.4 GiB free UMA, 44.95 tok/s C=1, 141.02 agg tok/s C=16, 1,574-2,018 tok/s 8K/16K prefill over 1 Gbps TCP, needle OK), and 4x PP=4+batched K=5 MTP (27s boot, 60.2 GiB free UMA, 43.82 tok/s C=1, 139.86 agg tok/s C=16, 1,416-1,650 tok/s 8K/16K prefill over 1 Gbps TCP, needle OK); (2) live-calibrated 1x-4x UMA KV pools across headless (>=112 GiB), desktop (98-112 GiB), and tight (<98 GiB) hosts (512K-10M BF16 / 1M-16M NVFP4) + prefix-cache-aware kv_pool unlock & topology-aware preload fit check (zero false FIT_WARN); (3) full-mesh TcpCommBackend for NAT/bridge clouds + CUDA legacy-stream H2D/D2D sync, worker SSM checkpointing, ConnectX-7 NcclBackend idle-worker broadcast timeout fix, and bare --enable-prefix-caching CLI override.",
+  "primary_stable_binary": {
+    "wave": "v1.0.2-ga-multispark",
+    "git_commit": "e100dbacd498cd563ae9e9d650f20631bc96a752",
+    "git_tree": "9d153fcc0f8ba190f846771b80a58cb7cf9adc8a",
+    "binary_name": "flux-server-real",
+    "installed_container_path": "/opt/flux/bin/flux-server-real",
+    "compat_symlink_path": "/usr/local/bin/spark-server",
+    "binary_bytes": 181957560,
+    "binary_sha256": "9c6d8ed9c4cd77accab64bd708559ff6c320e3e667635aac2386d65b6e5fa5f8",
+    "certified_metrics": {
+      "4x_spark_tp4_ep4_dflash2_tcp_1gbps": "PASS (12-16s boot; 24.71 GB weights/rank; 4M BF16 KV = 48 GiB, 40.2 GiB free UMA; C=1 math 20.3-21.3 tok/s math_4385_ok=True 7/7 DFlash2 accept; C=4 37.14 / C=16 59.45 agg tok/s 0 err; 8K needle_ok=True; 16K GQA 6:1 sparse QSA 0 err)",
+      "2x_spark_tp2_ep2_dflash2_tcp_1gbps": "PASS (26s boot; 4M BF16 KV = 48 GiB, 23.7 GiB free UMA; C=1 math 28.54 tok/s math_4385_ok=True; C=4 56.66 / C=16 109.46 agg tok/s 0 err)",
+      "3x_spark_pp3_k5mtp_tcp_1gbps": "PASS (13-27s boot; 27.23 GB weights/rank; fit_need=77052 vs peak=73781 MiB 0 FIT_WARN; 4M BF16 KV = 32 GiB, 46.4 GiB free UMA, R0 budget_blocks=506180; C=1 math 44.95 tok/s math_4385_ok=True; C=1 code 46.02; C=4 74.77 / C=16 141.02 agg tok/s 0 err; 8K 1,574 tok/s & 16K 2,018 tok/s needle_ok=True)",
+      "4x_spark_pp4_k5mtp_tcp_1gbps": "PASS (27s boot; ~20.5 GB weights/rank; fit_need=62178 vs peak=59800 MiB 0 FIT_WARN; 4M BF16 KV = 24 GiB, 60.2 GiB free UMA, R0 budget_blocks=732725; C=1 math 43.82 tok/s math_4385_ok=True; C=1 code 46.20; C=4 72.65 / C=16 139.86 agg tok/s 0 err; 8K 1,416 tok/s & 16K 1,650 tok/s needle_ok=True)",
+      "1x_spark_baseline_inherited_v101": "auto 393K BF16 C=1..16 Prose T=1.0: 59.3/99.8/147.1/194.6/287.6 tok/s; high-kv 786K C=1 63.5 tok/s; 1m-nvfp4 C=1 59.6 tok/s; GPQA 4/4 PASS 0 loops",
+      "unit_and_integration_tests": "6,721 Rust + 127 repro-kit Python tests PASS (0 failures, 0 clippy warnings, 0 leaks across 2,116 Rust source files)"
+    }
+  },
+  "companion_binaries": [
+    {
+      "binary_name": "flux-server-universal",
+      "installed_container_path": "/opt/flux/bin/flux-server-universal",
+      "git_commit": "e100dbacd498cd563ae9e9d650f20631bc96a752",
+      "binary_bytes": 158905072,
+      "binary_sha256": "31dfb09ad5943e4d448f170b785ad2656b0930d689e1b5a58b5018c34dcc1322",
+      "targets": [
+        "deepseek-v4.1",
+        "gemma-4-31b",
+        "qwen3.8-27b"
+      ]
+    },
+    {
+      "binary_name": "flux-server-glm53",
+      "installed_container_path": "/opt/flux/bin/flux-server-glm53",
+      "git_commit": "e100dbacd498cd563ae9e9d650f20631bc96a752",
+      "binary_bytes": 129715384,
+      "binary_sha256": "9f8cad4b70fb29dc99cf454a4cf40e6363faec4b9bfd878ccb6535d6c5b4bda1",
+      "targets": [
+        "glm5.3-flash"
+      ]
+    }
+  ],
+  "rollback_baseline": {
+    "engine_release_version": "1.0.1",
+    "git_commit": "6ea7befa404c3ea022b329b6100ce46b8b673206",
+    "binary_sha256": "df014cf8bab444fa80ee72ef9ce1270a8b6554b8d2e9508364e39c3f39245297"
+  },
+  "operating_recipes": {
+    "default_nextgen_max_prefill_decode": {
+      "mode": "auto",
+      "recipe_file": "/opt/flux/repro-kit/recipes/flux-nextgen-max-prefill-decode.env",
+      "sha256": "4261ea470073dd22e2b259f1f8e311e3b97bdd70a66c79f19290ddbd22532a75"
+    },
+    "compat_max_prefill": {
+      "mode": "max-prefill",
+      "recipe_file": "/opt/flux/repro-kit/recipes/flux-v9-max-prefill.env",
+      "sha256": "2942f6ae474c84a175bb3969f2d6eedad43c60bd917162f76ad443f706420889"
+    },
+    "interactive_w4096": {
+      "mode": "interactive",
+      "recipe_file": "/opt/flux/repro-kit/recipes/flux-v9-w4096-interactive.env",
+      "sha256": "318b36a75b485a4b73cc20b4b13285d21a1c66327f1de5a95d574c6a03039663"
+    },
+    "nextgen_1m_nvfp4": {
+      "mode": "1m-nvfp4",
+      "recipe_file": "/opt/flux/repro-kit/recipes/flux-nextgen-1m-nvfp4.env",
+      "sha256": "5eb9ec39921d6cc91c5453415e2edd3c8d2466fa446369b06a2ea3f0180a3033"
+    },
+    "nextgen_c128_concurrency": {
+      "mode": "c128",
+      "recipe_file": "/opt/flux/repro-kit/recipes/flux-nextgen-c128-concurrency.env",
+      "sha256": "bffc732b1f1186579c7786a6117f008096a9b4ddff6f219d5e17a44c3e9b399d"
+    },
+    "multispark_2x_tp2_disagg": {
+      "mode": "2x-spark",
+      "recipe_file": "/opt/flux/repro-kit/recipes/2x-spark-tp2-disagg.env",
+      "sha256": "0ddcbe6ee09b972ab45cb7aa08428ac4cafa2f384bb2ba214a73b048c76f14d5"
+    },
+    "multispark_3x_pp3_disagg": {
+      "mode": "3x-spark",
+      "recipe_file": "/opt/flux/repro-kit/recipes/3x-spark-pp3-disagg.env",
+      "sha256": "f5a16faea997e1f2d7a9b4ae90ce37805c730ac1a15c1cff8f1872d9102117b9"
+    },
+    "multispark_4x_tp4_ep4_and_pp4_cluster": {
+      "mode": "4x-spark",
+      "recipe_file": "/opt/flux/repro-kit/recipes/4x-spark-cluster.env",
+      "sha256": "8a659e48161c64dfe1410734e4887f5c2a612d1414111d65f59b622033c868f0"
+    }
+  }
+}

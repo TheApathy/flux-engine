@@ -1,0 +1,4 @@
+K=5 Decode [tf_streams_code_256]: decode_only=84.98 tok/s | wall=78.60 tok/s (chunks=253, dt=3.00s)
+K=5 Decode [tf_streams_prose_256]: decode_only=65.48 tok/s | wall=61.63 tok/s (chunks=243, dt=3.89s)
+K=5 Decode [sparkdash_code_400]: decode_only=93.13 tok/s | wall=87.95 tok/s (chunks=369, dt=4.28s)
+K=5 Decode [sparkdash_prose_400]: decode_only=64.12 tok/s | wall=61.90 tok/s (chunks=382, dt=6.22s)

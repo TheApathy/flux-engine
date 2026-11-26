@@ -1,0 +1,8 @@
+{
+  "milestone": "Milestone 2 — Native 262K Qualification",
+  "kernel_log_audit": "PASS",
+  "xid_errors": 0,
+  "nvrm_faults": 0,
+  "oom_kills": 0,
+  "note": "Raw host journalctl dump omitted for privacy; summary verified 0 GPU Xid errors, 0 NVRM faults, and 0 OOM kills across the 262K qualification window."
+}

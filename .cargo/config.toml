@@ -1,0 +1,22 @@
+# Flux Engine Rust build configuration.
+#
+# Portable defaults are kept here so builds succeed on Linux (x86_64/aarch64),
+# macOS (Apple Silicon / Metal), and CI without requiring host-specific linkers
+# or non-portable CPU ISA flags.
+#
+# Opt-in local performance tuning (set in your shell or ~/.cargo/config.toml):
+#   - Host-specific SIMD/SVE2 codegen (non-portable binaries, local machine only):
+#       RUSTFLAGS="-C target-cpu=native" cargo build --release
+#     Note: avoid `-C target-cpu=native` on macOS Apple Silicon (breaks `ring`
+#     compile-time CPU feature assertions) and when building redistributable
+#     release binaries or containers.
+#   - Fast local linking with `mold` (Linux only, when mold is installed):
+#       RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release
+
+# Names this source tree to crates/atlas-kernels/build.rs, which reruns when
+# it changes: worktrees sharing a CARGO_TARGET_DIR share one build-script
+# OUT_DIR, and without this a second tree could reuse another tree's PTX.
+# `relative` resolves "." against this file's directory (the repo root);
+# `force` keeps a stale shell export from naming the wrong tree.
+[env]
+ATLAS_BUILD_SOURCE_ROOT = { value = ".", relative = true, force = true }

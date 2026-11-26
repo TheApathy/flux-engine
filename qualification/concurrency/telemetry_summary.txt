@@ -1,0 +1,14 @@
+=== CONCURRENCY TELEMETRY CENSUS ===
+server_log=qualification/concurrency/server.log
+harness_log=qualification/concurrency/harness.log
+report_json=qualification/concurrency/report.json
+2026-10-24T12:32:49.517361Z  INFO spark_model::layers::qwen4_verify_lanes: QWEN4_BATCHED_K5_LANES_CONFIGURED lanes=8
+2026-10-24T12:33:30.891642Z  INFO spark_model::model::trait_impl::verify_qwen4_batched: QWEN4_BATCHED_K5_ENGAGED cross-sequence native-MTP verify frame seqs=2 k=5 rows=10
+bounded_transpose_owners_ready_count=48
+batched_k5_verify_frame_count=560
+batched_k5_refused_count=0
+serial_fallback_count=0
+serial_batch_frame_count=0
+serial_frame_first_count=0
+measured_floor_mib=9712
+watchdog_kills=0

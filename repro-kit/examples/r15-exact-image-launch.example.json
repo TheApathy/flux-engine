@@ -1,0 +1,103 @@
+{
+  "schema": "flux-r15-exact-image-launch/2",
+  "release_version": "v0.9.13-rc.r17.20261024",
+  "runtime_dir": "/results/r15-runtime",
+  "image": {
+    "id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "rootfs_layers_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "recipe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "in_container_binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "in_container_binary_path": "/opt/flux/bin/flux-server-real",
+    "in_container_recipe_path": "/opt/flux/repro-kit/recipes/flux-r15-release.env",
+    "performance_recipes": {
+      "interactive": {
+        "path": "/opt/flux/repro-kit/recipes/flux-v9-w4096-interactive.env",
+        "sha256": "318b36a75b485a4b73cc20b4b13285d21a1c66327f1de5a95d574c6a03039663"
+      },
+      "high-prefill": {
+        "path": "/opt/flux/repro-kit/recipes/flux-v9-max-prefill.env",
+        "sha256": "2942f6ae474c84a175bb3969f2d6eedad43c60bd917162f76ad443f706420889"
+      }
+    }
+  },
+  "provenance": {
+    "release_version": "v0.9.13-rc.r17.20261024",
+    "source_revision": "0000000000000000000000000000000000000000",
+    "source_tree": "0000000000000000000000000000000000000000",
+    "source_root_path": "/results/r15-source/clean-tree",
+    "source_bundle_manifest_path": "/results/r15-source/SOURCE_BUNDLE_MANIFEST.json",
+    "source_bundle_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_bundle_path": "/results/r15-source/flux-engine-source-v0.9.13-rc.r17.20261024.tar.gz",
+    "source_bundle_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "build_receipt_path": "/results/r15-build/sealed-build-receipt.json",
+    "build_receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_to_binary_receipt_path": "/results/r15-build/source-to-binary-receipt.json",
+    "source_to_binary_receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "binary_path": "/results/r15-build/flux-server-real",
+    "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "checkpoint_id": "JMNI-Labs/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+    "checkpoint_revision": "0000000000000000000000000000000000000000",
+    "checkpoint_path": "/models/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+    "checkpoint_manifest_path": "/results/r15-checkpoint-inventory.json",
+    "checkpoint_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "recipe_path": "/results/r15-build/flux-r15-release.env",
+    "recipe_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "launch": {
+    "name": "flux-r15-qualification",
+    "run_id": "replace-with-unique-run-id",
+    "cidfile": "/results/r15-runtime/container.cid",
+    "lockfile": "/results/r15-runtime/container-release.lock",
+    "diagnostics_dir": "/results/r15-runtime/diagnostics",
+    "base_url": "http://127.0.0.1:18898",
+    "extra_run_args": [
+      "--read-only",
+      "--network",
+      "host",
+      "--gpus",
+      "all",
+      "--ipc",
+      "host",
+      "--ulimit",
+      "memlock=-1",
+      "--security-opt",
+      "seccomp=unconfined",
+      "--volume",
+      "/models/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid:/models:ro",
+      "--volume",
+      "/results/r15-runtime:/results:rw"
+    ],
+    "entrypoint": "/usr/bin/sleep",
+    "container_command": [
+      "infinity"
+    ]
+  },
+  "suite": {
+    "program_path": "/results/r15-source/clean-tree/repro-kit/r15-container-suite.py",
+    "program_sha256": "a1968664703be33a87f7b3391050c94a8b64fc2577ea1faee480e6dd8ed9a1e9",
+    "plan_path": "/results/r15-suite-plan.json",
+    "plan_sha256": "e9d31923ef7f038f40032711c8a12ba6f444e5fbcec226a87126ef30f97cda00",
+    "argv": [
+      "/results/r15-source/clean-tree/repro-kit/r15-container-suite.py",
+      "--container-id",
+      "@CONTAINER_ID@",
+      "--image-id",
+      "@IMAGE_ID@",
+      "--image-digest",
+      "@IMAGE_DIGEST@",
+      "--base-url",
+      "@BASE_URL@",
+      "--run-id",
+      "@RUN_ID@",
+      "--plan-fd",
+      "@PLAN_FD@",
+      "--receipt-fd",
+      "@RECEIPT_FD@"
+    ],
+    "timeout_seconds": 86400,
+    "receipt_path": "/results/r15-runtime/suite-receipt.json",
+    "stdout_path": "/results/r15-runtime/suite.stdout",
+    "stderr_path": "/results/r15-runtime/suite.stderr"
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "schema": "flux-tool-eval-runaway-manifest-v1",
+  "launch_contract": {
+    "profile": "interactive-w4096",
+    "concurrency": 1,
+    "max_batch_size": 1,
+    "max_num_seqs": 1,
+    "prefill_chunk_tokens": 4096,
+    "kv_cache_dtype": "bf16",
+    "speculation": {"mode": "none", "num_drafts": 0},
+    "tool_call_parser": "qwen3_coder",
+    "chat_template": {
+      "source": "checkpoint-native",
+      "tool_format": "qwen-xml",
+      "native_tool_render_count": 1,
+      "hermes_prompt_injection_count": 0
+    }
+  },
+  "request": {
+    "model": "qad5500",
+    "messages": [
+      {"role": "user", "content": "Use get_weather once to look up Paris."}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Return current weather for one city.",
+          "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "required",
+    "parallel_tool_calls": false,
+    "max_tokens": 64,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "chat_template_kwargs": {"enable_thinking": false},
+    "seed": 130204855,
+    "n": 1,
+    "return_token_ids": true,
+    "report_interventions": true
+  },
+  "expected_tool_names": ["get_weather"],
+  "token_cap": 64,
+  "timeout_seconds": 45
+}

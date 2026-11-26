@@ -1,0 +1,109 @@
+# name<TAB>class<TAB>reason. Manual classifications win over keyword rules.
+# Evidence: precision audit and the reader code.
+ATLAS_QWEN4_PREFILL_GDN_FI	NUMERICS	FlashInfer GDN with f16 q/k/v/out operands
+ATLAS_QWEN4_PREFILL_ATTN_FI	NUMERICS	FlashInfer FA2 prefill attention, not bit-exact
+ATLAS_QWEN4_PREFILL_MHC_FUSED	NUMERICS	fused MHC non-bit-exact at >=2047 rows
+ATLAS_QWEN4_PREFILL_HC_FUSED	NUMERICS	fused HC prefill path
+ATLAS_QWEN4_PREFILL_MOE_V28Q	NUMERICS	W4A8 MoE prefill coupling, unverified
+ATLAS_QWEN4_PREFILL_GDN_CONV_V2	NUMERICS	f16 conv glue for the FI GDN path
+ATLAS_QWEN4_PREFILL_GDN_CONV_V3	NUMERICS	f16 conv glue for the FI GDN path
+ATLAS_QWEN4_PREFILL_HC_EXACT	NUMERICS	selects exact vs approximate HC prefill
+ATLAS_QWEN4_PREFILL_SSM_EXACT	NUMERICS	selects exact vs approximate SSM prefill
+ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB	RESOURCE	memory reserve for the FP8 weight cache
+ATLAS_QWEN4_FP8_WEIGHT_CACHE_FLOOR_MARGIN_MIB	RESOURCE	memory floor margin
+ATLAS_QWEN4_FAST_PROJ_CACHE	ROUTE	cache of an already-selected projection format
+ATLAS_QWEN4_RELEASE_BF16_QKVZ	RESOURCE	frees the BF16 copy after conversion, changes no numerics
+ATLAS_DSV41_ARENA_BUDGET_GB	RESOURCE	arena size
+ATLAS_QWEN4_PREFILL_MOE_TOPK_WARP	ROUTE	warp-level MoE top-k selector claimed bit-identical to the block kernel
+ATLAS_QWEN4_LMHEAD_BF16	NUMERICS	LM head served BF16 vs NVFP4 requant
+ATLAS_GDN_BF16_WEIGHTS	NUMERICS	BF16 out_proj weights plus related GDN precision side effects
+ATLAS_SSM_H_FP16	NUMERICS	FP16 recurrent state (memory note: corrupts DFlash)
+ATLAS_IGNORE_REQUEST_SAMPLING	NUMERICS	overrides request sampling fields
+ATLAS_CTX_OVERFLOW_TRUNCATE	NUMERICS	truncates prompt history, changes served output
+ATLAS_DISABLE_SPECULATION	ROUTE	greedy speculation claims identity with target-only
+ATLAS_QWEN4_MTP_VOCAB_PRUNE	ROUTE	draft-side vocabulary only; verify keeps the target argmax
+ATLAS_QWEN4_MTP_CONF	ROUTE	draft confidence threshold; verify keeps the target argmax
+ATLAS_MTP_THINK_SPEC	ROUTE	speculation inside thinking; verify keeps the target argmax
+ATLAS_DDTREE_BUDGET	ROUTE	draft tree size
+ATLAS_DDTREE_TOP_K	ROUTE	draft tree width
+ATLAS_DFLASH_CAPTURE_THINKING	ROUTE	drafter capture scope
+ATLAS_DFLASH_THINK_MASK_VERIFY	DEBUG	verification check
+ATLAS_GLM53_ROUTER_LOGITS_TOKENS	OBSERVABILITY	router logits capture
+ATLAS_TC_NVFP4_M16	ROUTE	tile shape of an unchanged format
+ATLAS_NVFP4_GATE_UP_M128	ROUTE	tile shape of an unchanged format
+ATLAS_NVFP4_MOE_WORKLIST	ROUTE	work scheduling of an unchanged format
+ATLAS_FP8_MOE_COALESCED	ROUTE	memory access pattern of an unchanged format
+ATLAS_DSV41_FP8_FIXED_M	ROUTE	tile shape of an unchanged format
+ATLAS_DSV41_FP8_ROWTILE	ROUTE	tile shape of an unchanged format
+ATLAS_PREFILL_INTERLEAVE_TOKEN_BUDGET	ROUTE	scheduling; chunk-size numerics unverified
+ATLAS_QWEN4_PREFILL_WIDE	ROUTE	prefill chunk width; chunk-size numerics unverified for FN
+FLUX_MODE	OBSERVABILITY	displayed by the TUI; the launcher resolves the mode into env
+FLUX_THINKING	DEAD	main excludes it from aliasing; thinking reaches the server as a CLI flag
+ATLAS_DISABLE_FORCED_TOKEN	NUMERICS	removes forced tokens, changes served output
+ATLAS_BOUNDED_HOST_COPY	RESOURCE	host staging copy bound
+ATLAS_DFLASH_SAM_MISFIRE_LIMIT	ROUTE	draft heuristic; verify keeps the target argmax
+ATLAS_DFLASH_TPS_ROUTER_FLOOR	ROUTE	draft routing heuristic
+ATLAS_DFLASH_DRAFT_CAP	ROUTE	draft length cap
+ATLAS_QWEN4_MTP_BOUNDED_BLOCKS	RESOURCE	MTP block budget
+ATLAS_QWEN4_PREFILL_ATTN_CORE16	ROUTE	SILENT FALLBACK: admit_or_suppress (qwen4_prefill_moe/attn16.rs:231-289) downgrades un-admitted prefills to the ordinary path, logged once per process
+ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE	RESOURCE	memory-vs-speed cache of the same FP8 weights
+ATLAS_TEMP_OVERRIDE	NUMERICS	overrides every request temperature (sampling_setup.rs)
+ATLAS_SOFTCAP_OVERRIDE	NUMERICS	overrides final_logit_softcapping (gemma4 parser)
+ATLAS_QWEN4_PREFILL_FAKEQUANT	NUMERICS	injects simulated NVFP4 quantization into prefill
+ATLAS_VERIFY_SKIP_LAYERS	NUMERICS	skips layers during target verification
+ATLAS_DFLASH_RELAX_ACCEPT	NUMERICS	accepts non-argmax drafts into output
+ATLAS_DFLASH_RELAX_RATIO	NUMERICS	accepts non-argmax drafts into output
+ATLAS_DFLASH_RELAX_TOPK	NUMERICS	accepts non-argmax drafts into output
+ATLAS_DFLASH_TYPICAL_ACCEPT	NUMERICS	typical acceptance changes output
+ATLAS_DFLASH_TYPICAL_ALPHA	NUMERICS	typical acceptance changes output
+ATLAS_DFLASH_MARGIN_GATE	NUMERICS	margin-gated acceptance changes output
+ATLAS_REASONING_EFFORT	NUMERICS	default reasoning_effort changes the rendered prompt
+ATLAS_ALLOW_SPECIAL_TOKENS_IN_CONTENT	NUMERICS	changes prompt token ids (serve_load.rs env_on)
+FLUX_ALLOW_SPECIAL_TOKENS_IN_CONTENT	NUMERICS	changes prompt token ids (serve_load.rs env_on)
+ATLAS_DFLASH2_W4A4_SHADOW	ROUTE	draft-only; verify keeps the target argmax (consistent with MTP gates)
+ATLAS_DFLASH_LM_HEAD_FP8	ROUTE	draft-only; verify keeps the target argmax
+ATLAS_DFLASH_LM_HEAD_NVFP4	ROUTE	draft-only; verify keeps the target argmax
+ATLAS_DFLASH_QUANT	ROUTE	draft-only; verify keeps the target argmax
+ATLAS_MTP_FP8_CALIB	ROUTE	draft-only; verify keeps the target argmax
+ATLAS_TARGET_QUANT	RESOURCE	build selector; at runtime read only as a transform-cache key (transform_cache.rs), option_env! is compile-time
+ATLAS_TARGET_MODEL	RESOURCE	build selector; at runtime read only as a transform-cache key (transform_cache.rs), option_env! is compile-time
+FLUX_TARGET_QUANT	RESOURCE	build selector; at runtime read only as a transform-cache key (transform_cache.rs), option_env! is compile-time
+ATLAS_QWEN4_DENSE_NATIVE	NUMERICS	umbrella native-dense precision selector (qwen4_native_selectors.rs:20), owned by [precision]
+ATLAS_QWEN4_PREFILL_NATIVE	NUMERICS	native-dense prefill precision selector (qwen4_prefill_native.rs:48), owned by [precision]
+ATLAS_QWEN4_RELEASE_MXFP8_SOURCES	RESOURCE	mxfp8_release.rs:34 frees consumed checkpoint MXFP8 store originals after conversion; byte-identical output
+ATLAS_QWEN4_DENSE_DEDUP	RESOURCE	dense_dedup.rs:31 frees consumed dense-projection construction copies; byte-identical output
+ATLAS_MEMLEAN_SSM_BF16_QKVZ	RESOURCE	memlean.rs:10 frees dense-hybrid SSM BF16 QKVZ copy after NVFP4 quantization; byte-identical output
+ATLAS_MEMLEAN_FP8_SOURCES	RESOURCE	memlean.rs:11 frees dense-hybrid converted FP8 E4M3 store tensors; byte-identical output
+ATLAS_MEMLEAN_FFN_GATE_UP_ALIAS	RESOURCE	memlean.rs:12 aliases separate gate/up packed weights into merged FlashInfer operand; byte-identical output
+ATLAS_MEMLEAN_SHARED_SCRATCH	RESOURCE	memlean.rs:13 shares per-layer FFN/SSM scratch workspace across layers; byte-identical output
+ATLAS_MEMLEAN_UNUSED_MTP	RESOURCE	memlean.rs:14 frees unused mtp.* store tensors when no MTP head is built
+ATLAS_MEMLEAN_DRAFTER_BF16	RESOURCE	memlean.rs:15 frees DFlash drafter BF16 weights after NVFP4 quantization; byte-identical output
+ATLAS_QWEN4_TEXT_ONLY	RESOURCE	weights.rs:187 skips loading the vision tower on text-only serves and refuses image requests
+ATLAS_SPECIAL_TOKENS_IN_CONTENT	NUMERICS	changes prompt token ids by parsing special-token text in request content (content_specials.rs:16)
+FLUX_SPECIAL_TOKENS_IN_CONTENT	NUMERICS	changes prompt token ids by parsing special-token text in request content (content_specials.rs:16)
+FLUX_CLAMP_MAX_TOKENS	RESOURCE	request admission max_tokens clamping policy (request_contract.rs:218)
+FLUX_MIN_ANSWER_TOKENS	RESOURCE	request admission minimum clamped answer room (request_contract.rs:219)
+FLUX_MIN_DECODE_TOKS_PER_S	RESOURCE	request timeout floor decode rate (request_contract.rs:56)
+FLUX_MIN_PREFILL_TOKS_PER_S	RESOURCE	request timeout floor prefill rate (request_contract.rs:60)
+FLUX_CONTINUATION_RESET_PROOF	DEBUG	continuation sequence reset proof verification toggle (continuation.rs:314)
+ATLAS_QWEN4_DENSE_MXFP8	DEAD	source_pins.rs:108 legacy alias-check name with no runtime engine reader
+ATLAS_DISPLAY_CARVEOUT_FD	RESOURCE	inherited RM object fd from spark display-carveout (carveout.rs:28)
+ATLAS_DISPLAY_CARVEOUT_SIZE	RESOURCE	byte size of exported DISPLAY_FRM carveout object (carveout.rs:30)
+ATLAS_KV_CARVEOUT_ORDER	RESOURCE	KV buffer placement order across system vs carveout memory (placement.rs)
+FLUX_KV_CARVEOUT_ORDER	RESOURCE	KV buffer placement order across system vs carveout memory (placement.rs)
+FLUX_KV_MAX_TOKENS	RESOURCE	KV pool capacity ceiling in tokens (build.rs)
+ATLAS_SSM_SNAP_LADDER	RESOURCE	logarithmic SSM snapshot retention ladder base interval (snapshot_ladder.rs)
+FLUX_SSM_SNAP_LADDER	RESOURCE	logarithmic SSM snapshot retention ladder base interval (snapshot_ladder.rs)
+ATLAS_GRAMMAR_SERIAL_VERIFY	ROUTE	opt-in serial vs batched grammar verify scheduling toggle (verify_qwen4_batched_step.rs)
+ATLAS_QWEN4_FP8_PAD128	ROUTE	zero-padded M128 TMA alignment of an already-selected FP8 projection (qwen4_fast_proj.rs)
+ATLAS_QWEN4_ATTN_PREFILL_HYBRID	ROUTE	batched exact continuation prefill for suppressed Qwen4 attention slices (trait_impl.rs)
+ATLAS_CUBLASLT_AUTOTUNE	ROUTE	cuBLASLt heuristic selection for tensor-scale FP8 GEMMs (cublaslt.rs)
+ATLAS_QWEN4_GDN_VERIFY_FUSED	ROUTE	0-ULP 48-CTA fused Qwen4 GDN conv1d+recurrence+gated-RMSnorm decode and verify kernel (qwen4_k5_ssm.rs)
+ATLAS_QWEN4_QSA_FUSED_GATE	ROUTE	0-ULP fused per-head sigmoid output gate in QSA sparse reduce and BF16 paged decode (qwen4_qsa.rs)
+ATLAS_CUDA_WFET_SYNC	ROUTE	ARMv9.2 WFET stream-write-value host synchronization; identical GPU arithmetic (wfet_sync.rs)
+ATLAS_CUDA_PDL	ROUTE	CUDA Programmatic Dependent Launch stream serialization; identical GPU arithmetic (registry.rs)
+ATLAS_SPEC_INITIAL_RATE	ROUTE	adaptive speculative draft depth cold-start survival prior; target verify is exact (adaptive_depth.rs)
+FLUX_SPEC_INITIAL_RATE	ROUTE	adaptive speculative draft depth cold-start survival prior; target verify is exact (adaptive_depth.rs)
+ATLAS_QWEN4_ROUTER_BF16_TK64	ROUTE	tile shape selector for BF16 MoE router GEMM (layers/moe/forward_prefill.rs); bit-identical output
+ATLAS_CUBLASLT_CACHE	RESOURCE	enable/disable persistent on-disk cuBLASLt heuristic plan cache (cublaslt/plan_cache.rs)
+ATLAS_CUBLASLT_CACHE_PATH	RESOURCE	override filesystem path for persistent cuBLASLt heuristic plan cache (cublaslt/plan_cache.rs)

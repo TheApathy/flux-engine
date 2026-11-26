@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""R15 cancellation-slot-reuse gate driver (live, in-container).
+
+For each mode (``none`` then ``native-mtp-k5``) this launches one fresh C8
+native-reference server process through the pinned native-concurrency driver,
+then, against that live endpoint:
+
+1. runs every C8 prompt and the replacement prompt alone (C1, fresh slot), to
+   get the reference token ids, full logits, and terminal state;
+2. admits eight streaming requests, disconnects the final admission (the
+   highest live slot) after eight content chunks, starts a replacement only
+   after that response closed, and lets the seven survivors finish;
+3. proves server-side release from the engine's own receipts: the cancelled
+   target-state receipt is logged before the replacement's first frame, the
+   replacement's first frame uses the retired physical slot, and that slot is
+   the highest of the full C8 frame; ``atlas_requests_active`` must return to
+   zero before the churn, after the drain, and after post-drain reuse;
+4. replays the replacement alone after the drain (post-drain reuse) and
+   demands no batch frame plus exact C1 token ids, logits, and terminal state.
+
+Survivors and the replacement must equal their C1 references bit for bit
+(token ids, finish reason, usage). Every request body and every streamed
+response byte is hashed with its timing. Nothing is accepted as a flag: each
+census boolean is recomputed here from observed rows, and the wrapper
+recomputes the census again from the validator document.
+
+All process, container, provenance, launch, log, memory, and cleanup
+machinery is the pinned ``native-concurrency-c2-c8`` driver, loaded from exact
+bytes and called unchanged. The probe validators it pins do the token, logit,
+state, frame-ownership, and slot checks. A subset of modes never produces a
+PASS receipt. Failures leave one private ``failure-<hex>.json``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import sys
+import threading
+import time
+import types
+import urllib.error
+import urllib.parse
+import urllib.request
+
+GATE = "cancellation-slot-reuse"
+MODES = ("none", "native-mtp-k5")
+WIDTH = 8
+PROFILE = "native-reference"
+CHURN_CANCEL_CHUNKS = 8
+MAX_DRIVER_BYTES = 16 * 1024 * 1024
+IDLE_TIMEOUT_SECONDS = 30.0
+ACTIVE_RE = re.compile(r"^atlas_requests_active\s+([0-9]+(?:\.0+)?)\s*$", re.MULTILINE)
+OWN_FLAGS = ("--concurrency-driver-program", "--concurrency-driver-sha256")
+
+
+class GateFailure(ValueError):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise GateFailure(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read_pinned(path, expected):
+    """Read exact regular-file bytes without following links."""
+    require(re.fullmatch(r"[0-9a-f]{64}", expected or "") is not None, "pin is invalid")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= MAX_DRIVER_BYTES,
+            "pinned program size or type differs",
+        )
+        raw = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    require(
+        identity(before) == identity(after) and len(raw) == before.st_size,
+        "pinned program changed while reading",
+    )
+    require(digest(raw) == expected, "pinned program SHA-256 differs")
+    return raw
+
+
+def load_concurrency_driver(path, expected):
+    raw = read_pinned(path, expected)
+    module = types.ModuleType("_r16_cancellation_concurrency_driver")
+    module.__file__ = str(path)
+    sys.modules[module.__name__] = module
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    require(module.GATE == "native-concurrency-c2-c8", "concurrency driver identity differs")
+    # Log frames appended by the pinned server context carry this gate's name.
+    module.GATE = GATE
+    return module
+
+
+# --- request/response hashing hook -------------------------------------------
+
+
+class ExchangeRegistry:
+    """Timing plus request/response digests around the probe's urlopen.
+
+    ``drain`` keeps the pinned driver's timing contract; ``archive`` retains
+    every exchange for this gate's request/response census.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.records = []
+        self.archive = []
+
+    def drain(self):
+        with self.lock:
+            records, self.records = self.records, []
+        return records
+
+    def mark(self):
+        with self.lock:
+            return len(self.archive)
+
+    def between(self, start, end):
+        """Completion exchanges only; bodiless health probes are excluded."""
+        with self.lock:
+            return [dict(item) for item in self.archive[start:end] if item["body_bytes"]]
+
+
+class HashedResponse:
+    def __init__(self, response, record):
+        self.response = response
+        self.record = record
+        self.hasher = hashlib.sha256()
+
+    def _absorb(self, raw):
+        self.hasher.update(raw)
+        self.record["response_bytes"] += len(raw)
+        self.record["response_sha256"] = self.hasher.hexdigest()
+
+    def __enter__(self):
+        self.response.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self.record["finished_unix"] = time.time()
+        return self.response.__exit__(*exc)
+
+    @property
+    def status(self):
+        return self.response.status
+
+    def read(self, *arguments):
+        raw = self.response.read(*arguments)
+        self._absorb(raw)
+        return raw
+
+    def __iter__(self):
+        for line in self.response:
+            self._absorb(line)
+            if line.startswith(b"data:"):
+                payload = line[5:].strip()
+                if payload == b"[DONE]":
+                    self.record["saw_done"] = True
+                elif (
+                    self.record["first_content_unix"] is None
+                    and payload
+                    and b'"content"' in payload
+                ):
+                    self.record["first_content_unix"] = time.time()
+            yield line
+
+
+def install_exchange_hook(probe, registry):
+    real_urlopen = urllib.request.urlopen
+
+    def hashed_urlopen(request_object, timeout=None):
+        body = request_object.data or b""
+        record = {
+            "body_sha256": digest(body),
+            "body_bytes": len(body),
+            "started_unix": time.time(),
+            "first_content_unix": None,
+            "finished_unix": None,
+            "response_sha256": digest(b""),
+            "response_bytes": 0,
+            "saw_done": False,
+        }
+        with registry.lock:
+            registry.records.append(record)
+            registry.archive.append(record)
+        return HashedResponse(real_urlopen(request_object, timeout=timeout), record)
+
+    probe.urllib = types.SimpleNamespace(
+        request=types.SimpleNamespace(Request=urllib.request.Request, urlopen=hashed_urlopen),
+        error=urllib.error,
+        parse=urllib.parse,
+    )
+
+
+# --- server-side release census ------------------------------------------------
+
+
+def active_requests(nc, args):
+    text = nc.request(args, "GET", "/metrics").decode("utf-8", "strict")
+    values = ACTIVE_RE.findall(text)
+    require(len(values) == 1, "atlas_requests_active gauge is missing or ambiguous")
+    return int(float(values[0]))
+
+
+def wait_idle(nc, args, phase):
+    deadline = time.monotonic() + IDLE_TIMEOUT_SECONDS
+    samples = []
+    while True:
+        value = active_requests(nc, args)
+        samples.append(value)
+        if value == 0:
+            return {"phase": phase, "samples": samples, "final": 0}
+        require(time.monotonic() < deadline, f"{phase}: active requests never drained")
+        time.sleep(0.05)
+
+
+# --- pure census (offline-tested) ---------------------------------------------
+
+
+def request_labels(probe, model, cases, max_tokens):
+    labels = {}
+    for case in cases:
+        body = probe.json_canonical(probe.request_body(model, case, max_tokens))
+        labels[digest(body)] = case.label
+    return labels
+
+
+def exchange_rows(records, labels):
+    rows = []
+    for record in records:
+        label = labels.get(record["body_sha256"])
+        require(label is not None, "an unplanned request reached the endpoint")
+        first, finished = record["first_content_unix"], record["finished_unix"]
+        rows.append(
+            {
+                "label": label,
+                "request_sha256": record["body_sha256"],
+                "request_bytes": record["body_bytes"],
+                "response_sha256": record["response_sha256"],
+                "response_bytes": record["response_bytes"],
+                "completed_stream": record["saw_done"],
+                "started_unix": record["started_unix"],
+                "ttft_s": None if first is None else first - record["started_unix"],
+                "elapsed_s": None if finished is None else finished - record["started_unix"],
+            }
+        )
+    return rows
+
+
+def frame_slot(frame, session):
+    sessions = frame["sessions"]
+    require(sessions.count(session) == 1, "frame session ownership is ambiguous")
+    return frame["slots"][sessions.index(session)]
+
+
+def derive_observation(mode, labels, base_receipts, churn, reuse, churn_rows, reuse_rows, idle):
+    """Recompute the cancellation census from observed rows; never trust flags."""
+    reference = {row["label"]: row for row in base_receipts}
+    require(len(labels) == WIDTH and len(set(labels)) == WIDTH, "C8 admission census differs")
+    cancelled = churn["cancelled"]
+    require(cancelled["label"] == labels[-1], "cancelled request was not the final admission")
+    require(
+        cancelled["content_chunks_before_close"] == CHURN_CANCEL_CHUNKS,
+        "cancellation boundary differs",
+    )
+    survivors = churn["survivors"]
+    require(
+        [row["label"] for row in survivors] == labels[:-1],
+        "survivor census differs from the admitted rows",
+    )
+    replacement = churn["replacement"]
+    replacement_label = replacement["label"]
+    require(replacement_label not in labels, "replacement reused an original prompt")
+
+    def same_as_fresh_slot(row):
+        fresh = reference.get(row["label"])
+        return (
+            fresh is not None
+            and row["token_ids_sha256"] == fresh["token_ids_sha256"]
+            and row["token_ids"] == fresh["token_ids"]
+            and row["finish_reason"] == fresh["finish_reason"]
+            and row["usage_identity"] == fresh["usage_identity"]
+        )
+
+    survivor_identity = all(same_as_fresh_slot(row) for row in survivors)
+    require(survivor_identity, "a survivor differs from its fresh-slot reference")
+    require(same_as_fresh_slot(replacement), "replacement differs from its fresh-slot reference")
+
+    frames = churn["frames"]
+    cancelled_session = cancelled["session"]
+    replacement_session = reference[replacement_label]["session"]
+    target_frames = [f for f in frames if cancelled_session in f["sessions"]]
+    replacement_frames = [f for f in frames if replacement_session in f["sessions"]]
+    require(target_frames and replacement_frames, "cancelled or replacement row never ran")
+    retired = frame_slot(target_frames[-1], cancelled_session)
+    reused = frame_slot(replacement_frames[0], replacement_session)
+    full_original = [f for f in target_frames if f["rows"] == WIDTH]
+    require(full_original, "the cancelled row never ran in a full C8 frame")
+    highest = retired == cancelled["retired_slot"] == max(full_original[-1]["slots"])
+    require(highest and reused == retired, "replacement did not reuse the retired highest slot")
+    require(churn["replacement_reused_retired_slot"] is True, "probe slot reuse verdict differs")
+    require(
+        churn["replacement_started_unix"] >= cancelled["closed_unix"],
+        "replacement started before the cancelled stream closed",
+    )
+
+    reuse_request = reuse["request"]
+    post_drain = (
+        reuse["frames"] == []
+        and reuse_request["label"] == replacement_label
+        and same_as_fresh_slot(reuse_request)
+        and all(item["final"] == 0 for item in idle)
+        and [item["phase"] for item in idle] == ["before-churn", "after-drain", "after-reuse"]
+    )
+    require(post_drain, "post-drain reuse is not clean")
+
+    by_label = {}
+    for row in churn_rows:
+        by_label.setdefault(row["label"], []).append(row)
+    require(
+        sorted(by_label) == sorted([*labels, replacement_label])
+        and all(len(rows) == 1 for rows in by_label.values()),
+        "churn exchanges differ from eight admissions plus one replacement",
+    )
+    cancelled_exchange = by_label[cancelled["label"]][0]
+    require(
+        not cancelled_exchange["completed_stream"] and cancelled_exchange["response_bytes"] > 0,
+        "cancelled exchange was not a mid-stream client disconnect",
+    )
+    require(
+        all(by_label[label][0]["completed_stream"] for label in [*labels[:-1], replacement_label]),
+        "a survivor or the replacement stream did not complete",
+    )
+    require(
+        [row["label"] for row in reuse_rows] == [replacement_label]
+        and reuse_rows[0]["completed_stream"],
+        "post-drain reuse exchange differs",
+    )
+    slots = [{"cancelled": label == cancelled["label"], "survivor": label != cancelled["label"]} for label in labels]
+    return {
+        "mode": mode,
+        "concurrency": WIDTH,
+        "slots": slots,
+        "cancelled": {
+            "label": cancelled["label"],
+            "content_chunks_before_close": cancelled["content_chunks_before_close"],
+            "closed_unix": cancelled["closed_unix"],
+            "state_output_tokens": cancelled["state_output_tokens"],
+            "terminal_geometry": cancelled["terminal_geometry"],
+            "retired_slot": retired,
+            "fresh_slot_reference_token_ids_sha256": reference[cancelled["label"]]["token_ids_sha256"],
+        },
+        "replacement": {
+            "label": replacement_label,
+            "slot": reused,
+            "token_ids_sha256": replacement["token_ids_sha256"],
+            "fresh_slot_reference_token_ids_sha256": reference[replacement_label]["token_ids_sha256"],
+            "started_unix": churn["replacement_started_unix"],
+        },
+        "survivors": [
+            {
+                "label": row["label"],
+                "token_ids_sha256": row["token_ids_sha256"],
+                "fresh_slot_reference_token_ids_sha256": reference[row["label"]]["token_ids_sha256"],
+                "elapsed_s": row["elapsed_s"],
+            }
+            for row in survivors
+        ],
+        "post_drain_reuse": {
+            "token_ids_sha256": reuse_request["token_ids_sha256"],
+            "frames": len(reuse["frames"]),
+            "logits_sha256_chain": reuse["logits_sha256_chain"],
+        },
+        "requests_active": idle,
+        "exchanges": {"churn": churn_rows, "post_drain_reuse": reuse_rows},
+        "churn_log_sha256": churn["log_sha256"],
+        "reuse_log_sha256": reuse["log_sha256"],
+        "exact_survivor_identity": survivor_identity,
+        "final_highest_slot_reused": highest and reused == retired,
+        "post_drain_clean": post_drain,
+        "replacement_survivor": same_as_fresh_slot(replacement)
+        and by_label[replacement_label][0]["completed_stream"],
+    }
+
+
+def census(observations):
+    modes = tuple(item["mode"] for item in observations)
+    require(modes == MODES, "both plain and native-K5 modes are required, in order")
+    slot_vectors = [item["slots"] for item in observations]
+    require(all(vector == slot_vectors[0] for vector in slot_vectors), "mode slot censuses differ")
+    for key in ("exact_survivor_identity", "final_highest_slot_reused", "post_drain_clean", "replacement_survivor"):
+        require(all(item[key] is True for item in observations), f"{key} differs")
+    slots = slot_vectors[0]
+    return {
+        "concurrency": len(slots),
+        "slots": slots,
+        # One replacement per C8 churn; both modes must agree on its outcome.
+        "replacement_requests": [all(item["replacement_survivor"] for item in observations)],
+        "replacement_survivor": True,
+        "plain_and_k5": modes == MODES,
+        "exact_survivor_identity": True,
+        "final_highest_slot_reused": True,
+        "post_drain_clean": True,
+    }
+
+
+def evidence_from(raw, locator, sha):
+    slots = raw["slots"]
+    cancelled = sum(1 for slot in slots if slot["cancelled"])
+    return {
+        "concurrency": raw["concurrency"],
+        "cancelled_requests": cancelled,
+        "survivors": len(slots) - cancelled,
+        "replacement_requests": len(raw["replacement_requests"]),
+        "plain_and_k5": raw["plain_and_k5"],
+        "exact_survivor_identity": raw["exact_survivor_identity"],
+        "final_highest_slot_reused": raw["final_highest_slot_reused"],
+        "post_drain_clean": raw["post_drain_clean"],
+        "validator_artifact": locator,
+        "validator_receipt_sha256": sha,
+    }
+
+
+# --- live arm -----------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Context:
+    probe: object
+    probe_identity: tuple
+    plan: dict
+    recipe: dict
+    container_env: dict
+    mounts: dict
+    provenance: object
+    runtime: Path
+    base: str
+    model: str
+    timing: ExchangeRegistry
+    timing_rows: dict = dataclasses.field(default_factory=dict)
+    diagnostics: dict = dataclasses.field(default_factory=dict)
+    proofs: list = dataclasses.field(default_factory=list)
+    identities: list = dataclasses.field(default_factory=list)
+
+
+def qualify_mode(args, nc, context, live):
+    probe = context.probe
+    plan = nc.arm_plan(args, probe, context, live)
+    require(plan.churn_replacement is not None, "C8 arm has no replacement prompt")
+    probe.healthcheck(args.base_url, min(args.timeout, 30.0))
+    cursor = probe.LogCursor(live.host_log)
+    nc.check_fresh_log(probe, cursor)
+    memory = probe.MemorySampler(live.pid)
+    memory.start()
+    started = time.time()
+    try:
+        base = nc.run_baseline(args, probe, context, live, plan, cursor)
+        idle = [wait_idle(nc, args, "before-churn")]
+        churn_mark = context.timing.mark()
+        original_reuse = probe.stream_request
+        reuse_mark = []
+
+        def marked_stream_request(*arguments, **keywords):
+            if not reuse_mark and arguments[2] == plan.churn_replacement and churn_done.is_set():
+                reuse_mark.append(context.timing.mark())
+                idle.append(wait_idle(nc, args, "after-drain"))
+            return original_reuse(*arguments, **keywords)
+
+        churn_done = threading.Event()
+        original_churn = probe.run_api_churn
+
+        def churn_then_flag(*arguments, **keywords):
+            try:
+                return original_churn(*arguments, **keywords)
+            finally:
+                churn_done.set()
+
+        probe.run_api_churn, probe.stream_request = churn_then_flag, marked_stream_request
+        try:
+            churn, reuse = nc.run_c8_churn(args, probe, context, live, plan, base, cursor)
+        finally:
+            probe.run_api_churn, probe.stream_request = original_churn, original_reuse
+        require(len(reuse_mark) == 1, "post-drain reuse boundary was not observed")
+        idle.append(wait_idle(nc, args, "after-reuse"))
+        reuse_end = context.timing.mark()
+        probe.healthcheck(args.base_url, min(args.timeout, 30.0))
+    finally:
+        memory.stop()
+    final = nc.finish_arm(args, probe, context, live, plan, cursor, memory)
+    nc.recheck_provenance(probe, context.provenance)
+    _payload, identity = nc.read_pinned_bytes(args.probe_program, args.probe_sha256)
+    require(identity == context.probe_identity, "qualifier source changed during qualification")
+    labels = request_labels(probe, live.model, plan.baseline_cases, args.max_tokens)
+    churn_rows = exchange_rows(context.timing.between(churn_mark, reuse_mark[0]), labels)
+    reuse_rows = exchange_rows(context.timing.between(reuse_mark[0], reuse_end), labels)
+    observation = derive_observation(
+        live.mode,
+        [case.label for case in plan.wave_cases],
+        base.receipts,
+        churn,
+        reuse,
+        churn_rows,
+        reuse_rows,
+        idle,
+    )
+    arm = {
+        "schema": "flux-r16-cancellation-slot-reuse-arm/1",
+        "plan": plan.plan,
+        "mode": live.mode,
+        "profile": live.profile,
+        "width": live.width,
+        "started_unix": started,
+        "finished_unix": time.time(),
+        "server_pid": live.pid,
+        "baseline_c1": base.receipts,
+        "api_churn": churn,
+        "post_drain_reuse": reuse,
+        "server_log_sha256": final["log_sha256"],
+        "safety_log_marker_counts": final["safety"],
+        "memory": final["memory"],
+        "native_engagement_widths": final["engaged"],
+        "k5_events": final["k5_events"],
+        "metrics_sha256": final["metrics_sha256"],
+    }
+    observation.update(
+        process_binding=live.proof,
+        k5_events=final["k5_events"],
+        memory_floor_kib=final["memory"]["mem_available_floor_kib"],
+        server_log_qualified_sha256=final["log_sha256"],
+    )
+    return arm, observation
+
+
+def write_failure(args, context, error):
+    payload = args.suite.canonical_bytes(
+        {
+            "schema": "flux-r16-cancellation-slot-reuse-failure/1",
+            "gate": GATE,
+            "status": "FAIL",
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "diagnostics": context.diagnostics,
+            "process_bindings": context.proofs,
+        }
+    )
+    try:
+        args.nc.write_artifact(
+            args.suite, context.runtime, context.base + "/failure-" + secrets.token_hex(4) + ".json", payload
+        )
+    except (OSError, ValueError):
+        pass
+
+
+def run(args):
+    nc, suite, probe = args.nc, args.suite, args.probe
+    plan, recipe, container_env, mounts = nc.inspect_container(args, suite)
+    runtime = suite.normalized_absolute(args.runtime_dir, "cancellation runtime")
+    runtime_identity = suite.directory_identity_sha256(runtime, "cancellation runtime")
+    nc.verify_runtime_bind(suite, runtime, mounts)
+    provenance = nc.preflight_provenance(args, suite, probe, plan, mounts)
+    parts = ["cancellation", GATE]
+    nc.make_directory(suite, runtime, parts)
+    context = Context(
+        probe, args.probe_identity, plan, recipe, container_env, mounts, provenance,
+        runtime, "/".join(parts), "flux-cancellation-" + secrets.token_hex(8), ExchangeRegistry(),
+    )
+    install_exchange_hook(probe, context.timing)
+    try:
+        nc.make_directory(suite, runtime, [*parts, "arms"])
+        observations = []
+        for mode in MODES:
+            if mode not in args.modes:
+                continue
+            stem = f"{context.base}/arms/{mode}-{PROFILE}-c{WIDTH}"
+            with nc.state_contract(probe, mode), nc.server(
+                args, context, mode, PROFILE, WIDTH, stem
+            ) as live:
+                nc.record_fresh_identity(context, live.process)
+                context.proofs.append(live.proof)
+                arm, observation = qualify_mode(args, nc, context, live)
+            locator = stem + ".json"
+            sha = nc.write_artifact(suite, runtime, locator, suite.canonical_bytes(arm))
+            observation["arm_receipt"] = {"artifact": locator, "sha256": sha}
+            observation["server_log"] = {"artifact": live.log_locator, "sha256": live.complete_log_sha256}
+            observations.append(observation)
+        require(
+            suite.directory_identity_sha256(runtime, "cancellation runtime") == runtime_identity,
+            "cancellation runtime identity changed",
+        )
+        raw = census(observations)
+        raw.update(
+            execution_scope="immutable-container",
+            mode_observations=observations,
+            process_bindings=context.proofs,
+            timing_rows=context.timing_rows,
+            provenance=context.provenance.public,
+            model=context.model,
+            max_tokens=args.max_tokens,
+            cancel_chunks=CHURN_CANCEL_CHUNKS,
+        )
+        validator = {
+            "schema": "flux-r15-gate-validator/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "raw": raw,
+        }
+        locator = context.base + "/validator.json"
+        sha = nc.write_artifact(suite, runtime, locator, suite.canonical_bytes(validator))
+        evidence = evidence_from(raw, locator, sha)
+    except Exception as error:
+        write_failure(args, context, error)
+        raise
+    finally:
+        probe.urllib = urllib
+    receipt = {
+        "schema": "flux-r15-container-gate-receipt/1",
+        "gate": GATE,
+        "status": "PASS",
+        "release_qualified": True,
+        "execution_scope": "immutable-container",
+        "image_id": args.image_id,
+        "image_digest": args.image_digest,
+        "container_id": args.container_id,
+        "run_id": args.run_id,
+        "evidence": evidence,
+    }
+    suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+    os.fsync(args.receipt_fd)
+    return receipt
+
+
+def split_own_flags(argv):
+    own, rest, index = {}, [], 0
+    while index < len(argv):
+        item = argv[index]
+        if item in OWN_FLAGS:
+            require(item not in own and index + 1 < len(argv), f"{item} is missing or repeated")
+            own[item] = argv[index + 1]
+            index += 2
+            continue
+        require(not any(item.startswith(flag + "=") for flag in OWN_FLAGS), "use separate flag values")
+        rest.append(item)
+        index += 1
+    require(set(own) == set(OWN_FLAGS), "the pinned concurrency driver is required")
+    return own, rest
+
+
+def parse_args(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    own, rest = split_own_flags(argv)
+    program = own["--concurrency-driver-program"]
+    require(Path(program).name == "native-concurrency-c2-c8", "concurrency driver basename differs")
+    nc = load_concurrency_driver(program, own["--concurrency-driver-sha256"])
+    args = nc.parse_args(rest)
+    require(not args.ladder, "the cancellation gate does not run ladder rungs")
+    require(args.max_tokens > CHURN_CANCEL_CHUNKS, "--max-tokens must exceed the cancel boundary")
+    args.nc = nc
+    args.concurrency_driver_sha256 = own["--concurrency-driver-sha256"]
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        print(GATE + ": qualification failed (" + type(error).__name__ + ")", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

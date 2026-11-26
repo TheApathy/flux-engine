@@ -1,0 +1,441 @@
+{
+  "metadata": {
+    "version": "0.7.9",
+    "mode": "completion_stats",
+    "interrupted": false,
+    "server": "http://127.0.0.1:8899",
+    "engine": "openai_proxy",
+    "server_version": "",
+    "kv_budget": 0,
+    "kv_source": "",
+    "max_running_requests": 0,
+    "model": "qwen38",
+    "models": [
+      "qwen38"
+    ],
+    "test_profile": "gsm8k",
+    "test_profile_description": "GSM8K accuracy benchmark: the full 1319-problem grade-school math test set, one different problem per request, scored by exact final-number match. Multi-step generation makes this the primary quantization-degradation anchor; compare runs with --compare-baseline.",
+    "prompt_source": "dataset:gsm8k_test (1319 items)",
+    "prompt_chars": 400,
+    "timestamp": "2026-10-25T17:01:38.576850",
+    "max_tokens": 16384,
+    "token_limit_field": "max_tokens",
+    "max_tokens_omitted": false,
+    "fixed_concurrency": 4,
+    "requested_runs": 1,
+    "concurrency_levels_requested": [
+      4
+    ],
+    "min_results": 1,
+    "probe_waves": 1,
+    "auto_stop": true,
+    "min_improvement": 0.03,
+    "patience": 1,
+    "correct_regex": "",
+    "score_source": "final_answer",
+    "profile_scorer": "dataset_gsm8k",
+    "scorer_version": 2,
+    "profile_version": 1,
+    "expected_answer": "",
+    "decoy_answers": [],
+    "approx_tolerance": "",
+    "dataset_rows": "",
+    "dataset_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "dataset": "gsm8k_test",
+    "dataset_path": "repro-kit/llm-inference-bench/data/gsm8k_test.jsonl",
+    "dataset_source": "openai/grade-school-math test split, verbatim (MIT license)",
+    "dataset_items_total": 1319,
+    "dataset_items_selected": 1,
+    "prompt_sha256": "",
+    "prompt_sha256_pinned": "",
+    "prefill_scout": false,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "seed_base": 20261018,
+    "stall_timeout_s": 600.0,
+    "request_timeout_s": 3600.0,
+    "reasoning_effort": null,
+    "request_overrides": {
+      "report_interventions": true
+    },
+    "system_prompt": false,
+    "nvidia_p2p_override_effective": false,
+    "p2pmark_status": "not_run",
+    "amd_fabric_status": "not_run"
+  },
+  "nvidia_p2p_override": {
+    "effective": false,
+    "configured": false,
+    "params_path": "/proc/driver/nvidia/params",
+    "params_available": true,
+    "modprobe_path": "/etc/modprobe.d/nvidia-p2p-override.conf",
+    "modprobe_available": false,
+    "runtime": {
+      "ForceP2P": "",
+      "RMForceP2PType": "",
+      "RMPcieP2PType": "",
+      "GrdmaPciTopoCheckOverride": "0",
+      "EnableResizableBar": "0",
+      "DmaRemapPeerMmio": "1"
+    },
+    "expected": {
+      "ForceP2P": "0x11",
+      "RMForceP2PType": "1",
+      "RMPcieP2PType": "2",
+      "GrdmaPciTopoCheckOverride": "1",
+      "EnableResizableBar": "1"
+    },
+    "missing": [
+      "ForceP2P",
+      "RMForceP2PType",
+      "RMPcieP2PType"
+    ],
+    "mismatched": {
+      "GrdmaPciTopoCheckOverride": {
+        "expected": "1",
+        "actual": "0"
+      },
+      "EnableResizableBar": {
+        "expected": "1",
+        "actual": "0"
+      }
+    },
+    "registry_dwords": "",
+    "suggested_modprobe_line": "options nvidia NVreg_RegistryDwords=\"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1\"",
+    "suggested_reload": "stop GPU workloads, then reload NVIDIA modules or reboot; the modprobe file alone is not enough until the nvidia module is reloaded"
+  },
+  "p2pmark": {
+    "status": "not_run"
+  },
+  "amd_fabric": {
+    "status": "not_run"
+  },
+  "prefill_scout": null,
+  "selected_concurrency": 4,
+  "selected_summary": {
+    "attempted": 1,
+    "completed": 1,
+    "errors": 0,
+    "correct": 1,
+    "wrong": 0,
+    "score_counts": {
+      "exact": 1
+    },
+    "exact": 1,
+    "near": 0,
+    "fail": 0,
+    "truncated": 0,
+    "stalled": 0,
+    "timeout": 0,
+    "decoy": 0,
+    "not_stated": 0,
+    "ambiguous": 0,
+    "near_miss": 0,
+    "wrong_checksum": 0,
+    "wrong_facts": 0,
+    "unparseable": 0,
+    "incomplete": 0,
+    "correct_rate": 1.0,
+    "correct_rate_completed": 1.0,
+    "score_available": true,
+    "hit_max_tokens": 0,
+    "estimated_token_runs": 0,
+    "completion_tokens": {
+      "avg": 189.0,
+      "min": 189.0,
+      "max": 189.0,
+      "p50": 189.0,
+      "p90": 189.0,
+      "p99": 189.0,
+      "std": 0.0
+    },
+    "ttft": {
+      "avg": 0.9181408770382404,
+      "min": 0.9181408770382404,
+      "max": 0.9181408770382404,
+      "p50": 0.9181408770382404,
+      "p90": 0.9181408770382404,
+      "p99": 0.9181408770382404,
+      "std": 0.0
+    },
+    "elapsed": {
+      "avg": 4.60644317092374,
+      "min": 4.60644317092374,
+      "max": 4.60644317092374,
+      "p50": 4.60644317092374,
+      "p90": 4.60644317092374,
+      "p99": 4.60644317092374,
+      "std": 0.0
+    },
+    "gen_elapsed": {
+      "avg": 3.686643252847716,
+      "min": 3.686643252847716,
+      "max": 3.686643252847716,
+      "p50": 3.686643252847716,
+      "p90": 3.686643252847716,
+      "p99": 3.686643252847716,
+      "std": 0.0
+    },
+    "gen_tok_s": {
+      "avg": 51.266148373322686,
+      "min": 51.266148373322686,
+      "max": 51.266148373322686,
+      "p50": 51.266148373322686,
+      "p90": 51.266148373322686,
+      "p99": 51.266148373322686,
+      "std": 0.0
+    },
+    "e2e_tok_s": {
+      "avg": 41.02948695709176,
+      "min": 41.02948695709176,
+      "max": 41.02948695709176,
+      "p50": 41.02948695709176,
+      "p90": 41.02948695709176,
+      "p99": 41.02948695709176,
+      "std": 0.0
+    },
+    "aggregate_gen_tok_s": 51.266148373322686,
+    "aggregate_e2e_tok_s": 41.02948695709176
+  },
+  "all_summary": {
+    "attempted": 1,
+    "completed": 1,
+    "errors": 0,
+    "correct": 1,
+    "wrong": 0,
+    "score_counts": {
+      "exact": 1
+    },
+    "exact": 1,
+    "near": 0,
+    "fail": 0,
+    "truncated": 0,
+    "stalled": 0,
+    "timeout": 0,
+    "decoy": 0,
+    "not_stated": 0,
+    "ambiguous": 0,
+    "near_miss": 0,
+    "wrong_checksum": 0,
+    "wrong_facts": 0,
+    "unparseable": 0,
+    "incomplete": 0,
+    "correct_rate": 1.0,
+    "correct_rate_completed": 1.0,
+    "score_available": true,
+    "hit_max_tokens": 0,
+    "estimated_token_runs": 0,
+    "completion_tokens": {
+      "avg": 189.0,
+      "min": 189.0,
+      "max": 189.0,
+      "p50": 189.0,
+      "p90": 189.0,
+      "p99": 189.0,
+      "std": 0.0
+    },
+    "ttft": {
+      "avg": 0.9181408770382404,
+      "min": 0.9181408770382404,
+      "max": 0.9181408770382404,
+      "p50": 0.9181408770382404,
+      "p90": 0.9181408770382404,
+      "p99": 0.9181408770382404,
+      "std": 0.0
+    },
+    "elapsed": {
+      "avg": 4.60644317092374,
+      "min": 4.60644317092374,
+      "max": 4.60644317092374,
+      "p50": 4.60644317092374,
+      "p90": 4.60644317092374,
+      "p99": 4.60644317092374,
+      "std": 0.0
+    },
+    "gen_elapsed": {
+      "avg": 3.686643252847716,
+      "min": 3.686643252847716,
+      "max": 3.686643252847716,
+      "p50": 3.686643252847716,
+      "p90": 3.686643252847716,
+      "p99": 3.686643252847716,
+      "std": 0.0
+    },
+    "gen_tok_s": {
+      "avg": 51.266148373322686,
+      "min": 51.266148373322686,
+      "max": 51.266148373322686,
+      "p50": 51.266148373322686,
+      "p90": 51.266148373322686,
+      "p99": 51.266148373322686,
+      "std": 0.0
+    },
+    "e2e_tok_s": {
+      "avg": 41.02948695709176,
+      "min": 41.02948695709176,
+      "max": 41.02948695709176,
+      "p50": 41.02948695709176,
+      "p90": 41.02948695709176,
+      "p99": 41.02948695709176,
+      "std": 0.0
+    },
+    "aggregate_gen_tok_s": 51.266148373322686,
+    "aggregate_e2e_tok_s": 41.02948695709176
+  },
+  "level_summaries": [
+    {
+      "concurrency": 4,
+      "phase": "profile",
+      "summary": {
+        "attempted": 1,
+        "completed": 1,
+        "errors": 0,
+        "correct": 1,
+        "wrong": 0,
+        "score_counts": {
+          "exact": 1
+        },
+        "exact": 1,
+        "near": 0,
+        "fail": 0,
+        "truncated": 0,
+        "stalled": 0,
+        "timeout": 0,
+        "decoy": 0,
+        "not_stated": 0,
+        "ambiguous": 0,
+        "near_miss": 0,
+        "wrong_checksum": 0,
+        "wrong_facts": 0,
+        "unparseable": 0,
+        "incomplete": 0,
+        "correct_rate": 1.0,
+        "correct_rate_completed": 1.0,
+        "score_available": true,
+        "hit_max_tokens": 0,
+        "estimated_token_runs": 0,
+        "completion_tokens": {
+          "avg": 189.0,
+          "min": 189.0,
+          "max": 189.0,
+          "p50": 189.0,
+          "p90": 189.0,
+          "p99": 189.0,
+          "std": 0.0
+        },
+        "ttft": {
+          "avg": 0.9181408770382404,
+          "min": 0.9181408770382404,
+          "max": 0.9181408770382404,
+          "p50": 0.9181408770382404,
+          "p90": 0.9181408770382404,
+          "p99": 0.9181408770382404,
+          "std": 0.0
+        },
+        "elapsed": {
+          "avg": 4.60644317092374,
+          "min": 4.60644317092374,
+          "max": 4.60644317092374,
+          "p50": 4.60644317092374,
+          "p90": 4.60644317092374,
+          "p99": 4.60644317092374,
+          "std": 0.0
+        },
+        "gen_elapsed": {
+          "avg": 3.686643252847716,
+          "min": 3.686643252847716,
+          "max": 3.686643252847716,
+          "p50": 3.686643252847716,
+          "p90": 3.686643252847716,
+          "p99": 3.686643252847716,
+          "std": 0.0
+        },
+        "gen_tok_s": {
+          "avg": 51.266148373322686,
+          "min": 51.266148373322686,
+          "max": 51.266148373322686,
+          "p50": 51.266148373322686,
+          "p90": 51.266148373322686,
+          "p99": 51.266148373322686,
+          "std": 0.0
+        },
+        "e2e_tok_s": {
+          "avg": 41.02948695709176,
+          "min": 41.02948695709176,
+          "max": 41.02948695709176,
+          "p50": 41.02948695709176,
+          "p90": 41.02948695709176,
+          "p99": 41.02948695709176,
+          "std": 0.0
+        },
+        "aggregate_gen_tok_s": 51.266148373322686,
+        "aggregate_e2e_tok_s": 41.02948695709176
+      },
+      "selected": true,
+      "improved": true
+    }
+  ],
+  "accuracy": {
+    "items_total": 1319,
+    "items_selected": 1,
+    "attempted": 1,
+    "scored": 1,
+    "correct": 1,
+    "accuracy": 1.0,
+    "wilson95_low": 0.2065493117918027,
+    "wilson95_high": 1.0,
+    "unparseable": 0,
+    "truncated_no_answer": 0,
+    "hit_max_tokens": 0,
+    "errors": 0,
+    "dataset_exhausted": false
+  },
+  "category_summaries": [],
+  "wrong_runs": [],
+  "hardware_run_summary": {},
+  "runs": [
+    {
+      "run_index": 1,
+      "phase": "profile",
+      "concurrency": 4,
+      "ok": true,
+      "correct": true,
+      "completion_tokens": 189,
+      "prompt_tokens": 144,
+      "elapsed": 4.60644317092374,
+      "gen_elapsed": 3.686643252847716,
+      "ttft": 0.9181408770382404,
+      "time_to_second_token": 0.0004430238623172045,
+      "gen_tok_s": 51.266148373322686,
+      "e2e_tok_s": 41.02948695709176,
+      "finish_reason": "stop",
+      "final_answer": "18",
+      "score_label": "exact",
+      "score_detail": "exact",
+      "parsed_answer": "18",
+      "output_excerpt": "18",
+      "output_text": "",
+      "reasoning_text": "",
+      "content_text": "",
+      "error": "",
+      "hit_max_tokens": false,
+      "estimated_tokens": false,
+      "cancelled": false,
+      "item_id": "gsm8k-0000",
+      "category": "",
+      "expected_answer": "18",
+      "interventions": {
+        "schema": "atlas.interventions.v1",
+        "policy": "report_only",
+        "events": []
+      }
+    }
+  ],
+  "methodology": {
+    "name": "GSM8K accuracy benchmark",
+    "prefill": "Dataset accuracy profiles send a different pinned item prompt per measured request, so a shared prefix-cache scout is disabled by default; prompts are short and prefill cost is negligible.",
+    "adaptive_concurrency": "If --profile-concurrency is set, the benchmark sends exactly the configured number of measured profile requests with that many concurrent workers. Otherwise it probes increasing concurrency levels and keeps the fastest aggregate generation-token throughput, then collects additional runs at the selected concurrency until min_results is reached.",
+    "token_need": "completion_tokens is taken from OpenAI stream usage. If usage is missing, streamed content chunks are used as an estimated fallback and the run is marked estimated_tokens=true.",
+    "correctness": "Each request is scored against its own pinned dataset item. GSM8K: the last number on the final answer line (falling back to the last number in the visible answer) must exactly match the reference final number; thousands separators, $ and % are tolerated. Headline metric is accuracy over scored items with a Wilson 95% interval. Runs are paired per item across configurations via --compare-baseline."
+  }
+}

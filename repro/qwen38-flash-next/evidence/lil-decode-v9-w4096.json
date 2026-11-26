@@ -1,0 +1,122 @@
+{
+  "artifact_policy": "hashes-and-metrics-only",
+  "benchmark": "LIL Decode Bench v0.7.9 + 05f-serve-v9-w4096-gate (w4096)",
+  "binary_sha256": "84d629bda7c9aa291b806bb55b914df31e58fe793170e9574e43804a1ba387b4",
+  "checkpoint_manifest_sha256": "ed8aa879996dc322e3720eb9848a4193c4cfc1d7c05e0421d85108429bd15869",
+  "coding_k5_probe": {
+    "accept_len_mean": 3.09,
+    "client_max_tps": 57.4,
+    "client_median_tps": 56.3,
+    "lossless_10p_exact_prompts": 10,
+    "lossless_10p_exact_tokens": 2560,
+    "lossless_10p_source_sha256": "e529d1c2cf2989e29c19c8e2a98ca74ffdb2c3df6541734bd69b3a34ff92826c",
+    "server_max_tps": 57.6,
+    "server_median_tps": 56.5,
+    "source_sha256": "f27451b268fc1054e165bb6b40119918b35e733b5b5c0a8b46d915c9b04fb55f",
+    "speedup_vs_k1": 1.7
+  },
+  "launcher": "./bench/qwen38-flash-next-gb10/serve-w4096.sh",
+  "lil_categories": {
+    "c1_concurrency_1": {
+      "aggregate_tps": 52.8,
+      "max_tps": 53.5,
+      "mean_tps": 52.8,
+      "median_tps": 52.7,
+      "min_tps": 52.1
+    },
+    "c2_concurrency_2": {
+      "aggregate_tps": 57.5,
+      "max_tps": 29.2,
+      "mean_tps": 28.9,
+      "median_tps": 28.9,
+      "min_tps": 28.5
+    },
+    "c4_concurrency_4": {
+      "aggregate_tps": 65.1,
+      "max_tps": 17.5,
+      "mean_tps": 16.6,
+      "median_tps": 16.5,
+      "min_tps": 15.8
+    },
+    "c8_concurrency_8": {
+      "aggregate_tps": 66.4,
+      "max_tps": 9.4,
+      "mean_tps": 8.6,
+      "median_tps": 8.5,
+      "min_tps": 7.9
+    },
+    "context_16k": {
+      "max_tps": 46.2,
+      "mean_tps": 46.1,
+      "median_tps": 46.2,
+      "min_tps": 45.8,
+      "ttft_seconds": 3.591904
+    },
+    "context_32k": {
+      "max_tps": 46.3,
+      "mean_tps": 46.2,
+      "median_tps": 46.2,
+      "min_tps": 46.0,
+      "ttft_seconds": 6.809921
+    },
+    "context_64k": {
+      "max_tps": 45.9,
+      "mean_tps": 45.6,
+      "median_tps": 45.6,
+      "min_tps": 45.1,
+      "ttft_seconds": 13.489212
+    },
+    "context_8k": {
+      "max_tps": 46.6,
+      "mean_tps": 46.5,
+      "median_tps": 46.5,
+      "min_tps": 46.4,
+      "ttft_seconds": 1.908982
+    },
+    "long_1024tok": {
+      "max_tps": 49.0,
+      "mean_tps": 47.6,
+      "median_tps": 47.9,
+      "min_tps": 46.0
+    },
+    "medium_512tok": {
+      "max_tps": 52.3,
+      "mean_tps": 48.3,
+      "median_tps": 46.3,
+      "min_tps": 46.1
+    },
+    "s1_1500tok": {
+      "max_tps": 54.4,
+      "mean_tps": 51.6,
+      "median_tps": 51.6,
+      "min_tps": 48.8
+    },
+    "short_256tok": {
+      "max_tps": 57.6,
+      "mean_tps": 52.8,
+      "median_tps": 51.6,
+      "min_tps": 49.3
+    }
+  },
+  "mem_available_floor_mib": 11907,
+  "mem_available_peak_floor_mib": 12695,
+  "overall_tps": 50.8,
+  "prefill_chunk_wide": 4096,
+  "prefill_sweep_source_sha256": "fb08245d314541a5290dcbf7d1273b8d9a4a1043e9e4a1f621b8be7be4ab89eb",
+  "prefill_sweep_tps": {
+    "128k_median": 4891.7,
+    "128k_peak": 4899.8,
+    "16k_median": 5164.5,
+    "16k_peak": 5176.9,
+    "32k_median": 5116.2,
+    "32k_peak": 5125.1,
+    "64k_median": 5016.1,
+    "64k_peak": 5026.5,
+    "8k_median": 5266.8,
+    "8k_peak": 5276.3
+  },
+  "profile": "serve-v9-w4096",
+  "schema": "theapathy-qwen38-flash-next-sanitized-evidence-v1",
+  "source_artifact_sha256": "7c3cb881fb0854ca1cf92cb1d0a81dbdd969bb02d00f6605212eb3364b0a22d2",
+  "wave11_binary_sha256": "29e959d401137bb4da2248319cbddced0fefb66b5a3c91f55cdc2141bd98dab5"
+}

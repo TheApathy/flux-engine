@@ -1,0 +1,891 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! `Qwen3AttentionLayer` constructors: `new`, `new_ungated`, and the
+//! private `new_with_gating` (kernel-loading core).
+
+use anyhow::Result;
+use spark_runtime::gpu::{GpuBackend, KernelHandle};
+use spark_runtime::kv_cache::KvCacheDtype;
+
+use super::types::Qwen3AttentionLayer;
+use crate::layers::FfnComponent;
+use crate::layers::fp8_calibration::Fp8KvCalibration;
+use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
+
+impl Qwen3AttentionLayer {
+    pub fn new(
+        input_norm: DenseWeight,
+        attn: AttentionWeights,
+        post_attn_norm: DenseWeight,
+        ffn: FfnComponent,
+        attn_layer_idx: usize,
+        q_nvfp4: Option<QuantizedWeight>,
+        k_nvfp4: Option<QuantizedWeight>,
+        v_nvfp4: Option<QuantizedWeight>,
+        gpu: &dyn GpuBackend,
+        kv_dtype: KvCacheDtype,
+        fp8_calibration_tokens: usize,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<Self> {
+        Self::new_with_gating(
+            input_norm,
+            attn,
+            post_attn_norm,
+            ffn,
+            attn_layer_idx,
+            q_nvfp4,
+            k_nvfp4,
+            v_nvfp4,
+            true,
+            gpu,
+            kv_dtype,
+            fp8_calibration_tokens,
+            config,
+        )
+    }
+
+    pub fn new_ungated(
+        input_norm: DenseWeight,
+        attn: AttentionWeights,
+        post_attn_norm: DenseWeight,
+        ffn: FfnComponent,
+        attn_layer_idx: usize,
+        q_nvfp4: Option<QuantizedWeight>,
+        k_nvfp4: Option<QuantizedWeight>,
+        v_nvfp4: Option<QuantizedWeight>,
+        gpu: &dyn GpuBackend,
+        kv_dtype: KvCacheDtype,
+        fp8_calibration_tokens: usize,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<Self> {
+        Self::new_with_gating(
+            input_norm,
+            attn,
+            post_attn_norm,
+            ffn,
+            attn_layer_idx,
+            q_nvfp4,
+            k_nvfp4,
+            v_nvfp4,
+            false,
+            gpu,
+            kv_dtype,
+            fp8_calibration_tokens,
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_gating(
+        input_norm: DenseWeight,
+        attn: AttentionWeights,
+        post_attn_norm: DenseWeight,
+        ffn: FfnComponent,
+        attn_layer_idx: usize,
+        q_nvfp4: Option<QuantizedWeight>,
+        k_nvfp4: Option<QuantizedWeight>,
+        v_nvfp4: Option<QuantizedWeight>,
+        gated: bool,
+        gpu: &dyn GpuBackend,
+        kv_dtype: KvCacheDtype,
+        fp8_calibration_tokens: usize,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<Self> {
+        let (reshape_mod, reshape_fn, decode_mod, decode_fn) =
+            super::init_kernel_dispatch::kernel_modules_for_dtype(kv_dtype, config.head_dim);
+        let mrope_interleaved = config.mrope_interleaved;
+        let yarn = super::yarn::YarnRopeParams::from_config(config)?;
+        if yarn.is_some() && config.model_type == "qwen3_5" {
+            anyhow::ensure!(
+                mrope_interleaved && config.mrope_section == [11, 11, 10],
+                "Qwen3.8 YaRN requires interleaved MRoPE section [11, 11, 10]"
+            );
+            anyhow::ensure!(
+                config.rotary_dim() == 64,
+                "Qwen3.8 YaRN requires rotary_dim=64, got {}",
+                config.rotary_dim()
+            );
+        }
+        let qwen4_yarn_inv_freq = if config.is_qwen4_exp() && config.yarn_factor > 0.0 {
+            crate::layers::qwen4_qsa::compute_yarn_inv_freq(config, config.rotary_dim(), gpu)?
+        } else {
+            spark_runtime::gpu::DevicePtr::NULL
+        };
+        let qwen4_yarn_attention_factor = if config.yarn_factor > 0.0 && !config.is_qwen4_exp() {
+            1.0 + 0.1 * config.yarn_factor.ln()
+        } else {
+            1.0
+        };
+        // Wide-head models only: the HDIM=512 TC instantiation ships in the
+        // Gemma-4 target, and no other model reaches the wide-head dispatch.
+        let prefill_attn_512_tc_requested =
+            config.head_dim > 256 && super::prefill::wide_prefill_attn_tc_requested()?;
+        Ok(Self {
+            input_norm,
+            attn,
+            post_attn_norm,
+            ffn,
+            qwen4_attn_hyper: None,
+            qwen4_mlp_hyper: None,
+            qwen4_qsa: None,
+            attn_layer_idx,
+            gated,
+            mrope_interleaved,
+            yarn,
+            kv_dtype,
+            head_dim_override: None,
+            num_q_heads_override: None,
+            num_kv_heads_override: None,
+            sliding_window: None,
+            rope_theta_override: None,
+            rotary_dim_override: None,
+            rope_proportional: false,
+            attn_scale_override: None,
+            k_eq_v: false,
+            v_norm_weight: None,
+            post_attn_out_norm: None,
+            post_ffn_out_norm: None,
+            layer_scalar: None,
+            moe_ffn: None,
+            pre_moe_norm: None,
+            post_moe_out_norm: None,
+            post_dense_ffn_norm: None,
+            q_weight: q_nvfp4.map(QuantWeight::Nvfp4),
+            k_weight: k_nvfp4.map(QuantWeight::Nvfp4),
+            v_weight: v_nvfp4.map(QuantWeight::Nvfp4),
+            o_weight: None,
+            o_dense_bf16: None,
+            q_dense_bf16_decode: None,
+            k_dense_bf16_decode: None,
+            v_dense_bf16_decode: None,
+            o_dense_bf16_decode: None,
+            qwen4_dense_fp8: None,
+            mla: None,
+            q_nvfp4_t: None,
+            k_nvfp4_t: None,
+            v_nvfp4_t: None,
+            o_nvfp4_t: None,
+            q_fp8w_t: None,
+            k_fp8w_t: None,
+            v_fp8w_t: None,
+            o_fp8w_t: None,
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            flashinfer_projection_prefill: None,
+            w8a16_gemm_t_k: super::super::try_kernel(gpu, "w8a16_gemm_t", "w8a16_gemm_t"),
+            rms_norm_k: gpu.kernel("norm", "rms_norm")?,
+            rms_norm_residual_k: if config.use_fp32_residual() {
+                if config.model_type == "gemma4" {
+                    gpu.kernel("norm", "rms_norm_residual_f32_abs")
+                        .or_else(|_| gpu.kernel("norm", "rms_norm_residual"))?
+                } else {
+                    gpu.kernel("norm", "rms_norm_residual_f32")
+                        .or_else(|_| gpu.kernel("norm", "rms_norm_residual"))?
+                }
+            } else {
+                gpu.kernel("norm", "rms_norm_residual")?
+            },
+            dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_exact_qkv_kernels: crate::layers::ops::W4a16ExactAttentionKernels::new(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_qg_exact_m17",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_dual_kv_exact_m17",
+                ),
+            )
+            .with_m4(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_qg_exact_m4",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_dual_kv_exact_m4",
+                ),
+            )
+            .with_m32(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_qg_exact_m32",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_dual_kv_exact_m32",
+                ),
+            ),
+            w4a16_exact_qkv_m17_astage_kernels:
+                crate::layers::ops::W4a16ExactAttentionM17AStageKernels::new(
+                    super::super::try_kernel(
+                        gpu,
+                        "w4a16_gemv_exact_attention",
+                        "w4a16_gemv_qg_exact_m17_astage",
+                    ),
+                    super::super::try_kernel(
+                        gpu,
+                        "w4a16_gemv_exact_attention",
+                        "w4a16_gemv_dual_kv_exact_m17_astage",
+                    ),
+                ),
+            w4a16_exact_o_proj_kernels: crate::layers::ops::W4a16ExactLmHeadKernels::new(
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m4"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m8"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m17"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m32"),
+            )
+            .with_rt2(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m4",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m8",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m17",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m32",
+                ),
+            )
+            .with_m17_astage(super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch_logits_exact_m17_astage",
+            ))
+            .with_wide_n_sw4(super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch_logits_exact_sw_m8_o4w4",
+            ))
+            .with_wide_n_sw4_m10(super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch_logits_exact_sw_m10_o4w4",
+            ))
+            .with_wide_n_sw4_m15_m25(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv",
+                    "w4a16_gemv_batch_logits_exact_sw_m15_o2w4",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv",
+                    "w4a16_gemv_batch_logits_exact_sw_m25_o1w4",
+                ),
+            ),
+            w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
+            gemv_sw: crate::layers::ops::gemv_sw_enabled(),
+            w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
+            w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
+            w4a16_gemv_dual_k: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
+            rope_k: gpu.kernel("rope", "rope_forward")?,
+            rope_mrope_interleaved_k: super::super::try_kernel(
+                gpu,
+                "rope_mrope_interleaved",
+                "rope_forward_mrope_interleaved",
+            ),
+            rope_mrope_interleaved_yarn_k: if yarn.is_some() && mrope_interleaved {
+                gpu.kernel(
+                    "rope_mrope_interleaved",
+                    "rope_forward_mrope_interleaved_yarn",
+                )?
+            } else {
+                super::super::try_kernel(
+                    gpu,
+                    "rope_mrope_interleaved",
+                    "rope_forward_mrope_interleaved_yarn",
+                )
+            },
+            rope_strided_b3_k: super::super::try_kernel(gpu, "rope", "rope_forward_strided_b3"),
+            rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
+            rope_yarn_scaled_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn_scaled"),
+            rope_strided_yarn_scaled_k: {
+                let k = super::super::try_kernel(
+                    gpu,
+                    "qwen4_qsa_wave2",
+                    "rope_forward_strided_yarn_scaled",
+                );
+                if k.0 != 0 {
+                    k
+                } else {
+                    super::super::try_kernel(gpu, "rope", "rope_forward_strided_yarn_scaled")
+                }
+            },
+            qwen4_yarn_inv_freq,
+            qwen4_yarn_attention_factor,
+            rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
+            reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
+            wht_bf16_k: super::super::try_kernel(gpu, "wht_bf16", "wht_bf16_inplace"),
+            wht_bf16_k_inv: super::super::try_kernel(gpu, "wht_bf16", "wht_bf16_inplace_inv"),
+            innerq_apply_q_k: super::super::try_kernel(
+                gpu,
+                "tq_plus_innerq",
+                "tq_plus_innerq_apply_q",
+            ),
+            innerq_apply_k_k: super::super::try_kernel(
+                gpu,
+                "tq_plus_innerq",
+                "tq_plus_innerq_apply_k",
+            ),
+            paged_decode_k: gpu.kernel(decode_mod, decode_fn)?,
+            paged_decode_bf16_gated_k: if kv_dtype == KvCacheDtype::Bf16 && config.head_dim == 256 {
+                super::super::try_kernel(gpu, decode_mod, "paged_decode_attn_gated")
+            } else {
+                KernelHandle(0)
+            },
+            paged_decode_bf16_qwen_tree_k: if kv_dtype == KvCacheDtype::Bf16
+                && config.model_type == "qwen3_5"
+                && config.head_dim == 256
+            {
+                super::super::try_kernel(
+                    gpu,
+                    "paged_decode_bf16_qwen_tree",
+                    "paged_decode_attn_bf16_qwen_tree",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            paged_decode_512_k: match kv_dtype {
+                // Only dtypes with a compiled HDIM=512 kernel load a handle here.
+                // Turbo3, Turbo2, NVFP4, and asymmetric dtypes have no HDIM=512
+                // variant yet, so leaving handle 0 keeps the standard path active.
+                KvCacheDtype::Bf16 => {
+                    super::super::try_kernel(gpu, "paged_decode_attn_512", "paged_decode_attn")
+                }
+                KvCacheDtype::Turbo4 => super::super::try_kernel(
+                    gpu,
+                    "paged_decode_turbo4_512",
+                    "paged_decode_attn_turbo4",
+                ),
+                KvCacheDtype::Turbo8 => super::super::try_kernel(
+                    gpu,
+                    "paged_decode_turbo8_512",
+                    "paged_decode_attn_turbo8",
+                ),
+                KvCacheDtype::Fp8 => super::super::try_kernel(
+                    gpu,
+                    "paged_decode_attn_fp8_512",
+                    "paged_decode_attn_fp8",
+                ),
+                KvCacheDtype::Nvfp4
+                | KvCacheDtype::Turbo3
+                | KvCacheDtype::Turbo2
+                | KvCacheDtype::Turbo4KTurbo3V
+                | KvCacheDtype::Turbo4KTurbo8V
+                | KvCacheDtype::Turbo3KTurbo8V
+                | KvCacheDtype::Bf16KTurbo4V
+                | KvCacheDtype::Bf16KTurbo3V
+                | KvCacheDtype::Bf16KTurbo2V
+                | KvCacheDtype::Fp8KTurbo4V
+                | KvCacheDtype::Fp8KTurbo3V
+                | KvCacheDtype::Fp8KTurbo2V => KernelHandle(0),
+            },
+            paged_decode_mla_k: super::super::try_kernel(
+                gpu,
+                "paged_decode_mla",
+                "paged_decode_attn",
+            ),
+            mla_batched_gemv_k: super::super::try_kernel(gpu, "mla_absorbed", "mla_batched_gemv"),
+            mla_q_rope_scatter_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_q_rope_scatter",
+            ),
+            mla_q_rope_writeback_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_q_rope_writeback",
+            ),
+            mla_cache_assemble_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_cache_assemble",
+            ),
+            mla_q_rope_extract_batched_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_q_rope_extract_batched",
+            ),
+            mla_q_rope_writeback_batched_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_q_rope_writeback_batched",
+            ),
+            mla_kv_assemble_batched_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_kv_assemble_batched",
+            ),
+            mla_cache_assemble_batched_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_cache_assemble_batched",
+            ),
+            mla_q_final_assemble_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_q_final_assemble_batched",
+            ),
+            mla_fused_prefill_k: super::super::try_kernel(
+                gpu,
+                "mla_fused_prefill",
+                "mla_fused_prefill",
+            ),
+            mla_prefill_paged_k: super::super::try_kernel(
+                gpu,
+                "mla_prefill_paged",
+                "mla_prefill_paged_320",
+            ),
+            mla_v_extract_batched_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "mla_v_extract_batched",
+            ),
+            dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
+            paged_decode_splitk_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 => {
+                    Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)
+                }
+                KvCacheDtype::Turbo2
+                | KvCacheDtype::Turbo3
+                | KvCacheDtype::Turbo4
+                | KvCacheDtype::Turbo8
+                | KvCacheDtype::Bf16KTurbo3V
+                | KvCacheDtype::Bf16KTurbo4V
+                | KvCacheDtype::Bf16KTurbo2V
+                | KvCacheDtype::Fp8KTurbo3V
+                | KvCacheDtype::Fp8KTurbo4V
+                | KvCacheDtype::Fp8KTurbo2V
+                | KvCacheDtype::Turbo4KTurbo3V
+                | KvCacheDtype::Turbo4KTurbo8V
+                | KvCacheDtype::Turbo3KTurbo8V => None,
+                _ => Some(gpu.kernel("paged_decode_fp8", "paged_decode_attn_splitk_fp8")?),
+            },
+            paged_decode_reduce_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 => {
+                    Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_reduce_nvfp4")?)
+                }
+                KvCacheDtype::Turbo2
+                | KvCacheDtype::Turbo3
+                | KvCacheDtype::Turbo4
+                | KvCacheDtype::Turbo8
+                | KvCacheDtype::Bf16KTurbo3V
+                | KvCacheDtype::Bf16KTurbo4V
+                | KvCacheDtype::Bf16KTurbo2V
+                | KvCacheDtype::Fp8KTurbo3V
+                | KvCacheDtype::Fp8KTurbo4V
+                | KvCacheDtype::Fp8KTurbo2V
+                | KvCacheDtype::Turbo4KTurbo3V
+                | KvCacheDtype::Turbo4KTurbo8V
+                | KvCacheDtype::Turbo3KTurbo8V => None,
+                _ => Some(gpu.kernel("paged_decode_fp8", "paged_decode_attn_reduce_fp8")?),
+            },
+            // K=γ FlashAttention-v2 fused kernel (NVFP4 + HDIM=256 only).
+            // Falls back to None for unsupported configs / missing PTX;
+            // gated by `ATLAS_FLASH_ATTN_KGAMMA=1` at the dispatch site.
+            paged_decode_kgamma_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            paged_decode_kgamma_fp8_bc4_k: match kv_dtype {
+                KvCacheDtype::Fp8 if config.head_dim == 128 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_fp8",
+                        "paged_decode_attn_kgamma_fp8_bc4_exact",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            paged_decode_kgamma_bf16_k: match kv_dtype {
+                KvCacheDtype::Bf16 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_bf16",
+                        "paged_decode_attn_kgamma_bf16_bc4_exact",
+                    );
+                    if h.0 != 0 {
+                        Some(h)
+                    } else {
+                        let h2 = super::super::try_kernel(
+                            gpu,
+                            "paged_decode_kgamma_bf16",
+                            "paged_decode_attn_kgamma_bf16",
+                        );
+                        if h2.0 != 0 { Some(h2) } else { None }
+                    }
+                }
+                _ => None,
+            },
+            // VEC variant of the kgamma kernel: 16 warps/CTA + 2-position
+            // dequant batching. Gated by `ATLAS_KGAMMA_VECDEQUANT=1` at the
+            // dispatch site. `try_kernel` falls back to None for older PTX
+            // caches; the dispatch site then uses the baseline kgamma kernel.
+            paged_decode_kgamma_vec_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4_vec",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            // Split-K variant + reduce kernel for the kgamma path.
+            // Gated by `ATLAS_FLASH_ATTN_KGAMMA_SPLITK=1` at the dispatch
+            // site. `try_kernel` lets older PTX caches load with None and
+            // simply fall back to the single-CTA kgamma kernel.
+            paged_decode_kgamma_splitk_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4_splitk",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            paged_decode_kgamma_reduce_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_reduce_nvfp4",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            // FA2-grafted variant of the kgamma kernel: cp.async double-
+            // buffered KV tile staging in shared memory. Gated by
+            // `ATLAS_FA2_KGAMMA=1` at the dispatch site. `try_kernel`
+            // falls back to None for older PTX caches; the dispatch site
+            // then uses the VEC or baseline kgamma kernel.
+            paged_decode_kgamma_fa2_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4_fa2",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            paged_decode_gqa12_ragged_k: match kv_dtype {
+                KvCacheDtype::Fp8 if config.head_dim == 256 => {
+                    let main_k = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_fp8",
+                        "paged_decode_attn_gqa12_ragged_fp8",
+                    );
+                    let red_k = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_fp8",
+                        "paged_decode_attn_gqa12_ragged_reduce_fp8",
+                    );
+                    if main_k.0 != 0 && red_k.0 != 0 {
+                        Some((main_k, red_k))
+                    } else {
+                        None
+                    }
+                }
+                KvCacheDtype::Bf16 if config.head_dim == 256 => {
+                    let main_k = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_attn_gqa4",
+                        "paged_decode_attn_gqa12_ragged_bf16",
+                    );
+                    let red_k = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_attn_gqa4",
+                        "paged_decode_attn_gqa12_ragged_reduce_bf16",
+                    );
+                    if main_k.0 != 0 && red_k.0 != 0 {
+                        Some((main_k, red_k))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            residual_add_k: if config.use_fp32_residual() {
+                gpu.kernel("norm", "f32_residual_add")
+                    .or_else(|_| gpu.kernel("residual_add", "bf16_residual_add"))?
+            } else {
+                gpu.kernel("residual_add", "bf16_residual_add")?
+            },
+            sigmoid_gate_mul_k: gpu.kernel("residual_add", "sigmoid_gate_mul")?,
+            deinterleave_qg_k: gpu.kernel("ssm_preprocess", "deinterleave_qg")?,
+            w4a16_gemv_qg_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg")?,
+            residual_add_rms_norm_k: if config.use_fp32_residual() {
+                if config.model_type == "gemma4" {
+                    gpu.kernel("norm", "residual_add_rms_norm_f32_abs")
+                        .or_else(|_| gpu.kernel("norm", "residual_add_rms_norm"))?
+                } else {
+                    gpu.kernel("norm", "residual_add_rms_norm_f32")
+                        .or_else(|_| gpu.kernel("norm", "residual_add_rms_norm"))?
+                }
+            } else {
+                gpu.kernel("norm", "residual_add_rms_norm")?
+            },
+            w4a16_gemv_qg_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg_batch2")?,
+            w4a16_gemv_dual_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch2")?,
+            w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
+            w4a16_gemv_qg_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg_batch3")?,
+            w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
+            w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            // Strided variants (ATLAS_ATTN_QKV_FUSED=1). try_kernel so older
+            // builds without the kernel still load.
+            w4a16_gemv_qg_batch3_strided_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_qg_batch3_strided",
+            ),
+            w4a16_gemv_dual_batch3_strided_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_dual_batch3_strided",
+            ),
+            rms_norm_qk_batch3_k: super::super::try_kernel(gpu, "norm", "rms_norm_qk_batch3"),
+            w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
+            w4a16_gemm_pipe_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
+            w4a16_gemm_pipe_m128n128_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_pipe_m128n128",
+            ),
+            dequant_nvfp4_to_bf16_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "dequant_nvfp4_to_bf16",
+            ),
+            bf16_weight_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            w4a16_gemm_pipe_dual_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe_dual"),
+            w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
+            w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            w4a16_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128n128_w8"),
+            fp8_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128n128_w8"),
+            w4a16_gemm_t_m32_n64_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
+            w4a16_gemm_t_m32_n64_splitk_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64_splitk",
+            ),
+            reduce_splitk_k: super::super::try_kernel(gpu, "w4a16", "reduce_splitk_f32_to_bf16"),
+            qkv_splitk_workspace: std::sync::Mutex::new(None),
+            w4a16_gemm_t_m128_v2_k: super::super::try_kernel(
+                gpu,
+                "w4a16_v2",
+                "w4a16_gemm_t_m128_v2",
+            ),
+            w4a16_gemm_t_m128_v3_k: {
+                let k = super::super::try_kernel(gpu, "w4a16_v3", "w4a16_gemm_t_m128_v3");
+                if k.0 != 0 {
+                    gpu.set_kernel_max_dynamic_shared_memory(k, 55_488)?;
+                }
+                k
+            },
+            // Optional small-M (M≤32) variant; qwen3.6-27b shadow only.
+            w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
+            dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
+            prefill_attn_k: gpu.kernel("inferspark_prefill", "inferspark_prefill")?,
+            prefill_attn_512_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_512",
+                "inferspark_prefill_512",
+            ),
+            prefill_attn_512_tc_k: if prefill_attn_512_tc_requested {
+                super::super::try_kernel(
+                    gpu,
+                    "inferspark_prefill_512tc",
+                    "inferspark_prefill_512tc",
+                )
+            } else {
+                spark_runtime::gpu::KernelHandle(0)
+            },
+            prefill_attn_512_tc_requested,
+            prefill_attn_paged_512_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_paged_512",
+                "inferspark_prefill_paged_512",
+            ),
+            prefill_attn_64_k: gpu.kernel("inferspark_prefill", "inferspark_prefill_64")?,
+            prefill_attn_64_gate_fused_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_gate_fused",
+                "inferspark_prefill_64_gate_fused",
+            ),
+            prefill_attn_128_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_128",
+                "inferspark_prefill_hd128",
+            ),
+            prefill_attn_paged_k: gpu.kernel("prefill_paged", "inferspark_prefill_paged")?,
+            prefill_attn_paged_fp8_k: gpu
+                .kernel("prefill_paged_fp8", "inferspark_prefill_paged_fp8")?,
+            prefill_attn_paged_nvfp4_k: gpu
+                .kernel("prefill_paged_nvfp4", "inferspark_prefill_paged_nvfp4")?,
+            prefill_attn_paged_64_k: gpu.kernel("prefill_paged", "inferspark_prefill_paged_64")?,
+            prefill_attn_paged_fp8_64_k: gpu
+                .kernel("prefill_paged_fp8", "inferspark_prefill_paged_fp8_64")?,
+            prefill_attn_paged_nvfp4_64_k: gpu
+                .kernel("prefill_paged_nvfp4", "inferspark_prefill_paged_nvfp4_64")?,
+            prefill_attn_paged_nvfp4_128_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_nvfp4",
+                "inferspark_prefill_paged_nvfp4_128",
+            ),
+            prefill_attn_paged_turbo2_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_turbo2",
+                "inferspark_prefill_paged_turbo2",
+            ),
+            prefill_attn_paged_turbo3_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_turbo3",
+                "inferspark_prefill_paged_turbo3_64",
+            ),
+            // TurboQuant+ safer-asym Bf16K + Turbo3V BR=64 prefill kernel.
+            // Compiled from inferspark_prefill_paged_bf16k_turbo3v.cu which
+            // forks prefill_paged_compute_asym.cuh (LOAD_K_TILE = bf16,
+            // LOAD_V_TILE = turbo3 3-bit dequant).
+            prefill_attn_paged_bf16k_turbo3v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_bf16k_turbo3v",
+                "inferspark_prefill_paged_bf16k_turbo3v_64",
+            ),
+            // Bf16K + Turbo4V BR=64 prefill (4-bit V dequant in LOAD_V_TILE).
+            prefill_attn_paged_bf16k_turbo4v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_bf16k_turbo4v",
+                "inferspark_prefill_paged_bf16k_turbo4v_64",
+            ),
+            // Bf16K + Turbo2V BR=64 prefill (2-bit V dequant in LOAD_V_TILE).
+            prefill_attn_paged_bf16k_turbo2v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_bf16k_turbo2v",
+                "inferspark_prefill_paged_bf16k_turbo2v_64",
+            ),
+            // Fp8K + TurboNV BR=64 prefill kernels — K loaded as FP8 (per-tensor
+            // `k_scale` dequant in LOAD_K_TILE), V as 3/4/2-bit Lloyd-Max packed.
+            prefill_attn_paged_fp8k_turbo3v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_fp8k_turbo3v",
+                "inferspark_prefill_paged_fp8k_turbo3v_64",
+            ),
+            prefill_attn_paged_fp8k_turbo4v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_fp8k_turbo4v",
+                "inferspark_prefill_paged_fp8k_turbo4v_64",
+            ),
+            prefill_attn_paged_fp8k_turbo2v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_fp8k_turbo2v",
+                "inferspark_prefill_paged_fp8k_turbo2v_64",
+            ),
+            // Both-sides-quantized TurboQuant+ asym BR=64 prefill kernels.
+            // K loaded via turbo* dequant in LOAD_K_TILE, V via the corresponding
+            // turbo* dequant in LOAD_V_TILE — separate (block_stride, data_section)
+            // pairs per side.
+            prefill_attn_paged_turbo4k_turbo3v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_turbo4k_turbo3v",
+                "inferspark_prefill_paged_turbo4k_turbo3v_64",
+            ),
+            prefill_attn_paged_turbo4k_turbo8v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_turbo4k_turbo8v",
+                "inferspark_prefill_paged_turbo4k_turbo8v_64",
+            ),
+            prefill_attn_paged_turbo3k_turbo8v_64_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_turbo3k_turbo8v",
+                "inferspark_prefill_paged_turbo3k_turbo8v_64",
+            ),
+            // ── Q12 Phase 3: batched paged-prefill kernel handles ──
+            prefill_attn_paged_batched_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_paged_batched",
+                "inferspark_prefill_paged_batched",
+            ),
+            prefill_attn_paged_fp8_batched_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_paged_fp8_batched",
+                "inferspark_prefill_paged_fp8_batched",
+            ),
+            prefill_attn_paged_nvfp4_batched_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_paged_nvfp4_batched",
+                "inferspark_prefill_paged_nvfp4_batched",
+            ),
+            prefill_attn_paged_batched_64_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_paged_batched",
+                "inferspark_prefill_paged_batched_64",
+            ),
+            prefill_attn_paged_fp8_batched_64_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_paged_fp8_batched",
+                "inferspark_prefill_paged_fp8_batched_64",
+            ),
+            deinterleave_qg_split_k: gpu.kernel("ssm_preprocess", "deinterleave_qg_split")?,
+            deinterleave_qg_split_qnorm_k: gpu
+                .kernel("ssm_preprocess", "deinterleave_qg_split_qnorm")?,
+            qwen38_prefill_qknorm_rope_k: super::super::try_kernel(
+                gpu,
+                "qwen38_prefill_qknorm_rope",
+                "qwen38_prefill_qknorm_rope",
+            ),
+            sigmoid_gate_mul_batched_k: gpu.kernel("residual_add", "sigmoid_gate_mul_batched")?,
+            q_fp8: None,
+            k_fp8: None,
+            v_fp8: None,
+            o_fp8: None,
+            fp8_gemm_k: gpu.kernel("w4a16", "fp8_gemm_t")?,
+            bf16_to_fp8_k: gpu.kernel("w4a16", "bf16_to_fp8")?,
+            fp8_fp8_gemm_k: gpu.kernel("w4a16", "fp8_fp8_gemm_t")?,
+            fp8_gemm_t_m128_k: gpu.kernel("w4a16", "fp8_gemm_t_m128")?,
+            fp8_fp8_gemm_t_m128_k: gpu.kernel("w4a16", "fp8_fp8_gemm_t_m128")?,
+            fp8_calibration: if fp8_calibration_tokens > 0
+                && matches!(
+                    kv_dtype,
+                    KvCacheDtype::Fp8
+                        | KvCacheDtype::Fp8KTurbo4V
+                        | KvCacheDtype::Fp8KTurbo3V
+                        | KvCacheDtype::Fp8KTurbo2V
+                ) {
+                Some(Fp8KvCalibration::new(fp8_calibration_tokens, gpu)?)
+            } else {
+                None
+            },
+        })
+    }
+}

@@ -1,0 +1,25 @@
+{
+  "verdict": "PASS",
+  "total_items_evaluated": 2,
+  "mismatches": 0,
+  "non_empty_interventions": 0,
+  "min_available_memory_mib": 8102.0,
+  "memory_floor_satisfied": true,
+  "profiles": {
+    "gsm8k": {
+      "total_items": 1,
+      "matched_items": 1,
+      "mismatches": 0,
+      "plain_score": 1.0,
+      "k5_score": 1.0
+    },
+    "mmlu-pro": {
+      "total_items": 1,
+      "matched_items": 1,
+      "mismatches": 0,
+      "plain_score": 1.0,
+      "k5_score": 1.0
+    }
+  },
+  "provenance_note": "Historical 1-item-per-profile smoke summary (min MemAvailable 8,102.0 MiB). Surviving smoke reports (k5-gsm8k.json, plain-mmlu-pro.json, k5-mmlu-pro.json) are stored in qualification/accuracy/reports-smoke/. The original 1-item smoke plain-gsm8k.json and smoke memory_samples.csv were overwritten when Step C ran full Plain GSM8K (qualification/accuracy/reports/plain-gsm8k.json, qualification/accuracy/memory_samples.csv)."
+}

@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+#![allow(unused_imports, dead_code, clippy::too_many_arguments)]
+
+//! Initialization helpers extracted from `TransformerModel::new`.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use atlas_core::config::ModelConfig;
+use spark_runtime::gpu::GpuBackend;
+
+use crate::speculative::DraftProposer;
+use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+
+/// Build the MTP draft proposer when speculative decoding is requested.
+///
+/// Precedence:
+///   - `mtp_dense_weights: Some(...)` → takes precedence (even when
+///     `mtp_weights` is empty) and builds a dense `MtpHead::new_dense`
+///     (Qwen3.5/3.6 27B-class).
+///   - `mtp_weights` empty (and `mtp_dense_weights` is `None`) → no MTP
+///     weights in checkpoint; proposer disabled.
+///   - `mtp_weights.len() == 1` → single-module MTP (Qwen3.5 family): build `MtpHead`.
+///   - `mtp_weights.len() > 1` → multi-module MTP (MiniMax M2, DeepSeek-V3 style):
+///     build `MultiModuleMtpHead` with N heads.
+///
+/// Returns `None` when speculative decoding is off, when no MTP weights
+/// are available, or when the LM head is not NVFP4 (MTP heads need the
+/// NVFP4 LM head for shared output projection).
+pub(super) fn build_mtp_proposer(
+    use_speculative: bool,
+    mtp_weights: Vec<MtpWeights>,
+    mtp_dense_weights: Option<crate::weight_map::MtpDenseWeights>,
+    embed_tokens: DenseWeight,
+    lm_head_nvfp4: Option<QuantizedWeight>,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    mtp_quant: crate::layers::MtpQuantization,
+    mtp_vocab_size: u32,
+    max_seq_len: usize,
+) -> Option<Arc<dyn DraftProposer>> {
+    if !use_speculative {
+        if !mtp_weights.is_empty() || mtp_dense_weights.is_some() {
+            tracing::info!(
+                "MTP weights available but --speculative not set, skipping MTP head construction"
+            );
+        }
+        return None;
+    }
+    // Dense MTP path (Qwen3.5/3.6 27B-class) takes precedence when present.
+    if let Some(dense) = mtp_dense_weights {
+        let lm_nvfp4 = match lm_head_nvfp4 {
+            Some(w) => w,
+            None => {
+                tracing::warn!(
+                    "Dense MTP weights found but no NVFP4 LM head — speculative decoding disabled."
+                );
+                return None;
+            }
+        };
+        match crate::layers::MtpHead::new_dense(
+            dense,
+            embed_tokens,
+            lm_nvfp4,
+            config,
+            gpu,
+            mtp_quant,
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                tracing::info!(
+                    "Dense MTP speculative decoding: ENABLED (single-module, dense MLP)"
+                );
+                return Some(Arc::new(head) as Arc<dyn DraftProposer>);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build dense MTP head: {e}. Speculative disabled.");
+                return None;
+            }
+        }
+    }
+    if mtp_weights.is_empty() {
+        return None;
+    }
+    let lm_nvfp4 = match lm_head_nvfp4 {
+        Some(w) => w,
+        None => {
+            tracing::warn!(
+                "MTP weights found but no NVFP4 LM head — speculative decoding disabled."
+            );
+            return None;
+        }
+    };
+    let build_head = |mtp_wts: MtpWeights| {
+        crate::layers::MtpHead::new(
+            mtp_wts,
+            embed_tokens,
+            lm_nvfp4,
+            config,
+            gpu,
+            mtp_quant,
+            mtp_vocab_size,
+            max_seq_len,
+        )
+    };
+    if mtp_weights.len() == 1 {
+        match build_head(mtp_weights.into_iter().next().unwrap()) {
+            Ok(head) => {
+                tracing::info!("MTP speculative decoding: ENABLED (single-module)");
+                Some(Arc::new(head) as Arc<dyn DraftProposer>)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build MTP head: {e}. Speculative decoding disabled.");
+                None
+            }
+        }
+    } else {
+        let count = mtp_weights.len();
+        let heads: Result<Vec<_>> = mtp_weights.into_iter().map(build_head).collect();
+        match heads.and_then(crate::layers::mtp_multi::MultiModuleMtpHead::new) {
+            Ok(multi) => {
+                tracing::info!("MTP speculative decoding: ENABLED (multi-module, {count} heads)");
+                Some(Arc::new(multi) as Arc<dyn DraftProposer>)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to build multi-module MTP: {e}. Speculative decoding disabled."
+                );
+                None
+            }
+        }
+    }
+}

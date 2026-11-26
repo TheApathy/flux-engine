@@ -1,0 +1,709 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Prefix caching trait for KV block reuse (SDD).
+//!
+//! When multiple requests share a common prompt prefix, previously-computed
+//! KV cache blocks can be reused instead of re-running prefill. The cache
+//! is indexed by token sequences at block granularity via a radix tree.
+//!
+//! Two implementations:
+//! - `NoPrefixCaching`: no-ops (zero overhead when disabled)
+//! - `RadixTree` (see `crate::radix_tree`): full radix tree with LRU eviction
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── Global prefix cache counters (one RadixTree per server) ──
+
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static CACHE_HIT_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_cache_hit(matched_tokens: usize) {
+    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    CACHE_HIT_TOKENS.fetch_add(matched_tokens as u64, Ordering::Relaxed);
+}
+
+pub fn record_cache_miss() {
+    CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn cache_hit_count() -> u64 {
+    CACHE_HITS.load(Ordering::Relaxed)
+}
+pub fn cache_miss_count() -> u64 {
+    CACHE_MISSES.load(Ordering::Relaxed)
+}
+pub fn cache_hit_tokens_total() -> u64 {
+    CACHE_HIT_TOKENS.load(Ordering::Relaxed)
+}
+
+/// Result of evicting LRU cached blocks (Phase 6.1.e).
+#[derive(Debug, Clone, Default)]
+pub struct EvictedBlocks {
+    /// Physical block indices freed (caller calls `PagedKvCache::free_block`).
+    pub physical: Vec<u32>,
+    /// Parallel disk-block IDs to release (caller calls
+    /// `HighSpeedSwap::dec_disk_ref`). Empty when HSS isn't in use.
+    pub disk_block_ids: Vec<u32>,
+}
+
+impl EvictedBlocks {
+    pub fn is_empty(&self) -> bool {
+        self.physical.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.physical.len()
+    }
+}
+
+/// Metadata for an evicted SSM/PLE snapshot slot returned by [`PrefixCache::evict_snapshot_lru_entry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictedSnapshot {
+    pub snapshot_id: usize,
+    pub session_hash: u64,
+    pub token_count: usize,
+    pub prefix_hash: u64,
+}
+
+/// Half-open token range `[start, end)` within which attention is non-causal
+/// (bidirectional, e.g. multimodal image/block spans).
+///
+/// Any prefix key or snapshot ending strictly inside the open interior
+/// `(start, end)` (`start < boundary && boundary < end`) has KV states
+/// conditioned on future tokens up to `end` and must NOT be reusable as a
+/// standalone prefix match for sequences diverging before `end`. Checkpoints
+/// at `<= start` and `>= end` remain valid causal prefix boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonCausalSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl NonCausalSpan {
+    #[inline]
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    /// True iff `boundary` lies strictly inside `(self.start, self.end)`.
+    #[inline]
+    pub const fn contains_interior(&self, boundary: usize) -> bool {
+        self.start < boundary && boundary < self.end
+    }
+}
+
+/// True iff `boundary` lies strictly inside `(span.start, span.end)` for any span.
+#[inline]
+pub fn is_interior_of_noncausal_span(boundary: usize, spans: &[NonCausalSpan]) -> bool {
+    spans.iter().any(|span| span.contains_interior(boundary))
+}
+
+/// Result of looking up a token sequence in the prefix cache.
+#[derive(Debug, Clone)]
+pub struct PrefixMatch {
+    /// Physical KV cache block indices to reuse (in order).
+    pub matched_blocks: Vec<u32>,
+    /// `--high-speed-swap` disk-block IDs parallel to `matched_blocks`
+    /// (Phase 6.1.e). Empty when HSS is not in use. Same length as
+    /// `matched_blocks` when populated. The cache holds its own disk-side
+    /// refcount (acquired at `insert`, released at `evict`); callers must
+    /// additionally `inc_disk_ref` each matched ID for the borrowing sequence's
+    /// lifetime so eviction cannot free a disk slot while the sequence uses it.
+    pub matched_disk_block_ids: Vec<u32>,
+    /// Number of tokens matched. Block-aligned for `lookup_paired`; plain
+    /// `lookup` may also include a sub-block trailing match (`< block_size`).
+    pub matched_tokens: usize,
+    /// SSM state snapshot ID at the deepest matched node (Marconi caching).
+    /// When `Some`, the caller can restore SSM h_state + conv_state from
+    /// this snapshot and skip SSM computation for the matched prefix.
+    pub ssm_snapshot: Option<usize>,
+    /// Number of tokens covered by `ssm_snapshot` (Marconi intermediate checkpoints).
+    /// With leaf-only snapshots this equals `matched_tokens`. With intermediate
+    /// checkpoints it may be less — the caller must recompute SSM state for
+    /// tokens between `ssm_snapshot_tokens` and `matched_tokens`.
+    pub ssm_snapshot_tokens: usize,
+}
+
+impl PrefixMatch {
+    /// Empty match (no cached prefix found).
+    pub fn empty() -> Self {
+        Self {
+            matched_blocks: Vec::new(),
+            matched_disk_block_ids: Vec::new(),
+            matched_tokens: 0,
+            ssm_snapshot: None,
+            ssm_snapshot_tokens: 0,
+        }
+    }
+
+    /// Whether any prefix was matched.
+    pub fn is_empty(&self) -> bool {
+        self.matched_tokens == 0
+    }
+
+    /// SSM checkpoint that can seed an exact hybrid reconstruction through
+    /// this KV match, or `None` when the match is attention-only.
+    ///
+    /// A shallower checkpoint is valid in this fork: prefill restores at that
+    /// point, replays recurrent state to `matched_tokens`, and preserves the
+    /// already-cached KV rows. A checkpoint deeper than the KV walk cannot be
+    /// restored against this prefix and fails closed.
+    pub fn paired_ssm_tokens(&self) -> Option<usize> {
+        let snapshot_tokens = self
+            .ssm_snapshot
+            .is_some()
+            .then_some(self.ssm_snapshot_tokens)?;
+        (self.matched_tokens > 0
+            && !self.matched_blocks.is_empty()
+            && snapshot_tokens > 0
+            && snapshot_tokens <= self.matched_tokens)
+            .then_some(snapshot_tokens)
+    }
+}
+
+/// Trait for prefix caching strategies.
+///
+/// All methods take `&self` — implementations use interior mutability
+/// (e.g., `Mutex`) for thread safety. This allows the prefix cache to be
+/// shared between the model (prefill) and scheduler (free_sequence) without
+/// requiring `&mut self`.
+pub trait PrefixCache: Send + Sync {
+    /// Whether this implementation is active (i.e., a real cache that
+    /// actually inserts/holds refs). `NoPrefixCaching` returns false;
+    /// `RadixTree` returns true. Callers use this to skip ref-bookkeeping
+    /// that's only meaningful when the cache holds refs (e.g., the manual
+    /// `kv_cache.inc_ref` in `cache_sequence` that pairs with eviction's
+    /// `return_evicted_block`).
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    /// Look up a token sequence and return cached KV blocks for the
+    /// longest matching prefix (block-aligned).
+    ///
+    /// Increments ref_count on matched nodes so they survive eviction
+    /// while the sequence is active. `session_hash` is used for SSM
+    /// snapshot isolation (0 = legacy/no session tracking).
+    fn lookup(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch;
+
+    /// Hybrid/GDN lookup: return a hit only when the KV walk has an SSM
+    /// checkpoint that can seed recurrent replay. Implementations must release
+    /// any KV walk refs before returning an unpaired miss.
+    ///
+    /// Pure-attention callers keep using [`Self::lookup`]. No-op caches can use
+    /// this default because they never return a match.
+    fn lookup_paired(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        self.lookup(tokens, block_size, session_hash)
+    }
+
+    /// Attention-only lookup for requests that require populated Qwen4 QSA
+    /// side-cache pages (`qwen4_qsa_required == true`).
+    ///
+    /// Stops before any cached node whose `qsa_populated` flag is `false` so a
+    /// shorter (`prompt + max_tokens < 2048`) turn can never expose unpopulated
+    /// QSA index pages to a `>= 2048` sparse QSA turn.
+    fn lookup_qsa(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        let _ = (tokens, block_size, session_hash);
+        PrefixMatch::empty()
+    }
+
+    /// Hybrid/GDN lookup for requests that require populated Qwen4 QSA
+    /// side-cache pages (`qwen4_qsa_required == true`).
+    ///
+    /// Stops the KV walk before any node with `!qsa_populated`, then pairs the
+    /// surviving prefix with an aligned SSM checkpoint. Any temporary KV refs
+    /// acquired on an unpaired walk must be released before returning a miss.
+    fn lookup_paired_qsa(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        session_hash: u64,
+    ) -> PrefixMatch {
+        let _ = (tokens, block_size, session_hash);
+        PrefixMatch::empty()
+    }
+
+    /// Mark cached prefix nodes along `tokens` as having populated QSA
+    /// side-cache pages, only for nodes whose stored physical `block_idx`
+    /// matches `block_table[i]`.
+    ///
+    /// Matching on physical `block_idx` guarantees that a later `>= 2048` turn
+    /// (which missed an earlier unpopulated block and computed a fresh physical
+    /// block) never falsely promotes the older unpopulated physical block.
+    fn mark_blocks_qsa_populated(&self, _tokens: &[u32], _block_table: &[u32], _block_size: usize) {
+    }
+
+    /// Insert a completed prefill's blocks into the cache.
+    ///
+    /// `block_table[i]` is the physical block for tokens
+    /// `[i*block_size .. (i+1)*block_size]`.
+    ///
+    /// `disk_block_ids` parallels `block_table` for `--high-speed-swap`
+    /// (Phase 6.1.e). Empty when HSS is not in use; same length as
+    /// `block_table` when populated. The cache stores these alongside the
+    /// physical block IDs and returns them in `EvictedBlocks` so the
+    /// caller can `dec_disk_ref` the orchestrator's per-block refcount.
+    ///
+    /// **Disk-ref obligation (Issue #17 fix):** the returned vec lists every
+    /// disk_block_id on which this insert call newly took an ownership ref
+    /// (a node was created OR an existing node had its `disk_block_id`
+    /// populated for the first time). The caller MUST `inc_disk_ref` each
+    /// returned ID so the swap allocator's refcount matches the cache's
+    /// reachability. Already-cached portions (matched-prefix entries, or
+    /// blocks a prior intermediate insert already covered) are NOT in the
+    /// returned vec — re-incing them would leak the cache's refcount.
+    ///
+    /// `matched_tokens` is the number of tokens the inserting sequence
+    /// already acquired via `lookup()`'s `inc_refs` (0 for a cache-miss
+    /// request). Tokens past this offset are "seq-owned" — the inserting
+    /// sequence's eventual `release()` will decrement them — so `insert`
+    /// must bump their ref_count to keep the cache's own reference alive
+    /// after the release. See the release/lookup dance on
+    /// `RadixTreeInner::insert` in `radix_tree/inner.rs`.
+    fn insert(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        matched_tokens: usize,
+    ) -> Vec<u32>;
+
+    /// Insert blocks with an SSM state snapshot registered in the snapshot index.
+    ///
+    /// The snapshot ID references a slot in an external `SsmSnapshotPool`.
+    /// On future lookups matching this prefix, the snapshot ID is returned
+    /// in `PrefixMatch::ssm_snapshot` so the caller can restore SSM state.
+    /// `session_hash` tags the snapshot for session-scoped isolation.
+    /// `matched_tokens` has the same semantics as in `insert`.
+    /// Returns `(snapshot_id_to_release, newly_acquired_disk_ids)`. When the
+    /// implementation retains `snapshot_id`, the first item is any displaced
+    /// snapshot; when it does not retain it, the first item is `snapshot_id`
+    /// itself. The caller must release every returned snapshot ID. The disk-ref
+    /// obligation matches `insert`: caller `inc_disk_ref`s each returned ID.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_with_snapshot(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+    ) -> (Option<usize>, Vec<u32>);
+
+    /// Insert an SSM snapshot at an intermediate token boundary.
+    ///
+    /// `tokens` is the token sequence up to and including the snapshot point.
+    /// `block_table` contains the physical block indices for those tokens.
+    /// `session_hash` tags the snapshot for session-scoped isolation.
+    /// `matched_tokens` has the same semantics as in `insert`.
+    /// Returns a snapshot ID the caller must release: an existing displaced
+    /// snapshot when this insert is retained, or `snapshot_id` itself when the
+    /// implementation does not retain snapshots.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_intermediate_snapshot(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+    ) -> Option<usize>;
+
+    /// Release ref_counts on blocks that were acquired via `lookup`.
+    ///
+    /// Called when a sequence finishes. Decrements ref_count on cache
+    /// nodes matching the token prefix, making them eligible for eviction.
+    fn release(&self, tokens: &[u32], block_size: usize);
+
+    /// Release only refs acquired for `matched_tokens`, not every cache node
+    /// that happens to exist under the longer request. Used when EP agreement
+    /// or paired classification shortens a lookup result.
+    fn release_matched(&self, tokens: &[u32], block_size: usize, matched_tokens: usize) {
+        self.release(&tokens[..matched_tokens.min(tokens.len())], block_size);
+    }
+
+    /// Evict up to `num_blocks` cached blocks, returning their physical
+    /// indices and parallel disk-block IDs (Phase 6.1.e).
+    ///
+    /// Reclaims any orphaned displaced partial-suffix blocks first, then picks
+    /// LRU leaf nodes with no active borrowers (`ref_count <= 1`, baseline
+    /// cache ref only). Evicting a leaf with a `partial_suffix` frees both the
+    /// full block and its partial block (so up to `num_blocks + 1` physical
+    /// blocks may be returned). Returns fewer than requested if not enough
+    /// evictable blocks exist. The caller is responsible for `dec_disk_ref`-ing
+    /// every entry in `disk_block_ids` (releasing the cache's HSS-side
+    /// refcount). When HSS isn't in use the `disk_block_ids` vec is empty.
+    fn evict(&self, num_blocks: usize) -> EvictedBlocks;
+
+    /// Drain any orphaned physical blocks and HSS disk-block IDs displaced
+    /// when a `partial_suffix` was cleared or replaced during `insert*`.
+    /// Also drained automatically at the head of [`Self::evict`].
+    fn drain_displaced_partials(&self) -> EvictedBlocks {
+        EvictedBlocks::default()
+    }
+
+    /// Evict the least-recently-used SSM snapshot from the snapshot index.
+    /// Returns the snapshot ID so the caller can free it in `SsmSnapshotPool`.
+    fn evict_snapshot_lru(&self) -> Option<usize>;
+
+    /// Evict the least-recently-used SSM snapshot along with its prefix metadata
+    /// for persistent disk-snapshot spill hooks.
+    fn evict_snapshot_lru_entry(&self) -> Option<EvictedSnapshot> {
+        self.evict_snapshot_lru()
+            .map(|snapshot_id| EvictedSnapshot {
+                snapshot_id,
+                session_hash: 0,
+                token_count: 0,
+                prefix_hash: 0,
+            })
+    }
+
+    /// Configure whether [`Self::lookup_paired`] truncates deeper KV matches
+    /// down to the deepest restorable SSM/PLE snapshot boundary (`PC_WRITE_FLOOR`).
+    ///
+    /// Enabled for hybrid models whose prefill attention path writes KV/selector
+    /// pages starting from `ssm_snapshot_tokens` (such as Qwen4 QSA), ensuring
+    /// recurrent replay never mutates live shared cached KV blocks.
+    fn set_paired_truncate_to_snapshot_floor(&self, _enabled: bool) {}
+
+    /// Insert blocks while marking non-causal/bidirectional spans `(span.start, span.end)`
+    /// so interior blocks `(span.start < block_end < span.end)` cannot match unless the
+    /// lookup matches through `span.end`, while keeping `<= span.start` and `>= span.end`
+    /// as valid causal prefix checkpoints.
+    fn insert_with_noncausal_spans(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        matched_tokens: usize,
+        noncausal_spans: &[NonCausalSpan],
+    ) -> Vec<u32> {
+        let _ = noncausal_spans;
+        self.insert(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            matched_tokens,
+        )
+    }
+
+    /// Insert blocks + SSM snapshot with non-causal span interior exclusion.
+    /// If `tokens.len()` itself lies strictly inside `(span.start, span.end)`,
+    /// the snapshot is rejected (returned for caller reclamation) so no interior
+    /// non-causal snapshot can be restored on a diverging suffix.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_with_snapshot_and_noncausal_spans(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+        noncausal_spans: &[NonCausalSpan],
+    ) -> (Option<usize>, Vec<u32>) {
+        let acq = self.insert_with_noncausal_spans(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            matched_tokens,
+            noncausal_spans,
+        );
+        if is_interior_of_noncausal_span(tokens.len(), noncausal_spans) {
+            return (Some(snapshot_id), acq);
+        }
+        let displaced = self.insert_intermediate_snapshot_with_noncausal_spans(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            snapshot_id,
+            session_hash,
+            matched_tokens,
+            noncausal_spans,
+        );
+        (displaced, acq)
+    }
+
+    /// Insert an intermediate SSM snapshot, suppressing registration when `tokens.len()`
+    /// falls strictly inside `(span.start, span.end)` of any non-causal span.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_intermediate_snapshot_with_noncausal_spans(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+        noncausal_spans: &[NonCausalSpan],
+    ) -> Option<usize> {
+        if is_interior_of_noncausal_span(tokens.len(), noncausal_spans) {
+            return Some(snapshot_id);
+        }
+        self.insert_intermediate_snapshot(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            snapshot_id,
+            session_hash,
+            matched_tokens,
+        )
+    }
+
+    /// Number of SSM snapshots currently stored in the snapshot index.
+    fn snapshot_count(&self) -> usize;
+
+    /// (entries, cached_blocks) for logging.
+    fn stats(&self) -> (usize, usize);
+}
+
+/// No-op prefix cache (zero overhead when disabled).
+pub struct NoPrefixCaching;
+
+impl PrefixCache for NoPrefixCaching {
+    fn is_active(&self) -> bool {
+        false
+    }
+
+    fn lookup(&self, _tokens: &[u32], _block_size: usize, _session_hash: u64) -> PrefixMatch {
+        PrefixMatch::empty()
+    }
+
+    fn insert(
+        &self,
+        _tokens: &[u32],
+        _block_table: &[u32],
+        _disk_block_ids: &[u32],
+        _block_size: usize,
+        _matched_tokens: usize,
+    ) -> Vec<u32> {
+        Vec::new()
+    }
+
+    fn insert_with_snapshot(
+        &self,
+        _tokens: &[u32],
+        _block_table: &[u32],
+        _disk_block_ids: &[u32],
+        _block_size: usize,
+        snapshot_id: usize,
+        _session_hash: u64,
+        _matched_tokens: usize,
+    ) -> (Option<usize>, Vec<u32>) {
+        (Some(snapshot_id), Vec::new())
+    }
+
+    fn insert_intermediate_snapshot(
+        &self,
+        _tokens: &[u32],
+        _block_table: &[u32],
+        _disk_block_ids: &[u32],
+        _block_size: usize,
+        snapshot_id: usize,
+        _session_hash: u64,
+        _matched_tokens: usize,
+    ) -> Option<usize> {
+        Some(snapshot_id)
+    }
+
+    fn release(&self, _tokens: &[u32], _block_size: usize) {}
+
+    fn evict(&self, _num_blocks: usize) -> EvictedBlocks {
+        EvictedBlocks::default()
+    }
+
+    fn evict_snapshot_lru(&self) -> Option<usize> {
+        None
+    }
+
+    fn snapshot_count(&self) -> usize {
+        0
+    }
+
+    fn stats(&self) -> (usize, usize) {
+        (0, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prefix_match_empty() {
+        let m = PrefixMatch::empty();
+        assert!(m.is_empty());
+        assert_eq!(m.matched_tokens, 0);
+        assert!(m.matched_blocks.is_empty());
+    }
+
+    #[test]
+    fn test_no_prefix_caching_is_noop() {
+        let cache = NoPrefixCaching;
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let block_table = vec![0, 1];
+        let disk_block_ids: Vec<u32> = vec![];
+
+        let m = cache.lookup(&tokens, 4, 0);
+        assert!(m.is_empty());
+
+        // These should not panic
+        let new_acq = cache.insert(&tokens, &block_table, &disk_block_ids, 4, 0);
+        assert!(new_acq.is_empty());
+        cache.release(&tokens, 4);
+
+        let evicted = cache.evict(10);
+        assert!(evicted.is_empty());
+
+        assert_eq!(cache.evict_snapshot_lru(), None);
+        assert_eq!(cache.snapshot_count(), 0);
+
+        assert_eq!(cache.stats(), (0, 0));
+    }
+
+    #[test]
+    fn test_no_prefix_caching_returns_every_snapshot_slot() {
+        let cache = NoPrefixCaching;
+        let tokens = [1, 2, 3, 4];
+        let blocks = [7];
+        let mut available_slots = vec![41];
+
+        for iteration in 0..64 {
+            let snapshot_id = available_slots
+                .pop()
+                .expect("no-prefix inserts must not exhaust snapshot slots");
+            let returned = if iteration % 2 == 0 {
+                let (returned, acquired) =
+                    cache.insert_with_snapshot(&tokens, &blocks, &[], 4, snapshot_id, 0, 0);
+                assert!(acquired.is_empty());
+                returned
+            } else {
+                cache.insert_intermediate_snapshot(&tokens, &blocks, &[], 4, snapshot_id, 0, 0)
+            };
+            available_slots.push(returned.expect("inactive cache must return the supplied slot"));
+
+            assert_eq!(available_slots, [41]);
+            assert_eq!(cache.snapshot_count(), 0);
+        }
+    }
+
+    #[test]
+    fn test_active_prefix_cache_keeps_snapshot_ownership_contract() {
+        let cache = crate::radix_tree::RadixTree::new();
+        let tokens: Vec<u32> = (0..16).collect();
+
+        let (returned, acquired) = cache.insert_with_snapshot(&tokens, &[7], &[], 16, 5, 0, 0);
+        assert!(returned.is_none());
+        assert!(acquired.is_empty());
+        assert_eq!(cache.snapshot_count(), 1);
+
+        let (returned, acquired) = cache.insert_with_snapshot(&tokens, &[7], &[], 16, 8, 0, 0);
+        assert_eq!(returned, Some(5));
+        assert!(acquired.is_empty());
+        assert_eq!(cache.snapshot_count(), 1);
+
+        assert_eq!(
+            cache.insert_intermediate_snapshot(&tokens, &[7], &[], 16, 13, 0, 0),
+            Some(8)
+        );
+        assert_eq!(cache.snapshot_count(), 1);
+    }
+
+    #[test]
+    fn test_qsa_unpopulated_turn1_cannot_poison_turn2_and_physical_block_guard() {
+        let cache = crate::radix_tree::RadixTree::new();
+        let bs = 16usize;
+        let session = 0x51A0_2048u64;
+        let prompt96: Vec<u32> = (0..96u32).collect();
+        let prompt64 = &prompt96[..64];
+
+        // Turn 1 (`prompt + max_tokens < 2048`, `qwen4_qsa_required = false`):
+        // inserts 4 KV blocks + SSM snapshot WITHOUT marking QSA populated.
+        let t1_blocks = [10u32, 11, 12, 13];
+        let (displaced, _) =
+            cache.insert_with_snapshot(prompt64, &t1_blocks, &[], bs, 1, session, 0);
+        assert!(displaced.is_none());
+        cache.release(prompt64, bs);
+
+        // Short follow-up (`qwen4_qsa_required = false`) still reuses Turn 1.
+        let short_hit = cache.lookup_paired(&prompt96, bs, session);
+        assert_eq!(short_hit.matched_tokens, 64);
+        assert_eq!(short_hit.matched_blocks, t1_blocks);
+        assert_eq!(short_hit.ssm_snapshot, Some(1));
+        cache.release_matched(&prompt96, bs, short_hit.matched_tokens);
+
+        // Turn 2 (`>= 2048`, `qwen4_qsa_required = true`) MUST miss Turn 1's
+        // unpopulated blocks on both paired and attention-only QSA lookups.
+        let t2_paired = cache.lookup_paired_qsa(&prompt96, bs, session);
+        assert!(t2_paired.is_empty());
+        assert!(t2_paired.matched_blocks.is_empty());
+        assert_eq!(t2_paired.ssm_snapshot, None);
+        let t2_attn = cache.lookup_qsa(&prompt96, bs, session);
+        assert!(t2_attn.is_empty());
+
+        // Turn 2 prefills from token 0 into fresh physical blocks [20..=25]
+        // and calls `mark_blocks_qsa_populated`. Nodes 0..4 still hold Turn 1's
+        // physical blocks [10..=13] != [20..=23], so they MUST remain unpopulated.
+        let t2_blocks = [20u32, 21, 22, 23, 24, 25];
+        let _ = cache.insert_with_snapshot(&prompt96, &t2_blocks, &[], bs, 2, session, 0);
+        cache.mark_blocks_qsa_populated(&prompt96, &t2_blocks, bs);
+        cache.release(&prompt96, bs);
+
+        // Turn 3 (`>= 2048`, `qwen4_qsa_required = true`) STILL cannot hit the
+        // unpopulated physical prefix blocks [10..=13].
+        let t3_paired = cache.lookup_paired_qsa(&prompt96, bs, session);
+        assert!(t3_paired.is_empty());
+
+        // Evict all 6 cached blocks (proving zero leaked refcounts).
+        let evicted = cache.evict(6);
+        assert_eq!(evicted.physical.len(), 6);
+
+        // Fresh QSA-populated Turn 1 (`>= 2048`) populates blocks [30..=33]
+        // with snapshot 3, then a short turn appends unpopulated blocks [34, 35]
+        // with snapshot 4.
+        let qsa_blocks = [30u32, 31, 32, 33];
+        let _ = cache.insert_with_snapshot(prompt64, &qsa_blocks, &[], bs, 3, session, 0);
+        cache.mark_blocks_qsa_populated(prompt64, &qsa_blocks, bs);
+        cache.release(prompt64, bs);
+
+        let short_reuse = cache.lookup_paired(&prompt96, bs, session);
+        assert_eq!(short_reuse.matched_tokens, 64);
+        assert_eq!(short_reuse.matched_blocks, qsa_blocks);
+        let mixed_blocks = [30u32, 31, 32, 33, 34, 35];
+        let _ = cache.insert_with_snapshot(
+            &prompt96,
+            &mixed_blocks,
+            &[],
+            bs,
+            4,
+            session,
+            short_reuse.matched_tokens,
+        );
+        cache.release(&prompt96, bs);
+
+        // A `>= 2048` QSA lookup stops right before unpopulated block 4,
+        // reusing only [30..=33] and pairing with snapshot 3 (never snapshot 4).
+        let partial_qsa = cache.lookup_paired_qsa(&prompt96, bs, session);
+        assert_eq!(partial_qsa.matched_tokens, 64);
+        assert_eq!(partial_qsa.matched_blocks, qsa_blocks);
+        assert_eq!(partial_qsa.ssm_snapshot, Some(3));
+        assert_eq!(partial_qsa.ssm_snapshot_tokens, 64);
+        cache.release_matched(&prompt96, bs, partial_qsa.matched_tokens);
+
+        let evicted2 = cache.evict(6);
+        assert_eq!(evicted2.physical.len(), 6);
+    }
+}

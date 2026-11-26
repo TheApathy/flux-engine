@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Standard Q/K/V projection branch of `prefill_attention_paged`.
+//! Multi-way quantization dispatch (FlashInfer, cuBLASLt NVFP4, dual-KV pipe,
+//! transposed-FP8, native FP8 W8A16, pre-dequanted NVFP4→FP8, NVFP4 transposed,
+//! NVFP4, BF16) shared across Q, K, V.
+
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
+
+use super::super::Qwen3AttentionLayer;
+use crate::layer::ForwardContext;
+use crate::layers::ops;
+
+/// Identifies which projection (Q/K/V) — selects the correct weight bank
+/// from `Qwen3AttentionLayer`.
+#[derive(Clone, Copy)]
+pub(super) enum Proj {
+    Q,
+    K,
+    V,
+}
+
+pub(super) fn use_prefill_kv_dual(
+    requested: bool,
+    has_kernel: bool,
+    n: u32,
+    h: u32,
+    original_layout: bool,
+    compatible_weights: bool,
+) -> Result<bool, &'static str> {
+    if !requested || n <= 32 || !h.is_multiple_of(64) {
+        return Ok(false);
+    }
+    if !original_layout {
+        return Err("ATLAS_PREFILL_KV_DUAL=1 requires ATLAS_PREFILL_PROJ_FAST=0");
+    }
+    if !compatible_weights {
+        return Err(
+            "ATLAS_PREFILL_KV_DUAL=1 requires compatible original-layout NVFP4 K/V weights",
+        );
+    }
+    if !has_kernel {
+        return Err("ATLAS_PREFILL_KV_DUAL=1 requires w4a16_gemm_pipe_dual");
+    }
+    Ok(true)
+}
+
+impl Qwen3AttentionLayer {
+    /// Run the Q, K, and V GEMMs (in that order) for non-MLA prefill.
+    /// Output destinations follow the existing buffer layout in `paged.rs`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefill_attention_paged_qkv(
+        &self,
+        normed: DevicePtr,
+        n: u32,
+        h: u32,
+        nkv: u32,
+        hd: u32,
+        q_proj_dim: usize,
+        kv_dim: usize,
+        num_tokens: usize,
+        bf16: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if self.try_flashinfer_projection_qgkv(normed, n, h, q_proj_dim, kv_dim, ctx, stream)? {
+            return Ok(());
+        }
+
+        let k_contiguous = ctx.buffers.ssm_qkvz();
+        let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
+        let k_nvfp4 = self.k_weight.as_ref().and_then(|weight| weight.as_nvfp4());
+        let v_nvfp4 = self.v_weight.as_ref().and_then(|weight| weight.as_nvfp4());
+        let compatible_weights = k_nvfp4.is_some()
+            && v_nvfp4.is_some()
+            && self.k_fp8w_t.is_none()
+            && self.v_fp8w_t.is_none()
+            && self.k_fp8.is_none()
+            && self.v_fp8.is_none();
+        let dual_kv = use_prefill_kv_dual(
+            crate::layers::prefill_kv_dual_enabled(),
+            self.w4a16_gemm_pipe_dual_k.0 != 0,
+            n,
+            h,
+            !crate::layers::prefill_proj_fast_enabled(),
+            compatible_weights,
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        // Select before Q so an eligible explicit request cannot partially run
+        // the parent Q/K/V sequence and then fail or silently fall back.
+        let qg_out = ctx.buffers.qkv_output();
+        if !dual_kv
+            && !self.k_eq_v
+            && compatible_weights
+            && self.q_fp8w_t.is_none()
+            && self.q_fp8.is_none()
+            && let (Some(q_nvfp4), Some(k_nvfp4), Some(v_nvfp4)) = (
+                self.q_weight.as_ref().and_then(|weight| weight.as_nvfp4()),
+                k_nvfp4,
+                v_nvfp4,
+            )
+            && crate::layers::dense_ffn::try_cublaslt_nvfp4_proj_qkv(
+                ctx.gpu,
+                normed,
+                q_nvfp4,
+                k_nvfp4,
+                v_nvfp4,
+                qg_out,
+                k_contiguous,
+                v_contiguous,
+                n,
+                q_proj_dim as u32,
+                nkv * hd,
+                h,
+                stream,
+            )?
+        {
+            return Ok(());
+        }
+        self.prefill_one_proj(
+            Proj::Q,
+            normed,
+            qg_out,
+            n,
+            q_proj_dim as u32,
+            h,
+            ctx,
+            stream,
+        )?;
+
+        if dual_kv {
+            ops::w4a16_gemm_pipe_dual(
+                ctx.gpu,
+                self.w4a16_gemm_pipe_dual_k,
+                normed,
+                k_nvfp4.unwrap(),
+                v_nvfp4.unwrap(),
+                k_contiguous,
+                v_contiguous,
+                false,
+                n,
+                nkv * hd,
+                h,
+                stream,
+            )?;
+            super::mark_prefill_kv_dual_paged_engaged();
+            return Ok(());
+        }
+        self.prefill_one_proj(Proj::K, normed, k_contiguous, n, nkv * hd, h, ctx, stream)?;
+
+        self.prefill_one_proj(Proj::V, normed, v_contiguous, n, nkv * hd, h, ctx, stream)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_one_proj(
+        &self,
+        proj: Proj,
+        normed: DevicePtr,
+        out: DevicePtr,
+        n: u32,
+        out_dim: u32,
+        h: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (fp8w_t, weight_opt, fp8, mut nvfp4_t, dense) = match proj {
+            Proj::Q => (
+                self.q_fp8w_t.as_ref(),
+                self.q_weight.as_ref(),
+                self.q_fp8,
+                self.q_nvfp4_t.as_ref(),
+                &self.attn.q_proj,
+            ),
+            Proj::K => (
+                self.k_fp8w_t.as_ref(),
+                self.k_weight.as_ref(),
+                self.k_fp8,
+                self.k_nvfp4_t.as_ref(),
+                &self.attn.k_proj,
+            ),
+            Proj::V => (
+                self.v_fp8w_t.as_ref(),
+                self.v_weight.as_ref(),
+                self.v_fp8,
+                self.v_nvfp4_t.as_ref(),
+                &self.attn.v_proj,
+            ),
+        };
+
+        // Correctness lever: opt out of the transposed-TC prefill projections
+        // (same class as ATLAS_PREFILL_FFN_FAST=0).
+        if !crate::layers::prefill_proj_fast_enabled() {
+            nvfp4_t = None;
+        }
+
+        if let Some(fp8t) = fp8w_t {
+            ops::w8a16_gemm_t(
+                ctx.gpu,
+                self.w8a16_gemm_t_k,
+                normed,
+                fp8t.weight_t,
+                fp8t.scale_t,
+                out,
+                n,
+                out_dim,
+                h,
+                stream,
+            )?;
+        } else if weight_opt.and_then(|w| w.as_fp8()).is_some() && self.w8a16_gemm_k.0 != 0 {
+            let fp8w = weight_opt.and_then(|w| w.as_fp8()).unwrap();
+            ops::w8a16_gemm(
+                ctx.gpu,
+                self.w8a16_gemm_k,
+                normed,
+                fp8w.weight,
+                fp8w.row_scale,
+                out,
+                n,
+                out_dim,
+                h,
+                stream,
+            )?;
+        } else if weight_opt.and_then(|w| w.as_fp8()).is_some() {
+            anyhow::bail!("w8a16_gemm kernel not loaded — cannot prefill with FP8 weights");
+        } else if let Some(fp8p) = fp8 {
+            if n > 128 {
+                ops::fp8_gemm_n128_m128(
+                    ctx.gpu,
+                    self.fp8_gemm_t_m128_k,
+                    normed,
+                    fp8p,
+                    out,
+                    n,
+                    out_dim,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::fp8_gemm_n128(
+                    ctx.gpu,
+                    self.fp8_gemm_k,
+                    normed,
+                    fp8p,
+                    out,
+                    n,
+                    out_dim,
+                    h,
+                    stream,
+                )?;
+            }
+        } else if let Some(nvfp4_t) = nvfp4_t {
+            if n > 128 {
+                self.w4a16_gemm_m128_dispatch(
+                    ctx.gpu, normed, nvfp4_t, out, n, out_dim, h, stream,
+                )?;
+            } else if n <= 32
+                && self.w4a16_gemm_t_m16_k.0 != 0
+                && crate::layers::tc_nvfp4_m16_enabled()
+            {
+                ops::w4a16_gemm_n128_m16(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m16_k,
+                    normed,
+                    nvfp4_t,
+                    out,
+                    n,
+                    out_dim,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::w4a16_gemm_n128(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_k,
+                    normed,
+                    nvfp4_t,
+                    out,
+                    n,
+                    out_dim,
+                    h,
+                    stream,
+                )?;
+            }
+        } else if let Some(nvfp4) = weight_opt.and_then(|w| w.as_nvfp4()) {
+            let label = match proj {
+                Proj::Q => "attention_q",
+                Proj::K => "attention_k",
+                Proj::V => "attention_v",
+            };
+            // Exact original-layout route (baseline / pipe / pipe_m128n128 are
+            // bit-identical; selected by ATLAS_PREFILL_PROJ_PIPE[_M128]).
+            self.exact_prefill_projection(
+                ctx.gpu, label, normed, nvfp4, out, n, out_dim, h, stream,
+            )?;
+        } else {
+            anyhow::ensure!(
+                !dense.weight.is_null(),
+                "attention BF16 fallback weight was released at load (ATLAS_QWEN4_DENSE_DEDUP)"
+            );
+            ops::dense_gemm_attn_prefill(
+                ctx.gpu,
+                self.dense_gemm_k,
+                normed,
+                dense,
+                out,
+                n,
+                out_dim,
+                h,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+}

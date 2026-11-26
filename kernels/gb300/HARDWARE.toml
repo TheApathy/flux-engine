@@ -1,0 +1,10 @@
+[hardware]
+name = "gb300"
+vendor = "nvidia"
+arch = "sm_103a"
+extends = "gb10"
+compute_capability = "10.3"
+memory_bandwidth_gbps = 8000
+memory_type = "HBM3E"
+memory_gb = 288
+use_fp32_residual = false

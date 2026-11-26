@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use super::*;
+
+#[test]
+fn most_keys_are_the_flag_with_dashes() {
+    assert_eq!(
+        flag_for("gpu_memory_utilization").as_deref(),
+        Some("gpu-memory-utilization")
+    );
+    assert_eq!(flag_for("port").as_deref(), Some("port"));
+}
+
+#[test]
+fn the_three_renames_are_applied() {
+    // Each of these silently serves the wrong thing if dropped: `max_model_len`
+    // and `tensor_parallel` are not fields at all, and the listen address is
+    // `--bind`, so a pass-through would be rejected or ignored.
+    assert_eq!(flag_for("max_model_len").as_deref(), Some("max-seq-len"));
+    assert_eq!(flag_for("tensor_parallel").as_deref(), Some("tp-size"));
+    assert_eq!(flag_for("host").as_deref(), Some("bind"));
+}
+
+#[test]
+fn a_presence_only_boolean_is_a_bare_flag_and_a_false_one_is_omitted() {
+    // `--speculative` is a clap SetTrue flag: it takes no value, so `false`
+    // can only be expressed by not passing it — which the shipped
+    // qwen3.5-0.8b recipe (`speculative: false`) depends on.
+    assert_eq!(
+        argv_for("speculative", "true"),
+        Some(vec!["--speculative".to_string()])
+    );
+    assert_eq!(argv_for("speculative", "false"), None);
+    // `enable_prefix_caching` is `bool` (not `Option<bool>`), so the derive
+    // gives it SetTrue despite its `num_args = 0..=1` — clap, not the field
+    // syntax, is the authority the presence-only set is read from.
+    assert_eq!(argv_for("enable_prefix_caching", "false"), None);
+    // REMOVED: `--video-allow-ffmpeg` is not a flag on this engine.
+    //
+    // `argv_for` reads the presence-only set from clap itself, so for an
+    // undeclared flag it cannot know the value is implied and renders
+    // `--video-allow-ffmpeg true`. That is not a bug in `argv_for`: the
+    // recipe pins a flag this server does not accept, and serving it is
+    // CORRECTLY refused rather than silently reshaped.
+    //
+    // Restore this WITH the flag. The original note is worth keeping: the
+    // 2026-08-15 video-fidelity gate 400'd every MP4 leg without it, so a
+    // recipe that pins it needs the bare-flag rendering to parse at all.
+}
+
+#[test]
+fn a_flag_that_takes_an_explicit_bool_keeps_its_value() {
+    use clap::Parser as _;
+
+    // `--high-speed-swap-graph` is a real `Option<bool>` flag on `ServeArgs`:
+    // both explicit `false` and explicit `true` must keep their values because
+    // absent mirrors `--high-speed-swap` whereas an explicit bool overrides it.
+    let false_argv =
+        argv_for("high_speed_swap_graph", "false").expect("explicit false must render");
+    assert_eq!(false_argv, vec!["--high-speed-swap-graph", "false"]);
+    let parsed_false = crate::cli::ServeArgs::try_parse_from(
+        ["spark".to_string(), "model".to_string()]
+            .into_iter()
+            .chain(false_argv),
+    )
+    .expect("clap accepts explicit false for Option<bool>");
+    assert_eq!(parsed_false.high_speed_swap_graph, Some(false));
+
+    let true_argv = argv_for("high_speed_swap_graph", "true").expect("explicit true must render");
+    assert_eq!(true_argv, vec!["--high-speed-swap-graph", "true"]);
+    let parsed_true = crate::cli::ServeArgs::try_parse_from(
+        ["spark".to_string(), "model".to_string()]
+            .into_iter()
+            .chain(true_argv),
+    )
+    .expect("clap accepts explicit true for Option<bool>");
+    assert_eq!(parsed_true.high_speed_swap_graph, Some(true));
+}
+
+#[test]
+fn unknown_boolean_flag_passes_through_so_clap_rejects_it() {
+    assert_eq!(
+        argv_for("nonexistent_lever", "false"),
+        Some(vec!["--nonexistent-lever".into(), "false".into()])
+    );
+    assert_eq!(
+        argv_for("nonexistent_lever", "true"),
+        Some(vec!["--nonexistent-lever".into(), "true".into()])
+    );
+}
+
+#[test]
+fn values_pass_through_verbatim() {
+    assert_eq!(
+        argv_for("max_model_len", "65536"),
+        Some(vec!["--max-seq-len".into(), "65536".into()])
+    );
+}

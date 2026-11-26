@@ -1,0 +1,25 @@
+# fn grid (container-9.15.1-w16384) url=http://127.0.0.1:18951 max_ctx=135168 prompt_mode=prompt_token_ids (exact)
+
+Prefill tok/s
+| ctx | tokens | TTFT s | tok/s | N |
+|---:|---:|---:|---:|---:|
+| 8k | 8192 | 1.369 | 5983.9 | 1 |
+| 16k | 16384 | 2.627 | 6237.4 | 1 |
+| 32k | 32768 | 5.338 | 6138.3 | 1 |
+| 64k | 65536 | 11.059 | 5926.2 | 1 |
+| 128k | 131072 | 22.542 | 5814.6 | 1 |
+
+Aggregate decode tok/s (incl. prefix prefill): not run (--no-decode)
+
+Decode-only tok/s (excl. prefix prefill): not run (--no-decode)
+
+MTP-normalized decode steps/s (accept len): not run (--no-decode)
+
+Coding peak cc1 probe: not run
+Same-prompt identity: 5 groups, 10 requests: all identical
+
+Notes:
+[1] Prompt mode: prompt_token_ids (exact); pool 395923 tokens of on-disk code/license/prose text tokenized by the server; prefill N excludes 1 dropped request(s) per size plus 1 warmup after start.
+[2] Decode cells not run (--no-decode).
+
+Results saved to fn-grid-container-9.15.1-w16384.json

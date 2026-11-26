@@ -1,0 +1,90 @@
+{
+  "schema": "flux-r15-container-gate-receipt/1",
+  "milestone": "Milestone 4 \u2014 Fast Loading & Cold Start Readiness (R4)",
+  "verdict": "PASS",
+  "timestamp_utc": "2026-10-24T18:06:13Z",
+  "target_median_seconds": 150.0,
+  "observed_runs_seconds": [
+    140.51,
+    139.23,
+    134.23
+  ],
+  "median_seconds": 139.23,
+  "consecutive_passes": 3,
+  "total_attempts": 3,
+  "health_status_all_200": true,
+  "model_identity_matched": true,
+  "anchors_verified": true,
+  "fatal_patterns_count": 0,
+  "runs": [
+    {
+      "run_idx": 1,
+      "launch_mono_ns": 1051424496020467,
+      "ready_mono_ns": 1051565004956481,
+      "readiness_seconds": 140.51,
+      "health_payload": {
+        "status": "ready",
+        "model": "qwen38"
+      },
+      "log_audit": {
+        "fatal_count": 0,
+        "fatal_matches": [],
+        "anchors_verified": true,
+        "anchors": {
+          "starting": true,
+          "scheduler": true,
+          "listening": true
+        }
+      },
+      "log_path": "qualification/profiles/logs/coldstart_server_run_1.log",
+      "pre_mem_gib": 107.26,
+      "post_mem_gib": 107.05
+    },
+    {
+      "run_idx": 2,
+      "launch_mono_ns": 1051568534637430,
+      "ready_mono_ns": 1051707759680542,
+      "readiness_seconds": 139.23,
+      "health_payload": {
+        "status": "ready",
+        "model": "qwen38"
+      },
+      "log_audit": {
+        "fatal_count": 0,
+        "fatal_matches": [],
+        "anchors_verified": true,
+        "anchors": {
+          "starting": true,
+          "scheduler": true,
+          "listening": true
+        }
+      },
+      "log_path": "qualification/profiles/logs/coldstart_server_run_2.log",
+      "pre_mem_gib": 107.06,
+      "post_mem_gib": 106.9
+    },
+    {
+      "run_idx": 3,
+      "launch_mono_ns": 1051711287196404,
+      "ready_mono_ns": 1051845521205176,
+      "readiness_seconds": 134.23,
+      "health_payload": {
+        "status": "ready",
+        "model": "qwen38"
+      },
+      "log_audit": {
+        "fatal_count": 0,
+        "fatal_matches": [],
+        "anchors_verified": true,
+        "anchors": {
+          "starting": true,
+          "scheduler": true,
+          "listening": true
+        }
+      },
+      "log_path": "qualification/profiles/logs/coldstart_server_run_3.log",
+      "pre_mem_gib": 106.95,
+      "post_mem_gib": 105.86
+    }
+  ]
+}

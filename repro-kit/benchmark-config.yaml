@@ -1,0 +1,221 @@
+# ==============================================================================
+# Flux Reproducibility Kit v0.1 — Canonical Benchmark Configuration
+# Schema Version: 1.0.0
+# Sanitization Policy: FLUX-SEC-0001
+# Engine Release: v1.0.3
+# ==============================================================================
+
+schema_version: "1.0.0"
+kit_version: "0.1.0"
+sanitization_policy: "FLUX-SEC-0001"
+
+engine:
+  name: "flux-engine"
+  binary_name: "flux-server"
+  compat_binary_name: "spark-server"
+  release_version: "1.0.3"
+  pinned_stable_commit: "ae58bc27efd8b35aa4272da15dd5f4c549ec332a"
+  pinned_stable_binary_sha256: "29e959d401137bb4da2248319cbddced0fefb66b5a3c91f55cdc2141bd98dab5"
+  pinned_stable_build_receipt_sha256: "d2fab21f5f69c5859ad1f7a53c96ba12d7caa1c4beb2e9cb196d1a14716eb99a"
+  certified_peak_16k_commit: "0760867638160ad0496bb7de4293f8e93e40f597"
+  certified_peak_16k_binary_sha256: "187811ccc713df82385a8ca37a56fd97a9707b40a00bb3745a1b06686de01b5d"
+  certified_peak_median_commit: "63618f6619c0780401e9a4da86e7f4c3eec17e77"
+  certified_peak_median_binary_sha256: "71252d2e13316dfbf02b5bcbd95fb01bc90dbeffcde5f0b7e944dd4b75c7943a"
+  license: "AGPL-3.0-only"
+  oci_image: "ghcr.io/theapathy/flux-engine:v1.0.3"
+
+model:
+  model_id: "Qwen/Qwen3.8-Flash-Next-NVFP4-Offload"
+  model_name: "qwen38-native-mtp-frontier-v1"
+  kernel_target: "qwen3.8-flash-next"
+  revision: "ed8aa879996dc322e3720eb9848a4193c4cfc1d7c05e0421d85108429bd15869"
+  checkpoint_path_container: "/models/Qwen3.8-Flash-Next-NVFP4-Offload"
+  checkpoint_path_host: "<MODELS_ROOT>/Qwen3.8-Flash-Next-NVFP4-Offload"
+  mtp_draft_model_id: "Qwen/Qwen3.8-Flash-Next-Inferact-MTP"
+  mtp_checkpoint_path_container: "/models/Qwen3.8-Flash-Next-Inferact-MTP"
+  mtp_checkpoint_path_host: "<MODELS_ROOT>/Qwen3.8-Flash-Next-Inferact-MTP"
+  architecture:
+    total_layers: 48
+    gated_deltanet_layers: 36
+    qsa_full_attention_layers: 12
+    routed_experts: 512
+    shared_experts: 1
+    top_k_experts: 10
+    mhc_streams: 4
+    mhc_lowrank: 320
+    hidden_size: 2560
+    vocab_size: 248320
+  quantization:
+    scheme: "NVFP4"
+    weights: "NVFP4 (FP4 E2M1 + UE4M3 block-16 scales, NVIDIA ModelOpt 0.46.0)"
+    activations: "MXFP8 / FP8-E4M3 dynamic tensor/row-scaled"
+    kv_cache: "BF16 (with FP8-E4M3 QSA sparse index/qkpv core)"
+    ple_offload: "4-ring sector-aligned NVFP4 128-part n-gram table"
+    speculative_mtp: "Inferact 1-layer MoE MTP head (K=5 verify, num_drafts=4, vocab=96000)"
+
+hardware_profiles:
+  1x_dgx_spark_gb10:
+    description: "Single NVIDIA DGX Spark (1x Grace Blackwell GB10 Superchip)"
+    gpu_name: "NVIDIA GB10"
+    compute_capability: "12.1"
+    nvcc_arch: "sm_121a"
+    gpu_count: 1
+    streaming_multiprocessors: 48
+    l2_cache_mib: 32
+    memory_type: "Coherent Unified Memory Architecture (UMA) LPDDR5X"
+    memory_capacity_gb: 128.0
+    os_visible_memory_gib: 119.7
+    sustained_bandwidth_gbps: 273.0
+    peak_bandwidth_gbps: 301.0
+    cpu_affinity: "5-9,15-19"
+    cpu_description: "10x ARM Cortex-X925 performance cores (out of 20-core Grace ARMv9.2 CPU)"
+    uma_free_floor_gate_mib: 5120
+    default_mode: "max-prefill"
+    default_recipe: "/opt/flux/repro-kit/recipes/flux-v9-max-prefill.env"
+
+  4x_dgx_spark_gb10_cluster:
+    description: "2x-4x NVIDIA DGX Spark Multi-Node Cluster via ConnectX-7 200GbE QSFP56 RoCEv2"
+    gpu_name: "NVIDIA GB10"
+    compute_capability: "12.1"
+    nvcc_arch: "sm_121a"
+    gpu_count: 4
+    nodes: 4
+    interconnect: "Dual-port NVIDIA ConnectX-7 200GbE QSFP56 RoCEv2 (GPUDirect RDMA)"
+    parallelism: "TP=2, EP=4 (or 4-way data-parallel / disaggregated prefill+decode)"
+    memory_capacity_gb: 512.0
+    cpu_affinity: "5-9,15-19"
+    uma_free_floor_gate_mib: 8192
+    default_mode: "max-prefill"
+    default_recipe: "/opt/flux/repro-kit/recipes/4x-spark-cluster.env"
+
+  nvidia_blackwell_sm120:
+    description: "NVIDIA RTX PRO 6000 Blackwell Workstation / Server Edition (96 GB GDDR7)"
+    gpu_name: "NVIDIA RTX PRO 6000 Blackwell"
+    compute_capability: "12.0"
+    nvcc_arch: "sm_120a"
+    gpu_count: 1
+    streaming_multiprocessors: 188
+    l2_cache_mib: 96
+    memory_type: "Discrete GDDR7 with ECC"
+    memory_capacity_gb: 96.0
+    peak_bandwidth_gbps: 1792.0
+    default_mode: "max-prefill"
+    default_recipe: "/opt/flux/repro-kit/recipes/nvidia-blackwell-sm120.env"
+
+  nvidia_hopper_sm90:
+    description: "NVIDIA H100 / H200 / GH200 Hopper (80-141 GB HBM3/HBM3e)"
+    gpu_name: "NVIDIA H100 / H200"
+    compute_capability: "9.0"
+    nvcc_arch: "sm_90a"
+    gpu_count: 1
+    memory_type: "HBM3 / HBM3e"
+    memory_capacity_gb: 80.0
+    peak_bandwidth_gbps: 3350.0
+    default_mode: "max-prefill"
+    default_recipe: "/opt/flux/repro-kit/recipes/nvidia-hopper-sm90.env"
+
+operating_modes:
+  max-prefill:
+    description: "Pinned 6,000+ tok/s Prefill + 57.4 tok/s Lossless K=5 Decode Unified Champion (w16384)"
+    recipe_env: "/opt/flux/repro-kit/recipes/flux-v9-max-prefill.env"
+    recipe_argv: "/opt/flux/repro-kit/recipes/flux-serve.argv"
+    max_prefill_tokens: 16384
+    max_seq_len: 135168
+    kv_cache_dtype: "bf16"
+    speculative_k: 5
+    num_drafts: 4
+    env_sha256: "2942f6ae474c84a175bb3969f2d6eedad43c60bd917162f76ad443f706420889"
+    effective_env_sha256: "5c66756f484115779cdd5acc6d83a7fd0e4e4d39a21d4e06349dc4b1153f3a0d"
+    argv_sha256: "78c9825d265e24fd077425d0cda815355b72059687fc70a6c9d9dc346541a14f"
+
+  interactive-w4096:
+    description: "Low-Memory Footprint Interactive Serve (4,096-token prefill chunks, ~12 GiB free UMA floor)"
+    recipe_env: "/opt/flux/repro-kit/recipes/flux-v9-w4096-interactive.env"
+    recipe_argv: "/opt/flux/repro-kit/recipes/flux-serve-w4096.argv"
+    max_prefill_tokens: 4096
+    max_seq_len: 135168
+    kv_cache_dtype: "bf16"
+    speculative_k: 5
+    num_drafts: 4
+    env_sha256: "318b36a75b485a4b73cc20b4b13285d21a1c66327f1de5a95d574c6a03039663"
+    effective_env_sha256: "8f17088c78584e1f3e5cfc2f84f70828546c0d64155aa325aa606e219040b1ab"
+    argv_sha256: "fe244cb7c14b481de349609b942e87f1ba53814db2f37c2a9fc8e7bf24861066"
+
+  fast-prefill:
+    description: "Standalone Pure Prefill Throughput Mode (w16384)"
+    recipe_env: "/opt/flux/repro-kit/recipes/flux-fast-prefill.env"
+    recipe_argv: "/opt/flux/repro-kit/recipes/flux-serve.argv"
+    max_prefill_tokens: 16384
+    max_seq_len: 135168
+
+  k5-decode:
+    description: "Lossless Inferact MTP K=5 Speculative Decode Mode (57.4 tok/s coding peak, 10/10 greedy exact)"
+    recipe_env: "/opt/flux/repro-kit/recipes/flux-k5-lossless-decode.env"
+    recipe_argv: "/opt/flux/repro-kit/recipes/flux-serve-w4096.argv"
+    max_prefill_tokens: 4096
+    max_seq_len: 135168
+    speculative_k: 5
+    num_drafts: 4
+
+  long-context-136k:
+    description: "136,584-Token Estonia Long-Context Needle-in-a-Haystack Mode (max_seq_len=147456, 5/5 PASS)"
+    recipe_env: "/opt/flux/repro-kit/recipes/flux-estonia-136k.env"
+    recipe_argv: "/opt/flux/repro-kit/recipes/flux-serve.argv"
+    max_prefill_tokens: 16384
+    max_seq_len: 147456
+    speculative_k: 5
+
+  exact-reference:
+    description: "Strict Reference Numerical Baseline Mode (non-speculative K=1 plain decode & conservative prefill)"
+    recipe_env: "/opt/flux/repro-kit/recipes/flux-exact-reference.env"
+    recipe_argv: "/opt/flux/repro-kit/recipes/flux-serve.argv"
+    max_prefill_tokens: 16384
+    max_seq_len: 135168
+    speculative_k: 1
+
+benchmark_protocol:
+  default_mode: "max-prefill"
+  endpoint_bind: "127.0.0.1"
+  endpoint_port: 8899
+  prompt_lengths: [8192, 16384, 32768, 65536, 131072]
+  long_context_needle_tokens: 136576
+  long_context_active_kv_tokens: 136584
+  warmup_tokens: 8192
+  dropped_uncounted_reps_per_length: 1
+  timed_repetitions_per_length: 3
+  concurrency_levels: [1, 2, 4]
+  primary_ttft_concurrency: 1
+  primary_ttft_batch_size: 1
+  prefill_max_tokens: 1
+  decode_max_tokens: 256
+  temperature: 0.0
+  prefix_caching_enabled: false
+  ssm_cache_slots: 0
+  prompt_pool_tokens: 395923
+  prompt_pool_ids_sha256: "0f214e7481731a78a91f68a68bb09210f8151179d8d7e86d886511b2b8e93ad1"
+
+gates:
+  same_prompt_identity_required: "PASS"
+  lossless_k5_greedy_prompts_required: 10
+  lossless_k5_greedy_tokens_required: 2560
+  estonia_136k_needle_trials_required: 5
+  minimum_uma_free_floor_mib: 5120
+  band_tolerance_pct: 5.0
+  expected_w16384_median_tps:
+    8192: 5819.3
+    16384: 6076.7
+    32768: 5952.6
+    65536: 5803.2
+    131072: 5684.0
+  expected_w16384_peak_tps:
+    8192: 5830.2
+    16384: 6082.2
+    32768: 5969.6
+    65536: 5828.3
+    131072: 5694.4
+  expected_w4096_median_tps:
+    8192: 5266.8
+    16384: 5164.5
+    32768: 5116.2
+    65536: 5016.1
+    131072: 4891.7

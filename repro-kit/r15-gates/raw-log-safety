@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""R15 raw-log-safety gate driver (S1).
+
+Standalone standard-library-only executable.  The suite runs it as the last
+gate with the complete uncapped raw log on an inherited read-only descriptor
+and an exclusive receipt descriptor.  Successful behavior:
+
+* scans one read-only mapping of the complete log with the case-insensitive
+  five-label census, without copying the complete file into the Python heap;
+* every census must be zero, otherwise the driver exits 2 without a receipt;
+* emits the wrapper-shape validator artifact under ``--validators-dir`` and
+  writes the gate receipt to the receipt file descriptor;
+* writes nothing to stdout/stderr, so the tracked suite sees a silent driver.
+
+The receipt evidence carries the exact eight-key contract of the outer
+wrapper ``_validate_raw_log_evidence`` recomputation:
+
+    scan_scope, patterns, match_count, raw_log_bytes, raw_log_sha256,
+    all_processes_included, validator_artifact, validator_receipt_sha256
+
+The validator document embeds the full per-label census in ``raw`` so the
+wrapper recomputes it independently; the tracked suite keeps its own final
+scan of the same bytes and fails closed on any positive match.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import mmap
+import os
+import re
+import stat
+import sys
+from typing import NoReturn
+
+MAX_RAW_LOG_BYTES = 8 * 1024 * 1024 * 1024
+MAX_PATTERN_MATCH_COUNT = 100_000
+GATE_RECEIPT_BYTES = 256 * 1024 * 1024
+VALIDATOR_ARTIFACT_BYTES = 16 * 1024 * 1024
+GATE_SCHEMA = "flux-r15-container-gate-receipt/1"
+GATE_VALIDATOR_SCHEMA = "flux-r15-gate-validator/1"
+SCAN_SCOPE = "complete-uncapped"
+PATTERN_LABELS = (
+    "CUDA fatal",
+    "CUDA out of memory",
+    "illegal memory access",
+    "NVRM",
+    "Xid",
+)
+_RAW_LOG_REGEX_LABELS = {
+    "CUDA fatal": r"cuda[-_: ]*fatal",
+    "CUDA out of memory": r"cuda[-_: ]*out[-_: ]*of[-_: ]*memory",
+    "illegal memory access": r"illegal[-_: ]*memory[-_: ]*access",
+    "NVRM": r"\bNVRM\b",
+    "Xid": r"\bXid\b",
+}
+_RAW_LOG_COMPILED = {
+    label: re.compile(pattern.encode("ascii"), re.IGNORECASE | re.ASCII)
+    for label, pattern in _RAW_LOG_REGEX_LABELS.items()
+}
+
+
+def die(message: str, exit_code: int = 1) -> NoReturn:
+    try:
+        payload = f"raw-log-safety: {message}\n".encode("utf-8", "replace")
+        if payload:
+            written = 0
+            while written < len(payload):
+                written += os.write(2, payload[written:])
+    finally:
+        os._exit(exit_code)
+
+
+def open_nofollow_parent(
+    path: str, *, create_last_directory: bool = False
+) -> tuple[int, str]:
+    """Walk every parent component of ``path`` without following links.
+
+    Returns ``(parent_fd, final_name)`` anchored to the real parent directory
+    inode.  With ``create_last_directory`` the final parent component may be
+    created with ``mkdir`` when missing (used for the validators directory the
+    driver owns); any other missing component fails closed.
+    """
+
+    parts = [part for part in path.split("/") if part]
+    if not path.startswith("/") or not parts:
+        die(f"validators artifact path must be absolute and non-root: {path!r}")
+    for part in parts:
+        if part in (".", ".."):
+            die(f"validators artifact path is not normalized: {part!r}")
+    parent_fd = os.open(
+        "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    try:
+        for index, part in enumerate(parts[:-1]):
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                final_parent = index == len(parts) - 2
+                if create_last_directory and final_parent:
+                    os.mkdir(part, 0o700, dir_fd=parent_fd)
+                    child = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                else:
+                    die(f"validators parent directory is missing: {part!r}")
+            os.close(parent_fd)
+            parent_fd = child
+        return parent_fd, parts[-1]
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def parse_arguments(argv: list[str]) -> dict[str, object]:
+    expected = {
+        "--container-id",
+        "--image-id",
+        "--image-digest",
+        "--base-url",
+        "--run-id",
+        "--receipt-fd",
+        "--raw-log-fd",
+        "--validators-dir",
+    }
+    tokens: dict[str, str] = {}
+    index = 0
+    while index < len(argv):
+        flag = argv[index]
+        if flag not in expected or index + 1 >= len(argv):
+            die(f"unrecognized or incomplete argument {flag!r}")
+        if flag in tokens:
+            die(f"duplicate argument {flag!r}")
+        tokens[flag] = argv[index + 1]
+        index += 2
+    if set(tokens) != expected:
+        missing = sorted(expected - set(tokens))
+        die(f"missing required arguments: {missing}")
+    for key in ("--container-id", "--image-id", "--image-digest", "--run-id"):
+        if not tokens[key] or "\x00" in tokens[key]:
+            die(f"identity {key} is empty")
+    if not re.fullmatch(r"[0-9a-f]{64}", tokens["--container-id"]):
+        die("container-id is not a plain 64-hex container ID")
+    for key in ("--image-id", "--image-digest"):
+        if not tokens[key].startswith("sha256:"):
+            die(f"{key} must carry a sha256: prefix")
+        if not re.fullmatch(r"[0-9a-f]{64}", tokens[key][7:]):
+            die(f"{key} is not sha256:<64-hex>")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", tokens["--run-id"]):
+        die("run-id must be one safe release run identifier")
+    try:
+        receipt_fd = int(tokens["--receipt-fd"])
+        raw_log_fd = int(tokens["--raw-log-fd"])
+    except ValueError:
+        die("receipt/raw-log descriptors must be integers")
+    if receipt_fd < 0 or raw_log_fd < 0:
+        die("receipt/raw-log descriptors must be non-negative")
+    os.fstat(receipt_fd)
+    os.fstat(raw_log_fd)
+    return {
+        "container_id": tokens["--container-id"],
+        "image_id": tokens["--image-id"],
+        "image_digest": tokens["--image-digest"],
+        "run_id": tokens["--run-id"],
+        "receipt_fd": receipt_fd,
+        "raw_log_fd": raw_log_fd,
+        "validators_dir": tokens["--validators-dir"],
+        "base_url": tokens["--base-url"],
+    }
+
+
+def scan_raw_log(descriptor: int) -> tuple[dict[str, int], int, str]:
+    """Count every case-insensitive census label exactly once, boundary-safe.
+
+    A whole-file mapping preserves word boundaries and arbitrarily long
+    separators. No finite overlap can preserve these regular expressions.
+    """
+
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size <= 0
+        or before.st_size > MAX_RAW_LOG_BYTES
+    ):
+        die("complete raw log must be one non-empty bounded regular file")
+    digest = hashlib.sha256()
+    per_label = {label: 0 for label in PATTERN_LABELS}
+    matches = 0
+    with mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ) as window:
+        digest.update(window)
+        for label, pattern in _RAW_LOG_COMPILED.items():
+            for _match in pattern.finditer(window):
+                if matches >= MAX_PATTERN_MATCH_COUNT:
+                    die("complete raw log census exceeded its bound")
+                per_label[label] += 1
+                matches += 1
+    after = os.fstat(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_nlink,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_nlink,
+    ):
+        die("complete raw log changed while it was scanned")
+    return per_label, after.st_size, digest.hexdigest()
+
+
+def canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("short write")
+        offset += written
+
+
+def main(argv: list[str]) -> None:  # pragma: no cover - real driver path
+    options = parse_arguments(argv)
+    raw_log_fd = options["raw_log_fd"]
+    position_state = os.fstat(raw_log_fd)
+    if not stat.S_ISREG(position_state.st_mode):
+        die("raw log descriptor is not a regular file")
+    counts, raw_log_bytes, raw_log_sha256 = scan_raw_log(raw_log_fd)
+    if any(counts.values()):
+        payload = b"".join(
+            f"raw-log-safety: {label!r} matched {count} time(s)\n".encode(
+                "utf-8", "replace"
+            )
+            for label, count in counts.items()
+            if count
+        )
+        written = 0
+        while written < len(payload):
+            written += os.write(2, payload[written:])
+        os._exit(2)
+    validator_raw = {
+        "scan_scope": SCAN_SCOPE,
+        "per_pattern_match_counts": {label: 0 for label in PATTERN_LABELS},
+        "raw_log_bytes": raw_log_bytes,
+        "all_processes_included": True,
+    }
+    document = {
+        "schema": GATE_VALIDATOR_SCHEMA,
+        "gate": "raw-log-safety",
+        "status": "PASS",
+        "release_qualified": True,
+        "container_id": options["container_id"],
+        "run_id": options["run_id"],
+        "raw": validator_raw,
+    }
+    validators_dir = options["validators_dir"]
+    if not validators_dir.startswith("/") or validators_dir in ("/", ""):
+        die("validators-dir must be one absolute non-root directory")
+    artifact_name = "raw-log-safety.json"
+    path = f"{validators_dir}/{artifact_name}"
+    locator = "validators/" + artifact_name
+    validators_fd, artifact_name = open_nofollow_parent(
+        path, create_last_directory=True
+    )
+    try:
+        try:
+            descriptor = os.open(
+                artifact_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o400,
+                dir_fd=validators_fd,
+            )
+        except FileExistsError:
+            die("validators artifact already exists")
+        except OSError as error:
+            die(f"validators artifact is unsafe: {error}")
+        try:
+            payload = canonical_bytes(document)
+            write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o400)
+            artifact_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(artifact_stat.st_mode) or artifact_stat.st_size != len(
+                payload
+            ):
+                die("validators artifact changed during its write")
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(validators_fd)
+    evidence = {
+        "scan_scope": SCAN_SCOPE,
+        "patterns": list(PATTERN_LABELS),
+        "match_count": 0,
+        "raw_log_bytes": raw_log_bytes,
+        "raw_log_sha256": raw_log_sha256,
+        "all_processes_included": True,
+        "validator_artifact": locator,
+        "validator_receipt_sha256": hashlib.sha256(
+            canonical_bytes(document)
+        ).hexdigest(),
+    }
+    receipt = {
+        "schema": GATE_SCHEMA,
+        "gate": "raw-log-safety",
+        "status": "PASS",
+        "release_qualified": True,
+        "execution_scope": "immutable-container",
+        "image_id": options["image_id"],
+        "image_digest": options["image_digest"],
+        "container_id": options["container_id"],
+        "run_id": options["run_id"],
+        "evidence": evidence,
+    }
+    try:
+        write_all(options["receipt_fd"], canonical_bytes(receipt))
+        os.fsync(options["receipt_fd"])
+    except OSError as error:
+        die(f"cannot write gate receipt: {error}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+    os._exit(0)

@@ -1,0 +1,84 @@
+# Built-in recipe: GLM-5.3-Flash EXL3 2.05 bpw with experimental DFlash2 speculative decoding.
+# Speculation requires explicit operator opt-in (`ATLAS_GLM53_UNVALIDATED_BRINGUP=1`);
+# this recipe intentionally omits that flag so admission fails closed by default.
+recipe_version: "2"
+model: GLM-5.3-Flash-exl3-2.05bpw
+runtime: atlas
+container: local
+metadata:
+  maintainer: flux-engine
+  category: agent
+  model_params: 320B
+  quantization: exl3
+  kv_dtype: bf16
+  description: |
+    GLM-5.3-Flash (KDA + DSA + mHC MoE) from the EXL3 checkpoint with the DFlash2 drafter
+    (block 8, verify width 3) and the exact row-batched verify. ~91 GB resident: runs alone.
+defaults:
+  port: 8888
+  host: 127.0.0.1
+  # Conservative 2048 default; raise via CLI overrides once longer contexts are validated.
+  max_model_len: 2048
+  max_prefill_tokens: 2048
+  max_batch_size: 1
+  max_num_seqs: 1
+  oom_guard_mb: 4096
+  dflash: true
+  draft_model: /models/GLM-5.3-Flash-DFlash2-bf582e4
+  dflash_gamma: 8
+  dflash_window_size: 2048
+  glm_dflash_max_drafts: 3
+atlas:
+  model_type: glm5_next
+  resident_gb: 91
+  headroom_gb: 10
+  run_alone: true
+  env:
+    ATLAS_GLM53_CUBLASLT_PREWARM: "1"
+    ATLAS_GLM53_EXACT_VERIFY: "1"
+    ATLAS_GLM53_EXACT_WIDE_DSA_PRECOMPUTE: "1"
+    ATLAS_GLM53_EXACT_WIDE_KDA_BATCH_COPY: "1"
+    ATLAS_GLM53_EXACT_WIDE_ROWEXACT: "1"
+    ATLAS_GLM53_EXL3_KDA_QKV_GRID_ORDER: "row-x"
+    ATLAS_GLM53_EXL3_MOE_PREFILL_DIRECT_COMBINE: "1"
+    ATLAS_GLM53_EXL3_ROUTE_PRIVATE: "1"
+    ATLAS_GLM53_EXL3_ROUTE_PRIVATE_PREFILL: "1"
+    ATLAS_GLM53_FFN_GRAPHS: "1"
+    ATLAS_GLM53_LAYER_MAJOR_PREFILL: "1"
+    ATLAS_GLM53_LAYER_MAJOR_PREFILL_ROWS: "2048"
+    # Kept off to match the target-only baseline recipe's prefill path;
+    # mixed-image layer-major prefill is an independent opt-in.
+    ATLAS_GLM53_LAYER_MAJOR_VISION_PREFILL: "0"
+    ATLAS_GLM53_PARTIAL_WIDE_REPLAY: "1"
+    ATLAS_GLM53_PHASE_TIMING: "0"
+    ATLAS_GLM53_VISION_FLASH_ATTN: "1"
+    ATLAS_GLM53_WIDE_PREFILL: "1"
+    ATLAS_GLM53_WIDE_PREFILL_ROWS: "8"
+    ATLAS_GLM53_EXL3_MOE_CHUNK_ROWS: "64"
+    ATLAS_GLM53_EXL3_PREFILL_RECONSTRUCT: "1"
+    ATLAS_GLM53_EXL3_RECONSTRUCT_PRECISION: "f16"
+    ATLAS_GLM53_EXL3_RECONSTRUCT_DTYPE: "bf16"
+    ATLAS_GLM53_ROUTER_GEMM: "1"
+    ATLAS_GLM53_HC_PRE_GEMM: "1"
+    ATLAS_GLM53_DSA_ABSORB_GEMM: "1"
+    ATLAS_GLM53_KDA_CONV_FUSED: "1"
+    ATLAS_GLM53_DSA_DENSE_FAST: "1"
+    ATLAS_GLM53_HC_POST_PROMPT: "1"
+    # Row-shared DSA sparse-path kernels (every prompt row past 2048):
+    # bit-identical to the per-(row, head) references, ~4.5x faster at 8K.
+    ATLAS_GLM53_DSA_SELECTED_ROWS: "1"
+    ATLAS_GLM53_DSA_SCORE_ROWS: "1"
+    # KDA recurrence with q/k/decay/beta/value staged through shared memory;
+    # bit-identical to rr_c8, ~-2% prefill at 2048 and 8192.
+    ATLAS_GLM53_KDA_RR_PREFETCH: "3"
+    # DFlash2 drafter configuration for GLM-5.3-Flash.
+    ATLAS_GLM53_DFLASH2_CAPTURE_TILE128: "1"
+    ATLAS_GLM53_DFLASH2_COMMITTED_PROJECTION: "original"
+    ATLAS_GLM53_DFLASH2_DEVICE_ARGMAX: "1"
+    ATLAS_GLM53_DFLASH2_KV_PREFIX: "0"
+    # Exact verify at row cost, and prefix commit sized to the verify width.
+    ATLAS_GLM53_EXL3_ROWBATCH: "1"
+    ATLAS_GLM53_VERIFY_DSA_PRECOMPUTE: "1"
+    ATLAS_GLM53_VERIFY_DSA_BATCH_OUTPUT: "1"
+    ATLAS_GLM53_PREFIX_COMMIT: "1"
+    ATLAS_GLM53_PREFIX_COMMIT_ROWS: "3"

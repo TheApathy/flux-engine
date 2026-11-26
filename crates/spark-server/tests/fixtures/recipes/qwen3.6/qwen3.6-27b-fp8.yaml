@@ -1,0 +1,32 @@
+recipe_version: "2"
+model: Qwen/Qwen3.6-27B-FP8
+runtime: atlas
+container: flux-engine:latest
+max_nodes: 1
+
+metadata:
+  description: |
+    Qwen3.6-27B (dense, native FP8) on the Atlas runtime. Long-context
+    fixture configuration pairing FP8 weights with FP8 KV
+    (`kv_high_precision_layers: auto`) and `max_model_len: 262144` without
+    speculative decoding (`speculative: false`).
+  maintainer: atlas
+  category: chat
+  model_params: 27B
+  model_dtype: fp8
+  quantization: fp8
+  kv_dtype: fp8
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  max_model_len: 262144
+  max_batch_size: 2
+  max_num_seqs: 2
+  kv_cache_dtype: fp8
+  kv_high_precision_layers: auto
+  gpu_memory_utilization: 0.88
+  scheduling_policy: slai
+  speculative: false
+  enable_prefix_caching: true
+  oom_guard_mb: 1024

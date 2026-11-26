@@ -1,0 +1,37 @@
+# Flux Engine gitleaks configuration (extends built-in default ruleset).
+# All provider-specific secret detectors (Anthropic, OpenAI, HuggingFace, AWS,
+# GitHub PATs, private keys, JWTs, etc.) remain 100% active.
+title = "Flux Engine gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Ignore local Rust build artifact directories (target/ and target-*/) for developer convenience"
+paths = [
+  '''(^|/)target(-[^/]+)?/''',
+]
+
+[[allowlists]]
+description = "Ignore deterministic 64-hex SHA-256 digests paired with tokenizer/prompt-token metadata"
+regexTarget = "line"
+regexes = [
+  '''(tokenizer(_config)?\.json|TOKENIZER_SHA256|tokenizer_sha256|token_ids_sha256|PROMPT_TOKENS)["']?\s*[:=]\s*["'][0-9a-f]{64}["']''',
+]
+
+[[allowlists]]
+description = "Ignore screaming-snake-case Rust/CUDA constants, ATLAS_/FLUX_ env names (must contain underscore so AWS AKIA keys are never skipped), and Docker label keys"
+regexTarget = "secret"
+regexes = [
+  '''^[A-Z][A-Z0-9]*_[A-Z0-9_]{4,}(=[0-9]+)?$''',
+  '''^io\.atlas\.[a-z0-9._-]+$''',
+]
+
+[[allowlists]]
+description = "Ignore synthetic HuggingFace redaction unit-test fixture in test_debug_bundle_launcher.py"
+paths = [
+  '''repro-kit/tests/test_debug_bundle_launcher\.py$''',
+]
+regexes = [
+  '''h[f]_PlantedHuggingFace0123''',
+]

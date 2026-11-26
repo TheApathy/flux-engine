@@ -1,0 +1,43 @@
+# Built-in recipe: DeepSeek-V4.1-Flash-Next (CB3 K124 expert pack) on one GB10.
+#
+# Measured single-node GB10 configuration:
+#   - keep=124 routed experts resident = 71.7 GB of CB3 planes; ~88 GB total with the rest
+#     (+1.1 GB scratch for the 2048-token prefill chunk)
+#   - DSpark (MTP drafter) OFF by default (+7.93 GB when enabled)
+recipe_version: "2"
+model: DeepSeek-V4.1-Flash-Next-DGX-Spark-512K
+runtime: atlas
+container: local
+metadata:
+  maintainer: flux-engine
+  category: agent
+  model_params: 284B
+  quantization: cb3
+  kv_dtype: bf16
+  description: |
+    DeepSeek-V4.1-Flash-Next, 124 of 384 routed experts per layer resident as CB3 (71.7 GB),
+    fused CB3 grouped-GEMM MoE, device routing, 2048-token prefill chunks (byte-identical to
+    512, 1333.5 tok/s prefill; the engine caps the chunk itself when DSpark is on). Needs the whole
+    GB10: the TUI refuses to start it unless ~88 GB plus a 16 GB floor is free after the
+    previous model is released.
+defaults:
+  port: 8888
+  host: 127.0.0.1
+  max_model_len: 8192
+  max_batch_size: 1
+  kv_cache_dtype: bf16
+# Atlas extension block, read by `main_modules::model_profile` (Recipe::parse ignores it).
+atlas:
+  model_type: deepseek_v41
+  # Admission is on the BASE: 85 GB measured + 2.83 GB shared-expert bf16 copies = ~88.
+  # Attention wq_b/wo_b/wo_a bf16 copies (up to +9.4 GB, ~97.4 max) are elastic: made one
+  # layer at a time only while free memory stays above a 20 GB floor, so they never refuse a
+  # load.
+  resident_gb: 88
+  dspark_extra_gb: 8
+  headroom_gb: 16
+  run_alone: true
+  env:
+    ATLAS_DSV41_PACKED_KEEP: "124"
+    ATLAS_DSV41_CHUNK: "2048"
+    ATLAS_DSV41_DSPARK: "0"

@@ -1,0 +1,2254 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Live native-concurrency C2-C8 release gate. See README.md beside this file.
+
+The driver is the operational layer for the already-integrated offline
+qualifier (`qwen4_native_concurrency_probe.py`) and matrix sealer
+(`qwen4_native_concurrency_matrix.py`). It launches one fresh in-container
+server process per arm, binds that process to the release image, runs the
+probe's request plan and validators against it, seals the plain nine-arm
+matrix with the untouched sealer, runs the native-K5 nine-arm matrix under the
+K5 state contract, and emits the wrapper's `native-concurrency-c2-c8` evidence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+from contextlib import contextmanager
+import dataclasses
+import fcntl
+import hashlib
+import http.client
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import select
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import types
+import urllib.error
+import urllib.parse
+import urllib.request
+
+GATE = "native-concurrency-c2-c8"
+LEVELS = (2, 4, 8)
+MODES = ("none", "native-mtp-k5")
+# Receipt scopes. "full" is the default and the only scope the release wrapper
+# accepts as native-concurrency-c2-c8: both modes, all 18 arms. "plain" (opt-in)
+# runs the nine plain arms only and names a distinct gate that the wrapper
+# never accepts in place of the full gate, so a plain PASS cannot stand in for
+# the native-K5 matrix. Its receipt records native K5 as not covered.
+SCOPES = {
+    "full": (GATE, MODES),
+    "plain": (GATE + "-plain", ("none",)),
+}
+PLAIN_NOT_COVERED = ("native-mtp-k5",)
+PROFILES = ("native-reference", "native-optimized", "serial-control")
+LADDER_WIDTHS = tuple(range(9, 33))
+MAX_RESPONSE = 32 * 1024 * 1024
+REQUEST_TIMEOUT = 900
+READY_TIMEOUT = 1800
+LABEL_PREFIX = "com.theapathy.flux."
+CONTAINER_MODELS = "/models"
+DIAGNOSTIC_ENVIRONMENT = {
+    "ATLAS_LOGITS_FNV": "1",
+    "ATLAS_QWEN4_NATIVE_BATCH_RECEIPT": "1",
+    "ATLAS_QWEN4_TARGET_STATE_RECEIPT": "1",
+}
+DIAGNOSTIC_LIMIT_KEYS = (
+    "ATLAS_LOGITS_FNV_REQUEST_LIMIT",
+    "ATLAS_QWEN4_TARGET_STATE_RECEIPT_LIMIT",
+)
+LIVE_ENVIRONMENT_PREFIXES = ("ATLAS_", "FLUX_")
+PLAIN_STATE = ("unloaded-target-only", "ordinary-target-only", False)
+K5_STATE = ("engaged-native-mtp", "native-mtp", True)
+FIXED_LAUNCH_FLAGS = (
+    ("--kernel-target", "qwen3.8-flash-next"),
+    ("--world-size", "1"),
+    ("--tp-size", "1"),
+    ("--ep-size", "1"),
+    ("--kv-cache-dtype", "bf16"),
+    ("--block-size", "16"),
+    ("--max-seq-len", "2048"),
+    ("--max-prefill-tokens", "1024"),
+    ("--ssm-cache-slots", "0"),
+    ("--swap-space-gb", "0"),
+    ("--enable-prefix-caching", "false"),
+    ("--request-timeout", "900"),
+)
+WRAPPER_PROVENANCE_KEYS = {
+    "release_version",
+    "source_revision",
+    "source_tree",
+    "source_root_path",
+    "source_bundle_manifest_path",
+    "source_bundle_manifest_sha256",
+    "source_bundle_path",
+    "source_bundle_sha256",
+    "build_receipt_path",
+    "build_receipt_sha256",
+    "source_to_binary_receipt_path",
+    "source_to_binary_receipt_sha256",
+    "binary_path",
+    "binary_sha256",
+    "checkpoint_id",
+    "checkpoint_revision",
+    "checkpoint_path",
+    "checkpoint_manifest_path",
+    "checkpoint_manifest_sha256",
+    "recipe_path",
+    "recipe_sha256",
+}
+FRAME_CENSUS_RE = re.compile(r"QWEN4_(NATIVE|SERIAL)_BATCH_FRAME rows=([0-9]+) ")
+K5_METRIC_RE = re.compile(
+    r'^atlas_spec_decode_verify_total\{[^\n}]*\bk="5"[^\n}]*\}\s+([0-9.eE+-]+)\s*$',
+    re.MULTILINE,
+)
+VOID_MARKERS = ("NVRM", "Xid", "out of memory", "CUDA error", "illegal memory")
+
+
+class GateFailure(ValueError):
+    """A fail-closed verdict with a failure class for the private diagnosis file."""
+
+    def __init__(self, failure_class, message):
+        super().__init__(message)
+        self.failure_class = failure_class
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_parent_suite(expected):
+    """Bind the helper pin to the actual sealed suite that launched this gate."""
+    parent = os.getppid()
+    argv = Path(f"/proc/{parent}/cmdline").read_bytes().split(b"\0")
+    candidates = [item for item in argv if re.fullmatch(rb"/proc/self/fd/[0-9]+", item)]
+    require(len(candidates) == 1, "gate must be launched by the sealed release suite")
+    number = int(candidates[0].rsplit(b"/", 1)[1])
+    descriptor = os.open(f"/proc/{parent}/fd/{number}", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        require(
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals == seals,
+            "launching suite bytes are not sealed",
+        )
+        size = os.fstat(descriptor).st_size
+        require(0 < size <= 16 * 1024 * 1024, "launching suite size differs")
+        require(
+            digest(os.pread(descriptor, size + 1, 0)) == expected
+            and os.getppid() == parent,
+            "helper differs from the launching suite",
+        )
+    finally:
+        os.close(descriptor)
+
+
+def read_pinned_bytes(path, expected):
+    """Read checked bytes once; never reopen the pathname after hashing."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * 1024 * 1024,
+            "module size is invalid",
+        )
+        payload = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        require(
+            identity
+            == (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ),
+            "module changed while reading",
+        )
+        require(digest(payload) == expected, "source dependency hash differs")
+    finally:
+        os.close(descriptor)
+    return payload, identity
+
+
+def load_module(path, expected, name, injected=None):
+    """Execute checked bytes under a private module identity."""
+    payload, _identity = read_pinned_bytes(path, expected)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    if injected:
+        module.__dict__.update(injected)
+    sys.modules[name] = module
+    try:
+        exec(compile(payload, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def docker(arguments):
+    result = subprocess.run(
+        ["docker", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
+    )
+    require(result.returncode == 0, "Docker identity or process query failed")
+    require(len(result.stdout) <= 16 * 1024 * 1024, "Docker response is oversized")
+    return result.stdout
+
+
+def live_environment_subset(environment):
+    return {
+        key: value
+        for key, value in environment.items()
+        if key.startswith(LIVE_ENVIRONMENT_PREFIXES) or key == "RUST_LOG"
+    }
+
+
+def _container_mounts(document):
+    mounts = document.get("Mounts")
+    require(type(mounts) is list, "container mount inventory is missing")
+    table = {}
+    for item in mounts:
+        require(
+            type(item) is dict and type(item.get("Destination")) is str,
+            "container mount entry is malformed",
+        )
+        require(item["Destination"] not in table, "container mount is duplicated")
+        table[item["Destination"]] = item
+    for destination, writable in ((CONTAINER_MODELS, False), ("/results", True)):
+        item = table.get(destination)
+        require(
+            type(item) is dict
+            and item.get("Type") == "bind"
+            and item.get("RW") is writable
+            and type(item.get("Source")) is str,
+            f"container {destination} bind differs from the release contract",
+        )
+    return table
+
+
+def inspect_container(args, suite):
+    document = suite.strict_json_loads(
+        docker(["container", "inspect", "--format", "{{json .}}", args.container_id]),
+        "concurrency container",
+    )
+    require(
+        type(document) is dict
+        and document.get("Id") == args.container_id
+        and document.get("Image") == args.image_id,
+        "container identity differs",
+    )
+    require(
+        document.get("State", {}).get("Running") is True
+        and document.get("HostConfig", {}).get("ReadonlyRootfs") is True,
+        "container is not running with read-only root",
+    )
+    labels = document.get("Config", {}).get("Labels", {})
+    plan = {
+        "in_container_binary_path": labels.get(LABEL_PREFIX + "binary-path"),
+        "in_container_recipe_path": labels.get(LABEL_PREFIX + "recipe-path"),
+        "in_container_binary_sha256": labels.get(LABEL_PREFIX + "binary-sha256"),
+        "recipe_sha256": labels.get(LABEL_PREFIX + "recipe-sha256"),
+    }
+    for key, prefix in (
+        ("in_container_binary_path", "/opt/flux/bin/"),
+        ("in_container_recipe_path", "/opt/flux/repro-kit/recipes/"),
+    ):
+        value = plan[key]
+        require(
+            type(value) is str and value.startswith(prefix),
+            "image artifact path differs",
+        )
+        suite.normalized_absolute(value, "image artifact")
+    for key in ("in_container_binary_sha256", "recipe_sha256"):
+        suite.exact_hex(plan[key], 64, "image artifact digest")
+    init_pid = suite.exact_int(
+        document.get("State", {}).get("Pid"), "container init PID", 1, 1 << 31
+    )
+    root = os.open(
+        f"/proc/{init_pid}/root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        descriptor = suite._open_process_file(root, plan["in_container_recipe_path"])
+        try:
+            observed, payload = suite._hash_regular_fd(
+                descriptor, "concurrency recipe", suite.MAX_PROGRAM_BYTES
+            )
+            require(observed == plan["recipe_sha256"], "image recipe hash differs")
+            recipe = {
+                key.decode(): value.decode()
+                for key, value in suite._recipe_environment(payload).items()
+            }
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root)
+    raw_env = document.get("Config", {}).get("Env")
+    require(
+        type(raw_env) is list and all(type(item) is str and "=" in item for item in raw_env),
+        "container environment inventory is malformed",
+    )
+    container_env = {}
+    for item in raw_env:
+        key, value = item.split("=", 1)
+        require(key not in container_env, "container environment repeats a key")
+        container_env[key] = value
+    return plan, recipe, container_env, _container_mounts(document)
+
+
+def verify_runtime_bind(suite, runtime, mounts):
+    """The in-container /results bind must be the exact suite runtime directory."""
+    source = suite.normalized_absolute(mounts["/results"]["Source"], "results bind")
+    require(source == runtime, "the /results bind source differs from the runtime")
+    left = suite.open_directory_chain(source, "results bind source")
+    try:
+        right = suite.open_directory_chain(runtime, "concurrency runtime")
+        try:
+            first, second = os.fstat(left), os.fstat(right)
+            require(
+                (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino),
+                "the /results bind identity differs from the runtime",
+            )
+        finally:
+            os.close(right)
+    finally:
+        os.close(left)
+
+
+def request(args, method, route, body=None, *, timeout=REQUEST_TIMEOUT):
+    parsed = urllib.parse.urlsplit(args.base_url)
+    connection = http.client.HTTPConnection(
+        parsed.hostname, parsed.port, timeout=timeout
+    )
+    try:
+        payload = None if body is None else args.suite.canonical_bytes(body)
+        connection.request(
+            method,
+            route,
+            body=payload,
+            headers={"Content-Type": "application/json", "Connection": "close"},
+        )
+        response = connection.getresponse()
+        raw = response.read(MAX_RESPONSE + 1)
+        if route == "/health" and response.status != 200:
+            raise ConnectionError("server is not ready")
+        require(
+            len(raw) <= MAX_RESPONSE and response.status == 200,
+            "endpoint status or response bound differs",
+        )
+        return raw
+    finally:
+        connection.close()
+
+
+def find_pid(args, plan, model):
+    """Locate the exec'd server: argv[0] is the release binary, not the shell."""
+    raw = docker(["container", "top", args.container_id, "-eo", "pid,args"]).decode(
+        "utf-8", "strict"
+    )
+    rows = []
+    for line in raw.splitlines()[1:]:
+        columns = line.strip().split(None, 1)
+        if len(columns) != 2:
+            continue
+        tokens = columns[1].split()
+        if tokens and tokens[0] == plan["in_container_binary_path"] and model in tokens:
+            rows.append(int(columns[0]))
+    require(len(rows) <= 1, "server process identity is ambiguous")
+    return None if not rows else rows[0]
+
+
+def claim_pid(args, pid, plan):
+    """Bind cleanup to our exact container/executable before taking ownership."""
+    descriptor = os.pidfd_open(pid)
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_bytes()
+        require(
+            re.search(
+                rb"(?<![0-9a-f])" + args.container_id.encode() + rb"(?![0-9a-f])",
+                cgroup,
+            )
+            is not None,
+            "server is outside the launch container",
+        )
+        executable = os.open(f"/proc/{pid}/exe", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            observed, _ = args.suite._hash_regular_fd(
+                executable, "concurrency executable", 2 * 1024 * 1024 * 1024
+            )
+            require(
+                observed == plan["in_container_binary_sha256"],
+                "server executable hash differs",
+            )
+        finally:
+            os.close(executable)
+        require(
+            not select.select([descriptor], [], [], 0)[0],
+            "server exited before ownership",
+        )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+# --- provenance ------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Provenance:
+    public: dict
+    checkpoint_root: Path
+    checkpoint_identities: dict
+    checkpoint_manifest: Path
+    checkpoint_manifest_identity: tuple
+    source_receipt: Path
+    source_receipt_identity: tuple
+    source_closure: dict
+
+
+def load_launch_manifest(args, suite):
+    descriptor = suite.open_absolute_file(
+        Path(args.launch_manifest), "release launch manifest"
+    )
+    try:
+        payload = suite.read_fd(
+            descriptor, "release launch manifest", 16 * 1024 * 1024, nlink=None
+        )
+    finally:
+        os.close(descriptor)
+    require(
+        digest(payload) == args.launch_manifest_sha256,
+        "release launch manifest hash differs",
+    )
+    manifest = suite.strict_json_loads(payload, "release launch manifest")
+    require(type(manifest) is dict, "release launch manifest is not an object")
+    provenance = suite.exact_object(
+        manifest.get("provenance"), WRAPPER_PROVENANCE_KEYS, "release provenance"
+    )
+    require(
+        provenance["release_version"] == manifest.get("release_version"),
+        "release provenance version differs from the sealed launch manifest",
+    )
+    return provenance
+
+
+def preflight_provenance(args, suite, probe, plan, mounts):
+    """Verify the R15 source closure and checkpoint through the probe's helpers."""
+    provenance = load_launch_manifest(args, suite)
+    for key in (
+        "source_bundle_manifest_sha256",
+        "source_bundle_sha256",
+        "build_receipt_sha256",
+        "source_to_binary_receipt_sha256",
+        "binary_sha256",
+        "checkpoint_manifest_sha256",
+        "recipe_sha256",
+    ):
+        probe.canonical_sha256(provenance[key], "release provenance." + key)
+    for key in ("source_revision", "source_tree"):
+        suite.exact_hex(provenance[key], 40, "release provenance." + key)
+        require(set(provenance[key]) != {"0"}, "release provenance Git object is zero")
+    require(
+        provenance["binary_sha256"] == plan["in_container_binary_sha256"]
+        and provenance["recipe_sha256"] == plan["recipe_sha256"],
+        "release provenance binary or recipe differs from the image labels",
+    )
+    checkpoint_id = probe.public_checkpoint_id(
+        provenance["checkpoint_id"], "release provenance.checkpoint_id"
+    )
+    revision = provenance["checkpoint_revision"]
+    require(
+        type(revision) is str
+        and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision) is not None
+        and set(revision) != {"0"},
+        "release provenance checkpoint revision is not immutable",
+    )
+    for key in WRAPPER_PROVENANCE_KEYS:
+        if key.endswith("_path"):
+            value = provenance[key]
+            require(
+                type(value) is str and Path(value).is_absolute(),
+                f"release provenance.{key} must be an absolute path",
+            )
+    probe.validate_r15_source_closure(provenance)
+    checkpoint_root = suite.normalized_absolute(
+        provenance["checkpoint_path"], "release checkpoint path"
+    )
+    models_source = suite.normalized_absolute(
+        mounts[CONTAINER_MODELS]["Source"], "checkpoint bind source"
+    )
+    require(models_source == checkpoint_root, "the /models bind differs from provenance")
+    checkpoint_manifest = Path(provenance["checkpoint_manifest_path"])
+    inventory, manifest_identity, identities = probe.validate_checkpoint_inventory(
+        checkpoint_root,
+        checkpoint_manifest,
+        provenance["checkpoint_manifest_sha256"],
+        checkpoint_id,
+        revision,
+        verify_bytes=True,
+    )
+    source_receipt = Path(provenance["source_to_binary_receipt_path"])
+    public = {
+        "release_version": provenance["release_version"],
+        "source_revision": provenance["source_revision"],
+        "source_tree": provenance["source_tree"],
+        "source_bundle_manifest_name": Path(
+            provenance["source_bundle_manifest_path"]
+        ).name,
+        "source_bundle_manifest_sha256": provenance["source_bundle_manifest_sha256"],
+        "source_bundle_name": Path(provenance["source_bundle_path"]).name,
+        "source_bundle_sha256": provenance["source_bundle_sha256"],
+        "build_receipt_name": Path(provenance["build_receipt_path"]).name,
+        "build_receipt_sha256": provenance["build_receipt_sha256"],
+        "source_to_binary_receipt_name": source_receipt.name,
+        "source_to_binary_receipt_sha256": provenance[
+            "source_to_binary_receipt_sha256"
+        ],
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_revision": revision,
+        "checkpoint_manifest_sha256": provenance["checkpoint_manifest_sha256"],
+        "checkpoint_files_verified": len(inventory["files"]),
+        "checkpoint_bytes_verified": inventory["total_bytes"],
+        "binary_name": Path(plan["in_container_binary_path"]).name,
+        "binary_sha256": provenance["binary_sha256"],
+    }
+    return Provenance(
+        public,
+        checkpoint_root.resolve(),
+        identities,
+        checkpoint_manifest,
+        manifest_identity,
+        source_receipt,
+        probe.stable_identity(source_receipt, "source-to-binary receipt"),
+        {key: provenance[key] for key in probe.PROVENANCE_KEYS},
+    )
+
+
+def recheck_provenance(probe, provenance):
+    """The probe's own after-arm identity revalidation, on the container closure."""
+    probe.validate_r15_source_closure(provenance.source_closure)
+    require(
+        probe.stable_identity(provenance.source_receipt, "source-to-binary receipt")
+        == provenance.source_receipt_identity,
+        "source-to-binary receipt changed during qualification",
+    )
+    require(
+        probe.stable_identity(provenance.checkpoint_manifest, "checkpoint inventory")
+        == provenance.checkpoint_manifest_identity,
+        "checkpoint inventory changed during qualification",
+    )
+    for relative, expected in provenance.checkpoint_identities.items():
+        observed = probe.stable_identity(
+            provenance.checkpoint_root / relative, f"checkpoint file {relative}"
+        )
+        require(observed == expected, "checkpoint file changed during qualification")
+
+
+# --- launch contract -------------------------------------------------------
+
+
+def rust_log_emits_info(value):
+    first = value.split(",", 1)[0].strip().lower()
+    return first in ("info", "debug", "trace")
+
+
+def arm_environment(probe, recipe, container_env, mode, profile):
+    """Recipe plus arm selectors; the recipe must not pin a qualification key."""
+    selectors = probe.SELECTOR_PROFILES[profile]
+    reserved = set(selectors) | set(DIAGNOSTIC_ENVIRONMENT) | set(DIAGNOSTIC_LIMIT_KEYS)
+    pinned = reserved & (set(recipe) | set(container_env))
+    require(not pinned, "release recipe or image pins a qualification selector")
+    require(
+        rust_log_emits_info(recipe.get("RUST_LOG", "")),
+        "release recipe RUST_LOG does not emit info-level qualification receipts",
+    )
+    overrides = {
+        **recipe,
+        **selectors,
+        **DIAGNOSTIC_ENVIRONMENT,
+        "ATLAS_DISABLE_SPECULATION": "1" if mode == "none" else "0",
+    }
+    expected_live = {
+        **live_environment_subset(container_env),
+        **live_environment_subset(overrides),
+    }
+    return overrides, expected_live
+
+
+def arm_argv(plan, args, model, width, mode):
+    argv = [
+        plan["in_container_binary_path"],
+        "serve",
+        "--no-tui",
+        "--model-from-path",
+        CONTAINER_MODELS,
+        "--model-name",
+        model,
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        str(args.container_port),
+        "--qwen4-qsa",
+        "--max-batch-size",
+        str(width),
+        "--max-num-seqs",
+        str(width),
+    ]
+    for flag, value in FIXED_LAUNCH_FLAGS:
+        argv += [flag, value]
+    if mode == "native-mtp-k5":
+        argv += ["--speculative", "--num-drafts", "4"]
+    return argv
+
+
+def launch_command(args, plan, overrides, argv, container_log):
+    assignments = " ".join(
+        shlex.quote(key + "=" + value) for key, value in sorted(overrides.items())
+    )
+    script = (
+        "exec /usr/bin/env "
+        + assignments
+        + " "
+        + " ".join(shlex.quote(item) for item in argv)
+        + ' >>"$0" 2>&1'
+    )
+    return [
+        "docker",
+        "exec",
+        "-w",
+        args.container_cwd,
+        args.container_id,
+        "/bin/sh",
+        "-c",
+        script,
+        container_log,
+    ]
+
+
+def bind_arm_process(probe, pid, manifest, host_log):
+    """The probe's live-process checks, read through the host /proc view."""
+    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    if cmdline and cmdline[-1] == b"":
+        cmdline.pop()
+    require(
+        [item.decode("utf-8", "strict") for item in cmdline] == manifest["argv"],
+        "live /proc/PID/cmdline differs from the launch manifest argv",
+    )
+    require(
+        os.readlink(f"/proc/{pid}/cwd") == manifest["cwd"],
+        "live process cwd differs from the launch manifest cwd",
+    )
+    live = {}
+    for entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+        if not entry or b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        key = key.decode("utf-8", "strict")
+        if key.startswith(LIVE_ENVIRONMENT_PREFIXES) or key == "RUST_LOG":
+            live[key] = value.decode("utf-8", "strict")
+    require(
+        live == manifest["environment"],
+        "live ATLAS_/FLUX_/RUST_LOG environment differs from the launch manifest",
+    )
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text("ascii").strip()
+    require(
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", boot_id
+        )
+        is not None
+        and not set(boot_id) <= {"0", "-"},
+        "kernel boot id is malformed",
+    )
+    log_device_inode = probe.validate_log_binding(host_log, pid)
+    return {
+        "pid": pid,
+        "boot_id": boot_id,
+        "start_ticks": probe.process_start_ticks(pid),
+        "log_device": log_device_inode[0],
+        "log_inode": log_device_inode[1],
+    }
+
+
+def recheck_arm_process(args, probe, pid, process, host_log, plan):
+    require(
+        probe.process_start_ticks(pid) == process["start_ticks"],
+        "server PID was reused during qualification",
+    )
+    require(
+        Path("/proc/sys/kernel/random/boot_id").read_text("ascii").strip()
+        == process["boot_id"],
+        "host rebooted during qualification",
+    )
+    require(
+        probe.validate_log_binding(host_log, pid)
+        == (process["log_device"], process["log_inode"]),
+        "server log binding changed during qualification",
+    )
+    executable = os.open(f"/proc/{pid}/exe", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        observed, _ = args.suite._hash_regular_fd(
+            executable, "concurrency executable", 2 * 1024 * 1024 * 1024
+        )
+    finally:
+        os.close(executable)
+    require(
+        observed == plan["in_container_binary_sha256"],
+        "live executable changed during qualification",
+    )
+
+
+@dataclasses.dataclass
+class LiveArm:
+    mode: str
+    profile: str
+    width: int
+    model: str
+    pid: int
+    pidfd: int
+    proof: dict
+    process: dict
+    manifest: dict
+    manifest_name: str
+    manifest_sha256: str
+    host_log: Path
+    log_locator: str
+    log_fd: int
+    complete_log_sha256: str | None = None
+
+
+def write_artifact(suite, runtime, locator, payload, mode=0o400):
+    target = suite.create_beneath(runtime, locator, "concurrency artifact", mode)
+    try:
+        require(len(payload) <= suite.MAX_GATE_RECEIPT_BYTES, "artifact exceeds bound")
+        suite.write_all(target, payload)
+        os.fsync(target)
+        suite.assert_path_identity(runtime, locator, target, "concurrency artifact")
+    finally:
+        os.close(target)
+    return digest(payload)
+
+
+def terminate_server(args, pidfd, process, plan, model):
+    try:
+        if pidfd is None:
+            candidate = find_pid(args, plan, model)
+            if candidate is not None:
+                pidfd = claim_pid(args, candidate, plan)
+        if pidfd is not None:
+            if not select.select([pidfd], [], [], 0)[0]:
+                signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            if not select.select([pidfd], [], [], 10)[0]:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                require(
+                    bool(select.select([pidfd], [], [], 5)[0]),
+                    "server survived forced cleanup",
+                )
+                raise GateFailure("VOID", "server required forced cleanup")
+        process.wait(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if pidfd is not None:
+            os.close(pidfd)
+
+
+@contextmanager
+def server(args, context, mode, profile, width, locator_stem):
+    """Launch one fresh in-container arm process bound to its own log file."""
+    suite, probe, plan = args.suite, context.probe, context.plan
+    model = context.model
+    overrides, expected_live = arm_environment(
+        probe, context.recipe, context.container_env, mode, profile
+    )
+    argv = arm_argv(plan, args, model, width, mode)
+    manifest = {
+        "schema": probe.LAUNCH_SCHEMA,
+        "argv": argv,
+        "cwd": args.container_cwd,
+        "base_url": args.base_url,
+        "model": model,
+        "environment": expected_live,
+        "provenance": context.provenance.source_closure,
+    }
+    manifest_raw = suite.canonical_bytes(manifest)
+    manifest_locator = locator_stem + ".manifest.json"
+    manifest_sha256 = write_artifact(suite, context.runtime, manifest_locator, manifest_raw)
+    log_locator = locator_stem + ".server.log"
+    log_fd = suite.create_beneath(
+        context.runtime, log_locator, "concurrency server log", 0o600
+    )
+    process = None
+    pid = pidfd = None
+    live = None
+    try:
+        host_log = context.runtime / log_locator
+        container_log = args.container_results_path.rstrip("/") + "/" + log_locator
+        command = launch_command(args, plan, overrides, argv, container_log)
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "server launcher exited before readiness")
+            if pid is None:
+                pid = find_pid(args, plan, model)
+                if pid is not None:
+                    pidfd = claim_pid(args, pid, plan)
+            if pid is not None:
+                try:
+                    request(args, "GET", "/health", timeout=2)
+                    request(args, "GET", "/health", timeout=2)
+                    proof = suite.verify_live_server(
+                        {
+                            "schema": "flux-r15-live-process-request/1",
+                            "mode": mode,
+                            "host_pid": pid,
+                        },
+                        plan,
+                        args.identities,
+                    )
+                    bound = bind_arm_process(probe, pid, manifest, host_log)
+                    live = LiveArm(
+                        mode,
+                        profile,
+                        width,
+                        model,
+                        pid,
+                        pidfd,
+                        proof,
+                        bound,
+                        manifest,
+                        Path(manifest_locator).name,
+                        manifest_sha256,
+                        host_log,
+                        log_locator,
+                        log_fd,
+                    )
+                    break
+                except (
+                    ConnectionError,
+                    TimeoutError,
+                    OSError,
+                    http.client.HTTPException,
+                ):
+                    pass
+            time.sleep(0.1)
+        require(live is not None, "fresh server readiness deadline expired")
+        yield live
+        final = suite.verify_live_server(
+            {"schema": "flux-r15-live-process-request/1", "mode": mode, "host_pid": pid},
+            plan,
+            args.identities,
+        )
+        require(final == live.proof, "server identity changed during the arm")
+        recheck_arm_process(args, probe, pid, live.process, host_log, plan)
+    finally:
+        try:
+            if process is not None:
+                terminate_server(args, pidfd, process, plan, model)
+        finally:
+            try:
+                os.fchmod(log_fd, 0o400)
+                complete_sha256 = publish_arm_log(args, suite, log_locator, log_fd)
+                suite.assert_path_identity(
+                    context.runtime, log_locator, log_fd, "complete concurrency server log"
+                )
+                if live is not None:
+                    live.complete_log_sha256 = complete_sha256
+            finally:
+                os.close(log_fd)
+
+
+# --- timing hook -----------------------------------------------------------
+
+
+class TimingRegistry:
+    """Per-request TTFT and decode timing captured around the probe's urlopen."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.records = []
+
+    def drain(self):
+        with self.lock:
+            records, self.records = self.records, []
+        return records
+
+
+class TimedResponse:
+    def __init__(self, response, record):
+        self.response = response
+        self.record = record
+
+    def __enter__(self):
+        self.response.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self.record["finished_unix"] = time.time()
+        return self.response.__exit__(*exc)
+
+    @property
+    def status(self):
+        return self.response.status
+
+    def read(self, *arguments):
+        return self.response.read(*arguments)
+
+    def __iter__(self):
+        for line in self.response:
+            if self.record["first_content_unix"] is None and line.startswith(b"data:"):
+                payload = line[5:].strip()
+                if payload and payload != b"[DONE]" and b'"content"' in payload:
+                    self.record["first_content_unix"] = time.time()
+            yield line
+
+
+def install_timing_hook(probe, registry):
+    real_urlopen = urllib.request.urlopen
+
+    def timed_urlopen(request_object, timeout=None):
+        record = {
+            "body_sha256": digest(request_object.data or b""),
+            "started_unix": time.time(),
+            "first_content_unix": None,
+            "finished_unix": None,
+        }
+        with registry.lock:
+            registry.records.append(record)
+        return TimedResponse(real_urlopen(request_object, timeout=timeout), record)
+
+    probe.urllib = types.SimpleNamespace(
+        request=types.SimpleNamespace(
+            Request=urllib.request.Request, urlopen=timed_urlopen
+        ),
+        error=urllib.error,
+        parse=urllib.parse,
+    )
+
+
+def timing_rows(probe, registry, model, cases, max_tokens):
+    labels = {}
+    for case in cases:
+        body = probe.json_canonical(probe.request_body(model, case, max_tokens))
+        labels.setdefault(digest(body), case.label)
+    rows = []
+    for record in registry.drain():
+        label = labels.get(record["body_sha256"])
+        if label is None:
+            continue
+        first, finished = record["first_content_unix"], record["finished_unix"]
+        decode = (
+            None if first is None or finished is None or finished <= first
+            else finished - first
+        )
+        rows.append(
+            {
+                "label": label,
+                "ttft_s": None if first is None else first - record["started_unix"],
+                "decode_s": decode,
+                "tokens_per_second": None if decode is None else max_tokens / decode,
+                "elapsed_s": (
+                    None if finished is None else finished - record["started_unix"]
+                ),
+            }
+        )
+    return rows
+
+
+# --- state contract --------------------------------------------------------
+
+
+@contextmanager
+def state_contract(probe, mode):
+    """Native-K5 arms must carry engaged-native-mtp receipts; plain is untouched."""
+    if mode == "none":
+        yield
+        return
+    original_validate = probe.validate_state_receipt
+    original_semantics = probe.baseline_semantics
+
+    def k5_validate(scope, receipt, expected_output_tokens, expected_prompt_tokens):
+        require(
+            (receipt.mode, receipt.scheduler_path, receipt.proposer_loaded) == K5_STATE,
+            f"{scope}: target-state receipt is not an engaged native-K5 receipt",
+        )
+        shadow = dataclasses.replace(
+            receipt,
+            mode=PLAIN_STATE[0],
+            scheduler_path=PLAIN_STATE[1],
+            proposer_loaded=PLAIN_STATE[2],
+        )
+        original_validate(scope, shadow, expected_output_tokens, expected_prompt_tokens)
+
+    def k5_semantics(rows):
+        rewritten = []
+        for row in rows:
+            state = row.get("target_state") if type(row) is dict else None
+            require(
+                type(state) is dict
+                and (state.get("mode"), state.get("scheduler_path"), state.get("proposer_loaded"))
+                == K5_STATE,
+                "reference receipt baseline C1 row is not native-K5",
+            )
+            rewritten.append(
+                {
+                    **row,
+                    "target_state": {
+                        **state,
+                        "mode": PLAIN_STATE[0],
+                        "scheduler_path": PLAIN_STATE[1],
+                        "proposer_loaded": PLAIN_STATE[2],
+                    },
+                }
+            )
+        return original_semantics(rewritten)
+
+    probe.validate_state_receipt = k5_validate
+    probe.baseline_semantics = k5_semantics
+    try:
+        yield
+    finally:
+        probe.validate_state_receipt = original_validate
+        probe.baseline_semantics = original_semantics
+
+
+# --- arm phases ------------------------------------------------------------
+
+
+def frame_census(text):
+    """Executed-width census that tolerates aliased sessions (same-prompt waves)."""
+    counts = {"native": {}, "serial": {}}
+    for route, rows in FRAME_CENSUS_RE.findall(text):
+        table = counts[route.lower()]
+        table[int(rows)] = table.get(int(rows), 0) + 1
+    return {
+        "native_frames_by_rows": {str(k): v for k, v in sorted(counts["native"].items())},
+        "serial_frames_by_rows": {str(k): v for k, v in sorted(counts["serial"].items())},
+        "native_width_executed": max(counts["native"], default=0),
+        "serial_width_executed": max(counts["serial"], default=0),
+    }
+
+
+def require_executed_width(census, expected_route, width, phase):
+    """Fail the phase when the claimed width was not what the engine executed."""
+    if expected_route == "native":
+        require(
+            census["native_width_executed"] == width
+            and not any(int(k) >= 2 for k in census["serial_frames_by_rows"]),
+            f"{phase}: native width C{width} was not executed (collapse to serial)",
+        )
+    else:
+        require(
+            census["native_width_executed"] == 0,
+            f"{phase}: serial control unexpectedly executed the native route",
+        )
+
+
+def token_divergence(observed, baseline):
+    for index, (left, right) in enumerate(zip(observed, baseline)):
+        if left != right:
+            return index
+    return None if len(observed) == len(baseline) else min(len(observed), len(baseline))
+
+
+def divergence_rows(results, baseline_results):
+    return [
+        {
+            "label": result.label,
+            "first_divergence_index": token_divergence(
+                result.token_ids, baseline_results[result.label].token_ids
+            ),
+        }
+        for result in results
+    ]
+
+
+@dataclasses.dataclass
+class ArmPlan:
+    width: int
+    expected_route: str
+    wave_cases: list
+    churn_replacement: object
+    baseline_cases: list
+    plan: dict
+
+
+def arm_plan(args, probe, context, live):
+    wave_cases = probe.make_cases(live.width)
+    churn_replacement = probe.make_cases(live.width + 1)[-1] if live.width == 8 else None
+    baseline_cases = wave_cases + ([churn_replacement] if churn_replacement else [])
+    expected_route = "serial" if live.profile == "serial-control" else "native"
+    plan = {
+        "schema": probe.SCHEMA,
+        "evidence_tier": "full",
+        "selector_profile": live.profile,
+        "width": live.width,
+        "expected_route": expected_route,
+        "model": live.model,
+        "max_tokens": args.max_tokens,
+        "minimum_full_frames": args.minimum_full_frames,
+        "memory_floor_mib": args.memory_floor_mib,
+        "probe_name": Path(args.probe_program).name,
+        "probe_sha256": args.probe_sha256,
+        "expected_binary_sha256": context.plan["in_container_binary_sha256"],
+        "expected_manifest_sha256": live.manifest_sha256,
+        "cases": [
+            {
+                "label": case.label,
+                "ordinal": case.ordinal,
+                "prompt_sha256": case.prompt_sha256,
+            }
+            for case in baseline_cases
+        ],
+    }
+    plan["plan_sha256"] = digest(probe.json_canonical(plan))
+    return ArmPlan(
+        live.width, expected_route, wave_cases, churn_replacement, baseline_cases, plan
+    )
+
+
+def check_fresh_log(probe, cursor):
+    initial = cursor.mark()
+    preexisting = cursor.read_from(0, settle_seconds=0.0, end_offset=initial)
+    probe.validate_evidence_line_syntax(preexisting)
+    require(
+        not any(
+            pattern.search(preexisting)
+            for pattern in (probe.ENGAGED_RE, probe.FRAME_RE, probe.LOGITS_RE, probe.STATE_RE)
+        ),
+        "server log contains inference receipts; use a fresh process",
+    )
+
+
+@dataclasses.dataclass
+class Baseline:
+    results: dict
+    sessions: dict
+    logits: dict
+    states: dict
+    receipts: list
+
+
+def run_baseline(args, probe, context, live, plan, cursor):
+    base = Baseline({}, {}, {}, {}, [])
+    for case in plan.baseline_cases:
+        offset = cursor.mark()
+        result = probe.stream_request(
+            args.base_url, live.model, case, args.max_tokens, args.timeout
+        )
+        base.results[case.label] = result
+        parsed = probe.parse_log(cursor.read_from(offset))
+        session = probe.sole_session(parsed, case.label)
+        rows = probe.row_digest_map(parsed.rows_by_session[session])
+        require(
+            list(rows) == list(range(1, args.max_tokens)),
+            f"{case.label}: C1 logits indices differ from 1..{args.max_tokens - 1}",
+        )
+        require(not parsed.frames, f"{case.label}: isolated C1 emitted batch frames")
+        require(
+            set(parsed.state_by_session) == {session},
+            f"{case.label}: isolated C1 target-state session differs",
+        )
+        state = parsed.state_by_session[session]
+        probe.validate_state_receipt(
+            case.label, state, len(result.token_ids), result.usage["prompt_tokens"]
+        )
+        base.sessions[case.label] = session
+        base.logits[case.label] = rows
+        base.states[case.label] = state
+        logits = probe.serialize_logit_rows(parsed.rows_by_session[session])
+        base.receipts.append(
+            {
+                **probe.serialize_result(result),
+                "session": session,
+                "logits_rows": len(rows),
+                "logits": logits,
+                "logits_sha256_chain": digest(probe.json_canonical(logits)),
+                "target_state": probe.state_signature(state),
+                "log_sha256": parsed.text_sha256,
+            }
+        )
+    require(
+        len(set(base.sessions.values())) == len(base.sessions),
+        "distinct C1 prompts collided on the session hash",
+    )
+    context.timing_rows[f"{live.mode}/{live.profile}-c{live.width}/baseline"] = (
+        timing_rows(probe, context.timing, live.model, plan.baseline_cases, args.max_tokens)
+    )
+    return base
+
+
+def validate_reference(args, probe, context, live, plan, base, reference):
+    if live.profile == "native-reference":
+        require(reference is None, "native-reference must not consume a reference")
+        return None
+    require(reference is not None, "optimized/serial arms require a reference arm")
+    namespace = types.SimpleNamespace(
+        reference_receipt=Path(reference["path"]),
+        reference_receipt_sha256=reference["sha256"],
+        width=live.width,
+        model=live.model,
+        max_tokens=args.max_tokens,
+        memory_floor_mib=args.memory_floor_mib,
+    )
+    public = {**context.provenance.public, "selector_profile": live.profile}
+    return probe.validate_reference_receipt(namespace, plan.plan, public, base.receipts)
+
+
+def run_validated_wave(args, probe, context, live, plan, base, cursor, name, cases):
+    offset = cursor.mark()
+    results = probe.run_wave(args.base_url, live.model, cases, args.max_tokens, args.timeout)
+    text = cursor.read_from(offset)
+    key = f"{live.mode}/{live.profile}-c{live.width}/{name}"
+    context.timing_rows[key] = timing_rows(
+        probe, context.timing, live.model, cases, args.max_tokens
+    )
+    context.diagnostics[key] = {
+        "divergence": divergence_rows(results, base.results),
+        "census": frame_census(text),
+    }
+    wave = probe.validate_wave(
+        name,
+        plan.expected_route,
+        live.width,
+        cases,
+        results,
+        probe.parse_log(text),
+        base.results,
+        base.sessions,
+        base.logits,
+        base.states,
+        args.minimum_full_frames,
+    )
+    require_executed_width(context.diagnostics[key]["census"], plan.expected_route, live.width, name)
+    return wave, results
+
+
+def run_c8_churn(args, probe, context, live, plan, base, cursor):
+    churn_offset = cursor.mark()
+    churn = probe.run_api_churn(
+        args.base_url,
+        live.model,
+        plan.wave_cases,
+        plan.churn_replacement,
+        args.max_tokens,
+        args.timeout,
+        base.results,
+    )
+    churn_text = cursor.read_from(churn_offset)
+    key = f"{live.mode}/{live.profile}-c8/churn"
+    context.diagnostics[key] = {"census": frame_census(churn_text)}
+    receipt = probe.validate_full_churn(
+        plan.expected_route,
+        live.width,
+        plan.wave_cases,
+        plan.churn_replacement,
+        churn,
+        probe.parse_log(churn_text),
+        base.results,
+        base.sessions,
+        base.logits,
+        base.states,
+    )
+    require_executed_width(context.diagnostics[key]["census"], plan.expected_route, 8, "churn")
+    reuse_offset = cursor.mark()
+    reuse_result = probe.stream_request(
+        args.base_url, live.model, plan.churn_replacement, args.max_tokens, args.timeout
+    )
+    reuse = probe.validate_reuse_phase(
+        probe.parse_log(cursor.read_from(reuse_offset)),
+        plan.churn_replacement,
+        reuse_result,
+        base.results[plan.churn_replacement.label],
+        base.sessions[plan.churn_replacement.label],
+        base.logits[plan.churn_replacement.label],
+        base.states[plan.churn_replacement.label],
+    )
+    context.timing.drain()
+    return receipt, reuse
+
+
+def run_same_prompt_wave(args, probe, context, live, plan, base, cursor):
+    """Token-level parity for W identical prompts; sessions alias so no log parse."""
+    source = plan.wave_cases[0]
+    cases = [
+        probe.Case(f"same-{ordinal:02d}", ordinal, source.content)
+        for ordinal in range(live.width)
+    ]
+    offset = cursor.mark()
+    results = probe.run_wave(args.base_url, live.model, cases, args.max_tokens, args.timeout)
+    text = cursor.read_from(offset)
+    baseline = base.results[source.label]
+    for result in results:
+        probe.validate_request_identity(f"same-prompt/{result.label}", result, baseline)
+    census = frame_census(text)
+    require_executed_width(census, plan.expected_route, live.width, "same-prompt")
+    context.timing.drain()
+    return {
+        "source_label": source.label,
+        "rows": live.width,
+        "requests": [probe.serialize_result(result) for result in results],
+        "census": census,
+        "log_sha256": digest(text.encode()),
+    }
+
+
+def run_mid_cancel_churn(args, probe, context, live, plan, base, cursor):
+    """P8: cancel a middle row at --cancel-token; survivors and replacement match C1."""
+    cases = plan.wave_cases
+    target = cases[len(cases) // 2 - 1]
+    replacement = plan.churn_replacement
+    barrier = threading.Barrier(len(cases))
+    cancelled = threading.Event()
+    order = {case.label: position for position, case in enumerate(cases)}
+    offset = cursor.mark()
+
+    def original(case):
+        barrier.wait(timeout=args.timeout)
+        time.sleep(order[case.label] * probe.WAVE_ADMISSION_STAGGER_S)
+        if case == target:
+            return probe.stream_then_cancel(
+                args.base_url,
+                live.model,
+                case,
+                args.max_tokens,
+                args.timeout,
+                cancel_after_chunks=args.cancel_token,
+                cancelled=cancelled,
+            )
+        return probe.stream_request(
+            args.base_url, live.model, case, args.max_tokens, args.timeout
+        )
+
+    def replacement_request():
+        require(cancelled.wait(timeout=args.timeout), "replacement timed out")
+        return probe.stream_request(
+            args.base_url, live.model, replacement, args.max_tokens, args.timeout
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(cases) + 1) as pool:
+        originals = {case.label: pool.submit(original, case) for case in cases}
+        future = pool.submit(replacement_request)
+        outcomes = {label: item.result(timeout=args.timeout) for label, item in originals.items()}
+        replacement_result = future.result(timeout=args.timeout)
+    cancel_result = outcomes[target.label]
+    require(isinstance(cancel_result, probe.CancelResult), "mid churn target was not cancelled")
+    require(
+        cancel_result.content_chunks == args.cancel_token
+        and replacement_result.started_unix >= cancel_result.closed_unix,
+        "mid churn cancellation boundary or replacement order differs",
+    )
+    survivors = [outcomes[case.label] for case in cases if case != target]
+    for survivor in survivors:
+        require(isinstance(survivor, probe.RequestResult), "mid churn survivor did not finish")
+        probe.validate_request_identity(
+            f"mid-churn/{survivor.label}", survivor, base.results[survivor.label]
+        )
+    probe.validate_request_identity(
+        "mid-churn/replacement", replacement_result, base.results[replacement.label]
+    )
+    text = cursor.read_from(offset)
+    parsed = probe.parse_log(text)
+    terminal_geometry = validate_mid_churn_log(
+        probe, plan, base, parsed, target, replacement, survivors,
+        replacement_result, cancel_result.content_chunks,
+    )
+    census = frame_census(text)
+    require_executed_width(census, plan.expected_route, live.width, "mid-churn")
+    context.timing.drain()
+    return {
+        "cancelled_label": target.label,
+        "cancel_token": args.cancel_token,
+        "content_chunks_before_close": cancel_result.content_chunks,
+        "cancelled_terminal_geometry": terminal_geometry,
+        "survivors": [probe.serialize_result(item) for item in survivors],
+        "replacement": probe.serialize_result(replacement_result),
+        "census": census,
+        "log_sha256": parsed.text_sha256,
+    }
+
+
+def validate_mid_churn_log(probe, plan, base, parsed, target, replacement, survivors, replacement_result, cancelled_content_chunks):
+    """Full logits/state parity for survivors and replacement after a mid-row cancel."""
+    expected_sessions = {base.sessions[case.label] for case in [*plan.wave_cases, replacement]}
+    require(
+        set(parsed.rows_by_session) == expected_sessions
+        and set(parsed.state_by_session) == expected_sessions,
+        "mid-churn: logits/state sessions differ from originals plus replacement",
+    )
+    for result in [*survivors, replacement_result]:
+        session = base.sessions[result.label]
+        require(
+            probe.row_digest_map(parsed.rows_by_session.get(session, {}))
+            == base.logits[result.label],
+            f"mid-churn/{result.label}: full logits differ from C1",
+        )
+        state = parsed.state_by_session.get(session)
+        require(state is not None, f"mid-churn/{result.label}: target-state receipt missing")
+        probe.validate_state_receipt(
+            f"mid-churn/{result.label}", state, len(result.token_ids), result.usage["prompt_tokens"]
+        )
+        require(
+            probe.state_signature(state) == probe.state_signature(base.states[result.label]),
+            f"mid-churn/{result.label}: terminal state differs from C1",
+        )
+    target_session = base.sessions[target.label]
+    cancelled_state = parsed.state_by_session.get(target_session)
+    require(cancelled_state is not None, "mid-churn: cancelled request has no state receipt")
+    require(
+        0 < cancelled_content_chunks <= cancelled_state.output_tokens
+        < base.results[target.label].usage["completion_tokens"],
+        "mid-churn: cancelled request target-state token count is invalid",
+    )
+    raw_cancelled_rows = parsed.rows_by_session.get(target_session, {})
+    terminal_geometry = probe.validate_cancelled_state_receipt(
+        "mid-churn/cancelled", cancelled_state,
+        base.results[target.label].usage["prompt_tokens"], raw_cancelled_rows,
+    )
+    cancelled_rows = probe.row_digest_map(raw_cancelled_rows)
+    require(
+        all(base.logits[target.label].get(i) == d for i, d in cancelled_rows.items()),
+        "mid-churn: cancelled logits are not an exact C1 prefix",
+    )
+    wrong = [f for f in parsed.frames if 2 <= f.rows <= 8 and f.route != plan.expected_route]
+    require(not wrong, "mid-churn: a C2-C8 frame used the wrong route")
+    labels_by_session = {
+        base.sessions[case.label]: case.label for case in [*plan.wave_cases, replacement]
+    }
+    for frame in parsed.frames:
+        require(2 <= frame.rows <= plan.width, "mid-churn: unexpected frame width")
+        require(
+            (frame.selector_on is None and frame.qsa_required is None)
+            if plan.expected_route == "native"
+            else (frame.selector_on is False and frame.qsa_required is False),
+            "mid-churn: route selector metadata differs",
+        )
+        for session, seq_len, row in zip(frame.sessions, frame.pre_step_seq_lens, frame.logits):
+            label = labels_by_session.get(session)
+            require(label is not None, "mid-churn: frame contains an unknown session")
+            require(
+                seq_len == base.results[label].usage["prompt_tokens"] + row.index - 1,
+                f"mid-churn/{label}: frame sequence length differs from output index",
+            )
+    probe.validate_frame_ownership(
+        "mid-churn", parsed.frames, parsed.state_by_session, allow_retired_slot_reuse=True
+    )
+    probe.validate_cancelled_frame_extent(
+        "mid-churn/cancelled", parsed.frames, cancelled_state, raw_cancelled_rows
+    )
+    replacement_session = base.sessions[replacement.label]
+    target_frames = [f for f in parsed.frames if target_session in f.sessions]
+    replacement_frames = [f for f in parsed.frames if replacement_session in f.sessions]
+    require(target_frames and replacement_frames, "mid-churn: target or replacement never entered a frame")
+    last_target, first_replacement = target_frames[-1], replacement_frames[0]
+    require(
+        last_target.line_number < cancelled_state.line_number < first_replacement.line_number,
+        "mid-churn: replacement entered before the cancelled state retired",
+    )
+    retired = last_target.slots[last_target.sessions.index(target_session)]
+    reused = first_replacement.slots[first_replacement.sessions.index(replacement_session)]
+    require(retired == reused, "mid-churn: replacement did not reuse the retired slot")
+    return terminal_geometry
+
+
+def finish_arm(args, probe, context, live, plan, cursor, memory):
+    end = cursor.mark()
+    complete_bytes = cursor.read_bytes_from(0, settle_seconds=0.0, end_offset=end)
+    complete = complete_bytes.decode("utf-8", "strict")
+    probe.validate_evidence_line_syntax(complete)
+    lowered = complete.lower()
+    safety = {m: lowered.count(m.lower()) for m in probe.FORBIDDEN_LOG_MARKERS}
+    for marker, count in safety.items():
+        if count:
+            raise GateFailure("VOID", f"server log contains forbidden marker: {marker}")
+    engaged = [int(v) for v in probe.ENGAGED_RE.findall(complete)]
+    if plan.expected_route == "native":
+        require(engaged == [live.width], f"expected one C{live.width} engagement marker")
+    else:
+        require(not engaged, "serial control unexpectedly engaged the native route")
+    selector_counts = {
+        s: complete.count(m) for s, m in probe.OPTIMIZATION_ENGAGEMENT_MARKERS.items()
+    }
+    expected = 1 if live.profile == "native-optimized" else 0
+    for selector, count in selector_counts.items():
+        require(count == expected, f"{selector}: engagement marker count differs")
+    summary = memory.summary()
+    require(
+        summary["mem_available_floor_kib"] >= args.memory_floor_mib * 1024,
+        "MemAvailable floor is below the memory contract",
+    )
+    metrics = request(args, "GET", "/metrics").decode("utf-8", "strict")
+    k5_events = sum(float(v) for v in K5_METRIC_RE.findall(metrics))
+    require(
+        math.isfinite(k5_events) and 0 <= k5_events <= 1e12 and k5_events.is_integer(),
+        "native K5 verification counter is malformed",
+    )
+    require(
+        k5_events > 0 if live.mode == "native-mtp-k5" else k5_events == 0,
+        "native K5 verifier engagement differs from the arm mode",
+    )
+    return {
+        "end_offset": end,
+        "log_sha256": digest(complete_bytes),
+        "safety": safety,
+        "engaged": engaged,
+        "selector_counts": selector_counts,
+        "memory": summary,
+        "memory_samples": memory.samples,
+        "k5_events": int(k5_events),
+        "metrics_sha256": digest(metrics.encode()),
+    }
+
+
+def arm_limitations(probe, mode):
+    limitations = [
+        "direct-binary endpoint evidence, not container evidence",
+        "correctness receipt, not a throughput receipt",
+        "terminal state covers all live GDN/PLE state and logical BF16 KV prefixes",
+        "per-step evidence covers complete logits plus logical-session/physical-slot/sequence-length routing",
+        "cancellation/replacement/drain/reuse is exercised only by C8",
+        "release requires a separate nine-arm selector matrix seal",
+    ]
+    if mode != "none":
+        limitations.append(
+            "native-K5 arm validated by the container driver under the engaged-native-mtp state contract, not by the nine-arm matrix sealer"
+        )
+    return limitations
+
+
+def qualify_arm(args, context, live, reference):
+    """Run every probe phase plus the driver's extra phases on one live arm."""
+    probe = context.probe
+    plan = arm_plan(args, probe, context, live)
+    probe.healthcheck(args.base_url, min(args.timeout, 30.0))
+    cursor = probe.LogCursor(live.host_log)
+    check_fresh_log(probe, cursor)
+    memory = probe.MemorySampler(live.pid)
+    memory.start()
+    started = time.time()
+    try:
+        base = run_baseline(args, probe, context, live, plan, cursor)
+        reference_receipt = validate_reference(args, probe, context, live, plan, base, reference)
+        forward, forward_results = run_validated_wave(
+            args, probe, context, live, plan, base, cursor, "forward", plan.wave_cases
+        )
+        reverse, reverse_results = run_validated_wave(
+            args, probe, context, live, plan, base, cursor, "reverse",
+            list(reversed(plan.wave_cases)),
+        )
+        churn = reuse = mid_churn = None
+        if plan.churn_replacement is not None:
+            churn, reuse = run_c8_churn(args, probe, context, live, plan, base, cursor)
+        same_prompt = run_same_prompt_wave(args, probe, context, live, plan, base, cursor)
+        if plan.churn_replacement is not None:
+            mid_churn = run_mid_cancel_churn(args, probe, context, live, plan, base, cursor)
+        probe.healthcheck(args.base_url, min(args.timeout, 30.0))
+    finally:
+        memory.stop()
+    final = finish_arm(args, probe, context, live, plan, cursor, memory)
+    recheck_provenance(probe, context.provenance)
+    _payload, identity = read_pinned_bytes(args.probe_program, args.probe_sha256)
+    require(identity == context.probe_identity, "qualifier source changed during qualification")
+    receipt = {
+        **plan.plan,
+        "provenance": {
+            **context.provenance.public,
+            "manifest_schema": probe.LAUNCH_SCHEMA,
+            "manifest_name": live.manifest_name,
+            "manifest_sha256": live.manifest_sha256,
+            "selector_profile": live.profile,
+            "configured_max_batch_size": live.width,
+            "configured_max_num_seqs": live.width,
+            "server_process": live.process,
+        },
+        "result": "PASS",
+        "arm_qualified": True,
+        "release_qualified": False,
+        "started_unix": started,
+        "finished_unix": time.time(),
+        "server_pid": live.pid,
+        "server_log_name": Path(live.log_locator).name,
+        "server_log_qualified_start_offset": 0,
+        "server_log_qualified_end_offset": final["end_offset"],
+        "server_log_sha256": final["log_sha256"],
+        "safety_log_marker_counts": final["safety"],
+        "memory": final["memory"],
+        "baseline_c1": base.receipts,
+        "waves": [forward, reverse],
+        "reference_receipt": reference_receipt,
+        "api_churn": churn,
+        "post_drain_reuse": reuse,
+        "native_engagement_widths": final["engaged"],
+        "optimization_selector_engagement_counts": final["selector_counts"],
+        "limitations": arm_limitations(probe, live.mode),
+    }
+    observation = {
+        "mode": live.mode,
+        "profile": live.profile,
+        "width": live.width,
+        "execution_scope": "immutable-container",
+        "process_binding": live.proof,
+        "full_frames": min(forward["full_width_frames"], reverse["full_width_frames"]),
+        "forward_reverse_token_identity": all(
+            left.token_ids == right.token_ids
+            for left, right in zip(forward_results, reversed(reverse_results))
+        ),
+        "same_prompt_wave": same_prompt,
+        "mid_cancel_churn": mid_churn,
+        "k5_events": final["k5_events"],
+        "metrics_sha256": final["metrics_sha256"],
+        "memory_samples_mib": [
+            int(row["mem_available_kib"]) // 1024 for row in final["memory_samples"]
+        ],
+    }
+    return receipt, observation
+
+
+# --- ladder (C9-C32, optional) ----------------------------------------------
+
+
+def validate_ladder_wave(probe, args, name, width, cases, results, parsed, base):
+    """Width-agnostic replay of the probe's wave checks for C9-C32 rungs."""
+    require(
+        [r.label for r in results] == [c.label for c in cases],
+        f"{name}: request result order differs from admission plan",
+    )
+    by_label = {r.label: r for r in results}
+    by_session = {base.sessions[case.label]: case.label for case in cases}
+    require(
+        set(parsed.rows_by_session) == set(by_session)
+        and set(parsed.state_by_session) == set(by_session),
+        f"{name}: logits/state sessions differ from the ladder wave",
+    )
+    for case in cases:
+        probe.validate_request_identity(f"{name}/{case.label}", by_label[case.label], base.results[case.label])
+        session = base.sessions[case.label]
+        observed = parsed.rows_by_session.get(session)
+        require(
+            observed is not None and probe.row_digest_map(observed) == base.logits[case.label],
+            f"{name}/{case.label}: full-logits SHA-256 differs from C1",
+        )
+        state = parsed.state_by_session.get(session)
+        require(state is not None, f"{name}/{case.label}: target-state receipt is missing")
+        probe.validate_state_receipt(
+            f"{name}/{case.label}", state, len(by_label[case.label].token_ids),
+            by_label[case.label].usage["prompt_tokens"],
+        )
+        require(
+            probe.state_signature(state) == probe.state_signature(base.states[case.label]),
+            f"{name}/{case.label}: terminal state differs from C1",
+        )
+    full = [f for f in parsed.frames if f.rows == width and f.route == "native"]
+    require(len(full) >= args.minimum_full_frames, f"{name}: too few complete native C{width} frames")
+    require(
+        all(
+            f.route == "native" and 2 <= f.rows <= width
+            and f.selector_on is None and f.qsa_required is None
+            for f in parsed.frames
+        ),
+        f"{name}: a frame used the wrong route, width, or selector metadata",
+    )
+    probe.validate_frame_ownership(name, parsed.frames, parsed.state_by_session, allow_retired_slot_reuse=False)
+    for frame in parsed.frames:
+        for session, seq_len, row in zip(frame.sessions, frame.pre_step_seq_lens, frame.logits):
+            label = by_session.get(session)
+            require(label is not None, f"{name}: frame contains an unknown session")
+            require(
+                seq_len == base.results[label].usage["prompt_tokens"] + row.index - 1,
+                f"{name}/{label}: frame sequence length differs from output index",
+            )
+            require(
+                base.logits[label].get(row.index) == row.sha256,
+                f"{name}/{label}: frame logits differ from C1",
+            )
+    expected_order = [c.label for c in cases]
+    require(
+        all([by_session[s] for s in f.sessions] == expected_order and f.slots == full[0].slots for f in full),
+        f"{name}: full frames do not preserve exact order and stable slots",
+    )
+    return {"name": name, "width": width, "full_width_frames": len(full), "log_sha256": parsed.text_sha256}
+
+
+def qualify_ladder_arm(args, context, live):
+    probe = context.probe
+    plan = arm_plan(args, probe, context, live)
+    cursor = probe.LogCursor(live.host_log)
+    check_fresh_log(probe, cursor)
+    memory = probe.MemorySampler(live.pid)
+    memory.start()
+    try:
+        base = run_baseline(args, probe, context, live, plan, cursor)
+        waves = []
+        for name, cases in (("forward", plan.wave_cases), ("reverse", list(reversed(plan.wave_cases)))):
+            offset = cursor.mark()
+            results = probe.run_wave(args.base_url, live.model, cases, args.max_tokens, args.timeout)
+            text = cursor.read_from(offset)
+            key = f"ladder/{live.profile}-c{live.width}/{name}"
+            context.diagnostics[key] = {
+                "divergence": divergence_rows(results, base.results),
+                "census": frame_census(text),
+            }
+            waves.append(validate_ladder_wave(probe, args, name, live.width, cases, results, probe.parse_log(text), base))
+            require_executed_width(context.diagnostics[key]["census"], "native", live.width, key)
+        probe.healthcheck(args.base_url, min(args.timeout, 30.0))
+    finally:
+        memory.stop()
+    final = finish_arm(args, probe, context, live, plan, cursor, memory)
+    recheck_provenance(probe, context.provenance)
+    return {
+        "profile": live.profile,
+        "width": live.width,
+        "process_binding": live.proof,
+        "server_process": live.process,
+        "waves": waves,
+        "server_log_sha256": final["log_sha256"],
+        "memory": final["memory"],
+        "memory_samples_mib": [int(r["mem_available_kib"]) // 1024 for r in final["memory_samples"]],
+        "native_engagement_widths": final["engaged"],
+    }
+
+
+# --- matrix seal -----------------------------------------------------------
+
+
+def seal_matrix(args, context, arm_paths):
+    """Seal the nine plain arms with the pinned, Git-captured matrix sealer."""
+    suite = args.suite
+    matrix = load_module(
+        args.matrix_program,
+        args.matrix_sha256,
+        "_r16_native_concurrency_matrix",
+    )
+    seals = matrix.reviewed_source_closure()
+    expected = {
+        matrix.MATRIX_RELATIVE_PATH: args.matrix_sha256,
+        matrix.PROBE_RELATIVE_PATH: args.probe_sha256,
+        matrix.R9_HELPER_RELATIVE_PATH: args.r9_sha256,
+    }
+    for relative, sha in expected.items():
+        require(seals[relative].sha256 == sha, "reviewed source closure differs from the pins")
+    specs = [[str(path), sha] for path, sha in arm_paths]
+    arms, public, identities = matrix.load_arms(specs)
+    result = matrix.validate_matrix(arms, public)
+    for path, (identity, sha) in identities.items():
+        require(matrix.probe.stable_identity(path, "arm") == identity, "arm receipt changed")
+        _, observed, _ = matrix.probe.read_stable_file_bytes(path, "arm")
+        require(observed == sha, "arm receipt bytes changed during sealing")
+    matrix.revalidate_reviewed_source_closure(seals)
+    require(result["probe_sha256"] == args.probe_sha256, "sealed probe SHA-256 differs")
+    sealer = seals[matrix.MATRIX_RELATIVE_PATH]
+    r9 = seals[matrix.R9_HELPER_RELATIVE_PATH]
+    result["sealer_name"] = sealer.path.name
+    result["sealer_sha256"] = sealer.sha256
+    result["sealer_git_blob"] = sealer.blob
+    result["r9_helper_name"] = r9.path.name
+    result["r9_helper_sha256"] = r9.sha256
+    result["r9_helper_git_blob"] = r9.blob
+    result["matrix_sha256"] = matrix.canonical_hash(result)
+    require(
+        result["result"] == "PASS" and result["release_qualified"] is True,
+        "matrix seal is not a release PASS",
+    )
+    raw = suite.canonical_bytes(result)
+    make_directory(suite, context.runtime, [*context.base.split("/"), "matrix"])
+    locator = context.base + "/matrix/none.json"
+    sha = write_artifact(suite, context.runtime, locator, raw)
+    return {"artifact": locator, "sha256": sha, "matrix_sha256": result["matrix_sha256"]}
+
+
+# --- orchestration ---------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Context:
+    probe: object
+    probe_identity: tuple
+    plan: dict
+    recipe: dict
+    container_env: dict
+    mounts: dict
+    provenance: Provenance
+    runtime: Path
+    base: str
+    model: str
+    timing: TimingRegistry
+    timing_rows: dict = dataclasses.field(default_factory=dict)
+    diagnostics: dict = dataclasses.field(default_factory=dict)
+    proofs: list = dataclasses.field(default_factory=list)
+    identities: list = dataclasses.field(default_factory=list)
+
+
+def make_directory(suite, runtime, parts):
+    parent = suite.open_directory_chain(runtime, "concurrency runtime")
+    try:
+        for name in parts:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+            os.close(parent)
+            parent = child
+    finally:
+        os.close(parent)
+
+
+def record_fresh_identity(context, process):
+    identity = (process["boot_id"], process["pid"], process["start_ticks"])
+    log = (process["log_device"], process["log_inode"])
+    require(
+        identity not in [row[0] for row in context.identities]
+        and log not in [row[1] for row in context.identities],
+        "server process or log identity is not fresh",
+    )
+    context.identities.append((identity, log))
+
+
+def publish_arm_log(args, suite, locator, descriptor):
+    """Publish even a failed arm from its owned descriptor, after cleanup."""
+    os.fsync(descriptor)
+    raw = suite.read_fd(
+        descriptor, "complete concurrency server log", suite.MAX_RAW_LOG_BYTES, nlink=1
+    )
+    suite.append_log_frame(args.raw_log_fd, GATE, Path(locator).name, raw)
+    return digest(raw)
+
+
+def run_mode_matrix(args, context, mode):
+    suite = args.suite
+    receipts, observations, arm_paths = [], [], []
+    make_directory(suite, context.runtime, [*context.base.split("/"), "arms", mode])
+    for width in LEVELS:
+        reference = None
+        for profile in PROFILES:
+            stem = f"{context.base}/arms/{mode}/{profile}-c{width}"
+            with state_contract(context.probe, mode), server(
+                args, context, mode, profile, width, stem
+            ) as live:
+                record_fresh_identity(context, live.process)
+                context.proofs.append(live.proof)
+                receipt, observation = qualify_arm(args, context, live, reference)
+            raw = suite.canonical_bytes(receipt)
+            locator = stem + ".json"
+            sha = write_artifact(suite, context.runtime, locator, raw)
+            observation["arm_receipt"] = {"artifact": locator, "sha256": sha}
+            observation["server_log"] = {
+                "artifact": live.log_locator,
+                "sha256": live.complete_log_sha256,
+            }
+            if profile == "native-reference":
+                reference = {"path": context.runtime / locator, "sha256": sha}
+            receipts.append(receipt)
+            observations.append(observation)
+            arm_paths.append((context.runtime / locator, sha))
+    return receipts, observations, arm_paths
+
+
+def run_ladder(args, context):
+    suite = args.suite
+    rows = []
+    make_directory(suite, context.runtime, [*context.base.split("/"), "ladder"])
+    for profile in args.ladder_profiles:
+        for width in args.ladder_widths:
+            stem = f"{context.base}/ladder/{profile}-c{width}"
+            with server(args, context, "none", profile, width, stem) as live:
+                record_fresh_identity(context, live.process)
+                context.proofs.append(live.proof)
+                row = qualify_ladder_arm(args, context, live)
+            row["server_log"] = {"artifact": live.log_locator, "sha256": live.complete_log_sha256}
+            rows.append(row)
+    return rows
+
+
+def wrapper_arm_rows(observations):
+    return [
+        {
+            "level": item["width"],
+            "mode": item["mode"],
+            "fresh_process": True,
+            "full_frames": item["full_frames"],
+            "forward_reverse_order_all_frames": True,
+            "per_frame_logit_identity": True,
+            "per_frame_state_identity": True,
+        }
+        for item in observations
+    ]
+
+
+def memory_samples(observations, ladder):
+    samples = []
+    for item in [*observations, *ladder]:
+        rows = item["memory_samples_mib"]
+        require(bool(rows), "arm memory samples are missing")
+        samples += [rows[0], min(rows), rows[-1]]
+    return samples
+
+
+def scope_contract(scope, modes):
+    """Return (gate, required modes) for a scope; plain demands exactly mode none."""
+    require(scope in SCOPES, "--scope must be full or plain")
+    gate, required = SCOPES[scope]
+    require(
+        scope == "full" or tuple(modes) == required,
+        "--scope plain requires exactly --modes none",
+    )
+    return gate, required
+
+
+def scope_coverage(scope):
+    """Extra receipt keys. The full scope adds none, so its receipt is unchanged."""
+    if scope == "full":
+        return {}
+    return {
+        "scope": "plain",
+        "covered_modes": list(SCOPES[scope][1]),
+        "not_covered_modes": list(PLAIN_NOT_COVERED),
+        "native_k5": "NOT_COVERED",
+        "release_scope": "plain native C2/C4/C8 only; not native-concurrency-c2-c8",
+    }
+
+
+def require_complete(scope, modes, observations):
+    _gate, required = SCOPES[scope]
+    message = (
+        "qualification is incomplete: both modes and all 18 arms are required"
+        if scope == "full"
+        else "qualification is incomplete: the plain scope requires mode none and all 9 arms"
+    )
+    require(
+        set(modes) == set(required)
+        and len(observations) == 3 * len(LEVELS) * len(required),
+        message,
+    )
+
+
+def build_validator(args, context, observations, matrix, ladder):
+    raw = {
+        "arms": wrapper_arm_rows(observations),
+        "available_mib_samples": memory_samples(observations, ladder),
+        "cancellation_replacement_pass": True,
+        "final_highest_slot_reused": True,
+        "post_drain_clean": True,
+        "execution_scope": "immutable-container",
+        "plain_matrix_seal": matrix,
+        "arm_observations": observations,
+        "process_bindings": context.proofs,
+        "timing_rows": context.timing_rows,
+        "diagnostics": context.diagnostics,
+        "ladder": ladder,
+        "provenance": context.provenance.public,
+        "model": context.model,
+        "max_tokens": args.max_tokens,
+        "cancel_token": args.cancel_token,
+    }
+    validator = {
+        "schema": "flux-r15-gate-validator/1",
+        "gate": args.gate,
+        "status": "PASS",
+        "release_qualified": True,
+        "container_id": args.container_id,
+        "run_id": args.run_id,
+        "raw": raw,
+        **scope_coverage(args.scope),
+    }
+    validator_raw = args.suite.canonical_bytes(validator)
+    locator = context.base + "/validator.json"
+    sha = write_artifact(args.suite, context.runtime, locator, validator_raw)
+    evidence = {
+        "levels": list(LEVELS),
+        "modes": list(SCOPES[args.scope][1]),
+        "fresh_processes": len(observations),
+        "minimum_full_frames": min(item["full_frames"] for item in observations),
+        "forward_reverse_order_all_frames": True,
+        "per_frame_logit_identity": True,
+        "per_frame_state_identity": True,
+        "cancellation_replacement_pass": True,
+        "final_highest_slot_reused": True,
+        "post_drain_clean": True,
+        "minimum_available_mib": min(raw["available_mib_samples"]),
+        "validator_artifact": locator,
+        "validator_receipt_sha256": sha,
+    }
+    return evidence
+
+
+def write_failure(args, context, error):
+    """Preserve a private diagnosis file; never a PASS receipt."""
+    failure_class = getattr(error, "failure_class", None)
+    if failure_class is None:
+        text = str(error)
+        failure_class = "VOID" if any(m.lower() in text.lower() for m in VOID_MARKERS) else "FAIL"
+    payload = args.suite.canonical_bytes(
+        {
+            "schema": "flux-r16-native-concurrency-failure/1",
+            "gate": getattr(args, "gate", GATE),
+            "status": failure_class,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "timing_rows": context.timing_rows,
+            "diagnostics": context.diagnostics,
+            "process_bindings": context.proofs,
+        }
+    )
+    try:
+        write_artifact(
+            args.suite,
+            context.runtime,
+            context.base + "/failure-" + secrets.token_hex(4) + ".json",
+            payload,
+        )
+    except (OSError, ValueError):
+        pass
+
+
+def run(args):
+    suite, probe = args.suite, args.probe
+    plan, recipe, container_env, mounts = inspect_container(args, suite)
+    runtime = suite.normalized_absolute(args.runtime_dir, "concurrency runtime")
+    runtime_identity = suite.directory_identity_sha256(runtime, "concurrency runtime")
+    verify_runtime_bind(suite, runtime, mounts)
+    provenance = preflight_provenance(args, suite, probe, plan, mounts)
+    parts = ["concurrency", GATE]
+    make_directory(suite, runtime, parts)
+    context = Context(
+        probe,
+        args.probe_identity,
+        plan,
+        recipe,
+        container_env,
+        mounts,
+        provenance,
+        runtime,
+        "/".join(parts),
+        "flux-concurrency-" + secrets.token_hex(8),
+        TimingRegistry(),
+    )
+    install_timing_hook(probe, context.timing)
+    try:
+        observations, matrix, ladder = [], None, []
+        if "none" in args.modes:
+            _receipts, plain, arm_paths = run_mode_matrix(args, context, "none")
+            observations += plain
+            matrix = seal_matrix(args, context, arm_paths)
+        if args.ladder:
+            ladder = run_ladder(args, context)
+        if "native-mtp-k5" in args.modes:
+            _receipts, k5, _paths = run_mode_matrix(args, context, "native-mtp-k5")
+            observations += k5
+        require(
+            suite.directory_identity_sha256(runtime, "concurrency runtime")
+            == runtime_identity,
+            "concurrency runtime identity changed",
+        )
+        require_complete(args.scope, args.modes, observations)
+        evidence = build_validator(args, context, observations, matrix, ladder)
+    except Exception as error:
+        write_failure(args, context, error)
+        raise
+    receipt = {
+        "schema": "flux-r15-container-gate-receipt/1",
+        "gate": args.gate,
+        "status": "PASS",
+        "release_qualified": True,
+        "execution_scope": "immutable-container",
+        "image_id": args.image_id,
+        "image_digest": args.image_digest,
+        "container_id": args.container_id,
+        "run_id": args.run_id,
+        "evidence": evidence,
+        **scope_coverage(args.scope),
+    }
+    suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+    os.fsync(args.receipt_fd)
+    return receipt
+
+
+def parse_widths(value):
+    match = re.fullmatch(r"([0-9]+)-([0-9]+)", value)
+    require(match is not None, "ladder widths must be a low-high range")
+    low, high = int(match[1]), int(match[2])
+    require(
+        LADDER_WIDTHS[0] <= low <= high <= LADDER_WIDTHS[-1],
+        "ladder widths must stay within C9-C32",
+    )
+    return tuple(range(low, high + 1))
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in (
+        "container-id",
+        "image-id",
+        "image-digest",
+        "base-url",
+        "run-id",
+        "receipt-fd",
+        "raw-log-fd",
+        "runtime-dir",
+        "suite-program",
+        "suite-sha256",
+        "probe-program",
+        "probe-sha256",
+        "r9-program",
+        "r9-sha256",
+        "matrix-program",
+        "matrix-sha256",
+        "launch-manifest",
+        "launch-manifest-sha256",
+    ):
+        parser.add_argument(
+            "--" + name, required=True, type=int if name.endswith("-fd") else str
+        )
+    parser.add_argument("--container-port", type=int, default=8888)
+    parser.add_argument("--container-results-path", default="/results")
+    parser.add_argument("--container-cwd", default="/")
+    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--minimum-full-frames", type=int, default=8)
+    parser.add_argument("--memory-floor-mib", type=int, default=6656)
+    parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--cancel-token", type=int, default=20)
+    parser.add_argument("--modes", default=",".join(MODES))
+    parser.add_argument("--scope", default="full")
+    parser.add_argument("--ladder", action="store_true")
+    parser.add_argument("--ladder-widths", default="9-32")
+    parser.add_argument("--ladder-profiles", default="native-reference")
+    args = parser.parse_args(argv)
+    parsed = urllib.parse.urlsplit(args.base_url)
+    require(
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.port is not None
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None,
+        "base URL must be explicit HTTP IPv4 loopback",
+    )
+    args.base_url = args.base_url.rstrip("/")
+    require(1 <= args.container_port <= 65535, "container port is invalid")
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.container_id) is not None,
+        "container ID differs",
+    )
+    for value in (args.image_id, args.image_digest):
+        require(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None,
+            "immutable image identity differs",
+        )
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.run_id) is not None,
+        "run ID is invalid",
+    )
+    for name in ("suite_sha256", "probe_sha256", "r9_sha256", "matrix_sha256", "launch_manifest_sha256"):
+        value = getattr(args, name)
+        require(
+            re.fullmatch(r"[0-9a-f]{64}", value) is not None and set(value) != {"0"},
+            f"{name} is invalid",
+        )
+    require(
+        Path(args.probe_program).name == "qwen4_native_concurrency_probe.py",
+        "probe program basename differs",
+    )
+    require(
+        Path(args.container_results_path).is_absolute()
+        and Path(args.container_cwd).is_absolute(),
+        "container paths must be absolute",
+    )
+    require(16 <= args.max_tokens <= 256, "--max-tokens must be in 16..256")
+    require(args.minimum_full_frames >= 8, "--minimum-full-frames must be at least 8")
+    require(args.memory_floor_mib >= 1, "--memory-floor-mib must be positive")
+    require(math.isfinite(args.timeout) and args.timeout > 0, "--timeout must be positive")
+    require(1 <= args.cancel_token < args.max_tokens, "--cancel-token must precede the budget")
+    args.modes = tuple(dict.fromkeys(item.strip() for item in args.modes.split(",")))
+    require(
+        args.modes and set(args.modes) <= set(MODES), "--modes must name none/native-mtp-k5"
+    )
+    args.gate, _required = scope_contract(args.scope, args.modes)
+    args.ladder_widths = parse_widths(args.ladder_widths)
+    args.ladder_profiles = tuple(
+        dict.fromkeys(item.strip() for item in args.ladder_profiles.split(","))
+    )
+    require(
+        set(args.ladder_profiles) <= {"native-reference", "native-optimized"},
+        "--ladder-profiles must be native selector profiles",
+    )
+    verify_parent_suite(args.suite_sha256)
+    args.suite = load_module(
+        args.suite_program, args.suite_sha256, "_r16_suite_native_concurrency"
+    )
+    require(
+        callable(getattr(args.suite, "_live_listener_identity", None))
+        and callable(getattr(args.suite, "_verify_live_mode", None)),
+        "source-pinned live broker upgrade is required",
+    )
+    r9 = load_module(args.r9_program, args.r9_sha256, "_r16_r9_native_concurrency")
+    _payload, args.probe_identity = read_pinned_bytes(args.probe_program, args.probe_sha256)
+    args.probe = load_module(
+        args.probe_program,
+        args.probe_sha256,
+        "_r16_probe_native_concurrency",
+        injected={"r9_provenance": r9},
+    )
+    args.identities = {
+        name: getattr(args, name)
+        for name in ("container_id", "image_id", "image_digest", "run_id", "base_url")
+    }
+    require(
+        hasattr(signal, "pidfd_send_signal") and hasattr(os, "pidfd_open"),
+        "local Linux pidfd support is required",
+    )
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        # Paths, host identifiers, and response text stay in private artifacts.
+        print(
+            GATE + ": qualification failed (" + type(error).__name__ + ")",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

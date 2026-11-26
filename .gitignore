@@ -1,0 +1,145 @@
+# ==============================================================================
+# Flux Engine — Security, Credential, Build Cache & Proprietary Artifact Guard
+# ==============================================================================
+
+# --- Tier 0: Credentials, Keys, Tokens & Local Environment Secrets ---
+.env
+.env.*
+.envrc
+*.env
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.asc
+*.gpg
+*.tfvars
+*token*
+*secret*
+*.credentials*
+*credential*
+# Uppercase env-file spellings, API keys, cloud and cluster credentials
+# (GH_TOKEN, HF_TOKEN, OPENAI_API_KEY, service-account JSON, ~/.aws, ~/.kube).
+*TOKEN*
+*SECRET*
+*CREDENTIAL*
+*API_KEY*
+*api_key*
+service-account*.json
+sa-key*.json
+**/.aws/
+kubeconfig
+**/.kube/
+.netrc
+.pypirc
+.npmrc
+.docker/config.json
+id_rsa*
+id_ed25519*
+id_ecdsa*
+authorized_keys
+known_hosts
+
+# Allow tracked sanitized runtime recipes and token/tokenizer source files
+!recipes/*.env
+!repro-kit/recipes/*.env
+!crates/spark-server/src/tokenizer/
+!/crates/xgrammar/src/tokenizer/
+!crates/spark-server/src/tokenizer/glm_tool_contract_template_tests.rs
+!crates/spark-server/src/grammar/tests/glm_native_tokenizer.rs
+!/crates/atlas-embed/src/token.rs
+!/kernels/gb10/glm5.3-flash/exl3/ggml_q6_token_embedding.cu
+!/kernels/gb10/glm5.3-flash/iq3/ggml_q6_token_embedding.cu
+
+# --- Local Agent / IDE / Host Lock & Telemetry Guardrails ---
+# AGENTS.md stays strictly gitignored for private local notes; public
+# contributor/agent guidance lives in tracked CLAUDE.md.
+AGENTS.md
+.claude/
+.codex/
+.cursor/
+.gemini/
+.vscode/
+.idea/
+.*-build.lock
+.*-build.hold
+.gb10.lock
+.gb10-queue
+qualification/**/kernel-*.jsonl
+*journal*.jsonl
+dmesg*.jsonl
+
+# --- Rust / Cargo Build Artifacts & Target Caches ---
+target/
+**/target/
+target-*/
+**/target-*/
+*-target/
+**/*-target/
+.cargo-target/
+.aux-spec-target/
+repro-kit/bin/
+repro-kit/fi_home/
+repro-kit/models/
+*.stale-*
+*.rlib
+*.rmeta
+*.d
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.profraw
+.build.lock
+
+# --- CUDA / PTX / Nsight / GPU Scratch Dumps ---
+*.cubin
+*.fatbin
+*.ptx
+*.ii
+*.cudafe1.*
+*.cudafe2.*
+*.module_id
+*.reg.txt
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+ptxas.log
+
+# --- Runtime, Benchmark & Compiler Scratch Logs ---
+*.log
+*.pid
+*.nohup
+nohup.out
+core
+core.*
+vgcore.*
+
+# --- Model Weights, Quantized Shards & Large Tensor Dumps ---
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+*.model
+atlas-weight-cache/
+
+# --- OS, Editor & Temporary Files ---
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

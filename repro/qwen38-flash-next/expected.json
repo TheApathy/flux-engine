@@ -1,0 +1,87 @@
+{
+  "completion_tokens": 512,
+  "estonia_136k_gate": {
+    "decode_client_median_tps": 47.4,
+    "decode_server_median_tps": 47.781,
+    "mean_acceptance_length": 2.88,
+    "mem_available_floor_mib": 8412,
+    "minimum_decode_client_tps": 45.0,
+    "minimum_prefill_tps": 5200.0,
+    "pass_count": 5,
+    "pass_rate": 1.0,
+    "prefill_median_tps": 5400.4,
+    "prompt_tokens_max": 136584,
+    "prompt_tokens_min": 136576,
+    "runs": 5,
+    "ttft_median_seconds": 25.291321
+  },
+  "finish_reason": "length",
+  "lil_decode_gates": {
+    "v9_w16384": {
+      "c1_concurrency_1_tps": 53.5,
+      "c4_aggregate_tps": 64.9,
+      "c8_aggregate_tps": 66.2,
+      "context_8k_64k_tps_max": 46.5,
+      "context_8k_64k_tps_min": 45.6,
+      "mem_available_floor_mib": 7757,
+      "overall_tps": 51.0,
+      "s1_1500tok_tps": 51.4,
+      "short_256tok_tps": 53.5
+    },
+    "v9_w4096": {
+      "c1_concurrency_1_tps": 52.8,
+      "c4_aggregate_tps": 65.1,
+      "c8_aggregate_tps": 66.4,
+      "context_8k_64k_tps_max": 46.5,
+      "context_8k_64k_tps_min": 45.6,
+      "mem_available_floor_mib": 11907,
+      "overall_tps": 50.8,
+      "s1_1500tok_tps": 51.6,
+      "short_256tok_tps": 52.8
+    }
+  },
+  "lossless_10p_gate": {
+    "exact_match_prompts": 10,
+    "exact_match_tokens": 2560,
+    "max_tokens_per_prompt": 256,
+    "prompts": 10,
+    "total_tokens": 2560
+  },
+  "minimum_median_server_tps": 51.0,
+  "prefill_gates": {
+    "v9_w16384": {
+      "128k_median_tps": 5664.8,
+      "128k_peak_tps": 5694.4,
+      "16k_median_tps": 6076.7,
+      "16k_peak_tps": 6082.2,
+      "32k_median_tps": 5952.6,
+      "32k_peak_tps": 5969.6,
+      "64k_median_tps": 5792.4,
+      "64k_peak_tps": 5828.3,
+      "8k_median_tps": 5819.3,
+      "8k_peak_tps": 5830.2,
+      "minimum_128k_tps": 5500.0,
+      "minimum_16k_tps": 5900.0
+    },
+    "v9_w4096": {
+      "128k_median_tps": 4891.7,
+      "128k_peak_tps": 4899.8,
+      "16k_median_tps": 5164.5,
+      "16k_peak_tps": 5176.9,
+      "32k_median_tps": 5116.2,
+      "32k_peak_tps": 5125.1,
+      "64k_median_tps": 5016.1,
+      "64k_peak_tps": 5026.5,
+      "8k_median_tps": 5266.8,
+      "8k_peak_tps": 5276.3,
+      "minimum_128k_tps": 4800.0,
+      "minimum_8k_tps": 5100.0
+    }
+  },
+  "reference_coding_peak_server_tps": 57.6,
+  "reference_median_server_tps": 56.5,
+  "required_repetitions": 3,
+  "schema": "theapathy-qwen38-flash-next-expected-v1",
+  "speculative_k": 5,
+  "speculative_num_drafts": 4
+}

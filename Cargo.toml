@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/atlas-core",
+    "crates/atlas-quant",
+    "crates/atlas-norm",
+    "crates/atlas-activation",
+    "crates/atlas-embed",
+    "crates/atlas-reduce",
+    "crates/atlas-kernels",
+    "crates/spark-runtime",
+    "crates/spark-comm",
+    "crates/spark-model",
+    "crates/spark-server",
+    "crates/atlas-spark-bench",
+    "crates/cufile-sys",
+    "crates/spark-storage",
+    "crates/xgrammar",
+    "crates/rest-store",
+]
+
+[workspace.package]
+version = "1.0.3"
+edition = "2024"
+rust-version = "1.88"
+license = "AGPL-3.0-only"
+authors = ["TheApathy Flux Engine Contributors", "Monumental Systems (Upstream Atlas)", "Avarok Cybersecurity (Upstream Atlas)"]
+repository = "https://github.com/TheApathy/flux-engine"
+homepage = "https://github.com/TheApathy/flux-engine"
+documentation = "https://github.com/TheApathy/flux-engine/tree/main/docs"
+readme = "README.md"
+keywords = ["llm", "inference", "cuda", "blackwell", "gpu"]
+categories = ["science", "command-line-utilities"]
+
+[workspace.dependencies]
+# CUDA FFI
+cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-version-from-build-system"] }
+
+# Serialization (HF config.json)
+serde = { version = "1", features = ["derive"] }
+# `preserve_order`: keep JSON object keys in insertion/declaration order
+# (IndexMap, not BTreeMap), as Python's json.dumps and HF transformers'
+# `tojson` do. Tool schemas in chat-template prompts and DeepSeek-V4.1's
+# encoding.py port depend on it.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+ring = "0.17"
+
+# Synchronization — parking_lot Mutex/RwLock are faster than std::sync,
+# don't poison, and `.lock()` returns the guard directly (no Result).
+# Already a transitive dep of several crates so this adds no binary
+# overhead — just standardizes the API across the workspace.
+parking_lot = "0.12"
+
+# Workspace crates
+# atlas-core: `default-features = false` so each consumer crate forwards the
+# right backend feature explicitly (cuda or metal). Without this, every
+# member would silently pull in cudarc via atlas-core's `cuda` default.
+atlas-core = { path = "crates/atlas-core", default-features = false }
+atlas-quant = { path = "crates/atlas-quant" }
+atlas-norm = { path = "crates/atlas-norm" }
+atlas-activation = { path = "crates/atlas-activation" }
+atlas-embed = { path = "crates/atlas-embed" }
+atlas-reduce = { path = "crates/atlas-reduce" }
+atlas-kernels = { path = "crates/atlas-kernels" }
+
+# Structured-generation grammar engine: Flux Engine depends directly on the
+# pure-Rust `crates/xgrammar` workspace crate (no C++ toolchain or FFI).
+
+# ── Release profile ────────────────────────────────────────────────────────
+# `lto = "thin"` enables ThinLTO across all workspace crates (~20-30% slower
+# link, but enables cross-crate inlining of hot decode/dispatch helpers).
+# `codegen-units = 1` per crate enables full intra-crate optimisation.
+# `panic = "unwind"` is kept so `spark-server`'s `CatchPanicLayer` and the
+# scheduler fault latch can contain unexpected handler/task panics without
+# terminating the entire serving process with SIGABRT.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+debug = false
+incremental = false
+strip = "none"
+
+# Workspace-wide lint policy. Warnings-as-errors (`-D warnings`) is enforced
+# in CI rather than hardcoded in source so newer Rust toolchains do not break
+# downstream builds.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+large_enum_variant = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+type_complexity = "allow"
+ptr_arg = "allow"
+if_same_then_else = "allow"

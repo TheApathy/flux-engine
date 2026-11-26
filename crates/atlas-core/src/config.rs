@@ -1,0 +1,799 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use anyhow::Result;
+use serde::Deserialize;
+
+/// Deserialize a u32 that may be JSON null (treat null as 0).
+fn nullable_u32<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u32, D::Error> {
+    Option::<u32>::deserialize(d).map(|v| v.unwrap_or(0))
+}
+
+/// Layer type in a hybrid transformer model.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerType {
+    FullAttention,
+    LinearAttention,
+    /// Standalone MoE FFN layer (Nemotron-H: no mixer, just expert routing + FFN).
+    Moe,
+}
+
+/// Runtime transform applied to target hidden states before DFlash capture.
+///
+/// This is never read from a checkpoint config: the target/drafter pairing
+/// selects it only after both configurations have been validated together.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DflashCaptureMode {
+    /// Copy a contiguous slice from the target residual row.
+    #[default]
+    ResidualSlice,
+    /// Collapse a Qwen4 four-stream residual with its terminal hyper mixer.
+    Qwen4HyperProjected,
+    /// Collapse a Qwen4 four-stream residual with the next layer's attention
+    /// hyperconnection mixer (`layers[t + 1].attn_hyper_connection`).
+    Qwen4LayerAttnHc,
+    /// Arithmetic mean of the four Qwen4 hyperconnection streams (H-wide).
+    Qwen4HcMean,
+}
+
+impl DflashCaptureMode {
+    /// True when this mode collapses a Qwen4 four-stream residual into an H-wide tap.
+    pub const fn is_qwen4_native(self) -> bool {
+        matches!(
+            self,
+            Self::Qwen4HyperProjected | Self::Qwen4LayerAttnHc | Self::Qwen4HcMean
+        )
+    }
+}
+
+/// Disaggregated prefill/decode serving role (`--role`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DisaggRole {
+    /// Standard co-located prefill + decode instance.
+    #[default]
+    Unified,
+    /// Dedicated prefill producer (`1P` in `1P + 1D` / `1P + 2D`).
+    Prefill,
+    /// Dedicated decode consumer (`1D` / `2D` in `1P + 1D` / `1P + 2D`).
+    Decode,
+}
+
+impl DisaggRole {
+    pub const ALL: [Self; 3] = [Self::Unified, Self::Prefill, Self::Decode];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "unified" => Some(Self::Unified),
+            "prefill" => Some(Self::Prefill),
+            "decode" => Some(Self::Decode),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unified => "unified",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+/// Model configuration parsed from HuggingFace config.json.
+///
+/// Single source of truth for model dimensions. All kernel launch
+/// parameters and buffer sizes derive from this struct.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    // ── Core dimensions ──
+    pub hidden_size: usize,
+    #[serde(default)]
+    pub num_hidden_layers: usize,
+    #[serde(default)]
+    pub intermediate_size: usize,
+    #[serde(default)]
+    pub vocab_size: usize,
+
+    // ── Full attention ──
+    #[serde(default)]
+    pub num_attention_heads: usize,
+    /// GQA: number of K/V heads (≤ `num_attention_heads`). MQA when 1.
+    #[serde(default)]
+    pub num_key_value_heads: usize,
+    #[serde(default)]
+    pub head_dim: usize,
+    /// Fraction of `head_dim` that gets RoPE-rotated. 1.0 = full RoPE,
+    /// 0.5 = half-rotated (Phi-style). Default 1.0.
+    #[serde(default = "default_partial_rotary")]
+    pub partial_rotary_factor: f64,
+
+    // ── Linear attention (SSM / GDN) ──
+    // "linear" = the recurrent state-space / gated-delta-net pathway used
+    // by hybrid models (Qwen3.5/3.6, Nemotron-Nano, MiniMax). Per-token
+    // updates run in O(1) state instead of O(seq) attention.
+    #[serde(default)]
+    pub linear_num_key_heads: usize,
+    #[serde(default)]
+    pub linear_key_head_dim: usize,
+    #[serde(default)]
+    pub linear_num_value_heads: usize,
+    #[serde(default)]
+    pub linear_value_head_dim: usize,
+    /// 1D causal-conv kernel size on the SSM input (typically 3 or 4).
+    #[serde(default = "default_conv_kernel")]
+    pub linear_conv_kernel_dim: usize,
+
+    // ── MoE ──
+    #[serde(default)]
+    pub num_experts: usize,
+    /// Top-K experts activated per token (the "A" in 35B-A3B = 3B
+    /// active params).
+    #[serde(default = "default_one")]
+    pub num_experts_per_tok: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
+    /// Renormalize routing probabilities so the K active experts sum
+    /// to 1 after top-K selection. Qwen3.5+ sets true; older Qwen2 MoE
+    /// variants set false.
+    #[serde(default)]
+    pub norm_topk_prob: bool,
+    /// MoE block stride: layer `i` uses MoE iff `i % decoder_sparse_step
+    /// == 0`. 1 = every layer is MoE. Mistral / DeepSeek-style stagger
+    /// uses 2.
+    #[serde(default = "default_one")]
+    pub decoder_sparse_step: usize,
+
+    // ── Hybrid layer layout ──
+    /// Per-layer kind (FullAttention | LinearAttention | …) parsed from
+    /// HF config. When empty, falls back to `full_attention_interval`.
+    #[serde(default)]
+    pub layer_types: Vec<LayerType>,
+    /// Stride for full-attention layers in hybrid models when
+    /// `layer_types` is empty: every Nth layer is FullAttention, the
+    /// rest LinearAttention. 1 = every layer is full attention.
+    #[serde(default = "default_one")]
+    pub full_attention_interval: usize,
+    /// Gemma-4 hybrid-attention sliding window size (0 = full attention).
+    /// Sliding layers only attend to the last `sliding_window` KV positions;
+    /// full layers (every 6th in Gemma-4) ignore this (effectively 0).
+    /// Parsed from HF config.json `sliding_window` field. Uses `nullable_u32`
+    /// because Nemotron-H (and some other models) set it to `null` in JSON.
+    #[serde(default, deserialize_with = "nullable_u32")]
+    pub sliding_window: u32,
+
+    // ── Position embeddings ──
+    #[serde(default)]
+    pub max_position_embeddings: usize,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f64,
+
+    // ── Normalization ──
+    #[serde(default = "default_rms_eps")]
+    pub rms_norm_eps: f64,
+
+    // ── Tokenizer ──
+    /// BOS token ID (null → 0 for models without explicit BOS).
+    #[serde(default, deserialize_with = "nullable_u32")]
+    pub bos_token_id: u32,
+    #[serde(default, deserialize_with = "nullable_u32")]
+    pub eos_token_id: u32,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+
+    // ── Model type ──
+    #[serde(default)]
+    pub model_type: String,
+
+    // ── MTP ──
+    #[serde(default)]
+    pub mtp_num_hidden_layers: usize,
+
+    // ── Qwen4-Exp / Qwen3.8-Flash-Next ──
+    /// Number of parallel gated-residual streams. Qwen4-Exp uses four.
+    #[serde(default = "default_one")]
+    pub hc_count: usize,
+    /// Bottleneck rank used to mix the gated-residual streams.
+    #[serde(default)]
+    pub hc_lowrank: usize,
+    /// One-indexed decoder layers carrying the PLE n-gram injection.
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub ple_embed_dim: usize,
+    #[serde(default = "default_conv_kernel")]
+    pub ple_conv_kernel_size: usize,
+    #[serde(default = "default_one")]
+    pub ngram_size: usize,
+    #[serde(default = "default_one")]
+    pub heads_per_ngram: usize,
+    #[serde(default)]
+    pub ngram_vocab_size_base: usize,
+    #[serde(default = "default_one")]
+    pub make_ngram_vocab_size_divisible_by: usize,
+    #[serde(default)]
+    pub seed: u64,
+    #[serde(default)]
+    pub split_ngram_parts: usize,
+    /// Qwen Sparse Attention indexer geometry. All five values are required
+    /// together; zero means the architecture does not use QSA.
+    #[serde(default)]
+    pub indexer_n_heads: usize,
+    #[serde(default)]
+    pub indexer_kv_heads: usize,
+    #[serde(default)]
+    pub indexer_head_dim: usize,
+    #[serde(default)]
+    pub indexer_budget: usize,
+    #[serde(default)]
+    pub indexer_compress_ratio: usize,
+    /// Runtime-only activation of QSA long-context execution.
+    #[serde(skip)]
+    pub qwen4_qsa: bool,
+    /// GDN output gate activation (`sigmoid` for Flash-Next).
+    #[serde(default)]
+    pub output_gate_type: String,
+
+    // ── Nemotron-H / Mamba-2 ──
+    #[serde(default)]
+    pub hybrid_override_pattern: String,
+    #[serde(default)]
+    pub mamba_num_heads: usize,
+    #[serde(default)]
+    pub mamba_head_dim: usize,
+    #[serde(default)]
+    pub ssm_state_size: usize,
+    #[serde(default)]
+    pub n_groups: usize,
+    #[serde(default)]
+    pub expand: usize,
+    /// Nemotron-H uses `n_routed_experts` (mapped to `num_experts` in parse_config).
+    #[serde(default)]
+    pub n_routed_experts: usize,
+    /// Nemotron-H uses `norm_eps` (mapped to `rms_norm_eps` in parse_config).
+    #[serde(default)]
+    pub norm_eps: f64,
+    /// Nemotron-H conv kernel size (mapped to `linear_conv_kernel_dim` in parse_config).
+    #[serde(default)]
+    pub conv_kernel: usize,
+    /// Nemotron-H shared expert intermediate (mapped to shared_expert_intermediate_size).
+    #[serde(default)]
+    pub moe_shared_expert_intermediate_size: usize,
+    /// Nemotron-H routed scaling factor for expert outputs.
+    #[serde(default = "default_one_f64")]
+    pub routed_scaling_factor: f64,
+    /// LatentMoE: latent projection dimension for routed experts (Super 120B).
+    /// When present, routed experts operate in latent space `[moe_latent_size]`
+    /// instead of full `[hidden_size]`. Absent for Nano 30B.
+    #[serde(default)]
+    pub moe_latent_size: usize,
+
+    // ── MLA (Multi-head Latent Attention) — Mistral Small 4 / DeepSeek-V2+ ──
+    /// KV latent dimension for compressed cache. 0 = standard attention (no MLA).
+    #[serde(default)]
+    pub kv_lora_rank: usize,
+    /// Per-layer KV cache dimensions (num_kv_heads, head_dim). Populated by
+    /// loaders for heterogeneous-attention models (e.g. Gemma-4 with sliding
+    /// and full attention having different head counts and dims). Empty for
+    /// homogeneous models.
+    #[serde(default, skip_deserializing, skip_serializing)]
+    pub kv_layer_dims: Vec<(usize, usize)>,
+    /// Query latent dimension for low-rank Q projection. 0 = standard Q.
+    #[serde(default)]
+    pub q_lora_rank: usize,
+    /// Non-rotary portion of Q/K per head (NoPE component).
+    #[serde(default)]
+    pub qk_nope_head_dim: usize,
+    /// Rotary portion of Q/K per head (RoPE component).
+    #[serde(default)]
+    pub qk_rope_head_dim: usize,
+    /// Value dimension per head (may differ from head_dim in MLA).
+    #[serde(default)]
+    pub v_head_dim: usize,
+
+    // ── YaRN RoPE scaling (Mistral Small 4) ──
+    /// YaRN scaling factor (`yarn.factor`). 0.0 = YaRN disabled, use plain RoPE.
+    #[serde(default)]
+    pub yarn_factor: f32,
+    /// YaRN low-rotation cutoff (`yarn.alpha` in Mistral params,
+    /// `beta_slow` in HF transformers terminology).
+    #[serde(default)]
+    pub yarn_beta_slow: f32,
+    /// YaRN high-rotation cutoff (`yarn.beta` in Mistral params,
+    /// `beta_fast` in HF transformers terminology).
+    #[serde(default)]
+    pub yarn_beta_fast: f32,
+    /// YaRN original context length used for the correction range
+    /// (`yarn.original_max_position_embeddings`).
+    #[serde(default)]
+    pub yarn_original_max_position_embeddings: usize,
+    /// llama_4_scaling Q temperature beta (`llama_4_scaling.beta`).
+    /// Q is multiplied by `1 + beta * log(1 + floor(pos / original_max_pos))`
+    /// after RoPE. 0.0 = disabled. Mistral Small 4 uses 0.1.
+    #[serde(default)]
+    pub llama_4_scaling_beta: f32,
+    /// llama_4_scaling original context length for the Q temperature scale.
+    #[serde(default)]
+    pub llama_4_scaling_original_max_position_embeddings: usize,
+
+    // ── Vision ──
+    /// Vision encoder configuration parsed from `vision_config` in config.json.
+    /// None for text-only models.
+    #[serde(skip)]
+    pub vision: Option<VisionConfig>,
+
+    /// Advertised quantization format + algorithm + per-module ignore list.
+    /// Populated from `config.json::quantization_config` or a sibling
+    /// `hf_quant_config.json` at `parse_config` time. `None` for
+    /// un-quantized BF16/FP16 checkpoints. Consumed by the `QuantFormat`
+    /// dispatcher (`crates/spark-model/src/quant_format/`) to pick the
+    /// correct on-disk loader without guessing from tensor names.
+    #[serde(skip)]
+    pub quantization_config: Option<QuantizationConfig>,
+
+    // ── Architecture flags (set by parse_config, not from JSON) ──
+    /// Whether Q projection includes an output gate (Q+Gate interleaved, 2x q_dim).
+    /// False for Qwen3-VL, Nemotron-H, Mistral (ungated Q).
+    #[serde(skip)]
+    pub attn_gated: bool,
+    /// Whether config.json wraps the LLM config in a nested field (e.g., `text_config`).
+    /// Determines weight prefix auto-detection behavior.
+    #[serde(skip)]
+    pub nested_config: bool,
+    /// MRoPE (multi-modal rotary position embedding) section sizes in
+    /// `[T, H, W]` order. `[0, 0, 0]` = scalar RoPE (default for Qwen3.5
+    /// and earlier). Qwen3.6 uses `[11, 11, 10]`. Summed × 2 == rotary_dim.
+    #[serde(skip)]
+    pub mrope_section: [usize; 3],
+    /// MRoPE channel layout: `true` = round-robin `[T H W T H W …]` (Qwen3.6),
+    /// `false` = contiguous `[T…T | H…H | W…W]` (Qwen3-VL non-interleaved).
+    /// Ignored when `mrope_section == [0, 0, 0]`.
+    #[serde(skip)]
+    pub mrope_interleaved: bool,
+
+    // ── Weight key prefix (set by parser for conditional generation models) ──
+    #[serde(skip)]
+    pub weight_prefix: String,
+
+    // ── Expert Parallelism (set at runtime, not from config.json) ──
+    #[serde(skip)]
+    pub ep_rank: usize,
+    #[serde(skip)]
+    pub ep_world_size: usize,
+
+    // ── Tensor Parallelism (set at runtime, not from config.json) ──
+    /// TP rank within the TP sub-communicator. 0 if `tp_world_size==1`.
+    #[serde(skip)]
+    pub tp_rank: usize,
+    /// Number of TP ranks. 1 = no TP. Composes with EP statically:
+    /// attention/MLP weights are TP-sharded; MoE expert weights are EP-sharded.
+    #[serde(skip)]
+    pub tp_world_size: usize,
+    /// Number of TP ranks sharing each KV head (`1` when `num_key_value_heads` is
+    /// divisible by `tp_world_size`; `tp_world_size / global_kv_heads` when
+    /// `tp_world_size > global_kv_heads`, e.g. `2` for `kv_heads=2` at `TP=4`).
+    #[serde(skip)]
+    pub tp_kv_replicate: usize,
+
+    // ── Pipeline Parallelism & P/D Disaggregation (set at runtime) ──
+    /// Pipeline stage rank (`0..pp_world_size`).
+    #[serde(skip)]
+    pub pp_rank: usize,
+    /// Number of pipeline stages (`1` = no pipeline parallelism; `3` = 3x Spark PP=3).
+    #[serde(skip)]
+    pub pp_world_size: usize,
+    /// Global first layer index owned by this pipeline stage.
+    #[serde(skip)]
+    pub pp_layer_offset: usize,
+    /// Disaggregated prefill/decode role (`Unified`, `Prefill`, or `Decode`).
+    #[serde(skip)]
+    pub disagg_role: DisaggRole,
+
+    // ── FP8 KV cache calibration (set at runtime from CLI) ──
+    /// Number of warmup tokens for online FP8 KV scale calibration.
+    /// 0 = disabled (use static scales from checkpoint or uncalibrated 1.0).
+    #[serde(skip)]
+    pub fp8_kv_calibration_tokens: usize,
+
+    // ── Gemma-4 specific ──
+    /// Final logit softcapping: logits = cap * tanh(logits / cap).
+    /// 0.0 = disabled (default for all models except Gemma-4 which uses 30.0).
+    #[serde(skip)]
+    pub final_logit_softcapping: f32,
+    /// Embedding scale factor: embeddings *= scale after lookup.
+    /// 0.0 = disabled (default). Gemma models use sqrt(hidden_size).
+    #[serde(skip)]
+    pub embed_scale: f32,
+
+    // ── MiniMax M2 specific ──
+    /// MoE routing activation. "" = default softmax. "sigmoid" = DeepSeek-V3
+    /// / MiniMax-M2 style: raw gate logits pass through sigmoid to produce
+    /// per-expert scores in (0,1), independent (not normalized across
+    /// experts). Top-k selection may use a bias term (see `use_routing_bias`).
+    #[serde(default)]
+    pub scoring_func: String,
+    /// If true, a per-expert `e_score_correction_bias` tensor is added to
+    /// routing scores *for top-k selection only* (not dispatch weighting).
+    /// This is the DeepSeek-V3 loss-free balancing trick. The bias tensor
+    /// itself lives in the checkpoint (typically one `[num_experts]` vector
+    /// per MoE layer).
+    #[serde(default)]
+    pub use_routing_bias: bool,
+    /// QK normalization granularity. "" = none (Qwen3-Next default).
+    /// "per_layer" = each attention layer has its own learned q_layernorm /
+    /// k_layernorm weight of shape `[head_dim]`, applied after Q/K projection
+    /// and before RoPE (MiniMax M2).
+    #[serde(default)]
+    pub qk_norm_type: String,
+    /// Number of sequential MTP draft modules. 0 = no MTP. 1 = existing
+    /// Atlas MTP path (Qwen3.5). 3 = MiniMax M2 (each module is a single
+    /// transformer layer that predicts one future token).
+    #[serde(default)]
+    pub num_mtp_modules: usize,
+    /// Transformer layers per MTP module. 1 for MiniMax M2 (3 modules × 1
+    /// layer = 3 future-token predictors).
+    #[serde(default)]
+    pub mtp_transformer_layers: usize,
+    /// Explicit rotary dimension from config (bypasses partial_rotary_factor
+    /// computation). MiniMax M2 ships `rotary_dim: 64` while head_dim=128,
+    /// so the rotary factor is 0.5 — we honor the explicit int value when
+    /// present for byte-exact rope dim.
+    #[serde(default)]
+    pub rotary_dim: usize,
+    /// Target-model layer indices to capture intermediate hidden states from
+    /// for DFlash speculative decoding. Sourced from the drafter's
+    /// `dflash_config.target_layer_ids` (e.g., `[1, 10, 19, 28, 37]` for
+    /// Qwen3.6-35B-A3B-DFlash). Empty when DFlash is disabled — its presence
+    /// gates `TransformerModel::dflash_hidden_save` allocation and the
+    /// per-layer capture hooks. Order matters: shallow-to-deep concatenation
+    /// is what the drafter's `fc` projection expects.
+    #[serde(default)]
+    pub dflash_capture_layers: Vec<usize>,
+    /// Runtime-only width copied from each target residual row into the
+    /// DFlash capture stack. Zero means the ordinary full residual width.
+    #[serde(skip)]
+    pub dflash_capture_width: usize,
+    /// Runtime-only BF16 element offset into each residual row. Used by the
+    /// explicit Flash-Next -> dense-DFlash compatibility bridge.
+    #[serde(skip)]
+    pub dflash_capture_offset: usize,
+    /// Runtime-only transform selected for target hidden-state capture.
+    #[serde(skip)]
+    pub dflash_capture_mode: DflashCaptureMode,
+
+    /// Runtime-only manifest for a sparse Qwen4 PLE backing store. The
+    /// server discovers `ple-offload/manifest.json` beside the checkpoint;
+    /// it is never read from or written to Hugging Face config.json.
+    #[serde(skip)]
+    pub ple_offload_manifest: Option<String>,
+
+    /// Number of hyper-connection residual streams per block (`hc_mult`).
+    /// 0 = disabled. GLM-5.3 (mHC) uses 4.
+    #[serde(default)]
+    pub hc_mult: usize,
+    /// Number of Sinkhorn normalization iterations for the HC mixing matrix
+    /// (`hc_sinkhorn_iters`). GLM-5.3 uses 20.
+    #[serde(default)]
+    pub hc_sinkhorn_iters: usize,
+    /// Numerical-stability epsilon for HC sigmoid/softmax/Sinkhorn (`hc_eps`).
+    #[serde(default)]
+    pub hc_eps: f32,
+
+    /// GLM-5-Next-only KDA, sparse indexer, FFN schedule, and stop-token ABI.
+    #[serde(skip)]
+    pub glm5_next: Option<Glm5NextConfig>,
+    // ---- DeepSeek V4 / V4.1 family ----
+    #[serde(default)]
+    pub num_attention_heads_per_layer: Vec<usize>,
+    #[serde(skip)]
+    pub deepseek_main_rope_theta: Option<f64>,
+    #[serde(default)]
+    pub lm_head_bf16_override: Option<bool>,
+    #[serde(default)]
+    pub lm_head_fp8: bool,
+    #[serde(default)]
+    pub mlp_only_layers: Vec<usize>,
+    #[serde(default, skip_deserializing, skip_serializing)]
+    pub moe_intermediate_sizes: Vec<usize>,
+    #[serde(default, skip_deserializing, skip_serializing)]
+    pub num_experts_per_toks: Vec<usize>,
+    #[serde(default)]
+    pub o_lora_rank: usize,
+    #[serde(default)]
+    pub o_groups: usize,
+    #[serde(default)]
+    pub yarn_mscale: f32,
+    #[serde(default)]
+    pub yarn_mscale_all_dim: f32,
+    #[serde(default)]
+    pub compress_ratios: Vec<usize>,
+    #[serde(skip)]
+    pub deepseek_v4_indexer: Option<DeepSeekV4IndexerConfig>,
+    #[serde(default)]
+    pub num_hash_layers: usize,
+    #[serde(default = "default_one_f32")]
+    pub yarn_attention_factor: f32,
+    #[serde(skip)]
+    pub deepseek_vision: Option<DeepSeekVisionConfig>,
+    #[serde(default)]
+    pub adapter_max_rank: usize,
+}
+
+/// Advertised weight-quantization layout, as declared in the HF
+/// `config.json`'s `quantization_config` block (or a sibling
+/// `hf_quant_config.json`). This is the authoritative signal for
+/// format dispatch — the `QuantFormat` trait prefers this over
+/// tensor-name sniffing, matching the dispatch model used by vLLM /
+/// TensorRT-LLM / SGLang.
+///
+/// `quant_method` is the serialization scheme:
+///   * `"compressed-tensors"` — Neural Magic / llm-compressor. Uses
+///     `weight_packed` + `weight_global_scale` + `input_global_scale`.
+///     Commonly paired with `format = "nvfp4-pack-quantized"` or
+///     `"float-quantized"`.
+///   * `"modelopt"` — NVIDIA TensorRT ModelOpt. Uses `weight` (as the
+///     packed FP4 payload when `quant_algo == "NVFP4"`) + `weight_scale`
+///     + `weight_scale_2` + `input_scale`.
+///   * `"fp8"` — native FP8 block-scaled (e.g. `Qwen/Qwen3.5-35B-A3B-FP8`)
+///     with `weight_scale_inv` sibling tensors.
+///
+/// `ignore_modules` holds the already-expanded list of module-path
+/// patterns that should be loaded as dense BF16 rather than quantized.
+/// Patterns use HF glob semantics (`*` matches any non-`.` sub-path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOptWeightFormat {
+    /// NVIDIA FP4 E2M1 payload with one scale per 16 weights.
+    Nvfp4,
+    /// NVIDIA FP8 E4M3 payload with one floating-point scale for the whole
+    /// tensor. ModelOpt omits `group_size` for this representation.
+    Fp8,
+    /// OCP MXFP8 payload with one E8M0 scale per 32 weights.
+    Mxfp8,
+}
+
+/// One entry from ModelOpt's `MIXED_PRECISION.config_groups` map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOptQuantizationGroup {
+    pub name: String,
+    pub weight_format: ModelOptWeightFormat,
+    /// Microscaling group width. Zero denotes ungrouped, per-tensor FP8.
+    pub group_size: usize,
+    pub targets: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuantizationConfig {
+    /// Raw `quant_method` string from the config. Stable values:
+    /// `"compressed-tensors"`, `"modelopt"`, `"fp8"`.
+    pub quant_method: String,
+    /// ModelOpt-specific algorithm label: `"NVFP4"`, `"FP8"`, …
+    /// Empty string for schemes that don't declare one (e.g. plain FP8).
+    pub quant_algo: String,
+    /// Optional `format` string (compressed-tensors uses this for
+    /// `"nvfp4-pack-quantized"` and friends).
+    pub format: String,
+    /// Module-path globs that should stay BF16 (`exclude_modules` in ModelOpt,
+    /// `ignore` in compressed-tensors, `modules_to_not_convert` in native FP8).
+    /// Example entries: `"lm_head"`, `"model.layers.*.self_attn*"`.
+    pub ignore_modules: Vec<String>,
+    /// Typed ModelOpt mixed-precision groups. Empty for uniform formats.
+    pub config_groups: Vec<ModelOptQuantizationGroup>,
+}
+
+impl QuantizationConfig {
+    /// Exact ModelOpt precision assigned to a module prefix.
+    ///
+    /// Mixed checkpoints such as Qwen3.8 Flash-Next enumerate concrete module
+    /// names. Ambiguous overlaps were rejected while parsing, so lookup has a
+    /// single deterministic answer.
+    pub fn modelopt_weight_format_for(&self, module_path: &str) -> Option<ModelOptWeightFormat> {
+        if let Some(group) = self
+            .config_groups
+            .iter()
+            .find(|group| group.targets.iter().any(|target| target == module_path))
+        {
+            return Some(group.weight_format);
+        }
+        self.config_groups
+            .iter()
+            .find(|group| {
+                group
+                    .targets
+                    .iter()
+                    .any(|target| modelopt_target_matches_module(target, module_path))
+            })
+            .map(|group| group.weight_format)
+    }
+}
+
+fn modelopt_target_matches_module(target: &str, module_path: &str) -> bool {
+    if target == module_path {
+        return true;
+    }
+    // 1. Canonicalize `model.language_model.layers.` <-> `model.layers.` prefix
+    //    between `hf_quant_config.json` and `config.json`/weight shards.
+    if let Some(rest) = target.strip_prefix("model.language_model.layers.") {
+        if module_path.strip_prefix("model.layers.") == Some(rest) {
+            return true;
+        }
+    } else if let Some(rest) = target.strip_prefix("model.layers.")
+        && module_path.strip_prefix("model.language_model.layers.") == Some(rest)
+    {
+        return true;
+    }
+    // 2. Match a concrete per-expert projection `<layer_prefix>.mlp.experts.<idx>.<proj>`
+    //    against a group-level `.mlp.experts` target in `quantized_layers`.
+    if let Some((before_experts, after_experts)) = module_path.split_once(".mlp.experts.")
+        && let Some((expert_idx, proj)) = after_experts.split_once('.')
+        && !expert_idx.is_empty()
+        && expert_idx.bytes().all(|b| b.is_ascii_digit())
+        && matches!(proj, "gate_proj" | "up_proj" | "down_proj")
+    {
+        let parent = format!("{before_experts}.mlp.experts");
+        if target == parent {
+            return true;
+        }
+        if let Some(rest) = parent.strip_prefix("model.language_model.layers.") {
+            if target.strip_prefix("model.layers.") == Some(rest) {
+                return true;
+            }
+        } else if let Some(rest) = parent.strip_prefix("model.layers.")
+            && target.strip_prefix("model.language_model.layers.") == Some(rest)
+        {
+            return true;
+        }
+        // ModelOpt exports MTP layer 0 as `mtp.layers.0` or `mtp.layers.48`.
+        if parent == "mtp.layers.0.mlp.experts" && target == "mtp.layers.48.mlp.experts" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Vision encoder configuration parsed from a conditional-generation model.
+#[derive(Debug, Clone)]
+pub struct VisionConfig {
+    /// Architecture tag from `vision_config.model_type`.
+    pub model_type: String,
+    /// Number of ViT transformer blocks (depth=27).
+    pub depth: usize,
+    /// ViT hidden dimension (1152).
+    pub hidden_size: usize,
+    /// Number of attention heads (16).
+    pub num_heads: usize,
+    /// Spatial patch size in pixels (16).
+    pub patch_size: usize,
+    /// Temporal patch size: still images are replicated this many times (2).
+    pub temporal_patch_size: usize,
+    /// 2×2 spatial merge: this many patch-lengths merged into one token (2).
+    pub spatial_merge_size: usize,
+    /// ViT MLP intermediate size (4304).
+    pub intermediate_size: usize,
+    /// Projection output dimension = LLM hidden_size (2048).
+    pub out_hidden_size: usize,
+    /// Input channel count (normally RGB = 3).
+    pub in_channels: usize,
+    /// Native image size from the checkpoint contract, when declared.
+    pub image_size: usize,
+    /// GLM vision merger bottleneck width. Zero for Qwen-family towers.
+    pub projection_intermediate_size: usize,
+    /// Vision RMSNorm epsilon. Zero when the tower uses LayerNorm/defaults.
+    pub rms_norm_eps: f64,
+    /// Optional model-defined clamp for vision SwiGLU.
+    pub swiglu_limit: Option<f32>,
+    /// Layer indices after which deepstack mergers are applied ([8, 16, 24]).
+    pub deepstack_visual_indexes: Vec<usize>,
+    /// Placeholder token ID that marks where vision embeddings get spliced
+    /// into the text embedding stream. Qwen3-VL uses 151655; Qwen3.6 uses
+    /// 248056. When 0 the runtime falls back to the legacy Qwen3-VL value.
+    pub image_pad_token_id: u32,
+    /// Video placeholder token ID. Zero when video is unsupported/not declared.
+    pub video_pad_token_id: u32,
+}
+
+impl VisionConfig {
+    /// Dimension of the merger input (spatial_merge_size² × hidden_size).
+    pub fn merger_input_size(&self) -> usize {
+        self.spatial_merge_size * self.spatial_merge_size * self.hidden_size
+    }
+}
+
+impl ModelConfig {
+    /// Complete model-defined generation stop set.
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        self.glm5_next
+            .as_ref()
+            .map(|config| config.eos_token_ids.clone())
+            .filter(|ids| !ids.is_empty())
+            .unwrap_or_else(|| vec![self.eos_token_id])
+    }
+}
+
+pub(crate) fn default_one() -> usize {
+    1
+}
+pub(crate) fn default_one_f32() -> f32 {
+    1.0
+}
+
+pub(crate) fn default_one_f64() -> f64 {
+    1.0
+}
+pub(crate) fn default_rope_theta() -> f64 {
+    10000.0
+}
+pub(crate) fn default_rms_eps() -> f64 {
+    1e-6
+}
+pub(crate) fn default_partial_rotary() -> f64 {
+    1.0
+}
+pub(crate) fn default_conv_kernel() -> usize {
+    4
+}
+
+mod dispatch;
+mod factory;
+mod glm5_next;
+mod methods;
+mod parsers;
+#[cfg(test)]
+mod tests;
+
+// DeepSeek-V4 / V4.1.
+mod deepseek_v4_indexer;
+pub use deepseek_v4_indexer::DeepSeekV4IndexerConfig;
+mod deepseek_vision;
+pub use deepseek_vision::DeepSeekVisionConfig;
+mod deepseek_vision_layout;
+pub use deepseek_vision_layout::{
+    ImageBlock, ImageTokenType, build_deepseek_image_block, deepseek_image_block_len,
+};
+mod deepseek_vision_tokens;
+pub use deepseek_vision_tokens::{DeepSeekImageSpan, validate_deepseek_image_tokens};
+mod deepseek_v41_pack;
+pub use deepseek_v41_pack::{
+    CB3_TENSORS, Cb3Tensor, ExpertPack, MIN_PACKED_KEEP, PACK_EXPERTS, ROUTED_EXPERTS,
+    SERVED_PACKED_KEEP,
+};
+pub(crate) use parsers::parse_deepseek_v4;
+pub(crate) use parsers::parse_deepseek_v41;
+
+pub use dispatch::parse_config;
+pub use glm5_next::{Glm5NextConfig, Glm5NextIndexerType, Glm5NextMlpType};
+pub(crate) use parsers::{
+    parse_gemma4_params, parse_glm5_next, parse_minimax_m2, parse_quantization_config_checked,
+    parse_vision_config,
+};
+pub use parsers::{parse_mistral_params, parse_quantization_config};
+
+pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
+    if config.quantization_config.is_none() {
+        config.quantization_config = parse_quantization_config_checked(raw)?;
+    }
+    validate_config(config)
+}
+
+/// Post-parse validation for ModelConfig.
+/// Checks layer_types length matches num_hidden_layers and SSM field consistency.
+pub(crate) fn validate_config(config: &ModelConfig) -> Result<()> {
+    if !config.layer_types.is_empty() && config.layer_types.len() != config.num_hidden_layers {
+        anyhow::bail!(
+            "layer_types length ({}) doesn't match num_hidden_layers ({}) in config.json",
+            config.layer_types.len(),
+            config.num_hidden_layers,
+        );
+    }
+
+    let has_ssm =
+        config.layer_types.contains(&LayerType::LinearAttention) || config.linear_num_key_heads > 0;
+    if has_ssm && config.linear_num_key_heads == 0 && config.mamba_num_heads == 0 {
+        anyhow::bail!(
+            "SSM model detected but linear_num_key_heads is 0 in config.json. \
+             This field is required for SSM/GDN layer initialization."
+        );
+    }
+
+    Ok(())
+}

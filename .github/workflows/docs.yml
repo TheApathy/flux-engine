@@ -1,0 +1,80 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/docs.yml'
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Skip CUDA/nvcc in build.rs so rustdoc can run on hosts without a GPU.
+  # - ATLAS_SKIP_BUILD=1: atlas-kernels emits a stub target_ptx.rs
+  # - CUDARC_CUDA_VERSION=13000: short-circuits cudarc's `nvcc --version`
+  #   probe. Format is {major}0{minor}0 — 13000 == CUDA 13.0.
+  ATLAS_SKIP_BUILD: "1"
+  CUDARC_CUDA_VERSION: "13000"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Build rustdoc
+        run: cargo doc --workspace --no-deps
+
+      - name: Add rustdoc index redirect
+        run: |
+          cat > target/doc/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html><head><meta charset="utf-8">
+          <title>Flux Engine API Reference</title>
+          <meta http-equiv="refresh" content="0; url=atlas_core/index.html">
+          </head><body>
+          <p>Redirecting to <a href="atlas_core/index.html">atlas_core</a>…</p>
+          </body></html>
+          EOF
+
+      - name: Upload rustdoc artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rustdoc-api
+          path: target/doc
+          retention-days: 7
+          if-no-files-found: error

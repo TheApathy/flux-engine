@@ -1,0 +1,2040 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Paired plain/native-K5 long-context exact-token gate. See README.md."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import http.client
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import select
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import types
+import urllib.parse
+
+GATE = "plain-k5-long-context"
+LABEL_PREFIX = "com.theapathy.flux."
+MAX_RESPONSE = 32 * 1024 * 1024
+MAX_SERVER_LOG_BYTES = 1024 * 1024 * 1024
+REQUEST_TIMEOUT = 14400
+READY_TIMEOUT = 1800
+# Source-pinned qualifier modules reused by import, loaded from checked bytes
+# in dependency order. A hash mismatch fails before any module executes.
+QUALIFIER_PINS = (
+    (
+        "qwen4_endpoint_admission",
+        "81d336c6bc477b6efafeb100e8e72b78c8e8b7cffc54c8880a77227c3fa84832",
+    ),
+    (
+        "r9_source_to_binary",
+        "8ef895c4a23b621af83976227b0be0442c2efb04d019e5ce0515649c6484576b",
+    ),
+    (
+        "qwen4_mtp_long_context_qualify",
+        "a7ef41f086afbec51ce3ef3cb2e4064a7b84a49fe30c33065e36996ebca808e1",
+    ),
+)
+# The outer wrapper's exact rung census (r15_exact_image_release.py
+# LONG_CONTEXT_PROMPT_TOKENS). Both 262,080-token cases fold into one row.
+CASE_PROMPT_TOKENS = (
+    2_017,
+    *range(2_043, 2_051),
+    2_112,
+    7_336,
+    7_710,
+    8_192,
+    30_647,
+    32_768,
+    65_536,
+    114_755,
+    122_413,
+    131_072,
+    238_938,
+    262_080,
+)
+NATIVE_CONTEXT = 262_144
+NATIVE_K5_ROWS = 5
+CONTINUATION_MAX_TOKENS = 1
+# Receipt logging the gate needs from the live process. Each key must be
+# absent from the release recipe or already pinned to this exact value.
+RECEIPT_LOGGING_ENV = {
+    "ATLAS_MTP_ACCEPT_LOG": "1",
+    "ATLAS_DFLASH_SPEC_CYCLE_V2": "1",
+    "ATLAS_DFLASH_ASYNC": "0",
+    "ATLAS_QWEN4_TARGET_STATE_RECEIPT": "1",
+}
+RUST_LOG_RECEIPT_TARGET = "spec_accept_log=debug"
+RUST_LOG_RECEIPT_DIRECTIVES = (
+    "info,spark::scheduler::spec_accept_log=debug,"
+    "flux_server::scheduler::spec_accept_log=debug,"
+    "flux_cli::scheduler::spec_accept_log=debug"
+)
+K5_POLICY_PREFIXES = ("ATLAS_QWEN4_", "FLUX_QWEN4_")
+FIXED_K5_ENV = {prefix + suffix: "0"
+                for prefix in K5_POLICY_PREFIXES
+                for suffix in ("MTP_CONF", "MTP_CONF_EARLY", "MTP_VOCAB_PRUNE")}
+# The two native-K5 draft policies this gate qualifies, chosen by the sealed
+# recipe. Fixed K5 drafts every chain to gamma=4. Confidence-gated K5 stops a
+# chain at the first draft whose top-1 probability falls below MTP_CONF; verify
+# still decides every committed token. Only the C=1 serve this gate runs takes
+# the gated path; batched K5 (C>1) keeps the server's fixed-K5 contract
+# (qwen4_verify_lanes::validate_fixed_k5_policy).
+FIXED_K5_POLICY = "fixed-k5"
+GATED_K5_POLICY = "confidence-gated-k5"
+GATED_K5_CONF_RE = re.compile(r"0\.[0-9]{1,4}")
+GATED_K5_EARLY_VALUES = ("0", "1")
+# Gated widths 2..4 at QSA context are lossless only with the all-K verify
+# journal (the K5-only journal corrupts pooled keys); the QSA width round-up is
+# a different, unqualified policy.
+GATED_K5_REFUSED_ENV = {
+    "ATLAS_QWEN4_QSA_JOURNAL_ALL_K": ("1",),
+    "ATLAS_QWEN4_MTP_GATE_QSA_MIN_WIDTH": (),
+}
+# Graph-disabled route-telemetry arm. ATLAS_DFLASH_DEBUG_NO_GRAPH=1 forces the
+# eager K=gamma verify route regardless of the recipe's VERIFY_GRAPH value.
+EAGER_ARM_ENV = {
+    "ATLAS_DFLASH_DEBUG_NO_GRAPH": "1",
+    "ATLAS_QWEN4_QSA_ROUTE_TELEMETRY": "1",
+}
+ARMS = (
+    ("plain", "none", {}),
+    ("k5", "native-mtp-k5", {}),
+    ("k5_eager_churn", "native-mtp-k5", EAGER_ARM_ENV),
+)
+# Qwen4 switches to sparse QSA at position 2,048. At this source revision the
+# native MTP verifier attends row by row for every frame; the sparse multi-row
+# route is unqualified, so every route receipt must say so.
+QSA_DENSE_ENDPOINT = 2_048
+SPARSE_ROWS_V2_QUALIFIED = False
+RELEASE_VERIFY_ROUTE = "row-serial"
+SCHEDULER_STARTED_RE = re.compile(
+    r"Scheduler started \(batched mode, [^\n]*max_prefill_tokens=([0-9]+)\)"
+)
+ERROR_LINE_RE = re.compile(rb"(?m)^\S+[ \t]+ERROR[ \t][^\n]*$")
+STDERR_FD = 2
+# Docker exec's client is not the parent of its in-container command. Keep a
+# launch-owned supervisor alive until stdin EOF, and acknowledge child reaping.
+EXEC_SUPERVISOR = r'''
+import base64
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+
+def supervise(argv, token):
+    child = descriptor = None
+    forced = False
+    cleanup_errors = []
+
+    def signal_owned_child(signum):
+        if descriptor is not None:
+            try:
+                signal.pidfd_send_signal(descriptor, signum)
+                return
+            except ProcessLookupError:
+                return
+            except BaseException as error:
+                cleanup_errors.append(error)
+        # This single-threaded parent owns the direct child. Popen tracks any
+        # successful reaping before its direct-child signal fallback.
+        try:
+            if signum == signal.SIGTERM:
+                child.terminate()
+            else:
+                child.kill()
+        except BaseException as error:
+            cleanup_errors.append(error)
+
+    try:
+        # The host enables launch only after its output pump owns the log FD.
+        if os.read(0, 1) != b"G":
+            return 0
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL)
+        # Do not poll/wait first: an unreaped direct child cannot reuse its PID.
+        descriptor = os.pidfd_open(child.pid)
+        while True:
+            ready = select.select([0, descriptor], [], [], None)[0]
+            if descriptor in ready or (0 in ready and not os.read(0, 65536)):
+                break
+    finally:
+        if child is not None:
+            try:
+                try:
+                    running = descriptor is None or not select.select(
+                        [descriptor], [], [], 0
+                    )[0]
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                    running = True
+                if running:
+                    signal_owned_child(signal.SIGTERM)
+                try:
+                    child.wait(timeout=10)
+                except BaseException as error:
+                    if not isinstance(error, subprocess.TimeoutExpired):
+                        cleanup_errors.append(error)
+                    forced = True
+                    signal_owned_child(signal.SIGKILL)
+                    child.wait(timeout=5)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+        print("R16_EXEC_CLEANUP token=" + token
+              + " child_started=" + str(child is not None).lower()
+              + " retired=true forced=" + str(forced).lower(), flush=True)
+    return 1 if forced else 0
+
+if __name__ == "__main__":
+    argv = json.loads(base64.b64decode(sys.argv[1], validate=True))
+    raise SystemExit(supervise(argv, sys.argv[2]))
+'''
+STATE_MARKER = "QWEN4_NATIVE_MTP_REQUEST_RECEIPT"
+STATE_RE = re.compile(
+    STATE_MARKER + r" schema=(?P<schema>[0-9]+) "
+    r"mode=(?P<mode>[^ ]+) scheduler_path=(?P<scheduler_path>[^ ]+) "
+    r"proposer_loaded=(?P<proposer_loaded>true|false) "
+    r"session_hash=(?P<session_hash>[0-9a-f]{16}) "
+    r"seq_len=(?P<seq_len>[0-9]+) token_count=(?P<token_count>[0-9]+) "
+    r"output_tokens=(?P<output_tokens>[0-9]+) gdn_layers=(?P<gdn_layers>[0-9]+) "
+    r"attention_layers=(?P<attention_layers>[0-9]+) "
+    r"logical_kv_blocks=(?P<logical_kv_blocks>[0-9]+) "
+    r"kv_token_positions=(?P<kv_token_positions>[0-9]+) "
+    r"compared_buffers=(?P<compared_buffers>[0-9]+) "
+    r"compared_bytes=(?P<compared_bytes>[0-9]+) "
+    r"state_scope=live-gdn-ple-plus-logical-bf16-kv checkpoints_excluded=true "
+    r"fed_tokens_sha256=(?P<fed_tokens_sha256>[0-9a-f]{64}) "
+    r"target_state_sha256=(?P<target_state_sha256>[0-9a-f]{64})"
+)
+STATE_INTEGER_FIELDS = (
+    "schema", "seq_len", "token_count", "output_tokens", "gdn_layers",
+    "attention_layers", "logical_kv_blocks", "kv_token_positions",
+    "compared_buffers", "compared_bytes",
+)
+STATE_IDENTITY_FIELDS = (
+    *STATE_INTEGER_FIELDS, "session_hash", "fed_tokens_sha256", "target_state_sha256",
+)
+
+
+class Void(ValueError):
+    """Fatal runtime signal: the run is void, not a measured failure."""
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_parent_suite(expected):
+    """Bind the helper pin to the actual sealed suite that launched this gate."""
+    parent = os.getppid()
+    argv = Path(f"/proc/{parent}/cmdline").read_bytes().split(b"\0")
+    candidates = [item for item in argv if re.fullmatch(rb"/proc/self/fd/[0-9]+", item)]
+    require(len(candidates) == 1, "gate must be launched by the sealed release suite")
+    number = int(candidates[0].rsplit(b"/", 1)[1])
+    descriptor = os.open(f"/proc/{parent}/fd/{number}", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        require(
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals == seals,
+            "launching suite bytes are not sealed",
+        )
+        size = os.fstat(descriptor).st_size
+        require(0 < size <= 16 * 1024 * 1024, "launching suite size differs")
+        require(
+            digest(os.pread(descriptor, size + 1, 0)) == expected
+            and os.getppid() == parent,
+            "helper differs from the launching suite",
+        )
+    finally:
+        os.close(descriptor)
+
+
+def load_module(path, expected, name):
+    """Execute checked bytes, never reopen the pathname after hashing."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * 1024 * 1024,
+            "module size is invalid",
+        )
+        payload = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+        require(
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            == (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ),
+            "module changed while reading",
+        )
+        require(digest(payload) == expected, "source dependency hash differs")
+    finally:
+        os.close(descriptor)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    sys.modules[name] = module
+    try:
+        exec(compile(payload, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def load_qualifier(directory):
+    """Load the pinned long-context qualifier and its pinned imports."""
+    root = Path(directory)
+    require(
+        root.is_absolute() and ".." not in root.parts, "qualifier directory differs"
+    )
+    module = None
+    for name, expected in QUALIFIER_PINS:
+        module = load_module(root / (name + ".py"), expected, name)
+    require(
+        module is not None
+        and module.NATIVE_CONTEXT == NATIVE_CONTEXT
+        and tuple(module.QSA_FULL_ATTENTION_LAYER_IDS) == tuple(range(12))
+        and set(CASE_PROMPT_TOKENS) <= set(module.PAIRED_PROMPT_TOKEN_COUNTS)
+        and (module.K5_FIXED_POLICY, module.K5_GATED_POLICY)
+        == (FIXED_K5_POLICY, GATED_K5_POLICY)
+        and module.K5_DRAFT_POLICY == FIXED_K5_POLICY,
+        "pinned qualifier workload differs from the release rung census",
+    )
+    return module
+
+
+def docker(arguments):
+    result = subprocess.run(
+        ["docker", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
+    )
+    require(result.returncode == 0, "Docker identity or process query failed")
+    require(len(result.stdout) <= 16 * 1024 * 1024, "Docker response is oversized")
+    return result.stdout
+
+
+def inspect_container(args, suite):
+    document = suite.strict_json_loads(
+        docker(["container", "inspect", "--format", "{{json .}}", args.container_id]),
+        "long-context container",
+    )
+    require(
+        type(document) is dict
+        and document.get("Id") == args.container_id
+        and document.get("Image") == args.image_id,
+        "container identity differs",
+    )
+    require(
+        document.get("State", {}).get("Running") is True
+        and document.get("HostConfig", {}).get("ReadonlyRootfs") is True,
+        "container is not running with read-only root",
+    )
+    labels = document.get("Config", {}).get("Labels", {})
+    plan = {
+        "in_container_binary_path": labels.get(LABEL_PREFIX + "binary-path"),
+        "in_container_recipe_path": labels.get(LABEL_PREFIX + "recipe-path"),
+        "in_container_binary_sha256": labels.get(LABEL_PREFIX + "binary-sha256"),
+        "recipe_sha256": labels.get(LABEL_PREFIX + "recipe-sha256"),
+    }
+    for key, prefix in (
+        ("in_container_binary_path", "/opt/flux/bin/"),
+        ("in_container_recipe_path", "/opt/flux/repro-kit/recipes/"),
+    ):
+        value = plan[key]
+        require(
+            type(value) is str and value.startswith(prefix),
+            "image artifact path differs",
+        )
+        suite.normalized_absolute(value, "image artifact")
+    for key in ("in_container_binary_sha256", "recipe_sha256"):
+        suite.exact_hex(plan[key], 64, "image artifact digest")
+    init_pid = suite.exact_int(
+        document.get("State", {}).get("Pid"), "container init PID", 1, 1 << 31
+    )
+    root = os.open(
+        f"/proc/{init_pid}/root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        descriptor = suite._open_process_file(root, plan["in_container_recipe_path"])
+        try:
+            observed, payload = suite._hash_regular_fd(
+                descriptor, "long-context recipe", suite.MAX_PROGRAM_BYTES
+            )
+            require(observed == plan["recipe_sha256"], "image recipe hash differs")
+            environment = {
+                key.decode(): value.decode()
+                for key, value in suite._recipe_environment(payload).items()
+            }
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root)
+    return plan, environment
+
+
+def k5_draft_policy(recipe):
+    """Classify the recipe's native-K5 draft policy, refusing anything else.
+
+    Fixed K5: every MTP_CONF/MTP_CONF_EARLY/MTP_VOCAB_PRUNE alias absent or
+    exactly "0". Confidence-gated K5: both aliases of each selector present and
+    equal, MTP_CONF a decimal strictly inside (0, 1), MTP_CONF_EARLY "0" or
+    "1", MTP_VOCAB_PRUNE "0", and none of GATED_K5_REFUSED_ENV overridden.
+    """
+    require(not any(prefix + "MTP_CONF_FILE" in recipe for prefix in K5_POLICY_PREFIXES),
+            "mutable draft confidence control file refused")
+    if all(recipe.get(key, "0") == "0" for key in FIXED_K5_ENV):
+        return FIXED_K5_POLICY
+    for suffix in ("MTP_CONF", "MTP_CONF_EARLY", "MTP_VOCAB_PRUNE"):
+        atlas, flux = (recipe.get(prefix + suffix) for prefix in K5_POLICY_PREFIXES)
+        require(atlas is not None and atlas == flux,
+                "release recipe K5 policy is neither fixed nor confidence-gated: "
+                "ATLAS/FLUX " + suffix + " differ or are missing")
+    conf = recipe["ATLAS_QWEN4_MTP_CONF"]
+    require(GATED_K5_CONF_RE.fullmatch(conf) is not None and set(conf[2:]) != {"0"},
+            "release recipe K5 policy is neither fixed nor confidence-gated: MTP_CONF="
+            + repr(conf))
+    require(recipe["ATLAS_QWEN4_MTP_CONF_EARLY"] in GATED_K5_EARLY_VALUES,
+            "release recipe K5 policy is neither fixed nor confidence-gated: MTP_CONF_EARLY")
+    require(recipe["ATLAS_QWEN4_MTP_VOCAB_PRUNE"] == "0",
+            "confidence-gated K5 refuses MTP_VOCAB_PRUNE")
+    for key, allowed in GATED_K5_REFUSED_ENV.items():
+        for alias in (key, key.replace("ATLAS_", "FLUX_", 1)):
+            require(alias not in recipe or recipe[alias] in allowed,
+                    "confidence-gated K5 refuses " + alias)
+    return GATED_K5_POLICY
+
+
+def receipt_environment(recipe, mode, extra):
+    """Release recipe plus the receipt logging this gate requires.
+
+    The live-process broker compares every recipe assignment against the
+    process environment, so a recipe that pins a receipt selector to another
+    value cannot be qualified by this gate and fails closed here.
+    """
+    environment = dict(recipe)
+    require(
+        "ATLAS_QWEN4_TARGET_STATE_RECEIPT_LIMIT" not in recipe,
+        "release recipe limits required target-state receipts",
+    )
+    environment["ATLAS_DISABLE_SPECULATION"] = "1" if mode == "none" else "0"
+    policy = k5_draft_policy(recipe)
+    if mode == "native-mtp-k5" and policy == FIXED_K5_POLICY:
+        environment.update(FIXED_K5_ENV)
+    for key, value in {**RECEIPT_LOGGING_ENV, **extra}.items():
+        require(
+            recipe.get(key, value) == value,
+            "release recipe pins a receipt selector to another value",
+        )
+        environment[key] = value
+    rust_log = recipe.get("RUST_LOG")
+    if rust_log is None:
+        environment["RUST_LOG"] = RUST_LOG_RECEIPT_DIRECTIVES
+    else:
+        directives = rust_log.split(",")
+        for required in RUST_LOG_RECEIPT_DIRECTIVES.split(",")[1:]:
+            target = required.split("=", 1)[0]
+            require([item for item in directives if item.split("=", 1)[0] == target] == [required],
+                    "release recipe RUST_LOG lacks one exact receipt target: " + target)
+    return environment
+
+
+def exchange(args, method, route, body=None, headers=None, *, timeout=REQUEST_TIMEOUT):
+    """One blocking HTTP exchange: (status, bounded raw body, header list)."""
+    parsed = urllib.parse.urlsplit(args.base_url)
+    connection = http.client.HTTPConnection(
+        parsed.hostname, parsed.port, timeout=timeout
+    )
+    try:
+        payload = None if body is None else args.suite.canonical_bytes(body)
+        request_headers = {"Content-Type": "application/json", "Connection": "close"}
+        if headers:
+            request_headers.update(headers)
+        connection.request(method, route, body=payload, headers=request_headers)
+        response = connection.getresponse()
+        raw = response.read(MAX_RESPONSE + 1)
+        require(len(raw) <= MAX_RESPONSE, "endpoint response bound differs")
+        return response.status, raw, list(response.getheaders())
+    finally:
+        connection.close()
+
+
+def request(args, method, route, body=None, *, timeout=REQUEST_TIMEOUT):
+    status, raw, _headers = exchange(args, method, route, body, timeout=timeout)
+    if route == "/health" and status != 200:
+        raise ConnectionError("server is not ready")
+    require(status == 200, "endpoint status differs")
+    return raw
+
+
+class Journal:
+    """Append-only, bounded, hashed response journal."""
+
+    def __init__(self, suite, descriptor):
+        self.suite = suite
+        self.descriptor = descriptor
+        self.hash = hashlib.sha256()
+        self.entries = 0
+
+    def record(self, entry):
+        line = self.suite.canonical_bytes(entry) + b"\n"
+        require(
+            os.fstat(self.descriptor).st_size + len(line)
+            <= self.suite.MAX_RAW_LOG_BYTES,
+            "response journal exceeds the release bound",
+        )
+        self.suite.write_all(self.descriptor, line)
+        self.hash.update(line)
+        self.entries += 1
+
+
+class GateClient:
+    """The qualifier's HTTP client surface, journaled and liveness-checked."""
+
+    def __init__(self, args, arm, journal, pidfd):
+        self.args = args
+        self.arm = arm
+        self.journal = journal
+        self.pidfd = pidfd
+        self.response_ids = set()
+
+    def _exchange(self, method, route, body, headers=None):
+        require(
+            not select.select([self.pidfd], [], [], 0)[0],
+            "long-context server exited",
+        )
+        status, raw, response_headers = exchange(
+            self.args, method, route, body, headers
+        )
+        require(
+            not select.select([self.pidfd], [], [], 0)[0],
+            "long-context server exited during request",
+        )
+        parsed = None
+        try:
+            parsed = self.args.suite.strict_json_loads(raw, route)
+        except ValueError:
+            parsed = None
+        if route == "/v1/completions" and status == 200 and type(parsed) is dict:
+            identity = parsed.get("id")
+            require(
+                type(identity) is str
+                and bool(identity)
+                and identity not in self.response_ids,
+                "response identity is missing or reused",
+            )
+            self.response_ids.add(identity)
+        self.journal.record(
+            {
+                "arm": self.arm,
+                "method": method,
+                "route": route,
+                "request_sha256": (
+                    None
+                    if body is None
+                    else digest(self.args.suite.canonical_bytes(body))
+                ),
+                "request_headers": headers,
+                "status": status,
+                "response_sha256": digest(raw),
+                "response": parsed,
+            }
+        )
+        return status, raw, response_headers
+
+    def request(self, method, route, body=None):
+        status, raw, _headers = self._exchange(method, route, body)
+        return status, raw
+
+    def json(self, method, route, body=None):
+        status, raw, _headers = self._exchange(method, route, body)
+        return status, self.args.suite.strict_json_loads(raw, route), raw
+
+    def correlated_json(self, method, route, body, request_id):
+        status, raw, headers = self._exchange(
+            method, route, body, {"X-Request-Id": request_id}
+        )
+        return status, self.args.suite.strict_json_loads(raw, route), raw, headers
+
+
+class LogCapture:
+    """Request-scoped deltas of the append-only server log descriptor."""
+
+    def __init__(self, descriptor, settle_seconds=0.1, deadline_seconds=3.0):
+        self.descriptor = descriptor
+        self.settle_seconds = settle_seconds
+        self.deadline_seconds = deadline_seconds
+        self.deltas = []
+        self.state_claims = set()
+
+    def size(self):
+        return os.fstat(self.descriptor).st_size
+
+    def read(self, offset, length):
+        chunks = []
+        while length:
+            chunk = os.pread(self.descriptor, min(1024 * 1024, length), offset)
+            require(chunk, "server log ended before its recorded size")
+            chunks.append(chunk)
+            offset += len(chunk)
+            length -= len(chunk)
+        return b"".join(chunks)
+
+    def snapshot(self):
+        return self.read(0, self.size())
+
+    def begin(self):
+        return self.size()
+
+    def finish(self, offset):
+        deadline = time.monotonic() + self.deadline_seconds
+        stable_since = time.monotonic()
+        previous = -1
+        while True:
+            size = self.size()
+            now = time.monotonic()
+            if size != previous:
+                previous = size
+                stable_since = now
+            if now - stable_since >= self.settle_seconds or now >= deadline:
+                break
+            time.sleep(0.005)
+        require(0 <= offset <= previous, "server log offset moved backwards")
+        delta = self.read(offset, previous - offset)
+        self.deltas.append(
+            {"offset": offset, "bytes": len(delta), "sha256": digest(delta)}
+        )
+        return delta
+
+    def delta_by_sha256(self, expected):
+        rows = [row for row in self.deltas if row["sha256"] == expected]
+        require(len(rows) == 1, "request log delta binding is ambiguous")
+        delta = self.read(rows[0]["offset"], rows[0]["bytes"])
+        require(digest(delta) == expected, "request log delta changed")
+        return delta
+
+    def claim_state_delta(self, expected):
+        # Repetitions can emit byte-identical Plain logs. Claim each actual
+        # offset once instead of treating a content hash as a unique request ID.
+        rows = [
+            (index, row) for index, row in enumerate(self.deltas)
+            if row["sha256"] == expected and index not in self.state_claims
+        ]
+        require(rows, "target-state request log delta is missing or already claimed")
+        index, row = rows[0]
+        delta = self.read(row["offset"], row["bytes"])
+        require(digest(delta) == expected, "target-state request log delta changed")
+        self.state_claims.add(index)
+        return delta, row
+
+    def verify_state_claims(self):
+        previous_end = 0
+        rows = (self.deltas[index] for index in self.state_claims)
+        for row in sorted(rows, key=lambda row: row["offset"]):
+            require(row["offset"] >= previous_end, "target-state request log ranges overlap")
+            require(
+                digest(self.read(row["offset"], row["bytes"])) == row["sha256"],
+                "target-state request log delta changed before sealing",
+            )
+            previous_end = row["offset"] + row["bytes"]
+
+
+def find_pid(args, model):
+    raw = docker(["container", "top", args.container_id, "-eo", "pid,args"]).decode(
+        "utf-8", "strict"
+    )
+    rows = []
+    for line in raw.splitlines()[1:]:
+        columns = line.strip().split(None, 1)
+        if len(columns) == 2 and model in columns[1].split():
+            rows.append(int(columns[0]))
+    require(len(rows) <= 1, "server process identity is ambiguous")
+    return None if not rows else rows[0]
+
+
+def claim_pid(args, pid, plan):
+    """Bind cleanup to our exact container/executable before taking ownership."""
+    descriptor = os.pidfd_open(pid)
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_bytes()
+        require(
+            re.search(
+                rb"(?<![0-9a-f])" + args.container_id.encode() + rb"(?![0-9a-f])",
+                cgroup,
+            )
+            is not None,
+            "server is outside the launch container",
+        )
+        executable = os.open(f"/proc/{pid}/exe", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            observed, _ = args.suite._hash_regular_fd(
+                executable, "long-context executable", 2 * 1024 * 1024 * 1024
+            )
+            require(
+                observed == plan["in_container_binary_sha256"],
+                "server executable hash differs",
+            )
+        finally:
+            os.close(executable)
+        require(
+            not select.select([descriptor], [], [], 0)[0],
+            "server exited before ownership",
+        )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def pump_output(source, sink_fd, errors):
+    """Copy server output to the sealed arm log and to this gate's stderr."""
+    try:
+        while True:
+            chunk = os.read(source, 65536)
+            if not chunk:
+                break
+            os_write_all(sink_fd, chunk)
+            os_write_all(STDERR_FD, chunk)
+    except BaseException as error:  # surfaced after the arm, fail closed
+        errors.append(error)
+    finally:
+        try:
+            os.close(source)
+        except BaseException as error:
+            errors.append(error)
+
+
+def os_write_all(descriptor, payload):
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        require(written > 0, "short write")
+        offset += written
+
+
+class PumpSource:
+    """Transfer a duplicated FD exactly once, including failed thread starts."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.descriptor = None
+
+    def take(self):
+        with self.lock:
+            descriptor, self.descriptor = self.descriptor, None
+            return descriptor
+
+
+def pump_owned_output(source, sink_fd, errors):
+    descriptor = source.take()
+    if descriptor is not None:
+        pump_output(descriptor, sink_fd, errors)
+
+
+def finish_server(process, pidfd, source, pump, log_fd, token, launched, errors):
+    """Retire the owned child before the Docker client, even without a claim."""
+    failures = []
+
+    def attempt(operation):
+        try:
+            return operation()
+        except BaseException as error:
+            failures.append(error)
+            return None
+
+    if process is not None:
+        try:
+            if pidfd is not None:
+                if not select.select([pidfd], [], [], 0)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                if not select.select([pidfd], [], [], 10)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    require(
+                        bool(select.select([pidfd], [], [], 5)[0]),
+                        "server survived forced cleanup",
+                    )
+                    failures.append(ValueError("server required forced cleanup"))
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            # EOF is the supervisor's containment path when claim/setup fails.
+            attempt(process.stdin.close)
+            if not process.stdin.closed:
+                attempt(process.stdin.close)
+            status = attempt(lambda: process.wait(timeout=20))
+            if process.poll() is None:
+                # Client death is not proof that the daemon-owned child died.
+                failures.append(ValueError("supervisor cleanup was not acknowledged"))
+                attempt(process.kill)
+                attempt(lambda: process.wait(timeout=5))
+            elif status != 0:
+                failures.append(ValueError("server supervisor exited unsuccessfully"))
+
+        # A failed start may still have scheduled the thread. FD ownership is
+        # shared through PumpSource so a late target cannot read a reused FD.
+        if pump is not None and pump.ident is not None:
+            attempt(lambda: pump.join(timeout=30))
+            if pump.is_alive():
+                failures.append(ValueError("server log pump did not drain"))
+        stopped = process.poll() is not None
+        if stopped:
+            attempt(lambda: pump_owned_output(source, log_fd, errors))
+        else:
+            descriptor = source.take()
+            if descriptor is not None:
+                attempt(lambda: os.close(descriptor))
+        if process.stdout is not None and not process.stdout.closed:
+            # Before the GO byte no engine can fill this pipe. This fallback
+            # captures the small cleanup acknowledgement if dup/setup failed.
+            if stopped and (pump is None or pump.ident is None):
+                def drain_stream():
+                    while True:
+                        chunk = process.stdout.read(65536)
+                        if not chunk:
+                            break
+                        os_write_all(log_fd, chunk)
+                        os_write_all(STDERR_FD, chunk)
+                attempt(drain_stream)
+            attempt(process.stdout.close)
+        if not failures and not errors:
+            receipt = (
+                "R16_EXEC_CLEANUP token=" + token
+                + " child_started=" + str(launched).lower()
+                + " retired=true forced=false\n"
+            ).encode("ascii")
+            def check_receipt():
+                size = os.fstat(log_fd).st_size
+                require(size <= MAX_SERVER_LOG_BYTES, "server log exceeds bound")
+                raw = os.pread(log_fd, min(size, 4096), max(0, size - 4096))
+                require(
+                    raw.endswith(receipt) and raw.count(receipt) == 1,
+                    "supervisor cleanup was not acknowledged",
+                )
+            attempt(check_receipt)
+    if pidfd is not None:
+        attempt(lambda: os.close(pidfd))
+    require(not errors, "server log capture failed")
+    if failures:
+        raise ValueError("server cleanup failed: " + str(failures[0])) from failures[0]
+
+
+@contextmanager
+def server(args, mode, plan, recipe, model, log_fd, extra_env):
+    environment = receipt_environment(recipe, mode, extra_env)
+    argv = [
+        plan["in_container_binary_path"],
+        "serve",
+        "--no-tui",
+        "--model-from-path",
+        "/models",
+        "--model-name",
+        model,
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        str(args.container_port),
+        "--max-batch-size",
+        "1",
+        "--max-num-seqs",
+        "1",
+        "--max-seq-len",
+        str(NATIVE_CONTEXT),
+        "--kv-cache-dtype",
+        "bf16",
+    ]
+    if mode == "native-mtp-k5":
+        argv += ["--speculative", "--num-drafts", "4"]
+    command = [
+        "docker",
+        "exec",
+        "-i",
+        args.container_id,
+        "/usr/bin/env",
+        *[key + "=" + value for key, value in sorted(environment.items())],
+        "/usr/bin/python3",
+        "-c",
+        EXEC_SUPERVISOR,
+        base64.b64encode(json.dumps(argv).encode("utf-8")).decode("ascii"),
+    ]
+    token = secrets.token_hex(32)
+    command.append(token)
+    process = pump = None
+    pump_errors = []
+    source = PumpSource()
+    launched = False
+    pid = pidfd = None
+    proof = None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        source.descriptor = os.dup(process.stdout.fileno())
+        pump = threading.Thread(
+            target=pump_owned_output,
+            args=(source, log_fd, pump_errors),
+            daemon=True,
+        )
+        process.stdout.close()
+        pump.start()
+        # One byte is atomic. Mark the attempt before writing so an ambiguous
+        # write failure cannot masquerade as proof that no engine was started.
+        launched = True
+        require(process.stdin.write(b"G") == 1, "server launch control short write")
+        process.stdin.flush()
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "server launcher exited before readiness")
+            if pid is None:
+                pid = find_pid(args, model)
+                if pid is not None:
+                    pidfd = claim_pid(args, pid, plan)
+            if pid is not None:
+                try:
+                    request(args, "GET", "/health", timeout=2)
+                    request(args, "GET", "/health", timeout=2)
+                    proof = args.suite.verify_live_server(
+                        {
+                            "schema": "flux-r15-live-process-request/1",
+                            "mode": mode,
+                            "host_pid": pid,
+                        },
+                        plan,
+                        args.identities,
+                    )
+                    break
+                except (
+                    ConnectionError,
+                    TimeoutError,
+                    OSError,
+                    http.client.HTTPException,
+                ):
+                    pass
+            time.sleep(0.1)
+        require(proof is not None, "fresh server readiness deadline expired")
+        yield proof, pidfd
+        final = args.suite.verify_live_server(
+            {
+                "schema": "flux-r15-live-process-request/1",
+                "mode": mode,
+                "host_pid": pid,
+            },
+            plan,
+            args.identities,
+        )
+        require(final == proof, "server identity changed during the long-context arm")
+    finally:
+        finish_server(
+            process, pidfd, source, pump, log_fd, token, launched, pump_errors
+        )
+
+
+def scan_fatal_markers(suite, qualifier, logs_raw):
+    """VOID the run on any NVRM/Xid/OOM/illegal-access/panic signal."""
+    for label, pattern in suite._RAW_LOG_COMPILED:
+        if pattern.search(logs_raw) is not None:
+            raise Void("server log matched fatal pattern " + label)
+    text = logs_raw.decode("utf-8", "replace")
+    for marker in qualifier.FORBIDDEN_LOG_MARKERS:
+        if marker in text:
+            raise Void("server log matched forbidden marker")
+
+
+def error_level_lines(logs_raw, permitted_ranges):
+    """ERROR-level lines fail closed unless inside a permitted rejection delta."""
+    observed = []
+    for match in ERROR_LINE_RE.finditer(logs_raw):
+        start = match.start()
+        inside = any(begin <= start < begin + size for begin, size in permitted_ranges)
+        observed.append({"offset": start, "permitted": inside})
+    require(
+        all(row["permitted"] for row in observed),
+        "server emitted ERROR-level lines outside the overflow rejection probe",
+    )
+    return observed
+
+
+def startup_max_prefill_tokens(startup_logs):
+    matches = SCHEDULER_STARTED_RE.findall(startup_logs)
+    require(len(matches) == 1, "server startup lacks one scheduler receipt")
+    return int(matches[0])
+
+
+def expected_verify_route(
+    seq_len, rows, *, sparse_rows_v2_qualified=None, k5_policy=FIXED_K5_POLICY
+):
+    """Release route policy for one native-K5 verify frame starting at seq_len.
+
+    Fixed K5 verifies exactly 5 rows; confidence-gated K5 verifies 2..5.
+    """
+    if sparse_rows_v2_qualified is None:
+        sparse_rows_v2_qualified = SPARSE_ROWS_V2_QUALIFIED
+    require(k5_policy in (FIXED_K5_POLICY, GATED_K5_POLICY), "route policy K5 policy differs")
+    allowed_rows = (
+        range(2, NATIVE_K5_ROWS + 1) if k5_policy == GATED_K5_POLICY else (NATIVE_K5_ROWS,)
+    )
+    require(
+        type(seq_len) is int and seq_len > 0 and type(rows) is int and rows in allowed_rows,
+        "route policy geometry differs",
+    )
+    every_row_sparse = seq_len >= QSA_DENSE_ENDPOINT
+    if sparse_rows_v2_qualified and every_row_sparse:
+        return "sparse-rows-v2"
+    return RELEASE_VERIFY_ROUTE
+
+
+def validate_route_policy(
+    frame_receipts, *, sparse_rows_v2_qualified=None, k5_policy=FIXED_K5_POLICY
+):
+    """Every telemetry frame must use exactly the route the policy expects."""
+    require(type(frame_receipts) is list and frame_receipts, "no QSA route frames")
+    counts = {"row-serial": 0, "sparse-rows-legacy": 0, "sparse-rows-v2": 0}
+    for frame in frame_receipts:
+        expected = expected_verify_route(
+            frame["seq_len"],
+            frame["rows"],
+            sparse_rows_v2_qualified=sparse_rows_v2_qualified,
+            k5_policy=k5_policy,
+        )
+        route_counts = frame["route_counts"]
+        require(
+            type(route_counts) is dict
+            and set(route_counts) == set(counts)
+            and all(
+                route_counts[route] == (12 if route == expected else 0)
+                for route in counts
+            ),
+            "QSA verify route differs from the release route policy",
+        )
+        counts[expected] += 1
+    return {
+        "frames": len(frame_receipts),
+        "frame_route_counts": counts,
+        "dense_endpoint": QSA_DENSE_ENDPOINT,
+        "sparse_rows_v2_qualified": bool(
+            SPARSE_ROWS_V2_QUALIFIED
+            if sparse_rows_v2_qualified is None
+            else sparse_rows_v2_qualified
+        ),
+        "release_route": RELEASE_VERIFY_ROUTE,
+    }
+
+
+def validate_continuation(value, prompt_tokens, model):
+    """One ordinary target token after the paired completion."""
+    require(
+        type(value) is dict and "error" not in value and value.get("model") == model,
+        "continuation response differs",
+    )
+    usage = value.get("usage")
+    choices = value.get("choices")
+    require(
+        type(usage) is dict and type(choices) is list and len(choices) == 1,
+        "continuation response shape differs",
+    )
+    require(
+        usage.get("prompt_tokens") == prompt_tokens
+        and type(usage.get("prompt_tokens")) is int
+        and usage.get("completion_tokens") == CONTINUATION_MAX_TOKENS
+        and usage.get("total_tokens") == prompt_tokens + CONTINUATION_MAX_TOKENS,
+        "continuation usage differs from the exact request",
+    )
+    details = usage.get("prompt_tokens_details")
+    require(
+        type(details) is dict and details.get("cached_tokens") == 0,
+        "continuation used or failed to report cached prompt tokens",
+    )
+    choice = choices[0]
+    require(
+        type(choice) is dict
+        and choice.get("index") == 0
+        and choice.get("finish_reason") == "length"
+        and type(choice.get("text")) is str,
+        "continuation choice differs",
+    )
+    tokens = choice.get("token_ids")
+    require(
+        type(tokens) is list
+        and len(tokens) == CONTINUATION_MAX_TOKENS
+        and all(type(token) is int and 0 <= token <= 0xFFFF_FFFF for token in tokens),
+        "continuation lacks its exact scheduler-owned token ID",
+    )
+    return {
+        "prompt_tokens": prompt_tokens,
+        "token_ids": tokens,
+        "text": choice["text"],
+        "finish_reason": "length",
+        "total_tokens": prompt_tokens + CONTINUATION_MAX_TOKENS,
+    }
+
+
+def continuation_log_evidence(qualifier, logs, prompt_tokens, native):
+    markers = (
+        f"Chunked prefill start: {prompt_tokens} prompt tokens,",
+        f"Prefilling: {prompt_tokens} prompt tokens,",
+    )
+    dispatches = sum(logs.count(marker) for marker in markers)
+    require(dispatches == 1, "continuation probe has no exact scheduler dispatch")
+    require("control=loaded-serial" not in logs, "continuation demoted to serial")
+    frames = qualifier.parse_mtp_accept_frames(logs)
+    records = qualifier.parse_completed_spec_cycles(logs)
+    if not native:
+        require(not frames and not records, "target-only continuation used native MTP")
+    return {
+        "prompt_tokens": prompt_tokens,
+        "scheduler_dispatches": dispatches,
+        "native_mtp_frames": len(frames),
+        "completed_spec_cycles": len(records),
+    }
+
+
+def execute_continuations(qualifier, client, bundle, results, capture, model, native):
+    rows = []
+    cases = {case["case_id"]: case for case in bundle["manifest"]["cases"]}
+    bodies = {
+        case["case_id"]: body
+        for case, body in zip(
+            bundle["manifest"]["cases"], bundle["bodies"], strict=True
+        )
+    }
+    for result in results:
+        case_id = result["case_id"]
+        observation = result["observations"][0]
+        prompt = (
+            bodies[case_id]["prompt_token_ids"] + observation["completion_token_ids"]
+        )
+        if len(prompt) + CONTINUATION_MAX_TOKENS > NATIVE_CONTEXT:
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "skipped": True,
+                    "reason": "continuation would exceed the native endpoint",
+                }
+            )
+            continue
+        body = qualifier.completion_body(
+            model, prompt, max_tokens=CONTINUATION_MAX_TOKENS, ignore_eos=True, stop=[]
+        )
+        offset = capture.begin()
+        status, value, _raw = client.json("POST", "/v1/completions", body)
+        require(status == 200, "continuation probe returned a non-200 status")
+        row = validate_continuation(value, len(prompt), model)
+        delta = capture.finish(offset)
+        row["request_log_evidence"] = continuation_log_evidence(
+            qualifier, delta.decode("utf-8", "replace"), len(prompt), native
+        )
+        row["request_log_evidence"]["log_delta_sha256"] = digest(delta)
+        row["target_state_receipt"] = bind_target_state(
+            "continuation/" + case_id, capture, row["request_log_evidence"],
+            prompt, row["token_ids"],
+            "k5" if native else "plain",
+        )
+        require(
+            cases[case_id]["prompt_tokens"] + observation["completion_tokens"]
+            == len(prompt),
+            "continuation geometry drifted",
+        )
+        rows.append({"case_id": case_id, "skipped": False, **row})
+    return rows
+
+
+def compare_continuations(plain, native):
+    require(len(plain) == len(native), "continuation census differs")
+    identity = {}
+    for left, right in zip(plain, native, strict=True):
+        require(left["case_id"] == right["case_id"], "continuation ordering differs")
+        if left["skipped"] or right["skipped"]:
+            require(
+                left["skipped"]
+                and right["skipped"]
+                and left["reason"] == right["reason"],
+                "continuation skip differs between arms",
+            )
+            identity[left["case_id"]] = True
+            continue
+        same = all(
+            left[field] == right[field]
+            for field in (
+                "prompt_tokens",
+                "token_ids",
+                "text",
+                "finish_reason",
+                "total_tokens",
+            )
+        )
+        require(same, "subsequent ordinary target token differs between plain and K5")
+        compare_target_states(
+            left["target_state_receipt"], right["target_state_receipt"],
+            "continuation/" + left["case_id"],
+        )
+        identity[left["case_id"]] = True
+    return identity
+
+
+def fed_tokens_sha256(tokens):
+    """Exact framed v1 domain from qwen4_target_state_receipt::token_digest."""
+    context = hashlib.sha256()
+
+    def field(label, raw):
+        context.update(len(label).to_bytes(8, "little"))
+        context.update(label)
+        context.update(len(raw).to_bytes(8, "little"))
+        context.update(raw)
+
+    field(b"domain", b"atlas-qwen4-fed-tokens-v1")
+    field(b"count", len(tokens).to_bytes(8, "little"))
+    for token in tokens:
+        require(type(token) is int and 0 <= token <= 0xFFFF_FFFF, "fed token is not u32")
+        context.update(token.to_bytes(4, "little"))
+    return context.hexdigest()
+
+
+def parse_target_states(logs):
+    receipts = []
+    for line in logs.splitlines():
+        if STATE_MARKER not in line:
+            continue
+        require(line.count(STATE_MARKER) == 1, "ambiguous target-state receipt line")
+        match = STATE_RE.fullmatch(line[line.index(STATE_MARKER):].strip())
+        require(match is not None, "malformed or failed target-state receipt")
+        row = match.groupdict()
+        for key in STATE_INTEGER_FIELDS:
+            row[key] = int(row[key])
+        row["proposer_loaded"] = row["proposer_loaded"] == "true"
+        receipts.append(row)
+    return receipts
+
+
+def capture_target_state(scope, delta, prompt, completion, arm):
+    rows = parse_target_states(delta.decode("utf-8", "strict"))
+    require(len(rows) == 1, scope + ": request must emit exactly one target-state receipt")
+    receipt = rows[0]
+    require(arm in {name for name, _mode, _extra in ARMS}, scope + ": unknown state arm")
+    expected_mode = (
+        ("unloaded-target-only", "ordinary-target-only", False)
+        if arm == "plain" else ("engaged-native-mtp", "native-mtp", True)
+    )
+    require(
+        receipt["schema"] == 1
+        and tuple(receipt[key] for key in ("mode", "scheduler_path", "proposer_loaded"))
+        == expected_mode,
+        scope + ": target-state proposer or scheduler mode differs",
+    )
+    # Ordinary decode and terminal verify reconciliation leave the final
+    # emitted token pending. A one-token completion has fed only its prompt.
+    require(prompt and completion, scope + ": unsupported empty target-fed geometry")
+    require(
+        len(prompt) + len(completion) <= NATIVE_CONTEXT,
+        scope + ": unsupported target-fed endpoint geometry",
+    )
+    fed = [*prompt, *completion[:-1]]
+    require(
+        receipt["seq_len"] == receipt["token_count"] == len(fed)
+        and receipt["output_tokens"] == len(completion),
+        scope + ": target-state one-token-behind census differs",
+    )
+    require(
+        receipt["gdn_layers"] == 36 and receipt["attention_layers"] == 12
+        and 0 < receipt["logical_kv_blocks"] <= len(fed)
+        and receipt["kv_token_positions"] == len(fed) * 12
+        and receipt["compared_buffers"] == 73 + 24 * receipt["logical_kv_blocks"]
+        and receipt["compared_bytes"] > 0,
+        scope + ": target-state GDN/PLE/logical-BF16-KV coverage differs",
+    )
+    require(
+        receipt["fed_tokens_sha256"] == fed_tokens_sha256(fed),
+        scope + ": target-fed token digest differs from the exact request and output prefix",
+    )
+    return {**receipt, "log_delta_sha256": digest(delta)}
+
+
+def bind_result_states(qualifier, capture, bundle, results, arm):
+    for result in results:
+        _case, body = qualifier.bundle_case(bundle, result["case_id"])
+        observations, evidence = result["observations"], result["request_log_evidence"]
+        require(len(observations) == len(evidence), "target-state repetition census differs")
+        result["target_state_receipts"] = [
+            bind_target_state(
+                f"{arm}/{result['case_id']}/{index}",
+                capture, log,
+                body["prompt_token_ids"], observation["completion_token_ids"], arm,
+            )
+            for index, (observation, log) in enumerate(
+                zip(observations, evidence, strict=True)
+            )
+        ]
+        for receipt in result["target_state_receipts"][1:]:
+            compare_target_states(
+                result["target_state_receipts"][0], receipt,
+                arm + "/" + result["case_id"] + "/repetition",
+            )
+
+
+def bind_one_case_state(qualifier, capture, bundle, result, arm):
+    _case, body = qualifier.bundle_case(bundle, result["case_id"])
+    result["target_state_receipt"] = bind_target_state(
+        arm + "/" + result["phase"],
+        capture, result["request_log_evidence"],
+        body["prompt_token_ids"], result["observation"]["completion_token_ids"], arm,
+    )
+
+
+def bind_target_state(scope, capture, evidence, prompt, completion, arm):
+    delta, locator = capture.claim_state_delta(evidence["log_delta_sha256"])
+    return {
+        **capture_target_state(scope, delta, prompt, completion, arm),
+        "log_delta_offset": locator["offset"], "log_delta_bytes": locator["bytes"],
+    }
+
+
+def compare_target_states(left, right, scope):
+    mismatched = [key for key in STATE_IDENTITY_FIELDS if left[key] != right[key]]
+    require(not mismatched, scope + ": target-state mismatch in " + ", ".join(mismatched))
+    return {
+        "fed_tokens_sha256": left["fed_tokens_sha256"],
+        "target_state_sha256": left["target_state_sha256"],
+    }
+
+
+def compare_observations(left, right, scope):
+    require(
+        {key: value for key, value in left.items() if key != "repetition"}
+        == {key: value for key, value in right.items() if key != "repetition"},
+        scope + ": response differs from the Plain control",
+    )
+
+
+def compare_result_states(plain, native, scope):
+    require(
+        [row["case_id"] for row in plain] == [row["case_id"] for row in native],
+        scope + ": target-state case census differs",
+    )
+    comparisons = []
+    for left, right in zip(plain, native, strict=True):
+        a, b = left["target_state_receipts"], right["target_state_receipts"]
+        require(len(a) == len(b) > 0, scope + ": target-state repetition census differs")
+        for index, (first, second) in enumerate(zip(a, b, strict=True)):
+            comparisons.append(
+                {
+                    "case_id": left["case_id"], "repetition": index,
+                    **compare_target_states(first, second, scope + "/" + left["case_id"]),
+                }
+            )
+    return comparisons
+
+
+def acceptance_depth(qualifier, capture, result):
+    """Per-request K5 acceptance census. Acceptance is not correctness."""
+    histogram = {str(depth): 0 for depth in range(5)}
+    cycles = 0
+    partial = 0
+    for evidence in result.get("request_log_evidence", []):
+        delta = capture.delta_by_sha256(evidence["log_delta_sha256"])
+        for record in qualifier.parse_completed_spec_cycles(
+            delta.decode("utf-8", "replace")
+        ):
+            cycles += 1
+            histogram[str(record["accepted"])] += 1
+            if record["accepted"] < record["gamma"]:
+                partial += 1
+    return {
+        "completed_spec_cycles": cycles,
+        "accepted_histogram": histogram,
+        "completed_partial_accept_cycles": partial,
+        "mean_accepted": (
+            sum(int(key) * value for key, value in histogram.items()) / cycles
+            if cycles
+            else None
+        ),
+    }
+
+
+def execute_arm(args, qualifier, arm, client, capture, bundle, model):
+    startup = capture.snapshot().decode("utf-8", "replace")
+    max_prefill = startup_max_prefill_tokens(startup)
+    record = {"arm": arm, "max_prefill_tokens": max_prefill}
+    if arm == "plain":
+        bundle = qualifier.build_request_bundle(client, model)
+        record["bundle"] = bundle
+    else:
+        require(bundle is not None, "request bundle is missing")
+        qualifier.validate_tokenizer_parity(client, bundle)
+    if arm == qualifier.EAGER_CHURN_ARM:
+        record["results"] = qualifier.execute_requests(
+            client,
+            bundle,
+            qualifier.GRAPH_DISABLED_CASE_IDS,
+            log_capture=capture,
+            require_native_mtp=True,
+            require_qsa_route_telemetry=True,
+        )
+        bind_result_states(qualifier, capture, bundle, record["results"], arm)
+        record["rollback_slot_reuse"] = qualifier.execute_rollback_slot_reuse(
+            client, bundle, capture, require_qsa_route_telemetry=True
+        )
+        for result in record["rollback_slot_reuse"]["sequence"]:
+            bind_one_case_state(qualifier, capture, bundle, result, arm)
+    else:
+        record["results"] = qualifier.execute_requests(
+            client, bundle, log_capture=capture, require_native_mtp=arm == "k5"
+        )
+        bind_result_states(qualifier, capture, bundle, record["results"], arm)
+        record["continuations"] = execute_continuations(
+            qualifier, client, bundle, record["results"], capture, model, arm == "k5"
+        )
+        if arm == "plain":
+            record["endpoint_admission"] = qualifier.execute_endpoint_admission_probes(
+                client,
+                bundle,
+                capture,
+                max_prefill if max_prefill > 0 else NATIVE_CONTEXT,
+            )
+            for key in ("accepted_262143_plus_1", "post_rejection_completion_canary"):
+                bind_one_case_state(
+                    qualifier, capture, bundle, record["endpoint_admission"][key], arm
+                )
+            rejection = record["endpoint_admission"]["rejected_262144_plus_1"]
+            require(
+                not parse_target_states(
+                    capture.delta_by_sha256(rejection["log_delta_sha256"]).decode(
+                        "utf-8", "strict"
+                    )
+                ),
+                "overflow rejection unexpectedly emitted target state",
+            )
+        else:
+            case, body = qualifier.bundle_case(
+                bundle, qualifier.ADMISSION_ACCEPT_CASE_SPEC[0]
+            )
+            record["endpoint_boundary_control"] = qualifier.execute_one_case(
+                client, case, body, "native-endpoint-boundary-control",
+                log_capture=capture,
+                require_native_mtp=False,
+            )
+            bind_one_case_state(
+                qualifier, capture, bundle, record["endpoint_boundary_control"], arm
+            )
+    if arm != "plain":
+        record["acceptance_depth"] = {
+            result["case_id"]: acceptance_depth(qualifier, capture, result)
+            for result in record["results"]
+        }
+    metrics = request(args, "GET", "/metrics").decode("utf-8", "strict")
+    k5_events = sum(
+        float(value)
+        for value in re.findall(
+            r'^atlas_spec_decode_verify_total\{[^\n}]*\bk="5"[^\n}]*\}\s+([0-9.eE+-]+)\s*$',
+            metrics,
+            re.MULTILINE,
+        )
+    )
+    require(
+        math.isfinite(k5_events)
+        and 0 <= k5_events <= 1_000_000_000_000
+        and float(k5_events).is_integer(),
+        "native K5 verification counter is malformed",
+    )
+    require(
+        k5_events > 0 if arm != "plain" else k5_events == 0,
+        "native K5 verifier engagement differs",
+    )
+    record["verification_metrics"] = {
+        "k5_events": int(k5_events),
+        "metrics_sha256": digest(metrics.encode()),
+        "metrics": metrics,
+    }
+    return record
+
+
+def finalize_arm_log(suite, qualifier, arm, record, capture, log_fd):
+    logs_raw = suite.read_fd(
+        log_fd, "long-context server log", MAX_SERVER_LOG_BYTES, nlink=1
+    )
+    scan_fatal_markers(suite, qualifier, logs_raw)
+    logs = logs_raw.decode("utf-8", "replace")
+    record["log_evidence"] = qualifier.validate_log_contract(arm, logs)
+    record["log_evidence"]["qsa_verify_rows_marker"] = (
+        qualifier.K5_QSA_VERIFY_ROWS_MARKER in logs
+    )
+    permitted = []
+    admission = record.get("endpoint_admission")
+    if admission is not None:
+        rejection = admission["rejected_262144_plus_1"]
+        rows = [
+            row
+            for row in capture.deltas
+            if row["sha256"] == rejection["log_delta_sha256"]
+        ]
+        require(len(rows) == 1, "overflow rejection delta binding is ambiguous")
+        permitted.append((rows[0]["offset"], rows[0]["bytes"]))
+        expected = {}
+        for result in record["results"]:
+            prompt_tokens = result["observations"][0]["prompt_tokens"]
+            expected[prompt_tokens] = expected.get(prompt_tokens, 0) + len(
+                result["observations"]
+            )
+        for row in record["continuations"]:
+            if not row["skipped"]:
+                expected[row["prompt_tokens"]] = (
+                    expected.get(row["prompt_tokens"], 0) + 1
+                )
+        for admission_row in (
+            admission["accepted_262143_plus_1"],
+            admission["post_rejection_completion_canary"],
+        ):
+            prompt_tokens = admission_row["observation"]["prompt_tokens"]
+            expected[prompt_tokens] = expected.get(prompt_tokens, 0) + 1
+        admission["final_dispatch_census"] = (
+            qualifier.endpoint_gate.validate_final_dispatch_census(
+                logs,
+                expected,
+                rejected_prompt_tokens=qualifier.ADMISSION_REJECT_CASE_SPEC[1],
+            )
+        )
+    record["error_level_lines"] = error_level_lines(logs_raw, permitted)
+    rollback = record.get("rollback_slot_reuse")
+    if rollback is not None:
+        rollback["rollback_log_evidence"] = {
+            "completed_partial_accept_rollbacks": record["log_evidence"][
+                "completed_partial_accept_rollbacks"
+            ],
+            "first_completed_partial_accept_rollback": record["log_evidence"][
+                "first_completed_partial_accept_rollback"
+            ],
+            "request_sequence": record["log_evidence"]["rollback_slot_log_sequence"],
+        }
+        rollback["single_slot_geometry"] = {
+            "max_batch_size": 1,
+            "max_num_seqs": 1,
+            "ssm_cache_slots": "argv-unspecified-cli-default",
+            "basis": (
+                "each completed request releases the only model-owned slot "
+                "before the next request"
+            ),
+        }
+        record["qsa_route_policy"] = validate_route_policy(
+            record["log_evidence"]["qsa_route_telemetry"]["frame_receipts"],
+            k5_policy=qualifier.K5_DRAFT_POLICY,
+        )
+    expected_states = sum(len(row["target_state_receipts"]) for row in record["results"])
+    expected_states += sum(not row["skipped"] for row in record.get("continuations", []))
+    if admission is not None:
+        expected_states += 2
+    if "endpoint_boundary_control" in record:
+        expected_states += 1
+    if rollback is not None:
+        expected_states += len(rollback["sequence"])
+    capture.verify_state_claims()
+    require(
+        len(parse_target_states(logs)) == expected_states == len(capture.state_claims),
+        "whole-arm target-state receipt census differs from dispatched requests",
+    )
+    record["target_state_request_count"] = expected_states
+    record["server_log"] = {"bytes": len(logs_raw), "sha256": digest(logs_raw)}
+
+
+def case_rows(qualifier, arms, continuation_identity):
+    """The wrapper's exact per-rung rows plus the extra qualifier cases."""
+    plain = {row["case_id"]: row for row in arms["plain"]["results"]}
+    native = {row["case_id"]: row for row in arms["k5"]["results"]}
+    depth = arms["k5"]["acceptance_depth"]
+    startup_rows = arms["k5"]["log_evidence"]["qsa_verify_rows_marker"] is True
+    per_case = {}
+    for case_id, prompt_tokens, _coverage in qualifier.PAIRED_CASE_SPECS:
+        left, right = plain[case_id], native[case_id]
+        left_rows, right_rows = left["observations"], right["observations"]
+        require(len(left_rows) == len(right_rows) >= 1, "repetition census differs")
+        token_identity = all(
+            a["completion_token_ids"] == b["completion_token_ids"]
+            for a, b in zip(left_rows, right_rows, strict=True)
+        ) and continuation_identity.get(case_id, False)
+        text_identity = all(
+            a["text"] == b["text"] for a, b in zip(left_rows, right_rows, strict=True)
+        )
+        finish_identity = all(
+            a["finish_reason"] == b["finish_reason"]
+            for a, b in zip(left_rows, right_rows, strict=True)
+        )
+        usage_identity = all(
+            (a["prompt_tokens"], a["completion_tokens"], a["total_tokens"])
+            == (b["prompt_tokens"], b["completion_tokens"], b["total_tokens"])
+            for a, b in zip(left_rows, right_rows, strict=True)
+        )
+        evidence = right["request_log_evidence"]
+        engaged = bool(evidence) and all(
+            row["matching_geometry_native_mtp_frames"] > 0
+            and row["matching_geometry_completed_spec_cycles"] > 0
+            and len(row["runtime_request_ids"]) == 1
+            for row in evidence
+        )
+        per_case[case_id] = {
+            "prompt_tokens": prompt_tokens,
+            "plain_total_tokens": left_rows[0]["total_tokens"],
+            "k5_total_tokens": right_rows[0]["total_tokens"],
+            "token_identity": token_identity,
+            "text_identity": text_identity,
+            "finish_reason_identity": finish_identity,
+            "usage_identity": usage_identity,
+            "native_k5_engaged": engaged,
+            "partial_accept_cycle": depth[case_id]["completed_partial_accept_cycles"]
+            > 0,
+            "qsa_verify_rows_engaged": engaged and startup_rows,
+        }
+    rows = []
+    for prompt_tokens in CASE_PROMPT_TOKENS:
+        members = [
+            case for case in per_case.values() if case["prompt_tokens"] == prompt_tokens
+        ]
+        require(members, "release rung is missing from the qualifier workload")
+        rows.append(
+            {
+                "prompt_tokens": prompt_tokens,
+                "plain_total_tokens": max(
+                    case["plain_total_tokens"] for case in members
+                ),
+                "k5_total_tokens": max(case["k5_total_tokens"] for case in members),
+                **{
+                    key: all(case[key] for case in members)
+                    for key in (
+                        "token_identity",
+                        "text_identity",
+                        "finish_reason_identity",
+                        "usage_identity",
+                        "native_k5_engaged",
+                        "partial_accept_cycle",
+                        "qsa_verify_rows_engaged",
+                    )
+                },
+            }
+        )
+    additional = {
+        case_id: case
+        for case_id, case in per_case.items()
+        if case["prompt_tokens"] not in CASE_PROMPT_TOKENS
+    }
+    return rows, per_case, additional
+
+
+def make_directory(suite, runtime, parts):
+    parent = suite.open_directory_chain(runtime, "long-context runtime")
+    try:
+        for name in parts:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+            os.close(parent)
+            parent = child
+    finally:
+        os.close(parent)
+
+
+def seal_artifact(suite, runtime, locator, payload, label):
+    descriptor = suite.create_beneath(runtime, locator, label, 0o400)
+    try:
+        suite.write_all(descriptor, payload)
+        os.fsync(descriptor)
+        suite.assert_path_identity(runtime, locator, descriptor, label)
+    finally:
+        os.close(descriptor)
+    return {"artifact": locator, "sha256": digest(payload), "bytes": len(payload)}
+
+
+def run(args):
+    suite = args.suite
+    qualifier = load_qualifier(args.qualifier_dir)
+    plan, recipe = inspect_container(args, suite)
+    # Classify before any server starts; the qualifier's log parsers then
+    # enforce the same policy for every arm. Fixed K5 stays the default.
+    policy = k5_draft_policy(recipe)
+    qualifier.configure_k5_draft_policy(policy)
+    runtime = suite.normalized_absolute(args.runtime_dir, "long-context runtime")
+    runtime_identity = suite.directory_identity_sha256(runtime, "long-context runtime")
+    parts = ["long-context", "plain-k5"]
+    make_directory(suite, runtime, parts)
+    base = "/".join(parts)
+    journal_path = base + "/responses.jsonl"
+    journal_fd = suite.create_beneath(
+        runtime, journal_path, "long-context response journal", 0o400
+    )
+    journal = Journal(suite, journal_fd)
+    model = "flux-long-context-" + secrets.token_hex(16)
+    arms, proofs = {}, []
+    bundle = None
+    request_bundle = None
+    try:
+        for arm, mode, extra in ARMS:
+            log_locator = base + "/" + arm + ".server.log"
+            log_fd = suite.create_beneath(
+                runtime, log_locator, "long-context server log", 0o400
+            )
+            try:
+                capture = LogCapture(log_fd)
+                with server(args, mode, plan, recipe, model, log_fd, extra) as (
+                    proof,
+                    pidfd,
+                ):
+                    proofs.append(proof)
+                    client = GateClient(args, arm, journal, pidfd)
+                    record = execute_arm(
+                        args, qualifier, arm, client, capture, bundle, model
+                    )
+                    if arm == "plain":
+                        bundle = record.pop("bundle")
+                        request_bundle = seal_artifact(
+                            suite,
+                            runtime,
+                            base + "/requests.json",
+                            suite.canonical_bytes(
+                                {
+                                    "schema": "flux-r15-long-context-requests/1",
+                                    "request_manifest": bundle["manifest"],
+                                    "request_manifest_sha256": bundle[
+                                        "manifest_sha256"
+                                    ],
+                                    "bodies": bundle["bodies"],
+                                }
+                            ),
+                            "long-context request bundle",
+                        )
+                os.fsync(log_fd)
+                suite.assert_path_identity(
+                    runtime, log_locator, log_fd, "long-context server log"
+                )
+                finalize_arm_log(suite, qualifier, arm, record, capture, log_fd)
+                record["server_log"]["artifact"] = log_locator
+                record["mode"] = mode
+                record["environment_overrides"] = dict(extra)
+                record["proof_index"] = len(proofs) - 1
+                arms[arm] = record
+            finally:
+                os.close(log_fd)
+        os.fsync(journal_fd)
+        suite.assert_path_identity(
+            runtime, journal_path, journal_fd, "long-context response journal"
+        )
+        observed_journal, _ = suite._hash_regular_fd(
+            journal_fd, "long-context response journal", suite.MAX_RAW_LOG_BYTES
+        )
+        require(
+            observed_journal == journal.hash.hexdigest(), "response journal changed"
+        )
+        require(
+            suite.directory_identity_sha256(runtime, "long-context runtime")
+            == runtime_identity,
+            "long-context runtime identity changed",
+        )
+        require(len(proofs) == len(ARMS), "live process proof census differs")
+        require(
+            len({(proof["host_pid"], proof["start_time_ticks"]) for proof in proofs})
+            == len(proofs),
+            "arms reused one live process",
+        )
+        comparison = qualifier.compare_arms(
+            arms["plain"]["results"], arms["k5"]["results"]
+        )
+        continuation_identity = compare_continuations(
+            arms["plain"]["continuations"], arms["k5"]["continuations"]
+        )
+        plain_by_id = {row["case_id"]: row for row in arms["plain"]["results"]}
+        k5_by_id = {row["case_id"]: row for row in arms["k5"]["results"]}
+        eager = arms[qualifier.EAGER_CHURN_ARM]
+        graph_disabled = {
+            "plain_vs_forced_eager": qualifier.compare_arms(
+                [plain_by_id[case_id] for case_id in qualifier.GRAPH_DISABLED_CASE_IDS],
+                eager["results"],
+                qualifier.GRAPH_DISABLED_CASE_IDS,
+            ),
+            "normal_k5_vs_forced_eager": qualifier.compare_arms(
+                [k5_by_id[case_id] for case_id in qualifier.GRAPH_DISABLED_CASE_IDS],
+                eager["results"],
+                qualifier.GRAPH_DISABLED_CASE_IDS,
+            ),
+        }
+        state_comparisons = {
+            "plain_vs_k5": compare_result_states(
+                arms["plain"]["results"], arms["k5"]["results"], "plain/K5"
+            ),
+            "plain_vs_forced_eager": compare_result_states(
+                [plain_by_id[case_id] for case_id in qualifier.GRAPH_DISABLED_CASE_IDS],
+                eager["results"], "plain/forced-eager",
+            ),
+            "normal_k5_vs_forced_eager": compare_result_states(
+                [k5_by_id[case_id] for case_id in qualifier.GRAPH_DISABLED_CASE_IDS],
+                eager["results"], "K5/forced-eager",
+            ),
+            "rollback_vs_plain": [],
+        }
+        for result in eager["rollback_slot_reuse"]["sequence"]:
+            baseline = plain_by_id[result["case_id"]]
+            scope = "rollback/" + result["phase"]
+            compare_observations(baseline["observations"][0], result["observation"], scope)
+            state_comparisons["rollback_vs_plain"].append(
+                {
+                    "phase": result["phase"], "case_id": result["case_id"],
+                    **compare_target_states(
+                        baseline["target_state_receipts"][0],
+                        result["target_state_receipt"], scope,
+                    ),
+                }
+            )
+        admission = arms["plain"]["endpoint_admission"]
+        plain_endpoint = admission["accepted_262143_plus_1"]
+        native_endpoint = arms["k5"]["endpoint_boundary_control"]
+        compare_observations(
+            plain_endpoint["observation"], native_endpoint["observation"], "endpoint/plain-K5"
+        )
+        state_comparisons["endpoint_plain_vs_k5"] = compare_target_states(
+            plain_endpoint["target_state_receipt"], native_endpoint["target_state_receipt"],
+            "endpoint/plain-K5",
+        )
+        canary = admission["post_rejection_completion_canary"]
+        canary_baseline = plain_by_id[canary["case_id"]]
+        compare_observations(
+            canary_baseline["observations"][0], canary["observation"], "post-rejection/plain"
+        )
+        state_comparisons["post_rejection_plain_canary"] = compare_target_states(
+            canary_baseline["target_state_receipts"][0], canary["target_state_receipt"],
+            "post-rejection/plain",
+        )
+        cases, per_case, additional = case_rows(qualifier, arms, continuation_identity)
+        for row in cases:
+            for key in (
+                "token_identity",
+                "text_identity",
+                "finish_reason_identity",
+                "usage_identity",
+                "native_k5_engaged",
+                "partial_accept_cycle",
+                "qsa_verify_rows_engaged",
+            ):
+                require(row[key] is True, "long-context rung " + key + " differs")
+        validator = {
+            "schema": "flux-r15-gate-validator/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "raw": {
+                "cases": cases,
+                "case_detail": per_case,
+                "additional_cases": additional,
+                "prompt_token_counts": list(CASE_PROMPT_TOKENS),
+                "native_context_total_tokens": NATIVE_CONTEXT,
+                "request_bundle": request_bundle,
+                "response_journal": {
+                    "artifact": journal_path,
+                    "sha256": journal.hash.hexdigest(),
+                    "requests": journal.entries,
+                },
+                "arms": arms,
+                "comparison": comparison,
+                "continuation_identity": continuation_identity,
+                "graph_disabled_boundary_comparisons": graph_disabled,
+                "target_state_comparisons": state_comparisons,
+                "target_state_contract": {
+                    "schema": 1,
+                    "fed_prefix": "prompt-plus-completion-excluding-final-pending-token",
+                    "scope": "live-gdn-ple-plus-logical-bf16-kv",
+                    "checkpoints_excluded": True,
+                    "native_metadata_is_not_verification_engagement": True,
+                },
+                "endpoint_admission": arms["plain"]["endpoint_admission"],
+                "rollback_slot_reuse": eager["rollback_slot_reuse"],
+                "qsa_route_policy": eager["qsa_route_policy"],
+                "process_bindings": proofs,
+                "qualifier_pins": {name: sha for name, sha in QUALIFIER_PINS},
+                "k5_draft_policy": policy,
+            },
+        }
+        validator_raw = suite.canonical_bytes(validator)
+        require(
+            len(validator_raw) <= suite.MAX_GATE_RECEIPT_BYTES,
+            "validator artifact exceeds the release bound",
+        )
+        validator_path = base + "/validator.json"
+        sealed = seal_artifact(
+            suite, runtime, validator_path, validator_raw, "long-context validator"
+        )
+        evidence = {
+            "case_count": len(cases),
+            "max_prompt_tokens": max(row["prompt_tokens"] for row in cases),
+            "max_total_tokens": max(
+                max(row["plain_total_tokens"], row["k5_total_tokens"]) for row in cases
+            ),
+            "prompt_token_counts": [row["prompt_tokens"] for row in cases],
+            "plain_k5_token_identity": True,
+            "plain_k5_text_identity": True,
+            "plain_k5_finish_reason_identity": True,
+            "plain_k5_usage_identity": True,
+            "native_k5_engaged": True,
+            "partial_accept_cycle": True,
+            "qsa_verify_rows_engaged": True,
+            "validator_artifact": validator_path,
+            "validator_receipt_sha256": sealed["sha256"],
+        }
+        require(
+            evidence["max_prompt_tokens"] == NATIVE_CONTEXT - 64
+            and evidence["max_total_tokens"] == NATIVE_CONTEXT,
+            "native endpoint geometry differs",
+        )
+        receipt = {
+            "schema": "flux-r15-container-gate-receipt/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "execution_scope": "immutable-container",
+            "image_id": args.image_id,
+            "image_digest": args.image_digest,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "evidence": evidence,
+        }
+        suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+        os.fsync(args.receipt_fd)
+        return receipt
+    finally:
+        os.close(journal_fd)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in (
+        "container-id",
+        "image-id",
+        "image-digest",
+        "base-url",
+        "run-id",
+        "receipt-fd",
+        "raw-log-fd",
+        "runtime-dir",
+        "suite-program",
+        "suite-sha256",
+        "qualifier-dir",
+    ):
+        parser.add_argument(
+            "--" + name, required=True, type=int if name.endswith("-fd") else str
+        )
+    parser.add_argument("--container-port", type=int, default=8888)
+    args = parser.parse_args(argv)
+    parsed = urllib.parse.urlsplit(args.base_url)
+    require(
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.port is not None
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None,
+        "base URL must be explicit HTTP IPv4 loopback",
+    )
+    require(1 <= args.container_port <= 65535, "container port is invalid")
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.container_id) is not None,
+        "container ID differs",
+    )
+    for value in (args.image_id, args.image_digest):
+        require(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None,
+            "immutable image identity differs",
+        )
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.run_id) is not None,
+        "run ID is invalid",
+    )
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.suite_sha256) is not None
+        and set(args.suite_sha256) != {"0"},
+        "suite dependency hash is invalid",
+    )
+    require(
+        Path(args.qualifier_dir).is_absolute()
+        and ".." not in Path(args.qualifier_dir).parts,
+        "qualifier directory must be one normalized absolute path",
+    )
+    verify_parent_suite(args.suite_sha256)
+    args.suite = load_module(
+        args.suite_program, args.suite_sha256, "_r16_suite_" + GATE.replace("-", "_")
+    )
+    require(
+        callable(getattr(args.suite, "_live_listener_identity", None))
+        and callable(getattr(args.suite, "_verify_live_mode", None)),
+        "source-pinned live broker upgrade is required",
+    )
+    args.identities = {
+        name: getattr(args, name)
+        for name in ("container_id", "image_id", "image_digest", "run_id", "base_url")
+    }
+    require(
+        hasattr(signal, "pidfd_send_signal") and hasattr(os, "pidfd_open"),
+        "local Linux pidfd support is required",
+    )
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Void as error:
+        print(GATE + ": VOID (" + str(error) + ")", file=sys.stderr)
+        return 3
+    except Exception as error:
+        # Paths, host identifiers, and response text stay in private artifacts.
+        print(
+            GATE + ": qualification failed (" + type(error).__name__ + ")",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

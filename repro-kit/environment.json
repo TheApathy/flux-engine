@@ -1,0 +1,116 @@
+{
+  "schema_version": "1.0.0",
+  "kit_version": "0.1.0",
+  "sanitization_policy": "FLUX-SEC-0001",
+  "recorded_at": "2026-10-17T12:15:35Z",
+  "host": {
+    "hostname": "<HOSTNAME>",
+    "user": "<USER>",
+    "os": "Ubuntu 24.04 LTS (aarch64)",
+    "kernel": "6.17.0-1014-nvidia",
+    "arch": "aarch64",
+    "container_base_image": "nvcr.io/nvidia/cuda:13.0.0-base-ubuntu24.04"
+  },
+  "gpu": {
+    "topology": "1x-spark",
+    "device_count": 1,
+    "device_index": 0,
+    "name": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "nvcc_target": "sm_121a",
+    "streaming_multiprocessors": 48,
+    "max_warps_per_sm": 48,
+    "shared_memory_per_sm_kb": 128,
+    "l2_cache_mib": 32,
+    "driver_version": "580.126.09",
+    "cuda_version": "13.0",
+    "nvcc_release": "V13.0.88",
+    "cublas_version": "13.1.0.3",
+    "power_state": "P8 / P0 active boost"
+  },
+  "cpu": {
+    "architecture": "ARM64 Grace (20 cores: 10x Cortex-X925 + 10x Cortex-A725)",
+    "isa": "ARMv9.2-A",
+    "pinned_cpulist": "5-9,15-19",
+    "pinned_core_count": 10,
+    "pinning_mechanism": "taskset -c 5-9,15-19 and ATLAS_PLE_READ_AFFINITY=big"
+  },
+  "memory": {
+    "type": "Coherent Unified Memory Architecture (UMA) LPDDR5X",
+    "physical_gb": 128.0,
+    "os_visible_gib": 119.7,
+    "peak_theoretical_bandwidth_gbps": 301.0,
+    "sustained_stream_bandwidth_gbps": 273.0,
+    "minimum_free_uma_floor_policy_mib": 5120,
+    "observed_free_uma_floor_w16384_mib": 7072,
+    "observed_free_uma_floor_w4096_mib": 11907,
+    "observed_free_uma_floor_estonia_136k_mib": 8431
+  },
+  "engine_pin": {
+    "release_version": "0.9.12-6k-stable",
+    "git_tree": "flux-engine",
+    "stable_git_commit": "ae58bc27efd8b35aa4272da15dd5f4c549ec332a",
+    "stable_binary_sha256": "29e959d401137bb4da2248319cbddced0fefb66b5a3c91f55cdc2141bd98dab5",
+    "stable_build_receipt_sha256": "d2fab21f5f69c5859ad1f7a53c96ba12d7caa1c4beb2e9cb196d1a14716eb99a",
+    "peak_16k_git_commit": "0760867638160ad0496bb7de4293f8e93e40f597",
+    "peak_16k_binary_sha256": "187811ccc713df82385a8ca37a56fd97a9707b40a00bb3745a1b06686de01b5d",
+    "peak_median_git_commit": "63618f6619c0780401e9a4da86e7f4c3eec17e77",
+    "peak_median_binary_sha256": "71252d2e13316dfbf02b5bcbd95fb01bc90dbeffcde5f0b7e944dd4b75c7943a"
+  },
+  "runtime_profiles": {
+    "max-prefill": {
+      "recipe_file": "/opt/flux/repro-kit/recipes/flux-v9-max-prefill.env",
+      "argv": [
+        "serve",
+        "--no-tui",
+        "--bind", "127.0.0.1",
+        "--port", "8899",
+        "--model-from-path", "<MODELS_ROOT>/Qwen3.8-Flash-Next-NVFP4-Offload",
+        "--model-name", "qwen38-native-mtp-frontier-v1",
+        "--kernel-target", "qwen3.8-flash-next",
+        "--gpu-memory-utilization", "0.85",
+        "--kv-cache-dtype", "bf16",
+        "--block-size", "16",
+        "--max-seq-len", "135168",
+        "--max-prefill-tokens", "16384",
+        "--max-batch-size", "1",
+        "--max-num-seqs", "1",
+        "--ssm-cache-slots", "0",
+        "--qwen4-qsa",
+        "--oom-guard-mb", "4096",
+        "--request-timeout", "300",
+        "--disable-simhash-watchdog",
+        "--enable-prefix-caching", "false",
+        "--speculative",
+        "--mtp-from-path", "<MODELS_ROOT>/Qwen3.8-Flash-Next-Inferact-MTP",
+        "--num-drafts", "4",
+        "--mtp-vocab", "96000",
+        "--mtp-quantization", "bf16"
+      ],
+      "argv_sha256": "78c9825d265e24fd077425d0cda815355b72059687fc70a6c9d9dc346541a14f",
+      "env_file_sha256": "2942f6ae474c84a175bb3969f2d6eedad43c60bd917162f76ad443f706420889",
+      "env_effective_sorted_sha256": "5c66756f484115779cdd5acc6d83a7fd0e4e4d39a21d4e06349dc4b1153f3a0d",
+      "active_atlas_keys_count": 163,
+      "historical_v0912_capture_pins": {
+        "argv_sha256": "34d7dbb721fb46038c433d3c99aa753bfe9c300176c6b3be71b1c1bd0b3e755a",
+        "env_file_sha256": "6376ccc2485dc502c4971f679658ecd27e0e433d7ea7e67139d009d6f32ab172",
+        "env_effective_sorted_sha256": "b6817eba2f62594a87bec84cfbbbcc844ca7d4f95151c7b4af23a619b147deaa",
+        "active_atlas_keys_count": 145
+      }
+    },
+    "interactive-w4096": {
+      "recipe_file": "/opt/flux/repro-kit/recipes/flux-v9-w4096-interactive.env",
+      "max_prefill_tokens": 4096,
+      "argv_sha256": "fe244cb7c14b481de349609b942e87f1ba53814db2f37c2a9fc8e7bf24861066",
+      "env_file_sha256": "318b36a75b485a4b73cc20b4b13285d21a1c66327f1de5a95d574c6a03039663",
+      "env_effective_sorted_sha256": "8f17088c78584e1f3e5cfc2f84f70828546c0d64155aa325aa606e219040b1ab",
+      "active_atlas_keys_count": 165,
+      "historical_v0912_capture_pins": {
+        "argv_sha256": "8be2812d0cd515982f25583d25116d97cc426e72564066c2721057ba978100cb",
+        "env_file_sha256": "911958d7663d6b5dccfc3a72c48988e56cd7ad1aa176d74b3c476ec35f8e9f86",
+        "env_effective_sorted_sha256": "6115890b7e4c14d7902d82c1b432b525ad1250844c89e9613bb6e91fda71d67d",
+        "active_atlas_keys_count": 145
+      }
+    }
+  }
+}

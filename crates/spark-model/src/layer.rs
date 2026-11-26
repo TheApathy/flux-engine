@@ -1,0 +1,456 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Composable transformer layer traits (SDD).
+//!
+//! Decouples the generic model loop (embed -> layers -> norm -> lm_head)
+//! from layer-specific logic (attention vs SSM, MoE vs dense FFN).
+//! Adding a new architecture only requires implementing [`TransformerLayer`]
+//! for each layer type, not duplicating the model loop.
+
+use std::any::Any;
+
+use atlas_core::config::ModelConfig;
+use spark_runtime::buffers::BufferArena;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+mod qwen4_cross_seq;
+mod transformer_layer;
+pub use qwen4_cross_seq::{
+    QWEN4_CROSS_SEQ_MAX_K, QWEN4_CROSS_SEQ_MAX_ROWS, QWEN4_CROSS_SEQ_MIN_K, Qwen4CrossSeqFrame,
+    Qwen4CrossSeqRows, Qwen4CrossSeqStaging, max_seqs_per_frame, plan_frames,
+};
+pub use transformer_layer::MoeStreamTransposeScratch;
+pub use transformer_layer::TransformerLayer;
+
+/// Per-layer persistent state tracked across decode steps.
+///
+/// Attention layers use [`EmptyLayerState`] (KV lives in `PagedKvCache`).
+/// SSM layers use [`SsmLayerState`] (recurrent h_state + conv_state).
+/// Custom layers can implement this trait for arbitrary state.
+pub trait LayerState: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// Empty state for layers that store all persistent state externally
+/// (e.g., attention layers where KV is in `PagedKvCache`).
+pub struct EmptyLayerState;
+
+impl LayerState for EmptyLayerState {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// SSM layer state: recurrent hidden state + conv1d sliding window.
+///
+/// Used by Mamba, Gated Delta Net (GDN), and similar recurrent layers.
+pub struct SsmLayerState {
+    /// Recurrent hidden state: [num_v_heads, v_dim, k_dim] in f32.
+    pub h_state: DevicePtr,
+    /// Conv1d sliding window state: [d_inner, d_conv] in f32.
+    pub conv_state: DevicePtr,
+    /// Checkpoint buffer for h_state (allocated lazily for speculative decode).
+    pub h_state_checkpoint: Option<DevicePtr>,
+    /// Checkpoint buffer for conv_state (allocated lazily for speculative decode).
+    pub conv_state_checkpoint: Option<DevicePtr>,
+    /// Intermediate h_state snapshots during batched verification.
+    /// Element i holds h_state after processing verification token i.
+    /// Used by rollback_ssm_states to restore to the correct position.
+    pub h_state_intermediates: Vec<DevicePtr>,
+    /// Intermediate conv_state snapshots during batched verification.
+    pub conv_state_intermediates: Vec<DevicePtr>,
+    /// WY17 LAZY commit retention: full per-verify k/q/v buffer
+    /// (`conv_out_buf` = `[K, conv_dim]` BF16) copied out of the shared
+    /// forward-context scratch during the lazy wy17 verify, so the commit
+    /// path can feed the SAME inputs to `gated_delta_rule_wy17_replay` when a
+    /// partial accept lands on a skipped (non-checkpoint) intermediate slot.
+    /// `None` unless `ATLAS_WY17_LAZY_COMMIT=1`. Allocated lazily.
+    pub wy17_kv_retain: Option<DevicePtr>,
+    /// WY17 LAZY commit retention: full per-verify gate/beta buffer
+    /// (`gates_buf` = `[K, 2*num_v_heads]` FP32). Paired with `wy17_kv_retain`.
+    pub wy17_gate_retain: Option<DevicePtr>,
+    /// Is the h-state in this slot stored as FP16 rather than FP32?
+    ///
+    /// `ATLAS_SSM_H_FP16` narrows the GDN decode/verify h-state to FP16. The
+    /// pool stays FP32-SIZED (prefill writes FP32 through several kernel
+    /// families); the FP16 state occupies the first half of the same region, so
+    /// allocation, snapshot sizing and every byte-wise copier stay correct
+    /// without knowing the dtype.
+    ///
+    /// The invariant is: a slot holds FP32 while its sequence is PREFILLING and
+    /// FP16 while it is DECODING, and this flag is the single source of truth
+    /// for which. It must be flipped OUTSIDE any CUDA-graph capture region —
+    /// a conversion launched from inside a layer gets captured and then replayed
+    /// on every subsequent step, re-reading already-FP16 state as FP32. That
+    /// fails silently: an FP32 bit pattern read as two halves is a plausible
+    /// number, not a fault.
+    pub h_is_f16: bool,
+}
+
+impl LayerState for SsmLayerState {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Pre-uploaded attention metadata device pointers.
+///
+/// Uploaded once per decode step in the model loop, reused across all
+/// 12 attention layers. Eliminates 44 redundant H2D copies per step.
+///
+/// For batched decode (num_seqs > 1), arrays are contiguous:
+/// - positions: `[N]` u32
+/// - slots: `[N]` i64
+/// - seq_lens: `[N]` i32
+/// - block_table: `[N * max_blocks_per_seq]` i32 (row-major)
+#[derive(Clone, Copy)]
+pub struct AttnMetadataDev {
+    /// Host-side request policy: maintain/use Qwen4 QSA side indexes.
+    /// This is deliberately carried alongside the device pointers so every
+    /// attention layer sees the same immutable decision during prefill,
+    /// decode, and speculative verification.
+    pub qwen4_qsa_required: bool,
+    /// Position values: `[N]` u32 at this device address. For multi-modal
+    /// MRoPE this is the temporal (T) stream; callers set
+    /// `positions_h`/`positions_w` to distinct buffers only when the token
+    /// stream contains image or video patches.
+    pub positions: DevicePtr,
+    /// Height (H) position stream for MRoPE-interleaved. When identical
+    /// to `positions` (same pointer) the rope reduces to scalar RoPE.
+    /// Default: same as `positions`.
+    pub positions_h: DevicePtr,
+    /// Width (W) position stream for MRoPE-interleaved. Same fallback as
+    /// `positions_h`.
+    pub positions_w: DevicePtr,
+    /// Slot mappings: `[N]` i64 at this device address.
+    pub slot: DevicePtr,
+    /// Sequence lengths (+1): `[N]` i32 at this device address.
+    pub seq_len: DevicePtr,
+    /// Block tables: `[N * max_blocks_per_seq]` i32 at this device address.
+    pub block_table: DevicePtr,
+    /// Number of blocks per sequence row in block_table.
+    pub max_blocks_per_seq: u32,
+    /// Number of sequences in this batch (1 for single-sequence decode).
+    pub num_seqs: u32,
+}
+
+/// Q12 batched-prefill device-side metadata.
+///
+/// The single-stream `AttnMetadataDev` collapses per-stream pointers into
+/// concrete device pointers because there's only one stream. For Q12 we
+/// dispatch N concurrent prefilling streams through one batched kernel,
+/// and the kernel takes:
+///   - stacked positions / slot tables (one big buffer with all streams'
+///     data concatenated in cu_seqlens order), and
+///   - per-stream pointer arrays for block_table / seq_len / h_state.
+///
+/// Built once per `prefill_batch_chunk_dispatch` call by
+/// `stage_batched_attn_metadata`; threaded through the model-level
+/// per-layer batched dispatch (`prefill_attn_batched_layer`,
+/// `prefill_ssm_batched_layer`) — see `model/trait_impl/prefill_b/batch.rs`.
+pub struct BatchedAttnMetadata {
+    /// Stacked positions across all streams: `[total_tokens]` u32 at this
+    /// address. For MRoPE interleaved this is the temporal (T) stream.
+    pub positions_stacked: DevicePtr,
+    /// MRoPE H position stream, stacked. Equal to `positions_stacked` when
+    /// MRoPE is disabled.
+    pub positions_h_stacked: DevicePtr,
+    /// MRoPE W position stream, stacked. Equal to `positions_stacked` when
+    /// MRoPE is disabled.
+    pub positions_w_stacked: DevicePtr,
+    /// Stacked slot indices for KV writes: `[total_tokens]` i64.
+    pub slot_stacked: DevicePtr,
+    /// Per-stream block_table pointer array: `[batch_size]` of `DevicePtr`,
+    /// each element pointing to a stream's chunked-prefill block_table.
+    /// Used by `prefill_attention_paged_*_batched` kernels.
+    pub block_table_ptrs: DevicePtr,
+    /// Per-stream seq_len pointer array: `[batch_size]` of `DevicePtr`.
+    pub seq_len_ptrs: DevicePtr,
+    // Note: `h_state_ptrs` is NOT cached in BatchedAttnMetadata because
+    // it's per-layer (each SSM layer's SsmLayerState has its own h_state
+    // allocation). `prefill_ssm_batched_layer` stages h_state_ptrs JIT
+    // per-layer-call into the model's scratch buffer.
+    /// Number of batched streams.
+    pub batch_size: u32,
+    /// Per-stream chunk_len (SAME for all streams — scheduler-enforced
+    /// constraint via `can_batch_prefill_only`).
+    pub chunk_len: u32,
+    /// Total tokens stacked across streams: `batch_size * chunk_len`.
+    pub total_tokens: u32,
+    /// Maximum block_table length across the batch (kernel uses for
+    /// bounds checking; per-stream block_table reads via the pointer
+    /// array dereference).
+    pub max_blocks_per_seq: u32,
+}
+
+/// Device pointers to full-sequence GDN input/output buffers.
+///
+/// Used by the two-phase SSM prefill: phase 1 writes GDN inputs here,
+/// phase 2 reads them for the single-launch GDN kernel, phase 3 reads output.
+///
+/// Uses a **packed QKV layout** matching the conv1d output: each token occupies
+/// `conv_dim` contiguous BF16 elements as `[Q(key_dim) | K(key_dim) | V(value_dim)]`.
+/// This allows simple contiguous memcpy from per-chunk conv1d output buffers.
+/// The GDN kernel reads Q/K/V via stride parameters (`qk_stride = conv_dim`,
+/// `v_stride = conv_dim`) to index into the packed layout.
+pub struct GdnPrefillBuffers {
+    /// Packed Q/K/V: [total_len, conv_dim] BF16.
+    /// Layout per token: [Q(key_dim) | K(key_dim) | V(value_dim)].
+    pub qkv: DevicePtr,
+    /// Interleaved gate/beta: [total_len, 2*num_v_heads] FP32.
+    /// Layout per token: [gate(nv) | beta(nv)].
+    pub gate_beta: DevicePtr,
+    /// GDN recurrence output: [total_len, value_dim] BF16.
+    pub output: DevicePtr,
+    /// Z gate for gated RMS norm: [total_len, value_dim] BF16.
+    pub z: DevicePtr,
+    /// Total number of tokens across all chunks.
+    pub total_len: usize,
+}
+
+/// Tree-aware attention KV indirection plumbing.
+///
+/// `ATLAS_TREE_AWARE_ATTN=1` + tree-mode K=γ verify: each query at compact
+/// slot `t` in the tree must attend ONLY to its true ancestor chain (not
+/// to sibling/cousin slots that happen to come before it in compact order).
+/// The host-side builder fills `kv_indir[t * stride + j]` with the compact
+/// index of the j-th ancestor of `t` (j in `[0..depth[t]+1)`). The kernel
+/// remaps positions `>= kv_indir_base` via this table; positions
+/// `[0..kv_indir_base)` (prior linear context) read normally.
+#[derive(Clone, Copy)]
+pub struct TreeAwareAttn {
+    /// Device pointer to `int32_t[num_seqs * kv_indir_stride]`. Row `t`
+    /// holds the compact indices of slot t's ancestors (depth[t]+1 entries,
+    /// padded out — the kernel only reads up to `seq_lens[t]-kv_indir_base`).
+    pub kv_indir: spark_runtime::gpu::DevicePtr,
+    /// CUDA graph fix: position threshold lives in a 1×i32 device buffer.
+    /// Positions `[0..*kv_indir_base_ptr)` are prior linear context (read
+    /// normally); positions `[*kv_indir_base_ptr..seq_lens[t])` are the
+    /// tree-window remapped via indirection. Host writes `seq.seq_len`
+    /// here before each K=γ verify step so captured CUDA graphs see the
+    /// fresh value on each replay instead of the stale scalar that was
+    /// baked into the kernel-launch node at capture time.
+    pub kv_indir_base_ptr: spark_runtime::gpu::DevicePtr,
+    /// Row stride of `kv_indir`, in i32 slots (= dflash_kgamma typically).
+    pub kv_indir_stride: u32,
+    /// ATLAS_TREE_KV_PACK: when present, the multi-seq attention dispatch
+    /// runs a tiny scatter kernel to pack the ancestor KV into a contiguous
+    /// per-layer scratch pool, then calls `paged_decode_attn_*` against the
+    /// scratch with NULL indirection (fast BC=4 batched path) instead of
+    /// the slower indirected per-position fallback. `None` keeps the
+    /// existing tree-aware single-position fallback path active.
+    pub pack: Option<TreeKvPack>,
+}
+
+/// ATLAS_TREE_KV_PACK plumbing — references the per-attention-layer scratch
+/// pools owned by `TransformerModel`. All pointers are stable (allocated at
+/// model init); per-step `verify_d.rs` only re-uploads `seq_lens` (chain
+/// length per row).
+#[derive(Clone, Copy)]
+pub struct TreeKvPack {
+    /// Number of attention layers (= length of `scratch_k_ptrs` /
+    /// `scratch_v_ptrs` arrays). Used to bounds-check `attn_layer_idx`.
+    pub num_attn_layers: u32,
+    /// Raw pointer to a `[num_attn_layers]` slice of K-pool `DevicePtr`
+    /// values. Lifetime: pinned for the duration of the forward pass
+    /// (lives on the model). The dispatcher dereferences this with
+    /// `attn_layer_idx` to find the K scratch pool for the current layer.
+    pub scratch_k_ptrs: *const spark_runtime::gpu::DevicePtr,
+    /// Same as `scratch_k_ptrs` for V.
+    pub scratch_v_ptrs: *const spark_runtime::gpu::DevicePtr,
+    /// Identity block table (`[num_seqs] i32`, value seq_idx) shared by all
+    /// layers. The packed scratch has `num_blocks = num_seqs` with one
+    /// `stride`-wide block per seq, and the consumer kernel multiplies
+    /// `seq_idx * max_blocks_per_seq=1` to land at `bt[seq] = seq`.
+    pub identity_block_table: spark_runtime::gpu::DevicePtr,
+    /// Per-step `seq_lens` (`[num_seqs] i32`) holding `depth[t] + 1` for
+    /// the packed-KV attention call. Uploaded fresh per K=γ verify step.
+    pub seq_lens: spark_runtime::gpu::DevicePtr,
+    /// Per-block bytes in the scratch pool. Passed as the consumer
+    /// kernel's `block_stride_bytes` (NVFP4) / `cache_stride` (FP8).
+    pub block_stride_bytes: u64,
+    /// NVFP4 data-section bytes per block (0 for FP8). Passed as
+    /// `data_section_bytes` to the NVFP4 consumer kernel.
+    pub data_section_bytes: u64,
+    /// Synthetic block_size (= max_chain_len = kv_indir_stride). Passed
+    /// as the consumer kernel's `block_size` argument.
+    pub block_size: u32,
+    /// FP8 scatter kernel handle (`KernelHandle(0)` if not loaded).
+    pub scatter_fp8_kernel: spark_runtime::gpu::KernelHandle,
+    /// NVFP4 scatter kernel handle (`KernelHandle(0)` if not loaded).
+    pub scatter_nvfp4_kernel: spark_runtime::gpu::KernelHandle,
+    /// Active KV cache geometry forwarded to the scatter kernel —
+    /// the source paged cache uses `cache_block_size` not `block_size`.
+    pub cache_block_size: u32,
+    /// Real `max_blocks_per_seq` for the source paged cache (used by the
+    /// scatter to index the caller's block_table).
+    pub cache_max_blocks_per_seq: u32,
+    /// CUDA graph fix: absolute position where the tree window begins
+    /// (`= seq.seq_len`, same value as `TreeAwareAttn::kv_indir_base_ptr`).
+    /// Stored in a 1×i32 device buffer (in practice the same buffer as
+    /// `kv_indir_base_ptr` since both hold `seq.seq_len`). Forwarded to
+    /// the scatter kernel so a captured graph sees the fresh value on
+    /// each replay instead of the stale scalar baked in at capture time.
+    pub abs_base_ptr: spark_runtime::gpu::DevicePtr,
+}
+
+// SAFETY: `TreeKvPack` holds raw pointers (`*const DevicePtr`) into a
+// `Vec<DevicePtr>` owned by `TransformerModel`. The vector is allocated
+// once at model init and never resized, so the pointers stay valid for
+// the model's lifetime. The struct is shared across threads in the same
+// way `TreeAwareAttn` is — via per-step `ForwardContext` copies. The
+// `DevicePtr` values themselves are POD (`Copy`), so reading them is
+// race-free.
+unsafe impl Send for TreeKvPack {}
+unsafe impl Sync for TreeKvPack {}
+
+/// Device base of the per-step attention metadata (positions | slots |
+/// seq_lens | block table) inside `buffers.scratch()`. One region shared by
+/// every target decode/verify frame and by the Qwen4 MTP draft step and chain
+/// (`qwen4_mtp.rs` `CHAIN_META_OFFSET`). Safe only because each user uploads
+/// its complete metadata with `copy_h2d_group_on_stream` (which drains the
+/// stream first) before its first launch that reads it, graph replays
+/// included. A path that would launch against metadata uploaded by an
+/// earlier frame (e.g. a replay across an MTP draft) needs its own region.
+pub(crate) const STEP_META_SCRATCH_OFFSET: usize = 32768;
+
+/// Shared context for a single forward pass step.
+///
+/// Provides access to GPU, buffers, and config without coupling
+/// layer implementations to the model struct.
+#[derive(Clone, Copy)]
+pub struct ForwardContext<'a> {
+    /// Pre-allocated scratch buffers.
+    pub buffers: &'a BufferArena,
+    /// GPU backend for kernel launches and memory ops.
+    pub gpu: &'a dyn GpuBackend,
+    /// Model configuration (dimensions, hyperparameters).
+    pub config: &'a ModelConfig,
+    /// Pre-uploaded attention metadata (None if no attention layers).
+    pub attn_metadata: Option<AttnMetadataDev>,
+    /// Profile mode: sync+time per-operation within layers.
+    pub profile: bool,
+    /// Communication backend for expert parallelism (EP) all-reduce.
+    /// None when running single-GPU (no distributed communication).
+    pub comm: Option<&'a dyn spark_comm::CommBackend>,
+    /// True when inside CUDA graph capture (between begin_capture/end_capture).
+    /// MoE layers use sync all_reduce (capturable) instead of async (event-based).
+    pub graph_capture: bool,
+    /// M8A: DDTree parent_ids device tensor for tree-aware GDN dispatch.
+    /// `Some(ptr)` when the K=γ verify path is processing a non-flat tree
+    /// payload (verify_d.rs uploads it from `a.pending_tree_payload`).
+    /// `None` for flat verify — GDN falls through to the fused wy_k path.
+    pub ddtree_parent_ids_dev: Option<spark_runtime::gpu::DevicePtr>,
+    /// ATLAS_TREE_AWARE_ATTN: optional per-row KV indirection for paged
+    /// decode attention during K=γ verify. `None` for the legacy chain-mode
+    /// path (every prior consumer just leaves this default).
+    pub tree_aware_attn: Option<TreeAwareAttn>,
+    /// Graph-safe override base address for the multi-seq SSM pointer
+    /// table. When `Some(ptr)`, the SSM multi-seq decode path uses `ptr`
+    /// as the `[h_state_ptrs[n] || conv_state_ptrs[n]]` array address
+    /// AND SKIPS the in-layer H2D upload — the caller (e.g.
+    /// `decode_batch_dispatch` under `ATLAS_SSM_MULTI_SEQ_GRAPH=1`) has
+    /// already populated the table BEFORE `begin_capture`. Iteration over
+    /// `decode_multi_seq` advances `ssm_layer_idx` in the caller; each
+    /// layer call receives its own per-layer slice address. `None` keeps
+    /// the legacy in-layer per-step H2D upload (eager / non-graphed
+    /// concurrent decode path).
+    pub ssm_multi_seq_ptr_table_override: Option<spark_runtime::gpu::DevicePtr>,
+    /// SPARSITY-DRAFTED SELF-SPECULATION: when `Some(thresh_frac)`, dense FFN
+    /// layers route their single-token `forward` through the column-sparse
+    /// DRAFT path (`DenseFfnLayer::forward_draft_sparse`) at the given keep
+    /// threshold (fraction of per-row max-abs). Set ONLY by
+    /// `decode_draft_sparse` (the sparse self-spec drafter, gated by
+    /// `ATLAS_SELF_SPEC_SPARSE`). `None` for every other caller — the dense
+    /// exact `forward` runs, so the verify path and all non-draft decodes are
+    /// byte-identical to before this field existed. The draft need not be
+    /// bit-exact (the dense verify is the oracle).
+    pub self_spec_sparse_draft: Option<f32>,
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39): when `Some`, the layer runs its
+    /// MIXER (SSM/GDN or attention) + post-mixer residual RMS-norm but SKIPS
+    /// its own FFN. Instead of running `self.ffn.forward*` and adding the FFN
+    /// output back into `hidden`, the layer writes its post-mixer normed FFN
+    /// input into `dst_base` at row `row_offset` (contiguous `[num_rows, H]`)
+    /// so the model orchestrator can run ONE batched FFN over all c×K rows of
+    /// all sequences — reading the 14 GB of FFN weights ONCE per layer instead
+    /// of once per sequence. `None` for every legacy caller — the layer runs
+    /// its own FFN exactly as before (byte-identical). See
+    /// `decode_verify_dflash_batched`.
+    pub ffn_defer: Option<FfnDefer>,
+}
+
+/// Directive for the cross-seq batched verify (#39): defer this layer's FFN,
+/// writing the post-mixer FFN input to an external contiguous buffer so the
+/// caller can batch the FFN GEMM across sequences.
+#[derive(Clone, Copy)]
+pub struct FfnDefer {
+    /// Base of the external `[total_rows, H]` BF16 buffer that collects every
+    /// sequence's post-mixer FFN input for this layer.
+    pub dst_base: spark_runtime::gpu::DevicePtr,
+    /// Row where THIS sequence's rows start in `dst_base` (× H × bf16 stride).
+    pub row_offset: usize,
+}
+
+/// Pure decision for the `debug`/`ATLAS_SSM_TRACE`-gated device->host debug
+/// dumps scattered through the SSM and MoE decode paths (`qwen3_ssm::
+/// trait_decode`, `qwen3_ssm::ssm_forward`, `layers::moe::forward`). Each of
+/// those dumps does a `gpu.synchronize(stream)` before reading the buffer
+/// back to the host, which is illegal while `stream` is mid-capture
+/// (`ATLAS_BOUNDED_HOST_COPY` turns that into a clean error instead of a
+/// driver-level crash, but it still aborts the capture region with no
+/// `end_capture`, wedging the stream — see the Qwen4 PLE suffix-graph bug).
+/// `graph_capture` is `ForwardContext::graph_capture`, set `true` for every
+/// layer call made between a `begin_capture`/`end_capture` pair (e.g.
+/// `decode_qwen4_ple_graph.rs`'s layers-1..N suffix region); callers should
+/// also recheck the backend's live `stream_is_capturing(stream)` where that
+/// is cheap, since `graph_capture` only reflects what *this* call site
+/// intended, not every way a stream could already be capturing.
+pub fn debug_sync_allowed(debug: bool, trace: bool, graph_capture: bool) -> bool {
+    (debug || trace) && !graph_capture
+}
+
+/// Explicit opt-in for the SSM/MoE decode dump-and-sync helpers
+/// (`qwen3_ssm::trait_decode`, `qwen3_ssm::ssm_forward`, `layers::moe::
+/// forward`), in place of `tracing::enabled!(tracing::Level::DEBUG)`.
+///
+/// These call sites used to gate on the ambient tracing DEBUG level. That
+/// is not a static, per-call-site fact — `tracing::enabled!` asks the
+/// *current* subscriber stack, and a per-layer `tracing_subscriber::Filter`
+/// (e.g. `spark-server`'s load-phase debug capture, `FLUX_LOAD_DEBUG=auto`)
+/// never gets to statically cache a hard `never` for a callsite on its own:
+/// `Filtered::register_callsite` always answers the registry with
+/// `Interest::always()` regardless of what the wrapped `Filter` actually
+/// decided (see `tracing_subscriber::filter::layer_filters::Filtered`'s own
+/// comment: "don't short circuit!... the Registry will return the actual
+/// Interest value that's the sum of all the register_callsite calls"), and
+/// `Filtered::enabled` returning `false` does not disable the event either —
+/// it returns `true` so sibling layers still get asked, and it is the
+/// Registry root that ANDs every layer's vote together. A layer's `Filter`
+/// can therefore flip this decode gate on only by being one of several
+/// layers under per-layer filtering, and the ambient level is a GLOBAL
+/// (non-per-target) `max_level_hint` while that layer is active — it has no
+/// way to express "DEBUG, except for spark_model/spark_runtime targets",
+/// which is exactly what `spark-server`'s own `LoadFilter`/`debug_log`
+/// filters try to do with a hand-rolled target exclusion the blanket hint
+/// can't carry. The result (confirmed by a GPU A/B: identical build and
+/// env, only `FLUX_LOAD_DEBUG=auto` vs `off`, and only `auto` reproduces the
+/// Qwen4 PLE suffix-graph capture bug) is that whether this gate opens
+/// depends on server-side logging configuration that has nothing to do with
+/// whether a GPU-synchronizing debug dump is actually safe to run right
+/// now. An explicit, single, plain env-var read removes that dependency
+/// entirely; `debug_sync_allowed` above still gates the actual sync on
+/// `graph_capture`/live capture state as the second, independent check.
+pub fn decode_debug_dumps_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_DECODE_DEBUG_DUMPS").ok().as_deref() == Some("1"))
+}
+
+#[cfg(test)]
+mod tests;

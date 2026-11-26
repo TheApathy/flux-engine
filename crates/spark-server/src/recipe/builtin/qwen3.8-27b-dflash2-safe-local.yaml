@@ -1,0 +1,139 @@
+# Built-in recipe: dense Qwen3.8-27B DFlash V14 qualification profile.
+# It is build-track bound and cannot run from a V15 binary.
+recipe_version: "2"
+model: q27-nvidia-nvfp4
+runtime: atlas
+container: local
+metadata:
+  maintainer: atlas-radix
+  category: agent
+  model_params: 27B
+  quantization: nvfp4
+  kv_dtype: nvfp4
+  description: |
+    NVIDIA's ModelOpt mixed FP8+NVFP4 Qwen3.8-27B target (q27-nvidia-nvfp4) with
+    the official DFlash2 checkpoint at /models/drafter-dflash2-incoai.
+    The loader admits its exact H=5120, five-layer, block-8, gamma-7, taps
+    [5,19,33,47,61] geometry. Flat verify, NVFP4 drafter weights, prefix caching
+    off, async proposal off, and bounded host copies are pinned for the fail-closed
+    V14 reliability profile. Enables the runtime-SHA-pinned FlashInfer dense FFN
+    route while leaving unqualified FlashInfer projection routes disabled.
+defaults:
+  port: 8888
+  host: 127.0.0.1
+  kernel_target: qwen3.8-27b
+  gpu_memory_utilization: 0.55
+  kv_cache_dtype: nvfp4
+  kv_high_precision_layers: 8
+  max_model_len: 135168
+  max_prefill_tokens: 8192
+  max_batch_size: 1
+  max_num_seqs: 1
+  mtp_vocab: 248320
+  max_thinking_budget: 57344
+  request_timeout: 300
+  enable_prefix_caching: false
+  disable_confidence_early_stop: true
+  dflash: true
+  draft_model: /models/drafter-dflash2-incoai
+  dflash_gamma: 7
+  dflash_window_size: 4096
+  dflash_quantization: nvfp4
+  dflash_draft_sample_method: greedy
+  dflash_method: flat
+atlas:
+  model_type: qwen3_5
+  resident_gb: 70
+  headroom_gb: 8
+  run_alone: true
+  environment_policy: sealed-v1
+  profile_kind: dense-qwen-dflash-v14
+  build_track: dense-qwen-dflash-v14
+  environment_sha256: 2359b7c392b64c1fdde468f777c3810ea6cc1957b4db62a0da4b8843109604e5
+  forbidden_env:
+    - ATLAS_DFLASH_BRANCH
+    - ATLAS_DFLASH_BATCHED_VERIFY
+    - ATLAS_DFLASH_DEEPLOOP
+    - ATLAS_DDTREE_ENABLE
+    - ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE
+    - ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB
+  env:
+    ATLAS_BOUNDED_HOST_COPY: "1"
+    ATLAS_H2D_LEGACY_DRAIN: "0"
+    ATLAS_DFLASH_ASYNC: "0"
+    ATLAS_DFLASH_METHOD: "flat"
+    ATLAS_DFLASH_CTX_WINDOW: "4096"
+    ATLAS_DFLASH_DRAFT_CAP: "7"
+    ATLAS_DFLASH_NOISE_ONLY: "1"
+    ATLAS_DFLASH_QUANT: "nvfp4"
+    ATLAS_DFLASH_SPEC_CYCLE_V2: "1"
+    ATLAS_DFLASH_SWA: "1"
+    ATLAS_DFLASH_HONOR_IS_CAUSAL: "1"
+    ATLAS_DFLASH_DRAFT_SPLITK: "8"
+    ATLAS_DFLASH_PREFILL_PIPE: "1"
+    ATLAS_DFLASH_CAPTURE_STRIDED: "1"
+    ATLAS_DFLASH_LM_HEAD_NVFP4: "1"
+    ATLAS_DFLASH_LM_HEAD_FP8: "0"
+    ATLAS_DFLASH_FFN_KGAMMA: "1"
+    ATLAS_DFLASH_ATTN_KGAMMA: "1"
+    ATLAS_DFLASH_FREE_SLOTS: "0"
+    ATLAS_DFLASH_FREE_SLOTS_TAIL: "4"
+    ATLAS_DFLASH_SAM: "0"
+    ATLAS_DFLASH_RETR_WIDE: "31"
+    ATLAS_DFLASH_KERNEL_PROFILE: "0"
+    ATLAS_DFLASH_TREE_COMMIT: "0"
+    ATLAS_DFLASH_ECHO: "0"
+    ATLAS_MTP_ACCEPT_LOG: "1"
+    ATLAS_FFN_TC: "1"
+    ATLAS_SSM_PROJ_TC: "1"
+    ATLAS_LM_HEAD_TC: "1"
+    ATLAS_DECODE_TC_PARITY: "1"
+    ATLAS_LM_HEAD_T: "1"
+    ATLAS_ACCEPT_FAST_ARGMAX: "1"
+    ATLAS_PREFILL_FFN_FLASHINFER: "1"
+    ATLAS_FLASHINFER_SM121_LIB: "/opt/flux/artifacts/flashinfer/libatlas_fi_fp4_sm121.so"
+    ATLAS_FLASHINFER_FFN_EXTRA_M: "1"
+    ATLAS_GDN_PREFILL_GATECACHE: "1"
+    # PACK is an experimental two-phase-only path. With the production
+    # 8192-token prefill arena, long requests use the ordinary chunk fallback.
+    ATLAS_SSM_PREFILL_PACK: "0"
+    ATLAS_GDN_C143_PREFILL: "0"
+    ATLAS_PREFILL_PROJ_FLASHINFER: "0"
+    ATLAS_PREFILL_SSM_FLASHINFER: "0"
+    ATLAS_PREFILL_FFN_FAST: "0"
+    ATLAS_PREFILL_PROJ_FAST: "0"
+    ATLAS_PREFILL_PROJ_PIPE: "1"
+    ATLAS_PREFILL_FFN_PIPE: "1"
+    ATLAS_SSM_GDN_SEQ_PERSISTENT: "1"
+    ATLAS_SSM_GDN_LAZY: "1"
+    ATLAS_ATTN_QKV_EXACT_STRIDED: "1"
+    ATLAS_ATTN_QKV_FUSED: "1"
+    ATLAS_ATTN_QKV_SPLITK: "4"
+    ATLAS_THINK_SPEC: "1"
+    ATLAS_FFN_FUSED_GATEUP: "1"
+    ATLAS_FFN_KGAMMA_M16: "1"
+    ATLAS_FFN_KGAMMA_M128: "1"
+    ATLAS_FFN_M16_TRANSPOSED: "1"
+    ATLAS_FFN_DOWN_SPLITK: "4"
+    ATLAS_NVFP4_GATE_UP_M128: "1"
+    ATLAS_NO_GEMV_SW: "1"
+    ATLAS_TC_NVFP4_M16: "0"
+    ATLAS_TC_NVFP4_M16_MS_ATTN: "0"
+    ATLAS_SSM_OUT_SPLITK: "4"
+    ATLAS_SSM_QKVZ_SPLITK: "4"
+    ATLAS_SSM_BA_BATCH: "1"
+    ATLAS_WY17_LAZY: "1"
+    ATLAS_WY17_LAZY_COMMIT: "0"
+    ATLAS_WY17_SPLIT: "2"
+    ATLAS_DISABLE_TREE_WY: "1"
+    ATLAS_DSPARK_ASYMMETRIC_ATTN: "1"
+    ATLAS_FLASH_ATTN_KGAMMA_SPLITK: "1"
+    ATLAS_FA2_KGAMMA: "1"
+    ATLAS_PAGED_DECODE_SPLITK: "1"
+    ATLAS_MULTISEQ_GRAPHS: "0"
+    # This target's transformed cache exceeds the currently provisioned local
+    # disk headroom. Keep the serving-safe profile read/write-cache-free; the
+    # checkpoint itself loads in about a minute from the warm filesystem.
+    ATLAS_WEIGHT_CACHE: "0"
+    ATLAS_ATTN_PROJ_CUBLASLT: "1"
+    ATLAS_SSM_PROJ_CUBLASLT: "1"

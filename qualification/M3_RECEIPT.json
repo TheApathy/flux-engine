@@ -1,0 +1,66 @@
+{
+  "milestone": "Milestone 3 — Accuracy Qualification (R1)",
+  "verdict": "PARTIAL",
+  "status_detail": "Fast-Track Partial Scope: Plain GSM8K 1,319/1,319 complete at 97.27%; Plain MMLU-Pro stopped early at 340/1,000; Step C Native-MTP K=5 parity arm skipped",
+  "timestamp_utc": "2026-10-25T20:36:00Z",
+  "hardware": "NVIDIA DGX Spark (GB10, SM121a, 128 GB unified memory)",
+  "model": "Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+  "binary": "target/release/flux-server",
+  "binary_sha256": "a3b49aa3e1e3eb41b20bc28c4193026522865ee083d2d3e0cc1135d333da8b5e",
+  "head_commit": "b47b9fe6b0c5826df769277bb306f5b41e2372c7",
+  "evaluator": {
+    "name": "Lil Bench",
+    "version": "0.7.9",
+    "scorer_version": 2
+  },
+  "accuracy_qualification": {
+    "status": "PARTIAL",
+    "total_gsm8k_items_evaluated": 1319,
+    "gsm8k_accuracy": 0.9727,
+    "gsm8k_correct": 1283,
+    "gsm8k_total": 1319,
+    "mmlu_pro_items_evaluated": 340,
+    "k5_parity_evaluated": false,
+    "profiles": {
+      "gsm8k": {
+        "items": 1319,
+        "plain_correct": 1283,
+        "plain_score": 0.9727,
+        "interventions": 0,
+        "status": "COMPLETE"
+      },
+      "mmlu-pro": {
+        "items": 340,
+        "interventions": 0,
+        "status": "PARTIAL",
+        "note": "Stopped early at 340/1,000 items; Step C K=5 arm skipped in this fast-track run"
+      }
+    }
+  },
+  "zero_intervention_ledger": {
+    "schema": "atlas.interventions.v1",
+    "policy": "report_only",
+    "total_requests_audited": 1659,
+    "empty_ledger_count": 1659,
+    "nonempty_ledger_count": 0,
+    "compliance": true
+  },
+  "memory_compliance": {
+    "measured_floor_mib": 11430.0,
+    "required_floor_mib": 6656,
+    "watchdog_kills": 0,
+    "samples_count": 43756,
+    "compliance": true
+  },
+  "artifacts": {
+    "recipe_plain": "qualification/accuracy/recipe-plain.env",
+    "recipe_plain_sha256": "10c47705b5db6a69be612229ffe90ff35d9588c588b80b610da90f65c675aa95",
+    "recipe_plain_historical_pre_sanitization_sha256": "c5c2c7225ef1714a29d21d1419ad06355516bfd43600ca9057624b56b649e3ec",
+    "recipe_k5": "qualification/accuracy/recipe-k5.env",
+    "recipe_k5_sha256": "f595a0cdcfbd1822b9a358cef34c5e2ceddf83f9efc7c7a15901cf3d34fd08cb",
+    "recipe_k5_historical_pre_sanitization_sha256": "c6bc49bf832788cfe2f153e28f39ff88b3cdf4d53a19f7c88ef74ad811201de4",
+    "plain_gsm8k_report": "qualification/accuracy/reports/plain-gsm8k.json",
+    "plain_gsm8k_report_sha256": "f9381bb9ec99500c9e925fea6aa78edaad8a8db6ae22accb6554503da83a78dd",
+    "plain_gsm8k_report_historical_pre_sanitization_sha256": "551aa5c3dcf90be675dff377430c3a212827c0405915a43caa4c88fef5294b85"
+  }
+}

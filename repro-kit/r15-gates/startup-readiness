@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Fresh-process startup readiness for both serving modes. See R16 startup notes."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import http.client
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+import types
+import urllib.parse
+
+GATE = "startup-readiness"
+LIFECYCLE_SHA256 = "dfae597a00c668ee5e3b2f02042c39df6035fa48cbb887cea53a3cb50a41b032"
+MODES = ("none", "native-mtp-k5")
+K5_DRAFTS = 4
+PROBE_TIMEOUT = 30
+MAX_HTTP_BYTES = 1024 * 1024
+MAX_PROBES = 100_000
+MAX_LOG_BYTES = 512 * 1024 * 1024
+MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+MIB = 1024 * 1024
+ANCHORS = {
+    "starting": re.compile(rb"Atlas Spark starting\.\.\."),
+    "scheduler": re.compile(
+        rb"Scheduler started \(batched mode, max_batch=1, mtp=(true|false), "
+        rb"ngram=(true|false), num_drafts=([0-9]+), "
+    ),
+    "k5_admission": re.compile(rb"QWEN4_SPECULATION_ADMISSION_ENGAGED mode=native-only"),
+    "listening": re.compile(rb"Listening on 0\.0\.0\.0:([0-9]+)(?![0-9])"),
+}
+# Any of these in a startup window is a STOP, never a warning.
+FATAL_PATTERN = re.compile(
+    rb"\bnvrm\b|\bxid\b|\bcuda[-_: ]*fatal\b|\billegal[-_: ]*memory[-_: ]*access\b"
+    rb"|\bout[-_: ]*of[-_: ]*memory\b|\boom[-_: ]*kill(?:er)?\b|\bpanicked at\b"
+    rb"|\bCUDA_ERROR_[A-Z_]+\b|\bcudaError(?!Success)[A-Za-z]+\b|\bAssertion failed\b",
+    re.I,
+)
+SEMANTICS = {
+    "ready_http_status": "status of a fresh GET /health after the lifecycle readiness proof",
+    "model_identity_match": "/health names the launched alias and /v1/models lists exactly it",
+    "checkpoint_identity_match": "/models in the live process is the read-only bind source, "
+    "with identical config.json bytes, and the same checkpoint in both modes",
+    "plain_scheduler_ready": "one startup, scheduler and listener anchor in order on the port",
+    "k5_scheduler_ready": "the speculative scheduler state is exactly the mode's: none has "
+    "mtp=false and no admission; native-mtp-k5 has mtp=true, num_drafts=4 and native-only "
+    "admission",
+}
+STARTUP_ENGINE_PAIRS = (
+    ("--kernel-target", "qwen3.8-flash-next"), ("--world-size", "1"),
+    ("--tp-size", "1"), ("--ep-size", "1"), ("--gpu-memory-utilization", "0.85"),
+    ("--block-size", "16"), ("--ssm-cache-slots", "0"),
+    ("--enable-prefix-caching", "false"), ("--oom-guard-mb", "4096"),
+    ("--mtp-vocab", "0"), ("--mtp-quantization", "bf16"),
+)
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def file_identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_nlink,
+    )
+
+
+def load_checked(path, expected, name):
+    """Execute exactly the checked bytes; never import mutable sibling code."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * MIB,
+            "helper size differs",
+        )
+        raw = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+        require(
+            file_identity(before) == file_identity(after)
+            and len(raw) == before.st_size
+            and digest(raw) == expected,
+            "helper source pin differs",
+        )
+    finally:
+        os.close(descriptor)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def parent_plan(args):
+    """Bind runtime/checkpoint provenance to the actual sealed launching plan."""
+    parent = os.getppid()
+    argv = Path(f"/proc/{parent}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+    for name in ("container-id", "image-id", "image-digest", "base-url", "run-id"):
+        token = ("--" + name).encode()
+        require(argv.count(token) == 1, "parent identity is ambiguous")
+        index = argv.index(token)
+        require(
+            index + 1 < len(argv)
+            and argv[index + 1].decode() == getattr(args, name.replace("-", "_")),
+            "parent launch identity differs",
+        )
+    require(argv.count(b"--plan-fd") == 1, "parent plan descriptor is ambiguous")
+    index = argv.index(b"--plan-fd")
+    require(
+        index + 1 < len(argv) and re.fullmatch(rb"[0-9]+", argv[index + 1]),
+        "parent plan descriptor differs",
+    )
+    descriptor = os.open(
+        f"/proc/{parent}/fd/{int(argv[index + 1])}", os.O_RDONLY | os.O_CLOEXEC
+    )
+    try:
+        seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        require(
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals == seals,
+            "parent plan is not sealed",
+        )
+        raw = args.suite.read_fd(
+            descriptor, "startup parent plan", args.suite.MAX_PLAN_BYTES, nlink=None
+        )
+        require(os.getppid() == parent, "parent changed during plan verification")
+    finally:
+        os.close(descriptor)
+    plan = args.suite.strict_json_loads(raw, "startup parent plan")
+    require(
+        type(plan) is dict
+        and plan.get("schema") == args.suite.PLAN_SCHEMA
+        and plan.get("runtime_dir") == args.runtime_dir,
+        "parent runtime plan differs",
+    )
+    return plan, digest(raw)
+
+
+def recipe_chunk(recipe):
+    """The scheduler chunk must match both aliases of the bound recipe."""
+    chunk = recipe.get("ATLAS_QWEN4_PREFILL_WIDE")
+    require(chunk in ("4096", "16384") and recipe.get("FLUX_QWEN4_PREFILL_WIDE") == chunk,
+            "startup recipe WIDE aliases are missing or disagree")
+    require(recipe.get("FLUX_MODE") == {"4096": "interactive-w4096", "16384": "max-prefill"}[chunk],
+            "startup profile mode differs from its chunk")
+    for key in ("ATLAS_TARGET_LMHEAD_VOCAB", "FLUX_TARGET_LMHEAD_VOCAB"):
+        require(recipe.get(key) in (None, "0", "248077"), "startup recipe caps the target vocabulary")
+    return chunk
+
+
+def startup_launch(command, args, plan, recipe, mode):
+    """Extend only the sealed C1 lifecycle's exact launch, without changing that helper."""
+    require(mode in MODES and type(command) is list and all(type(v) is str for v in command),
+            "startup launch mode or command differs")
+    environment = dict(recipe)
+    environment["ATLAS_DISABLE_SPECULATION"] = "1" if mode == "none" else "0"
+    prefix = ["docker", "exec", args.container_id, "/usr/bin/env",
+              *[key + "=" + value for key, value in sorted(environment.items())]]
+    require(command[:len(prefix)] == prefix, "sealed startup Docker/environment launch changed")
+    old = command[len(prefix):]
+    require(old.count("--model-name") == 1 and old.index("--model-name") + 1 < len(old),
+            "startup model alias is ambiguous")
+    model = old[old.index("--model-name") + 1]
+    expected = [plan["in_container_binary_path"], "serve", "--no-tui", "--model-from-path", "/models",
+                "--model-name", model, "--bind", "0.0.0.0", "--port", str(args.container_port),
+                "--request-timeout", "14340", "--max-batch-size", "1", "--max-num-seqs", "1",
+                "--max-seq-len", "262144", "--qwen4-qsa", "--kv-cache-dtype", "bf16"]
+    if mode == "native-mtp-k5":
+        expected += ["--speculative", "--num-drafts", "4"]
+    require(old == expected, "sealed startup engine argv changed")
+    result = list(command)
+    for option, value in STARTUP_ENGINE_PAIRS:
+        result.extend((option, value))
+    result.extend(("--max-prefill-tokens", recipe_chunk(recipe), "--disable-simhash-watchdog"))
+    return result
+
+
+class EngineLog:
+    """Route the lifecycle's server launcher output into the startup engine log."""
+
+    def __init__(self, descriptor, args, plan, recipe):
+        self.descriptor, self.args, self.plan, self.recipe = descriptor, args, plan, recipe
+        self.mode = None
+
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+    def Popen(self, *args, **kwargs):
+        require(
+            len(args) == 1 and "stdout" not in kwargs and "stderr" not in kwargs,
+            "lifecycle logging contract changed",
+        )
+        return subprocess.Popen(
+            startup_launch(args[0], self.args, self.plan, self.recipe, self.mode),
+            stdout=self.descriptor, stderr=self.descriptor, **kwargs
+        )
+
+
+class ProbeRecorder:
+    """Timestamp every lifecycle readiness request without changing its result."""
+
+    def __init__(self, request):
+        self.request = request
+        self.mode = None
+        self.rows = []
+
+    def __call__(self, args, method, route, body=None, **kwargs):
+        start = time.monotonic_ns()
+        row = {"mode": self.mode, "method": method, "route": route,
+               "start_monotonic_ns": start}
+        try:
+            raw = self.request(args, method, route, body, **kwargs)
+        except BaseException as error:
+            row.update(end_monotonic_ns=time.monotonic_ns(), outcome=type(error).__name__)
+            self.append(row)
+            raise
+        row.update(end_monotonic_ns=time.monotonic_ns(), outcome="ok",
+                   response_sha256=digest(raw), response_bytes=len(raw))
+        self.append(row)
+        return raw
+
+    def append(self, row):
+        require(len(self.rows) < MAX_PROBES, "readiness probe census exceeds bound")
+        self.rows.append(row)
+
+
+class ProofChannel:
+    """The suite's startup broker: it re-verifies each live process and returns its proof."""
+
+    def __init__(self, descriptor):
+        info = os.fstat(descriptor)
+        require(stat.S_ISSOCK(info.st_mode), "process-proof FD is not a socket")
+        self.socket = socket.socket(fileno=descriptor)
+        require(
+            self.socket.family == socket.AF_UNIX and self.socket.type == socket.SOCK_SEQPACKET,
+            "process-proof FD is not a Unix sequenced-packet socket",
+        )
+        self.sent = 0
+
+    def request(self, suite, mode, pid):
+        require(self.sent < len(MODES) and mode == MODES[self.sent],
+                "startup process proofs requested out of order")
+        self.socket.sendall(suite.canonical_bytes(
+            {"schema": "flux-r15-live-process-request/1", "mode": mode, "host_pid": pid}))
+        self.sent += 1
+        raw = self.socket.recv(16 * 1024)
+        require(raw, "suite broker closed before returning the process proof")
+        return suite.strict_json_loads(raw, "suite live process proof")
+
+    def close(self):
+        # An empty packet tells the broker that exactly the sent requests were all.
+        self.socket.close()
+
+
+def http_get(args, route):
+    """One real GET against the published endpoint; returns the status and exact body."""
+    parsed = urllib.parse.urlsplit(args.base_url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=PROBE_TIMEOUT)
+    try:
+        connection.request("GET", route, headers={"Connection": "close"})
+        response = connection.getresponse()
+        raw = response.read(MAX_HTTP_BYTES + 1)
+        require(len(raw) <= MAX_HTTP_BYTES, "readiness response exceeds bound")
+        return response.status, raw
+    finally:
+        connection.close()
+
+
+def model_identity(suite, model, health_status, health_raw, models_status, models_raw):
+    health = suite.strict_json_loads(health_raw, "startup health response")
+    require(
+        health_status == 200 and health == {"status": "ready", "model": model},
+        "fresh /health does not report the launched model ready",
+    )
+    listing = suite.strict_json_loads(models_raw, "startup model listing")
+    require(
+        models_status == 200 and type(listing) is dict and set(listing) == {"object", "data"}
+        and listing["object"] == "list" and type(listing["data"]) is list
+        and len(listing["data"]) == 1,
+        "fresh /v1/models listing differs",
+    )
+    entry = listing["data"][0]
+    require(
+        type(entry) is dict and set(entry) == {"id", "object", "created", "owned_by"}
+        and entry["id"] == model and entry["object"] == "model"
+        and entry["owned_by"] == "atlas-spark" and type(entry["created"]) is int,
+        "fresh /v1/models does not list exactly the launched model",
+    )
+    return True
+
+
+def anchor_census(segment, mode, port):
+    """Startup log anchors of one fresh process; fatal text anywhere is a STOP."""
+    require(len(segment) <= MAX_LOG_BYTES, "startup log segment exceeds bound")
+    require(FATAL_PATTERN.search(segment) is None, "fatal startup log event")
+    found = {name: list(pattern.finditer(segment)) for name, pattern in ANCHORS.items()}
+    for name in ("starting", "scheduler", "listening"):
+        require(len(found[name]) == 1, f"startup {name} anchor is missing or repeated")
+    starting, scheduler, listening = (found[name][0] for name in
+                                      ("starting", "scheduler", "listening"))
+    require(starting.start() < scheduler.start() and starting.start() < listening.start(),
+            "startup anchors are out of order")
+    require(int(listening.group(1)) == port, "server listens on another port")
+    mtp, ngram, drafts = scheduler.group(1), scheduler.group(2), int(scheduler.group(3))
+    admissions = len(found["k5_admission"])
+    require(ngram == b"false", "n-gram speculation engaged at startup")
+    schema = b"Qwen4 native MTP schema admitted for direct proposer construction"
+    heads = re.findall(rb"Qwen4 native MTP head constructed[^\r\n]*", segment)
+    require(b"DFlash drafter installed as the active proposer" not in segment,
+            "external drafter replaced native MTP")
+    if mode == "none":
+        require(mtp == b"false" and admissions == 0, "plain process engaged K5 scheduling")
+        require(not heads and schema not in segment, "plain startup constructed a speculative head")
+    else:
+        require(
+            mtp == b"true" and drafts == K5_DRAFTS and admissions == 1,
+            "native K5 scheduler did not engage with four drafts",
+        )
+        require(len(heads) == 1 and segment.count(schema) == 1
+                and segment.index(schema) < segment.index(heads[0])
+                and re.search(rb"\bhidden=2560\b", heads[0]) is not None
+                and re.search(rb"\bvocab=248077\s*$", heads[0]) is not None,
+                "native startup did not construct the full-vocabulary checkpoint MTP head")
+    return {
+        "anchors": {name: [match.start() for match in matches] for name, matches in found.items()},
+        "scheduler_line_sha256": digest(scheduler.group(0)),
+        "mtp": mtp.decode(),
+        "num_drafts": drafts,
+        "listen_port": port,
+        "plain_scheduler_ready": True,
+        "k5_scheduler_ready": True,
+    }
+
+
+def compare_checkpoint(suite, source_fd, models_fd, label):
+    """The live /models directory is the bind source, with identical config bytes."""
+    source, models = os.fstat(source_fd), os.fstat(models_fd)
+    require(
+        stat.S_ISDIR(source.st_mode) and stat.S_ISDIR(models.st_mode)
+        and (source.st_dev, source.st_ino) == (models.st_dev, models.st_ino),
+        f"{label} live /models differs from the bind source",
+    )
+    hashes = []
+    for directory in (source_fd, models_fd):
+        descriptor = os.open("config.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=directory)
+        try:
+            hashes.append(suite._hash_regular_fd(descriptor, label + " config", 64 * MIB)[0])
+        finally:
+            os.close(descriptor)
+    require(hashes[0] == hashes[1], f"{label} checkpoint config differs")
+    return {"models_dev": models.st_dev, "models_ino": models.st_ino, "config_sha256": hashes[0]}
+
+
+def checkpoint_identity(args, pid):
+    suite = args.suite
+    document = suite.strict_json_loads(
+        args.lifecycle.docker(["container", "inspect", "--format", "{{json .}}",
+                               args.container_id]),
+        "startup container",
+    )
+    mountinfo = Path(f"/proc/{pid}/mountinfo").read_text("utf-8")
+    source_path = suite._checkpoint_mount_source(document, mountinfo)
+    source_fd = suite.open_directory_chain(source_path, "startup checkpoint source")
+    root_fd = models_fd = None
+    try:
+        root_fd = os.open(f"/proc/{pid}/root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        models_fd = suite._open_process_file(root_fd, "/models")
+        identity = compare_checkpoint(suite, source_fd, models_fd, "startup checkpoint")
+    finally:
+        for descriptor in (models_fd, root_fd, source_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+    return {**identity, "source": str(source_path)}
+
+
+def rootfs_read_only(args, pid):
+    """The live process's own root mount is read-only (not only the image flag)."""
+    mountinfo = Path(f"/proc/{pid}/mountinfo").read_text("utf-8")
+    args.suite._require_readonly_paths(mountinfo, ["/"])
+    return True
+
+
+def run(args):
+    suite, helper = args.suite, args.lifecycle
+    launch_plan, plan_hash = parent_plan(args)
+    plan, recipe = helper.inspect_container(args, suite)  # also requires ReadonlyRootfs
+    for key in ("in_container_binary_path", "in_container_recipe_path",
+                "in_container_binary_sha256", "recipe_sha256"):
+        require(plan[key] == launch_plan[key], "startup image differs from sealed source plan")
+    runtime = suite.normalized_absolute(args.runtime_dir, "startup runtime")
+    identity = suite.directory_identity_sha256(runtime, "startup runtime")
+    helper.make_directory(suite, runtime, ["startup"])
+    require(stat.S_IMODE((runtime / "startup").stat().st_mode) == 0o700,
+            "startup artifacts directory is not private")
+    descriptors, consumed = {}, {}
+
+    def create(name):
+        descriptor = suite.create_beneath(runtime, "startup/" + name, "startup artifact", 0o400)
+        descriptors[name] = descriptor
+        return descriptor
+
+    journal_hash, journal_bytes = hashlib.sha256(), [0]
+
+    def append(value):
+        raw = suite.canonical_bytes(value) + b"\n"
+        require(journal_bytes[0] + len(raw) <= MAX_JOURNAL_BYTES, "startup journal bound exceeded")
+        suite.write_all(journal, raw)
+        journal_hash.update(raw)
+        journal_bytes[0] += len(raw)
+
+    original_subprocess, original_request = helper.subprocess, helper.request
+    engine = create("engine.log")
+    journal = create("responses.jsonl")
+    recorder = ProbeRecorder(original_request)
+    attempts, observations = [], []
+    try:
+        helper.subprocess = EngineLog(engine, args, plan, recipe)
+        helper.request = recorder
+        for mode in MODES:
+            recorder.mode = mode
+            helper.subprocess.mode = mode
+            offset = os.fstat(engine).st_size
+            launched = time.monotonic_ns()
+            with helper.server(args, mode, plan, recipe) as (model, proof, pidfd):
+                ready = time.monotonic_ns()
+                require(not select.select([pidfd], [], [], 0)[0], "startup process exited")
+                require(proof.get("status") == "PASS" and proof.get("mode") == mode,
+                        "lifecycle live-process proof differs")
+                brokered = args.proof_channel.request(suite, mode, proof["host_pid"])
+                require(brokered == proof, "suite-brokered process proof differs from the lifecycle")
+                health_status, health_raw = http_get(args, "/health")
+                health_at = time.monotonic_ns()
+                models_status, models_raw = http_get(args, "/v1/models")
+                models_at = time.monotonic_ns()
+                for route, status, raw, at in (("/health", health_status, health_raw, health_at),
+                                               ("/v1/models", models_status, models_raw, models_at)):
+                    append({"mode": mode, "route": route, "status": status,
+                            "monotonic_ns": at, "raw_response_utf8": raw.decode("utf-8", "strict")})
+                model_match = model_identity(suite, model, health_status, health_raw,
+                                             models_status, models_raw)
+                os.fsync(engine)
+                end = os.fstat(engine).st_size
+                segment = os.pread(engine, end - offset, offset)
+                census = anchor_census(segment, mode, args.container_port)
+                checkpoint = checkpoint_identity(args, proof["host_pid"])
+                root_ro = rootfs_read_only(args, proof["host_pid"])
+                require(proof["executable_sha256"] == plan["in_container_binary_sha256"],
+                        "startup process executable differs from the image")
+                require(not select.select([pidfd], [], [], 0)[0], "startup process exited")
+                attempts.append({
+                    "fresh_process_mode": mode,
+                    "ready_http_status": health_status,
+                    "model_identity_match": model_match,
+                    "checkpoint_identity_match": True,
+                    "plain_scheduler_ready": census.pop("plain_scheduler_ready"),
+                    "k5_scheduler_ready": census.pop("k5_scheduler_ready"),
+                })
+                observations.append({
+                    "mode": mode, "model": model, "process_binding": proof,
+                    "launch_monotonic_ns": launched, "ready_monotonic_ns": ready,
+                    "health_monotonic_ns": health_at, "models_monotonic_ns": models_at,
+                    "readiness_probes": [row for row in recorder.rows if row["mode"] == mode],
+                    "health_sha256": digest(health_raw), "models_sha256": digest(models_raw),
+                    "log_segment": {"offset": offset, "bytes": end - offset,
+                                    "sha256": digest(segment)},
+                    "log_census": census, "checkpoint": checkpoint, "root_read_only": root_ro,
+                })
+        require([row["fresh_process_mode"] for row in attempts] == list(MODES),
+                "startup attempts are incomplete")
+        args.proof_channel.close()
+        bindings = {(row["process_binding"]["host_pid"], row["process_binding"]["start_time_ticks"])
+                    for row in observations}
+        require(len(bindings) == 2, "startup modes did not use distinct fresh processes")
+        require(len({row["process_binding"]["executable_sha256"] for row in observations}) == 1,
+                "startup modes ran different executables")
+        require(len({(row["checkpoint"]["models_dev"], row["checkpoint"]["models_ino"],
+                      row["checkpoint"]["config_sha256"]) for row in observations}) == 1,
+                "startup modes loaded different checkpoints")
+        os.fsync(engine)
+        size = os.fstat(engine).st_size
+        require(0 < size <= MAX_LOG_BYTES, "startup engine log is empty or oversized")
+        complete = os.pread(engine, size, 0)
+        require(FATAL_PATTERN.search(complete) is None, "fatal engine log event after startup")
+        consumed["engine.log"] = {"bytes": size, "sha256": digest(complete)}
+        consumed["responses.jsonl"] = {"bytes": journal_bytes[0], "sha256": journal_hash.hexdigest()}
+        artifacts = {}
+        for name, descriptor in descriptors.items():
+            os.fsync(descriptor)
+            suite.assert_path_identity(runtime, "startup/" + name, descriptor, "startup artifact")
+            observed, _ = suite._hash_regular_fd(descriptor, "startup artifact", MAX_LOG_BYTES)
+            require(os.fstat(descriptor).st_nlink == 1, "startup artifact was linked")
+            require(consumed[name] == {"bytes": os.fstat(descriptor).st_size, "sha256": observed},
+                    "startup artifact differs from the validated bytes")
+            artifacts[name] = {"artifact": "startup/" + name, **consumed[name]}
+        require(suite.directory_identity_sha256(runtime, "startup runtime") == identity,
+                "startup runtime identity changed")
+        executable = observations[0]["process_binding"]["executable_sha256"]
+        raw = {
+            "attempts": attempts,
+            "rootfs_read_only": all(row["root_read_only"] for row in observations),
+            "process_executable_sha256": executable,
+            "observations": observations,
+            "artifacts": artifacts,
+            "semantics": SEMANTICS,
+            "suite_plan_sha256": plan_hash,
+            "lifecycle_sha256": LIFECYCLE_SHA256,
+            "checkpoint_id": launch_plan["checkpoint_id"],
+            "checkpoint_revision": launch_plan["checkpoint_revision"],
+            "qualification_scope": "fresh-process startup readiness only; not accuracy, "
+            "long-context, concurrency, memory or performance qualification",
+        }
+        validator = {
+            "schema": "flux-r15-gate-validator/1", "gate": GATE, "status": "PASS",
+            "release_qualified": True, "container_id": args.container_id,
+            "run_id": args.run_id, "raw": raw,
+        }
+        payload = suite.canonical_bytes(validator)
+        target = create("validator.json")
+        suite.write_all(target, payload)
+        os.fsync(target)
+        suite.assert_path_identity(runtime, "startup/validator.json", target, "startup validator")
+        evidence = {
+            "fresh_process_modes": [row["fresh_process_mode"] for row in attempts],
+            "ready_http_statuses": [row["ready_http_status"] for row in attempts],
+            "model_identity_match": all(row["model_identity_match"] for row in attempts),
+            "checkpoint_identity_match": all(row["checkpoint_identity_match"] for row in attempts),
+            "rootfs_read_only": raw["rootfs_read_only"],
+            "plain_scheduler_ready": all(row["plain_scheduler_ready"] for row in attempts),
+            "k5_scheduler_ready": all(row["k5_scheduler_ready"] for row in attempts),
+            "process_executable_sha256": executable,
+            "validator_artifact": "startup/validator.json",
+            "validator_receipt_sha256": digest(payload),
+        }
+        receipt = {
+            "schema": "flux-r15-container-gate-receipt/1", "gate": GATE, "status": "PASS",
+            "release_qualified": True, "execution_scope": "immutable-container",
+            "image_id": args.image_id, "image_digest": args.image_digest,
+            "container_id": args.container_id, "run_id": args.run_id, "evidence": evidence,
+        }
+        suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+        os.fsync(args.receipt_fd)
+        return receipt
+    finally:
+        helper.subprocess, helper.request = original_subprocess, original_request
+        args.proof_channel.close()
+        try:
+            # The inherited raw FD is read-only. The suite collects stderr.
+            size = os.fstat(engine).st_size
+            require(size <= MAX_LOG_BYTES, "startup log bound exceeded")
+            for offset in range(0, size, MIB):
+                suite.write_all(2, os.pread(engine, min(MIB, size - offset), offset))
+        finally:
+            for descriptor in descriptors.values():
+                os.close(descriptor)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in ("container-id", "image-id", "image-digest", "base-url", "run-id",
+                 "receipt-fd", "raw-log-fd", "runtime-dir", "suite-program",
+                 "suite-sha256", "lifecycle-program", "process-proof-fd"):
+        parser.add_argument("--" + name, required=True,
+                            type=int if name.endswith("-fd") else str)
+    parser.add_argument("--container-port", type=int, default=8888)
+    args = parser.parse_args(argv)
+    parsed = urllib.parse.urlsplit(args.base_url)
+    require(
+        parsed.scheme == "http" and parsed.hostname == "127.0.0.1"
+        and parsed.port is not None and parsed.path == "" and not parsed.query
+        and not parsed.fragment and parsed.username is None,
+        "base URL must be an explicit HTTP IPv4 loopback origin",
+    )
+    require(1 <= parsed.port <= 65535 and 1 <= args.container_port <= 65535,
+            "startup port is invalid")
+    require(re.fullmatch(r"[0-9a-f]{64}", args.container_id), "container ID differs")
+    require(all(re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+                for value in (args.image_id, args.image_digest)), "image identity differs")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", args.run_id), "run ID is unsafe")
+    require(re.fullmatch(r"[0-9a-f]{64}", args.suite_sha256) and set(args.suite_sha256) != {"0"},
+            "suite source pin is invalid")
+    args.lifecycle = load_checked(args.lifecycle_program, LIFECYCLE_SHA256,
+                                  "_r16_startup_lifecycle")
+    args.lifecycle.verify_parent_suite(args.suite_sha256)
+    args.suite = args.lifecycle.load_module(args.suite_program, args.suite_sha256,
+                                            "_r16_startup_suite")
+    require(callable(getattr(args.suite, "verify_live_server", None))
+            and callable(getattr(args.suite, "_checkpoint_mount_source", None)),
+            "live broker upgrade is required")
+    require(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+            "local Linux pidfds are required")
+    require(args.receipt_fd >= 3 and args.raw_log_fd >= 3 and args.process_proof_fd >= 3
+            and len({args.receipt_fd, args.raw_log_fd, args.process_proof_fd}) == 3,
+            "inherited descriptors differ")
+    args.suite.validate_inherited_receipt_fd(args.receipt_fd)
+    require(fcntl.fcntl(args.raw_log_fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY,
+            "raw log FD must be read-only")
+    require(stat.S_ISREG(os.fstat(args.raw_log_fd).st_mode), "raw log FD must be regular")
+    args.proof_channel = ProofChannel(args.process_proof_fd)
+    args.identities = {name: getattr(args, name) for name in
+                       ("container_id", "image_id", "image_digest", "base_url", "run_id")}
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        print(GATE + ": qualification failed (" + type(error).__name__ + ")", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

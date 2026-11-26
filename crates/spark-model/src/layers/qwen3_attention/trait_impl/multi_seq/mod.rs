@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Multi-sequence batched-decode body for [`super::super::Qwen3AttentionLayer`].
+//!
+//! Split into phase modules under the `_inner` delegation pattern:
+//! - `ctx`  — `MultiSeqCtx` shared scalars + buffer pointers
+//! - `qkv`  — phase 2: per-token Q/K/V projections (batch3/batch2/seq)
+//! - `attn` — phases 3-6: RoPE → cache write → paged decode → O proj
+//! - `mla`  — absorbed-MLA decode path (replaces phases 2-6 for MLA layers)
+//! - `ffn`  — phase 7: residual + post-norm + MoE/dense FFN
+//!
+//! The trait impl in `super::trait_impl` calls
+//! [`Qwen3AttentionLayer::decode_multi_seq_inner`] which simply builds
+//! the ctx, runs phase 1 inline (RMS norm), and dispatches the rest.
+
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kv_cache::PagedKvCache;
+
+use super::super::Qwen3AttentionLayer;
+use crate::layer::{ForwardContext, LayerState};
+use crate::layers::ops;
+
+pub(super) mod attn;
+mod ctx;
+mod ffn;
+mod mla;
+mod mla_gemv;
+mod post_norm;
+mod qkv;
+mod qkv_batched;
+mod qwen4_native;
+mod qwen4_native_policy;
+
+impl Qwen3AttentionLayer {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn decode_multi_seq_inner<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // Full path (phases 1-7): QKV computed inline, default qkv_output base.
+        self.decode_multi_seq_inner_impl(
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+            None,
+        )
+    }
+
+    /// #39 v2 cross-seq batched-QKV entry point: run ONLY attention phases 3-7
+    /// for one sequence's `num_seqs` (= K) rows, reading its Q/K/V from
+    /// `qkv_base` (a slice of the shared `qkv_output` that the caller populated
+    /// for ALL `c*K` rows via [`Self::decode_multi_seq_qkv_batched`]). Phases 1
+    /// (RMS-norm) and 2 (QKV projection) are SKIPPED — they already ran, once,
+    /// across every sequence. Bit-identical to the full path: the projection
+    /// output in `qkv_base` is the same per-row math, only batched.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn decode_multi_seq_attn_from_qkv<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+        qkv_base: DevicePtr,
+    ) -> Result<()> {
+        self.decode_multi_seq_inner_impl(
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+            Some(qkv_base),
+        )
+    }
+
+    /// Cross-sequence batched DFlash verify: run ONLY phases 3-5 (RoPE, KV
+    /// cache write, paged decode) for one sequence's `num_seqs` (= K) rows,
+    /// reading pre-projected Q/K/V from `qkv_base` and writing paged-attention
+    /// output directly into `attn_out_dst` (`[num_seqs, q_dim]` BF16).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn decode_multi_seq_attn_core_from_qkv_inner(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        ctx: &ForwardContext,
+        stream: u64,
+        qkv_base: DevicePtr,
+        attn_out_dst: DevicePtr,
+    ) -> Result<()> {
+        self.validate_yarn_multi_seq_controls()?;
+        let bs = kv_cache.block_size() as u32;
+        let max_seq_len_host = seq_lens
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1) as u32;
+        let c = ctx::MultiSeqCtx::new_with_qkv_base(
+            self,
+            ctx,
+            hidden,
+            residual,
+            num_seqs,
+            bs,
+            stream,
+            max_seq_len_host,
+            Some(qkv_base),
+        );
+        let meta = ctx
+            .attn_metadata
+            .expect("attention layer requires metadata");
+        self.ms_phase_rope(&c, meta)?;
+        self.ms_phase_cache_write(&c, kv_cache, meta)?;
+        let _ = self.ms_phase_paged_decode_into(&c, kv_cache, meta, attn_out_dst)?;
+        Ok(())
+    }
+
+    /// Cross-sequence batched DFlash verify: hoist phase 6 (gated sigmoid
+    /// multiply + `o_proj` + TP all-reduce) and phase 7 (post-attn residual
+    /// RMS norm + FFN + residual add) across ALL `total_rows = c * K` rows
+    /// gathered into `attn_out_base`, reading `o_proj` and FFN weights ONCE
+    /// with zero D2D copies through `dflash_batched_ffn_input`.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn decode_multi_seq_o_proj_post_norm_ffn_batched_inner(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        total_rows: usize,
+        qkv_base: DevicePtr,
+        attn_out_base: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let c = ctx::MultiSeqCtx::new_with_qkv_base(
+            self,
+            ctx,
+            hidden,
+            residual,
+            total_rows,
+            1,
+            stream,
+            0,
+            Some(qkv_base),
+        );
+        let o_out = self.ms_phase_o_proj(&c, attn_out_base)?;
+        if c.fwd.config.tp_world_size > 1
+            && let Some(comm) = c.fwd.comm
+        {
+            comm.all_reduce_async(o_out.0, total_rows * c.h * c.bf16, c.stream)?;
+        }
+        if self.ffn.is_none() {
+            ops::residual_add(
+                c.fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                o_out,
+                (total_rows * c.h) as u32,
+                stream,
+            )?;
+            return Ok(());
+        }
+        let normed2 = ctx.buffers.norm_output();
+        self.ms_post_norm(&c, o_out, normed2)?;
+        crate::layer::TransformerLayer::run_deferred_ffn(
+            self, normed2, hidden, total_rows, ctx, stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_inner_impl<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+        qkv_base_override: Option<DevicePtr>,
+    ) -> Result<()> {
+        self.validate_yarn_multi_seq_controls()?;
+        let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
+        let bs = kv_cache.block_size() as u32;
+        // Max host-side seq_len drives the split-K KV partition. Safe upper
+        // bound across all sequences in the batch (verify dispatch uploads
+        // monotonically increasing seq_len per K slot, so `max()` matches the
+        // longest KV scan any CTA will perform).
+        let max_seq_len_host = seq_lens
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1) as u32;
+        let c = ctx::MultiSeqCtx::new_with_qkv_base(
+            self,
+            ctx,
+            hidden,
+            residual,
+            num_seqs,
+            bs,
+            stream,
+            max_seq_len_host,
+            qkv_base_override,
+        );
+        let serial = crate::model::env_diag::DflashSerialControls::current();
+        let serial_norms = c.n > 1 && serial.layer_norms;
+
+        // Validate every requested attention control before this layer launches
+        // work. Engagement is counted only inside the selected implementation.
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnPaged,
+            c.n > 1 && ctx.tree_aware_attn.is_none(),
+            "requires the flat-chain multi-sequence paged-attention path",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnOut,
+            c.n > 1
+                && self
+                    .o_weight
+                    .as_ref()
+                    .and_then(|weight| weight.as_fp8())
+                    .is_none()
+                && !self.attn.o_proj.is_null(),
+            "requires the ordinary K1 NVFP4 attention output-projection weight",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnFfn,
+            c.n > 1 && !self.ffn.is_none() && ctx.ffn_defer.is_none(),
+            "requires a local FFN and no deferred cross-sequence FFN",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnPreNorm,
+            c.n > 1 && qkv_base_override.is_none(),
+            "requires inline attention input normalization",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnPostNorm,
+            c.n > 1 && !self.ffn.is_none(),
+            "requires the attention post-normalization/FFN phase",
+        )?;
+
+        // Phases 1-2 (RMS-norm + QKV) are skipped when QKV is precomputed
+        // across sequences (the #39 v2 batched-QKV path).
+        if qkv_base_override.is_none() {
+            // ── Phase 1: RMS norm + residual for N tokens ──
+            crate::kprof!(ctx.gpu, stream, "attn_rms_norm_residual", {
+                if serial_norms {
+                    let residual_elem = if ctx.config.use_fp32_residual() { 4 } else { 2 };
+                    for row in 0..c.n {
+                        ops::rms_norm_residual(
+                            ctx.gpu,
+                            self.rms_norm_residual_k,
+                            c.hidden.offset(row * c.h * residual_elem),
+                            &self.input_norm,
+                            c.normed.offset(row * c.h * c.bf16),
+                            c.residual.offset(row * c.h * residual_elem),
+                            1,
+                            c.h as u32,
+                            c.eps,
+                            c.stream,
+                        )?;
+                    }
+                    crate::model::control_engagement::engage(
+                        crate::model::control_engagement::ControlPath::AttnPreNorm,
+                    )?;
+                } else {
+                    ops::rms_norm_residual(
+                        ctx.gpu,
+                        self.rms_norm_residual_k,
+                        c.hidden,
+                        &self.input_norm,
+                        c.normed,
+                        c.residual,
+                        c.n as u32,
+                        c.h as u32,
+                        c.eps,
+                        c.stream,
+                    )?;
+                }
+                anyhow::Result::<()>::Ok(())
+            })?;
+
+            // ── Phase 2: QKV projections (batch3 / batch2 / sequential) ──
+            // MLA layers bypass standard Q/K/V/attn/O phases and run their
+            // absorbed latent chain directly from `c.normed` below.
+            if self.mla.is_none() {
+                crate::kprof!(ctx.gpu, stream, "attn_qkv_proj", {
+                    self.ms_phase_qkv(&c)?;
+                    anyhow::Result::<()>::Ok(())
+                })?;
+            }
+        } else if self.mla.is_some() {
+            anyhow::bail!(
+                "decode_multi_seq_attn_from_qkv is not supported for MLA layers (layer {})",
+                self.attn_layer_idx
+            );
+        }
+
+        let meta = ctx
+            .attn_metadata
+            .expect("attention layer requires metadata");
+        let o_out = if self.mla.is_some() {
+            crate::kprof!(ctx.gpu, stream, "attn_mla_decode", {
+                self.ms_mla_decode(&c, kv_cache, meta)?
+            })
+        } else {
+            // ── Phase 3: RoPE per-sequence ──
+            crate::kprof!(ctx.gpu, stream, "attn_rope", {
+                self.ms_phase_rope(&c, meta)?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+
+            // ── Phase 4: KV cache write ──
+            crate::kprof!(ctx.gpu, stream, "attn_cache_write", {
+                self.ms_phase_cache_write(&c, kv_cache, meta)?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+
+            // ── Phase 5: paged decode attention (batched) ──
+            let attn_out = crate::kprof!(ctx.gpu, stream, "attn_paged_decode", {
+                self.ms_phase_paged_decode(&c, kv_cache, meta)?
+            });
+
+            // ── Phase 6: gate multiply + O projection ──
+            crate::kprof!(ctx.gpu, stream, "attn_o_proj", {
+                self.ms_phase_o_proj(&c, attn_out)?
+            })
+        };
+
+        // TP all-reduce on o_out after o_proj (Megatron row-parallel
+        // pattern). Mirrors decode_inner.rs and prefill_inner.rs. Without
+        // this, multi-token decode (K=2 / K=3 / K=γ verify) under
+        // tp_world_size>1 reads a partial attention output from each
+        // rank, corrupting the FFN/MoE input and producing degenerate
+        // logits — observed as `/`/`,` repetition spirals on
+        // Qwen3.6 FP8 + TP=2 + MTP for HTML/code prompts.
+        if c.fwd.config.tp_world_size > 1
+            && let Some(comm) = c.fwd.comm
+        {
+            let bytes = c.n * c.h * c.bf16;
+            comm.all_reduce_async(o_out.0, bytes, c.stream)?;
+        }
+
+        // ── Phase 7: residual + post-norm + MoE ──
+        crate::kprof!(ctx.gpu, stream, "attn_ffn", {
+            self.ms_phase_ffn(&c, o_out)?;
+            anyhow::Result::<()>::Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    fn validate_yarn_multi_seq_controls(&self) -> Result<()> {
+        if self.yarn.is_some() && attn::attn_qkv_mega_enabled() {
+            anyhow::bail!(
+                "ATLAS_ATTN_QKV_MEGA=1 is incompatible with YaRN; \
+                 the strided kernel has no scaling ABI"
+            );
+        }
+        Ok(())
+    }
+}

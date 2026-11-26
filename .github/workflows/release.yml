@@ -1,0 +1,368 @@
+name: Release
+
+# Builds, attests, signs, and publishes AGPL-3.0-only Complete Corresponding
+# Source (CCS) release archives, deterministic SPDX 2.3 SBOM, SHA-256 checksums,
+# Sigstore Cosign keyless bundle, GitHub Artifact Attestations, and true SLSA
+# Build Level 3 provenance (isolated reusable generator) on signed semver tags
+# (`vX.Y.Z` / `vX.Y.Z-rc.N`) or manual dry-run dispatches.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify/package (optional when dry_run=true; defaults to v0.0.0-dryrun.<sha>)"
+        required: false
+        type: string
+      dry_run:
+        description: "Package and verify artifacts without creating a GitHub Release"
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+# Never cancel a release mid-publish.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Release Preflight, Signed-Tag & Compliance Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.context.outputs.release_tag }}
+      dry_run: ${{ steps.context.outputs.dry_run }}
+      is_prerelease: ${{ steps.context.outputs.is_prerelease }}
+      commit_timestamp: ${{ steps.context.outputs.commit_timestamp }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and validate release context
+        id: context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            dry_run="false"
+            tag="$REF_NAME"
+            # Require tagged commits to be reachable from the default branch so
+            # unmerged or rogue branch tags cannot trigger a public release.
+            git fetch --no-tags origin "$DEFAULT_BRANCH"
+            if ! git merge-base --is-ancestor HEAD "origin/$DEFAULT_BRANCH"; then
+              echo "::error::Tagged commit $(git rev-parse HEAD) is not an ancestor of origin/$DEFAULT_BRANCH."
+              exit 1
+            fi
+          else
+            dry_run="${INPUT_DRY_RUN:-true}"
+            if [ -n "$INPUT_TAG" ]; then
+              tag="$INPUT_TAG"
+            elif [ "$dry_run" = "true" ]; then
+              short_sha="$(git rev-parse --short=9 HEAD)"
+              tag="v0.0.0-dryrun.${short_sha}"
+            else
+              echo "::error::An explicit semver tag is required when dry_run=false."
+              exit 1
+            fi
+          fi
+
+          semver_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$tag" =~ $semver_re ]]; then
+            echo "::error::Invalid release tag format: $tag (expected vX.Y.Z or vX.Y.Z-prerelease)"
+            exit 1
+          fi
+
+          is_prerelease="false"
+          if [[ "$tag" == *-* ]]; then
+            is_prerelease="true"
+          fi
+
+          # For real releases, verify tag matches Cargo.toml [workspace.package] version.
+          if [ "$dry_run" != "true" ]; then
+            tag_core="${tag#v}"
+            tag_core="${tag_core%%-*}"
+            cargo_ver="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+            if [ "$tag_core" != "$cargo_ver" ]; then
+              echo "::error::Release tag version ($tag_core) does not match Cargo.toml workspace.package.version ($cargo_ver)."
+              exit 1
+            fi
+          fi
+
+          commit_ts="$(git show -s --format=%ct HEAD)"
+          {
+            echo "release_tag=$tag"
+            echo "dry_run=$dry_run"
+            echo "is_prerelease=$is_prerelease"
+            echo "commit_timestamp=$commit_ts"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release_tag=$tag dry_run=$dry_run is_prerelease=$is_prerelease commit_timestamp=$commit_ts"
+
+      - name: Verify allowed_signers & cryptographic tag signature
+        env:
+          RELEASE_TAG: ${{ steps.context.outputs.release_tag }}
+          DRY_RUN: ${{ steps.context.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          SIGNERS=".github/allowed_signers"
+          if [ ! -f "$SIGNERS" ]; then
+            echo "::error::Missing required $SIGNERS file."
+            exit 1
+          fi
+
+          # Validate format of any active (non-comment, non-blank) signer lines.
+          active_keys=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+            if [[ ! "$trimmed" =~ ^[^[:space:]]+[[:space:]]+namespaces=\"git\"[[:space:]]+(sk-ssh-ed25519@openssh\.com|ssh-ed25519|sk-ecdsa-sha2-nistp256@openssh\.com|ecdsa-sha2-nistp256)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; then
+              echo "::error::Malformed entry in $SIGNERS: expected '<principal> namespaces=\"git\" <ssh-key-type> <pubkey>'."
+              exit 1
+            fi
+            active_keys=$((active_keys + 1))
+          done < "$SIGNERS"
+
+          if [ "$DRY_RUN" != "true" ]; then
+            if [ "$active_keys" -eq 0 ]; then
+              echo "::error::$SIGNERS contains no active maintainer signing keys; register a key before publishing a signed release (see SIGNING.md)."
+              exit 1
+            fi
+            git -c "gpg.ssh.allowedSignersFile=$SIGNERS" verify-tag "$RELEASE_TAG"
+            echo "Verified SSH signature on tag $RELEASE_TAG against $SIGNERS ($active_keys active key(s))."
+          else
+            if [ "$active_keys" -eq 0 ]; then
+              echo "::warning::$SIGNERS has 0 active maintainer keys registered yet. Dry-run continues, but real tag releases will fail closed until a signing key is registered (see SIGNING.md)."
+            else
+              echo "$SIGNERS validated ($active_keys active key(s))."
+              if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+                git -c "gpg.ssh.allowedSignersFile=$SIGNERS" verify-tag "$RELEASE_TAG"
+              fi
+            fi
+          fi
+
+      - name: Verify required AGPL-3.0 license and notice files
+        run: |
+          set -euo pipefail
+          for f in LICENSE CREDITS.md THIRD_PARTY_NOTICES.md SOURCE_AND_LICENSES.md; do
+            if [ ! -s "$f" ]; then
+              echo "::error::Required AGPL-3.0 compliance file missing or empty: $f"
+              exit 1
+            fi
+          done
+          if [ ! -d LICENSES ] || [ -z "$(ls -A LICENSES)" ]; then
+            echo "::error::Required LICENSES/ directory missing or empty."
+            exit 1
+          fi
+
+      - name: Privacy & PII leak check
+        run: python3 -B scripts/verify_no_leaks.py --root .
+
+      - name: Check typos
+        uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
+
+      - name: Verify SPDX license headers
+        uses: apache/skywalking-eyes/header@a196742f472feaffafea537ce5a2a4c3c53a8de4 # v0.9.0
+        with:
+          config: .licenserc.yaml
+          mode: check
+
+  build-artifacts:
+    name: Build Deterministic AGPL Tarballs, SPDX 2.3 SBOM & Cosign Bundle
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      slsa_subjects: ${{ steps.package.outputs.slsa_subjects }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build deterministic source/license bundles, SPDX 2.3 SBOM & SHA256SUMS
+        id: package
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          COMMIT_TIMESTAMP: ${{ needs.preflight.outputs.commit_timestamp }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          src_tar="flux-engine-${RELEASE_TAG}-src.tar.gz"
+          lic_tar="flux-engine-${RELEASE_TAG}-licenses.tar.gz"
+          sbom_json="flux-engine-${RELEASE_TAG}.spdx.json"
+
+          # Deterministic source archive (`gzip -n` omits timestamps).
+          git archive --format=tar --prefix="flux-engine-${RELEASE_TAG}/" HEAD \
+            | gzip -n -9 > "dist/${src_tar}"
+
+          # Standalone AGPL-3.0 license & third-party notices bundle.
+          git archive --format=tar --prefix="flux-engine-${RELEASE_TAG}-licenses/" HEAD \
+            LICENSE CREDITS.md THIRD_PARTY_NOTICES.md SOURCE_AND_LICENSES.md LICENSES \
+            | gzip -n -9 > "dist/${lic_tar}"
+
+          # Deterministic SPDX 2.3 JSON SBOM from Cargo.toml + Cargo.lock.
+          python3 -B scripts/generate_cargo_spdx_sbom.py \
+            --repo-root . \
+            --release-tag "$RELEASE_TAG" \
+            --commit "$GITHUB_SHA" \
+            --created "$COMMIT_TIMESTAMP" \
+            --output "dist/${sbom_json}"
+
+          (
+            cd dist
+            sha256sum "${src_tar}" "${lic_tar}" "${sbom_json}" > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+            # Compute base64-encoded SHA-256 subjects for SLSA Build Level 3 generator
+            # covering both tarballs, the SPDX 2.3 SBOM, and SHA256SUMS.txt itself.
+            subjects_b64="$(sha256sum "${src_tar}" "${lic_tar}" "${sbom_json}" SHA256SUMS.txt | base64 -w0)"
+            echo "slsa_subjects=${subjects_b64}" >> "$GITHUB_OUTPUT"
+          )
+          ls -lh dist/
+
+      - name: Install Sigstore Cosign
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+
+      - name: Keyless-sign SHA256SUMS.txt with Cosign (GitHub OIDC + Rekor)
+        if: needs.preflight.outputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.txt.sigstore.json \
+            dist/SHA256SUMS.txt
+
+      - name: Attest build provenance (GitHub Artifact Attestations)
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/flux-engine-*.tar.gz
+            dist/flux-engine-*.spdx.json
+            dist/SHA256SUMS.txt
+
+      - name: Attest SPDX 2.3 SBOM (GitHub Artifact Attestations)
+        if: needs.preflight.outputs.dry_run != 'true'
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/flux-engine-${{ needs.preflight.outputs.release_tag }}-src.tar.gz
+          sbom-path: dist/flux-engine-${{ needs.preflight.outputs.release_tag }}.spdx.json
+
+      - name: Upload release artifacts for provenance & publishing
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ needs.preflight.outputs.release_tag }}
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  slsa-provenance:
+    name: Generate SLSA Build Level 3 Provenance
+    needs: [preflight, build-artifacts]
+    if: needs.preflight.outputs.dry_run != 'true'
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    with:
+      base64-subjects: ${{ needs.build-artifacts.outputs.slsa_subjects }}
+      provenance-name: flux-engine-${{ needs.preflight.outputs.release_tag }}.intoto.jsonl
+      upload-assets: false
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [preflight, build-artifacts, slsa-provenance]
+    if: needs.preflight.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release bundle artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ needs.preflight.outputs.release_tag }}
+          path: dist
+
+      - name: Download SLSA Build Level 3 provenance
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: flux-engine-${{ needs.preflight.outputs.release_tag }}.intoto.jsonl
+          path: dist
+
+      - name: Verify bundle integrity & publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          src_tar="flux-engine-${RELEASE_TAG}-src.tar.gz"
+          lic_tar="flux-engine-${RELEASE_TAG}-licenses.tar.gz"
+          sbom_json="flux-engine-${RELEASE_TAG}.spdx.json"
+          prov_jsonl="flux-engine-${RELEASE_TAG}.intoto.jsonl"
+          cosign_bundle="SHA256SUMS.txt.sigstore.json"
+
+          for f in "$src_tar" "$lic_tar" "$sbom_json" "SHA256SUMS.txt" "$cosign_bundle" "$prov_jsonl"; do
+            if [ ! -s "dist/$f" ]; then
+              echo "::error::Expected release artifact missing or empty: dist/$f"
+              exit 1
+            fi
+          done
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+
+          extra_args=()
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            extra_args+=(--prerelease)
+          fi
+
+          notes_footer=$(cat <<EOF
+
+          ---
+          ### Verification & AGPL-3.0-only Complete Corresponding Source
+          Verify every supply-chain layer (SHA-256 checksums, SSH signed tag, SLSA Build Level 3 provenance, Sigstore Cosign keyless bundle, and GitHub Artifact Attestations) with:
+          \`\`\`bash
+          ./scripts/verify_release.sh --tag ${RELEASE_TAG} --dir .
+          \`\`\`
+          - \`${src_tar}\`: Deterministic Complete Corresponding Source archive (AGPL-3.0-only).
+          - \`${lic_tar}\`: \`LICENSE\`, \`CREDITS.md\`, \`THIRD_PARTY_NOTICES.md\`, \`SOURCE_AND_LICENSES.md\`, and \`LICENSES/\`.
+          - \`${sbom_json}\`: Deterministic SPDX 2.3 SBOM generated from \`Cargo.toml\` + \`Cargo.lock\`.
+          - \`SHA256SUMS.txt\` + \`${cosign_bundle}\`: SHA-256 manifest signed keyless via Sigstore Cosign (GitHub OIDC + Rekor).
+          - \`${prov_jsonl}\`: Isolated SLSA Build Level 3 provenance (\`slsa-verifier verify-artifact\`).
+          - See [\`SIGNING.md\`](https://github.com/TheApathy/flux-engine/blob/${RELEASE_TAG}/SIGNING.md) for manual verification commands.
+          EOF
+          )
+
+          gh release create "$RELEASE_TAG" \
+            "dist/${src_tar}" \
+            "dist/${lic_tar}" \
+            "dist/${sbom_json}" \
+            "dist/SHA256SUMS.txt" \
+            "dist/${cosign_bundle}" \
+            "dist/${prov_jsonl}" \
+            --verify-tag \
+            --generate-notes \
+            --title "Flux Engine ${RELEASE_TAG}" \
+            --notes "$notes_footer" \
+            "${extra_args[@]}"

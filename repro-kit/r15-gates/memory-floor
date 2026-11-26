@@ -1,0 +1,1007 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Real C1 host/cgroup memory qualification. See R16 memory driver notes."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import math
+import mmap
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import types
+import urllib.parse
+
+GATE = "memory-floor"
+LIFECYCLE_SHA256 = "dfae597a00c668ee5e3b2f02042c39df6035fa48cbb887cea53a3cb50a41b032"
+TOKENIZER_SHA256 = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+CONTEXTS = (8192, 131072, 262144)
+OUTPUT_TOKENS = 64
+FLOOR_MIB = 6656
+INTERVAL_SECONDS = 0.25
+MAX_SAMPLES = 10000
+MAX_LOG_BYTES = 512 * 1024 * 1024
+MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+MIB = 1024 * 1024
+LOG_PATTERNS = {
+    "allocator_warning_count": rb"\b(?:allocat(?:or|ion)[^\r\n]*(?:warn(?:ing)?|fail(?:ed|ure)?)|(?:warn(?:ing)?|fail(?:ed|ure)?)[^\r\n]*allocat(?:or|ion)|KV cache exhausted)\b",
+    "cuda_oom_count": rb"\bcuda[-_: ]*out[-_: ]*of[-_: ]*memory\b",
+    "nvrm_count": rb"\bnvrm\b",
+    "xid_count": rb"\bxid\b",
+}
+FATAL_PATTERN = re.compile(
+    rb"\bcuda[-_: ]*fatal\b|\billegal[-_: ]*memory[-_: ]*access\b|\bout[-_: ]*of[-_: ]*memory\b|\boom[-_: ]*kill(?:er)?\b|\b(?:CUDA_ERROR_(?:OUT_OF_MEMORY|ILLEGAL_ADDRESS)|cudaError(?:MemoryAllocation|IllegalAddress))\b",
+    re.I,
+)
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def file_identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_nlink,
+    )
+
+
+def load_checked(path, expected, name):
+    """Execute exactly the checked bytes; never import mutable sibling code."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * MIB,
+            "helper size differs",
+        )
+        raw = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+        require(
+            file_identity(before) == file_identity(after)
+            and len(raw) == before.st_size
+            and digest(raw) == expected,
+            "helper source pin differs",
+        )
+    finally:
+        os.close(descriptor)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def parent_plan(args):
+    """Bind runtime/checkpoint provenance to the actual sealed launching plan."""
+    parent = os.getppid()
+    argv = Path(f"/proc/{parent}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+    for name in ("container-id", "image-id", "image-digest", "base-url", "run-id"):
+        token = ("--" + name).encode()
+        require(argv.count(token) == 1, "parent identity is ambiguous")
+        index = argv.index(token)
+        require(
+            index + 1 < len(argv)
+            and argv[index + 1].decode() == getattr(args, name.replace("-", "_")),
+            "parent launch identity differs",
+        )
+    require(argv.count(b"--plan-fd") == 1, "parent plan descriptor is ambiguous")
+    index = argv.index(b"--plan-fd")
+    require(
+        index + 1 < len(argv) and re.fullmatch(rb"[0-9]+", argv[index + 1]),
+        "parent plan descriptor differs",
+    )
+    descriptor = os.open(
+        f"/proc/{parent}/fd/{int(argv[index + 1])}", os.O_RDONLY | os.O_CLOEXEC
+    )
+    try:
+        seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        require(
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals == seals,
+            "parent plan is not sealed",
+        )
+        raw = args.suite.read_fd(
+            descriptor, "memory parent plan", args.suite.MAX_PLAN_BYTES, nlink=None
+        )
+        require(os.getppid() == parent, "parent changed during plan verification")
+    finally:
+        os.close(descriptor)
+    plan = args.suite.strict_json_loads(raw, "memory parent plan")
+    require(
+        type(plan) is dict
+        and plan.get("schema") == args.suite.PLAN_SCHEMA
+        and plan.get("runtime_dir") == args.runtime_dir,
+        "parent runtime plan differs",
+    )
+    return plan, digest(raw)
+
+
+def read_small(path, *, dir_fd=None):
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
+    )
+    try:
+        raw = os.read(descriptor, 65537)
+        require(len(raw) <= 65536, "kernel counter exceeds bound")
+        return raw.decode("ascii", "strict")
+    finally:
+        os.close(descriptor)
+
+
+def integers(text):
+    result = {}
+    for line in text.splitlines():
+        words = line.split()
+        require(
+            len(words) == 2
+            and words[0] not in result
+            and re.fullmatch(r"[0-9]+", words[1]),
+            "kernel event census is malformed",
+        )
+        result[words[0]] = int(words[1])
+    return result
+
+
+class MemorySource:
+    def __init__(self, args):
+        self.args = args
+        document = args.suite.strict_json_loads(
+            args.lifecycle.docker(
+                ["container", "inspect", "--format", "{{json .}}", args.container_id]
+            ),
+            "memory container",
+        )
+        require(
+            document.get("Id") == args.container_id
+            and document.get("Image") == args.image_id
+            and document.get("State", {}).get("Running") is True,
+            "memory container identity differs",
+        )
+        self.pid = args.suite.exact_int(
+            document["State"].get("Pid"), "container init PID", 1, 1 << 31
+        )
+        self.start = args.suite._process_start_ticks(self.pid)
+        self.cgroup_raw = read_small(f"/proc/{self.pid}/cgroup")
+        rows = self.cgroup_raw.splitlines()
+        require(
+            len(rows) == 1 and rows[0].startswith("0::/"), "local cgroup v2 is required"
+        )
+        path = rows[0][3:]
+        require(
+            re.search(r"(?<![0-9a-f])" + args.container_id + r"(?![0-9a-f])", path),
+            "memory cgroup differs from exact container",
+        )
+        self.path = args.suite.normalized_absolute(
+            "/sys/fs/cgroup" + path, "memory cgroup"
+        )
+        self.groups = []
+        current = self.path
+        try:
+            # Host MemAvailable covers the root. Every non-root ancestor can
+            # impose an additional effective limit on this exact container.
+            while current != Path("/sys/fs/cgroup"):
+                descriptor = args.suite.open_directory_chain(current, "memory cgroup")
+                group = {
+                    "path": current,
+                    "descriptor": descriptor,
+                    "identity": os.fstat(descriptor),
+                }
+                self.groups.append(group)
+                group["baseline_events"] = integers(
+                    read_small("memory.events", dir_fd=descriptor)
+                )
+                require(
+                    {"oom", "oom_kill"} <= group["baseline_events"].keys(),
+                    "cgroup OOM counters are unavailable",
+                )
+                current = current.parent
+        except BaseException:
+            self.close()
+            raise
+
+    def group_snapshot(self, group):
+        info = group["path"].stat(follow_symlinks=False)
+        identity = group["identity"]
+        require(
+            (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino),
+            "memory cgroup directory changed",
+        )
+        counters = {}
+        for name in ("memory.current", "memory.peak", "memory.max"):
+            raw = read_small(name, dir_fd=group["descriptor"]).strip()
+            require(
+                (name == "memory.max" and raw == "max") or re.fullmatch(r"[0-9]+", raw),
+                "cgroup memory counter is malformed",
+            )
+            counters[name] = None if raw == "max" else int(raw)
+        require(
+            counters["memory.peak"] >= counters["memory.current"],
+            "cgroup peak is below current memory",
+        )
+        baseline = group["baseline_events"]
+        events = integers(read_small("memory.events", dir_fd=group["descriptor"]))
+        require(
+            events.keys() == baseline.keys()
+            and all(events[key] >= value for key, value in baseline.items()),
+            "cgroup event counters changed identity",
+        )
+        require(
+            all(
+                events[key] == baseline[key]
+                for key in ("oom", "oom_kill", "oom_group_kill")
+                if key in events
+            ),
+            "container hierarchy recorded an OOM event",
+        )
+        return counters, events
+
+    def snapshot(self):
+        require(
+            self.args.suite._process_start_ticks(self.pid) == self.start
+            and read_small(f"/proc/{self.pid}/cgroup") == self.cgroup_raw,
+            "container memory identity changed",
+        )
+        values = {}
+        for line in read_small("/proc/meminfo").splitlines():
+            match = re.fullmatch(r"(MemTotal|MemAvailable):\s+([0-9]+) kB", line)
+            if match:
+                require(match[1] not in values, "host memory counter is duplicated")
+                values[match[1]] = int(match[2]) * 1024
+        require(
+            set(values) == {"MemTotal", "MemAvailable"}
+            and 0 < values["MemAvailable"] <= values["MemTotal"],
+            "host memory counters are invalid",
+        )
+        available = values["MemAvailable"]
+        hierarchy = []
+        for group in self.groups:
+            counters, events = self.group_snapshot(group)
+            hierarchy.append(
+                {
+                    "relative_path": str(group["path"].relative_to("/sys/fs/cgroup")),
+                    "counters": counters,
+                    "events": events,
+                }
+            )
+            if counters["memory.max"] is not None:
+                require(
+                    counters["memory.current"] <= counters["memory.max"],
+                    "container hierarchy exceeds its memory limit",
+                )
+                available = min(
+                    available, counters["memory.max"] - counters["memory.current"]
+                )
+        return {
+            "available_mib": available // MIB,
+            "used_mib": (values["MemTotal"] - values["MemAvailable"] + MIB - 1) // MIB,
+        }, {
+            "host": values,
+            "cgroup": hierarchy[0]["counters"],
+            "events": hierarchy[0]["events"],
+            "hierarchy": hierarchy,
+        }
+
+    def close(self):
+        for group in self.groups:
+            os.close(group["descriptor"])
+        self.groups.clear()
+
+
+class Sampler:
+    def __init__(self, args, source, journal):
+        self.args, self.source, self.journal = args, source, journal
+        self.samples, self.observations = [], []
+        self.phase, self.error = "startup-none", None
+        self.lock, self.stop_event = threading.Lock(), threading.Event()
+        self.thread = threading.Thread(
+            target=self.loop, name="memory-floor-sampler", daemon=True
+        )
+
+    def sample(self):
+        with self.lock:
+            require(len(self.samples) < MAX_SAMPLES, "memory sample bound exceeded")
+            sample_start = time.monotonic_ns()
+            values, detail = self.source.snapshot()
+            sample = {
+                **values,
+                "allocator_warnings": 0,
+                "cuda_oom_count": 0,
+                "nvrm_count": 0,
+                "xid_count": 0,
+            }
+            observation = {
+                "sample_start_monotonic_ns": sample_start,
+                "monotonic_ns": time.monotonic_ns(),
+                "phase": self.phase,
+                **detail,
+                **sample,
+            }
+            self.args.suite.write_all(
+                self.journal, self.args.suite.canonical_bytes(observation) + b"\n"
+            )
+            self.samples.append(sample)
+            self.observations.append(observation)
+            require(values["available_mib"] >= FLOOR_MIB, "memory safety floor failed")
+
+    def loop(self):
+        try:
+            while not self.stop_event.wait(INTERVAL_SECONDS):
+                self.sample()
+        except BaseException as error:
+            self.error = error
+            self.stop_event.set()
+
+    def start(self):
+        self.sample()
+        self.thread.start()
+
+    def set_phase(self, phase):
+        self.check()
+        with self.lock:
+            self.phase = phase
+
+    def check(self):
+        if self.error is not None:
+            raise self.error
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=10)
+            require(not self.thread.is_alive(), "memory sampler did not stop")
+        self.check()
+
+
+def kernel_command(args, arguments, target):
+    result = subprocess.run(
+        ["journalctl", "--dmesg", "--boot", "--no-pager", "--output=json", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=target,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
+    )
+    require(
+        result.returncode == 0 and not result.stderr,
+        "complete kernel journal is unavailable",
+    )
+    require(os.fstat(target).st_size <= MAX_LOG_BYTES, "kernel log bound exceeded")
+
+
+def kernel_records(args, descriptor):
+    raw = args.suite.read_fd(
+        descriptor, "memory kernel journal", MAX_LOG_BYTES, nlink=1
+    )
+    records = [
+        args.suite.strict_json_loads(line, "kernel journal event")
+        for line in raw.splitlines()
+    ]
+    require(
+        records
+        and all(
+            type(row) is dict
+            and type(row.get("__CURSOR")) is str
+            and type(row.get("_BOOT_ID")) is str
+            and type(row.get("MESSAGE")) is str
+            for row in records
+        ),
+        "kernel cursor records are unavailable",
+    )
+    return records, raw
+
+
+def fixture(context, model):
+    require(context in CONTEXTS, "unknown memory workload")
+    length = context - OUTPUT_TOKENS
+    pattern = list(range(1000, 1064))
+    prompt = [1100 + CONTEXTS.index(context)] + (pattern * ((length + 63) // 64))[
+        : length - 1
+    ]
+    return {
+        "model": model,
+        "prompt": "",
+        "prompt_token_ids": prompt,
+        "max_tokens": OUTPUT_TOKENS,
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "top_n_sigma": 0.0,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "seed": 38262144,
+        "stream": False,
+        "stop": [],
+        "ignore_eos": True,
+        "return_token_ids": True,
+    }
+
+
+def validate_response(args, body, response):
+    require(
+        type(response) is dict
+        and response.get("model") == body["model"]
+        and type(response.get("id")) is str
+        and bool(response["id"]),
+        "memory response identity differs",
+    )
+    choices = response.get("choices")
+    require(
+        type(choices) is list and len(choices) == 1 and type(choices[0]) is dict,
+        "memory response choices differ",
+    )
+    choice = choices[0]
+    tokens = choice.get("token_ids")
+    require(
+        choice.get("finish_reason") == "length"
+        and type(tokens) is list
+        and len(tokens) == OUTPUT_TOKENS
+        and all(type(token) is int and 0 <= token <= 0xFFFFFFFF for token in tokens),
+        "memory output budget or scheduler tokens differ",
+    )
+    usage = response.get("usage")
+    require(type(usage) is dict, "memory usage is absent")
+    for key, expected in (
+        ("prompt_tokens", len(body["prompt_token_ids"])),
+        ("completion_tokens", OUTPUT_TOKENS),
+        ("total_tokens", len(body["prompt_token_ids"]) + OUTPUT_TOKENS),
+    ):
+        require(
+            type(usage.get(key)) is int and usage[key] == expected,
+            "memory measured token geometry differs",
+        )
+    details = usage.get("prompt_tokens_details")
+    require(
+        type(details) is dict
+        and type(details.get("cached_tokens")) is int
+        and details["cached_tokens"] == 0,
+        "memory workload reused cached prompt tokens",
+    )
+
+
+def tokenizer_pin(args, pid):
+    root = os.open(f"/proc/{pid}/root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        descriptor = args.suite._open_process_file(root, "/models/tokenizer.json")
+        try:
+            observed, _ = args.suite._hash_regular_fd(
+                descriptor, "memory tokenizer", 64 * MIB
+            )
+            require(
+                observed == TOKENIZER_SHA256, "mounted tokenizer source pin differs"
+            )
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root)
+
+
+def verify_counter(metrics):
+    candidates = [
+        line
+        for line in metrics.splitlines()
+        if line.startswith("atlas_spec_decode_verify_total{")
+        and re.search(r'\bk="5"', line)
+    ]
+    values = re.findall(
+        r'^atlas_spec_decode_verify_total\{[^\n}]*\bk="5"[^\n}]*\}\s+([0-9.eE+-]+)\s*$',
+        metrics,
+        re.M,
+    )
+    require(len(candidates) == len(values), "native K5 counter is malformed")
+    numbers = [float(value) for value in values]
+    require(
+        all(
+            math.isfinite(value) and 0 <= value <= 1e12 and value.is_integer()
+            for value in numbers
+        ),
+        "native K5 counter is malformed",
+    )
+    return int(sum(numbers))
+
+
+def scan_log_snapshot(descriptor):
+    before = os.fstat(descriptor)
+    require(
+        stat.S_ISREG(before.st_mode)
+        and before.st_nlink == 1
+        and before.st_size <= MAX_LOG_BYTES,
+        "complete memory log is outside bound",
+    )
+    counts = {key: 0 for key in LOG_PATTERNS}
+    observed = digest(b"")
+    if before.st_size:
+        with mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ) as raw:
+            require(FATAL_PATTERN.search(raw) is None, "fatal engine log event")
+            for key, expression in LOG_PATTERNS.items():
+                counts[key] = sum(1 for _ in re.finditer(expression, raw, re.I))
+            observed = digest(raw)
+    require(
+        file_identity(os.fstat(descriptor)) == file_identity(before),
+        "memory log changed during full scan",
+    )
+    return counts, {"bytes": before.st_size, "sha256": observed}
+
+
+def scan_log(descriptor):
+    return scan_log_snapshot(descriptor)[0]
+
+
+class EngineLog:
+    def __init__(self, descriptor):
+        self.descriptor = descriptor
+
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+    def Popen(self, *args, **kwargs):
+        require(
+            "stdout" not in kwargs and "stderr" not in kwargs,
+            "lifecycle logging contract changed",
+        )
+        return subprocess.Popen(
+            *args, stdout=self.descriptor, stderr=self.descriptor, **kwargs
+        )
+
+
+def run(args):
+    suite, helper = args.suite, args.lifecycle
+    launch_plan, plan_hash = parent_plan(args)
+    plan, recipe = helper.inspect_container(args, suite)
+    for key in (
+        "in_container_binary_path",
+        "in_container_recipe_path",
+        "in_container_binary_sha256",
+        "recipe_sha256",
+    ):
+        require(
+            plan[key] == launch_plan[key],
+            "memory image differs from sealed source plan",
+        )
+    runtime = suite.normalized_absolute(args.runtime_dir, "memory runtime")
+    identity = suite.directory_identity_sha256(runtime, "memory runtime")
+    helper.make_directory(suite, runtime, ["memory"])
+    require(
+        stat.S_IMODE((runtime / "memory").stat().st_mode) == 0o700,
+        "memory artifacts directory is not private",
+    )
+    descriptors, artifacts, consumed, journals = {}, {}, {}, {}
+
+    def create(name):
+        locator = "memory/" + name
+        descriptor = suite.create_beneath(runtime, locator, "memory artifact", 0o400)
+        descriptors[name] = descriptor
+        return descriptor
+
+    def append(descriptor, value):
+        raw = suite.canonical_bytes(value) + b"\n"
+        require(
+            os.fstat(descriptor).st_size + len(raw) <= MAX_JOURNAL_BYTES,
+            "memory journal bound exceeded",
+        )
+        suite.write_all(descriptor, raw)
+        journal = journals.setdefault(
+            descriptor, {"hash": hashlib.sha256(), "bytes": 0}
+        )
+        journal["hash"].update(raw)
+        journal["bytes"] += len(raw)
+
+    source = sampler = None
+    original_subprocess = helper.subprocess
+    engine = create("engine.log")
+    kernel_text = create("kernel-measured.log")
+    baseline = create("kernel-start.jsonl")
+    kernel_full = create("kernel-full.jsonl")
+    samples = create("samples.jsonl")
+    requests = create("requests.jsonl")
+    proofs, workloads, response_ids = [], [], set()
+    try:
+        kernel_command(args, ["--lines=1"], baseline)
+        initial, initial_raw = kernel_records(args, baseline)
+        consumed["kernel-start.jsonl"] = {
+            "bytes": len(initial_raw),
+            "sha256": digest(initial_raw),
+        }
+        require(len(initial) == 1, "kernel baseline is ambiguous")
+        cursor, boot = initial[0]["__CURSOR"], initial[0]["_BOOT_ID"]
+        source = MemorySource(args)
+        sampler = Sampler(args, source, samples)
+        helper.subprocess = EngineLog(engine)
+        try:
+            sampler.start()
+            for mode in ("none", "native-mtp-k5"):
+                sampler.set_phase("startup-" + mode)
+                startup_start = time.monotonic_ns()
+                with helper.server(args, mode, plan, recipe) as (model, proof, pidfd):
+                    ready = time.monotonic_ns()
+                    require(
+                        any(
+                            startup_start
+                            <= row["sample_start_monotonic_ns"]
+                            <= row["monotonic_ns"]
+                            <= ready
+                            and row["phase"] == "startup-" + mode
+                            for row in sampler.observations
+                        ),
+                        "startup memory was not sampled",
+                    )
+                    tokenizer_pin(args, proof["host_pid"])
+                    proofs.append(proof)
+                    previous = 0
+                    for context in CONTEXTS:
+                        sampler.check()
+                        require(
+                            not select.select([pidfd], [], [], 0)[0],
+                            "memory workload process exited",
+                        )
+                        body = fixture(context, model)
+                        phase = mode + "-" + str(context)
+                        sampler.set_phase(phase)
+                        append(
+                            requests,
+                            {
+                                "kind": "request",
+                                "mode": mode,
+                                "context_tokens": context,
+                                "request": body,
+                                "monotonic_ns": time.monotonic_ns(),
+                            },
+                        )
+                        start = time.monotonic_ns()
+                        raw = helper.request(args, "POST", "/v1/completions", body)
+                        end = time.monotonic_ns()
+                        append(
+                            requests,
+                            {
+                                "kind": "response",
+                                "mode": mode,
+                                "context_tokens": context,
+                                "raw_response_utf8": raw.decode("utf-8", "strict"),
+                                "monotonic_ns": end,
+                            },
+                        )
+                        response = suite.strict_json_loads(
+                            raw, "memory workload response"
+                        )
+                        validate_response(args, body, response)
+                        require(
+                            response["id"] not in response_ids,
+                            "memory response ID was reused",
+                        )
+                        response_ids.add(response["id"])
+                        sampler.set_phase("idle-" + mode)
+                        require(
+                            any(
+                                start
+                                <= row["sample_start_monotonic_ns"]
+                                <= row["monotonic_ns"]
+                                <= end
+                                and row["phase"] == phase
+                                for row in sampler.observations
+                            ),
+                            "active workload memory was not sampled",
+                        )
+                        metrics = helper.request(args, "GET", "/metrics").decode(
+                            "utf-8", "strict"
+                        )
+                        counter = verify_counter(metrics)
+                        require(
+                            (
+                                counter > previous
+                                if mode == "native-mtp-k5"
+                                else counter == 0
+                            ),
+                            "native K5 workload engagement differs",
+                        )
+                        previous = counter
+                        append(
+                            requests,
+                            {
+                                "kind": "metrics",
+                                "mode": mode,
+                                "context_tokens": context,
+                                "metrics": metrics,
+                            },
+                        )
+                        workloads.append(
+                            {
+                                "mode": mode,
+                                "context_tokens": context,
+                                "prompt_tokens": context - OUTPUT_TOKENS,
+                                "completion_tokens": OUTPUT_TOKENS,
+                                "prompt_sha256": digest(
+                                    suite.canonical_bytes(body["prompt_token_ids"])
+                                ),
+                                "start_monotonic_ns": start,
+                                "end_monotonic_ns": end,
+                            }
+                        )
+                    tokenizer_pin(args, proof["host_pid"])
+                sampler.sample()
+        finally:
+            try:
+                if sampler is not None:
+                    sampler.stop()
+            finally:
+                helper.subprocess = original_subprocess
+                kernel_command(args, ["--cursor=" + cursor], kernel_full)
+                records, records_raw = kernel_records(args, kernel_full)
+                require(
+                    records[0] == initial[0]
+                    and all(row["_BOOT_ID"] == boot for row in records),
+                    "kernel baseline cursor was lost or boot changed",
+                )
+                require(
+                    len({row["__CURSOR"] for row in records}) == len(records),
+                    "kernel event cursor was repeated",
+                )
+                measured = b"".join(
+                    row["MESSAGE"].encode("utf-8") + b"\n" for row in records[1:]
+                )
+                require(
+                    len(measured) <= MAX_LOG_BYTES, "measured kernel log exceeds bound"
+                )
+                suite.write_all(kernel_text, measured)
+                for name, raw in (
+                    ("kernel-full.jsonl", records_raw),
+                    ("kernel-measured.log", measured),
+                ):
+                    consumed[name] = {"bytes": len(raw), "sha256": digest(raw)}
+        require(
+            len(sampler.samples) >= 3 and len(workloads) == len(CONTEXTS) * 2,
+            "memory workload coverage is incomplete",
+        )
+        counts = {key: 0 for key in LOG_PATTERNS}
+        for name in ("engine.log", "kernel-measured.log"):
+            descriptor = descriptors[name]
+            os.fsync(descriptor)
+            log_counts, snapshot = scan_log_snapshot(descriptor)
+            require(
+                name not in consumed or consumed[name] == snapshot,
+                "memory log differs from consumed kernel messages",
+            )
+            consumed[name] = snapshot
+            for key, value in log_counts.items():
+                counts[key] += value
+        require(not any(counts.values()), "memory safety log census failed")
+        require(
+            len({(proof["host_pid"], proof["start_time_ticks"]) for proof in proofs})
+            == 2,
+            "memory modes did not use distinct processes",
+        )
+        sample_hash, sample_bytes = hashlib.sha256(), 0
+        for observation in sampler.observations:
+            raw = suite.canonical_bytes(observation) + b"\n"
+            sample_hash.update(raw)
+            sample_bytes += len(raw)
+        consumed["samples.jsonl"] = {
+            "bytes": sample_bytes,
+            "sha256": sample_hash.hexdigest(),
+        }
+        consumed["requests.jsonl"] = {
+            "bytes": journals[requests]["bytes"],
+            "sha256": journals[requests]["hash"].hexdigest(),
+        }
+        for name, descriptor in descriptors.items():
+            os.fsync(descriptor)
+            suite.assert_path_identity(
+                runtime, "memory/" + name, descriptor, "memory artifact"
+            )
+            size = os.fstat(descriptor).st_size
+            require(size <= MAX_LOG_BYTES, "memory artifact bound exceeded")
+            if size:
+                observed, _ = suite._hash_regular_fd(
+                    descriptor, "memory artifact", MAX_LOG_BYTES
+                )
+            else:
+                observed = digest(b"")
+            require(os.fstat(descriptor).st_nlink == 1, "memory artifact was linked")
+            require(
+                consumed[name] == {"bytes": size, "sha256": observed},
+                "memory artifact differs from the bytes consumed by validation",
+            )
+            artifacts[name] = {
+                "artifact": "memory/" + name,
+                **consumed[name],
+            }
+        require(
+            suite.directory_identity_sha256(runtime, "memory runtime") == identity,
+            "memory runtime identity changed",
+        )
+        raw = {
+            "samples": sampler.samples,
+            "process_bindings": proofs,
+            "workloads": workloads,
+            "artifacts": artifacts,
+            "safety_floor_mib": FLOOR_MIB,
+            "sample_interval_seconds": INTERVAL_SECONDS,
+            "suite_plan_sha256": plan_hash,
+            "lifecycle_sha256": LIFECYCLE_SHA256,
+            "tokenizer_sha256": TOKENIZER_SHA256,
+            "checkpoint_id": launch_plan["checkpoint_id"],
+            "checkpoint_revision": launch_plan["checkpoint_revision"],
+            "qualification_scope": "synthetic-token C1 memory only; not semantic, C8, parity or performance qualification",
+        }
+        validator = {
+            "schema": "flux-r15-gate-validator/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "raw": raw,
+        }
+        payload = suite.canonical_bytes(validator)
+        target = create("validator.json")
+        suite.write_all(target, payload)
+        os.fsync(target)
+        evidence = {
+            "sample_count": len(sampler.samples),
+            "minimum_available_mib": min(
+                row["available_mib"] for row in sampler.samples
+            ),
+            "peak_used_mib": max(row["used_mib"] for row in sampler.samples),
+            **counts,
+            "validator_artifact": "memory/validator.json",
+            "validator_receipt_sha256": digest(payload),
+        }
+        receipt = {
+            "schema": "flux-r15-container-gate-receipt/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "execution_scope": "immutable-container",
+            "image_id": args.image_id,
+            "image_digest": args.image_digest,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "evidence": evidence,
+        }
+        suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+        os.fsync(args.receipt_fd)
+        return receipt
+    finally:
+        helper.subprocess = original_subprocess
+        if source is not None:
+            source.close()
+        try:
+            # The inherited raw FD is read-only. The suite collects stderr.
+            for descriptor in (engine, kernel_text):
+                size = os.fstat(descriptor).st_size
+                require(size <= MAX_LOG_BYTES, "memory log bound exceeded")
+                for offset in range(0, size, MIB):
+                    suite.write_all(
+                        2, os.pread(descriptor, min(MIB, size - offset), offset)
+                    )
+        finally:
+            for descriptor in descriptors.values():
+                os.close(descriptor)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in (
+        "container-id",
+        "image-id",
+        "image-digest",
+        "base-url",
+        "run-id",
+        "receipt-fd",
+        "raw-log-fd",
+        "runtime-dir",
+        "suite-program",
+        "suite-sha256",
+        "lifecycle-program",
+    ):
+        parser.add_argument(
+            "--" + name, required=True, type=int if name.endswith("-fd") else str
+        )
+    parser.add_argument("--container-port", type=int, default=8888)
+    args = parser.parse_args(argv)
+    parsed = urllib.parse.urlsplit(args.base_url)
+    require(
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.port is not None
+        and parsed.path == ""
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None,
+        "base URL must be an explicit HTTP IPv4 loopback origin",
+    )
+    require(
+        1 <= parsed.port <= 65535 and 1 <= args.container_port <= 65535,
+        "memory port is invalid",
+    )
+    require(re.fullmatch(r"[0-9a-f]{64}", args.container_id), "container ID differs")
+    require(
+        all(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+            for value in (args.image_id, args.image_digest)
+        ),
+        "image identity differs",
+    )
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", args.run_id),
+        "run ID is unsafe",
+    )
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.suite_sha256)
+        and set(args.suite_sha256) != {"0"},
+        "suite source pin is invalid",
+    )
+    args.lifecycle = load_checked(
+        args.lifecycle_program, LIFECYCLE_SHA256, "_r16_memory_lifecycle"
+    )
+    args.lifecycle.verify_parent_suite(args.suite_sha256)
+    args.suite = args.lifecycle.load_module(
+        args.suite_program, args.suite_sha256, "_r16_memory_suite"
+    )
+    require(
+        callable(getattr(args.suite, "_live_listener_identity", None))
+        and callable(getattr(args.suite, "_verify_live_mode", None)),
+        "live broker upgrade is required",
+    )
+    require(
+        hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+        "local Linux pidfds are required",
+    )
+    require(
+        args.receipt_fd >= 3
+        and args.raw_log_fd >= 3
+        and args.receipt_fd != args.raw_log_fd,
+        "inherited descriptors differ",
+    )
+    args.suite.validate_inherited_receipt_fd(args.receipt_fd)
+    require(
+        fcntl.fcntl(args.raw_log_fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY,
+        "raw log FD must be read-only",
+    )
+    require(
+        stat.S_ISREG(os.fstat(args.raw_log_fd).st_mode), "raw log FD must be regular"
+    )
+    args.identities = {
+        name: getattr(args, name)
+        for name in ("container_id", "image_id", "image_digest", "base_url", "run_id")
+    }
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        print(
+            GATE + ": qualification failed (" + type(error).__name__ + ")",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

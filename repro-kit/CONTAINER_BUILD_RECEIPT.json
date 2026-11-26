@@ -1,0 +1,96 @@
+{
+  "receipt_version": "1.1.0",
+  "built_at_utc": "2026-11-24T18:20:24Z",
+  "engine_version": "1.0.2",
+  "git_commit": "e100dbacd498cd563ae9e9d650f20631bc96a752",
+  "git_tree": "9d153fcc0f8ba190f846771b80a58cb7cf9adc8a",
+  "base_image": {
+    "repository": "nvidia/cuda",
+    "tag": "13.0.0-runtime-ubuntu24.04",
+    "architecture": "linux/arm64"
+  },
+  "image": {
+    "image_id": "sha256:2f3325dbea81690c0a7b5af7f349d993956770560f3edcf87f68761967353516",
+    "core_image_id": "sha256:1f4414eca6c6939f81a6933006d7a19e1cb14fadfe25d52c4191c4a4b75ccdf9",
+    "size_bytes": 5924467419,
+    "size_human": "5.92 GB",
+    "tags": [
+      "ghcr.io/theapathy/flux-engine:v1.0.2",
+      "ghcr.io/theapathy/flux-engine:v1.0",
+      "ghcr.io/theapathy/flux-engine:1.0.2",
+      "ghcr.io/theapathy/flux-engine:1.0",
+      "ghcr.io/theapathy/flux-engine:gb10",
+      "ghcr.io/theapathy/flux-engine:latest",
+      "flux-engine:v1.0.2",
+      "flux-engine:v1.0",
+      "flux-engine:latest"
+    ],
+    "ghcr_packages_url": "https://github.com/TheApathy?tab=packages",
+    "diagnostics_repo": "https://github.com/TheApathy/flux-engine/issues",
+    "privacy_first_default": true,
+    "repo_digest": "ghcr.io/theapathy/flux-engine@sha256:b36d1fe73b6221ce4949c828c682f89d1a8424e4a91913bd33ee3900dbd115dd"
+  },
+  "router_image": {
+    "image_id": "sha256:58090299cd9d5dded8d7a810399122b50ea30f5b61b3a33e674869db3afe969c",
+    "size_bytes": 173792397,
+    "size_human": "173.8 MB",
+    "base": "haproxy:2.8",
+    "tags": [
+      "ghcr.io/theapathy/flux-router:v1.0.2",
+      "ghcr.io/theapathy/flux-router:v1.0",
+      "ghcr.io/theapathy/flux-router:1.0.2",
+      "ghcr.io/theapathy/flux-router:1.0",
+      "ghcr.io/theapathy/flux-router:latest",
+      "flux-router:v1.0.2",
+      "flux-router:v1.0",
+      "flux-router:latest"
+    ],
+    "repo_digest": "ghcr.io/theapathy/flux-router@sha256:f4ca35f47cad3f556dc40c546673cf3f342fb6c68812e3974a4c3a8d0414a839"
+  },
+  "bundled_binaries": {
+    "/opt/flux/bin/flux-server-real": {
+      "sha256": "9c6d8ed9c4cd77accab64bd708559ff6c320e3e667635aac2386d65b6e5fa5f8",
+      "size_bytes": 181957560,
+      "targets": [
+        "qwen3.8-flash-next"
+      ]
+    },
+    "/opt/flux/bin/flux-server-universal": {
+      "sha256": "31dfb09ad5943e4d448f170b785ad2656b0930d689e1b5a58b5018c34dcc1322",
+      "size_bytes": 158905072,
+      "targets": [
+        "deepseek-v4.1",
+        "gemma-4-31b",
+        "qwen3.8-27b"
+      ]
+    },
+    "/opt/flux/bin/flux-server-glm53": {
+      "sha256": "9f8cad4b70fb29dc99cf454a4cf40e6363faec4b9bfd878ccb6535d6c5b4bda1",
+      "size_bytes": 129715384,
+      "targets": [
+        "glm5.3-flash"
+      ]
+    }
+  },
+  "bundled_tools": {
+    "flux_cli": "/usr/local/bin/flux",
+    "flux_router": "/usr/local/bin/flux-router",
+    "flux_bench": "/usr/local/bin/flux-bench",
+    "flux_lens": "/usr/local/bin/flux-lens",
+    "lil_bench": "/usr/local/bin/lil-bench",
+    "repack_ple": "/usr/local/bin/repack-ple",
+    "llm_inference_bench_dir": "/opt/flux/llm-inference-bench"
+  },
+  "smoke_tests": {
+    "validate_image_provenance": "PASS (in-Dockerfile SHA-256 & symlink-free descriptor validation for 1.0.2)",
+    "cli_help_and_version_checks": "PASS (flux-engine v1.0.2; SHA256SUMS 7/7 OK; all 3 flux-server binaries OK; flux-router --help OK; auto/high-kv/1m-nvfp4/2x-spark/3x-spark/4x-spark launch plans verified)",
+    "rootfs_privacy_audit_core": "PASS (9,475 files / 4,532,662,626 bytes scanned, 0 violations)",
+    "rootfs_privacy_audit_unified": "PASS (9,526 files / 4,828,055,206 bytes scanned, 0 violations)",
+    "rootfs_privacy_audit_router": "PASS (4,434 files / 170,569,844 bytes scanned, 0 violations)",
+    "live_4x_gb10_tp4_ep4_dflash2": "PASS (12-16s boot; 24.71 GB weights/rank; 4M BF16 KV = 48 GiB, 40.2 GiB free UMA; C=1 math 20.3-21.3 tok/s math_4385_ok=True 7/7 DFlash2 accept; C=4 37.14 / C=16 59.45 agg tok/s 0 err; 8K needle_ok=True; 16K GQA 6:1 sparse QSA 0 err; 1 Gbps NAT TCP)",
+    "live_2x_gb10_tp2_ep2_dflash2": "PASS (26s boot; 4M BF16 KV = 48 GiB, 23.7 GiB free UMA; C=1 math 28.54 tok/s math_4385_ok=True; C=4 56.66 / C=16 109.46 agg tok/s 0 err; 1 Gbps NAT TCP)",
+    "live_3x_gb10_pp3_k5mtp": "PASS (13-27s boot; 27.23 GB weights/rank; fit_need=77052 vs peak=73781 MiB 0 FIT_WARN; 4M BF16 KV = 32 GiB, 46.4 GiB free UMA, R0 budget_blocks=506180; C=1 math 44.95 tok/s math_4385_ok=True; C=1 code 46.02; C=4 74.77 / C=16 141.02 agg tok/s 0 err; 8K 1,574 tok/s & 16K 2,018 tok/s needle_ok=True; 1 Gbps NAT TCP)",
+    "live_4x_gb10_pp4_k5mtp": "PASS (27s boot; ~20.5 GB weights/rank; fit_need=62178 vs peak=59800 MiB 0 FIT_WARN; 4M BF16 KV = 24 GiB, 60.2 GiB free UMA, R0 budget_blocks=732725; C=1 math 43.82 tok/s math_4385_ok=True; C=1 code 46.20; C=4 72.65 / C=16 139.86 agg tok/s 0 err; 8K 1,416 tok/s & 16K 1,650 tok/s needle_ok=True; 1 Gbps NAT TCP)"
+  },
+  "image_id": "sha256:2f3325dbea81690c0a7b5af7f349d993956770560f3edcf87f68761967353516"
+}

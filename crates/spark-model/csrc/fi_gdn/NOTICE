@@ -1,0 +1,48 @@
+FlashInfer Gated DeltaNet (GDN) Optional Bridge — Notice & Build Behavior
+
+1. First-Party Source Files in This Directory (`AGPL-3.0-only`)
+   - `fi_gdn_bridge.cu`
+   - `fi_gdn_bridge_f16.cu`
+   - `fi_gdn_bridge_f16_nf8.cu`
+   - `abi_shim.cpp`
+   These bridge and ABI-shim sources are part of Flux Engine and are licensed
+   under the GNU Affero General Public License v3.0 only (`AGPL-3.0-only`; see
+   `../../../../LICENSE`).
+
+2. Upstream FlashInfer Attribution (`Apache-2.0`)
+   The optional ahead-of-time (AOT) GDN prefill kernel integrated by this bridge
+   derives from FlashInfer (`flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py`):
+
+     Upstream Project:   https://github.com/flashinfer-ai/flashinfer
+     Upstream Copyright: Copyright (c) 2023-2026 FlashInfer Contributors
+     Upstream License:   Apache License, Version 2.0 (`../../../../LICENSES/Apache-2.0.txt`)
+
+3. Default Build Behavior (No Precompiled `.o` Objects Distributed)
+   Precompiled CuTe-DSL AOT object files (`atlas_fi_gdn_*_prefill*.o`) and their
+   generated C headers (`atlas_fi_gdn_*_prefill*.h`) are intentionally NOT
+   committed to or distributed with this repository in order to preserve full
+   AGPL-3.0 Corresponding Source compliance and avoid redistributing proprietary
+   `nvidia-cutlass-dsl` runtime objects.
+
+   By default, `crates/spark-model/build.rs` detects that no AOT `.o` objects
+   are present, skips compiling `libatlas_fi_gdn.a` (`cfg(not(atlas_fi_gdn))`),
+   and automatically builds with the native CUDA GDN prefill fallback for both
+   `ATLAS_TARGET_HW=gb10` (`sm_121f`) and `ATLAS_TARGET_HW=rtx6000` (`sm_120a`).
+
+4. Optional Local Source-Built FlashInfer GDN Acceleration
+   Operators who want to enable optional FlashInfer CuTe-DSL GDN prefill
+   acceleration locally using their own FlashInfer + NVIDIA CuTe-DSL toolchain
+   can export the three AOT `.o`/`.h` pairs from source via:
+
+     repro-kit/source-closure/v0.9.13-r8/gdn-aot/rebuild-aot.sh
+
+   `crates/spark-model/build.rs` searches this directory
+   (`crates/spark-model/csrc/fi_gdn/`) for the three AOT object files matching
+   `atlas_fi_gdn_<arch>_<target_arch>_prefill{,_f16,_f16_nf8}.o` (with `_`
+   stripped from `<arch>`, e.g., `sm121f_aarch64`, `sm121a_aarch64`, or
+   `sm120a_x86_64`, plus a legacy `atlas_fi_gdn_sm121a_prefill{,_f16,_f16_nf8}.o`
+   fallback for `sm_121*` on `aarch64`), alongside the matching generated
+   headers (`atlas_fi_gdn_sm121a_prefill{,_f16,_f16_nf8}.h` included by
+   `fi_gdn_bridge*.cu`). Once placed here and `spark-model` is rebuilt,
+   `build.rs` automatically detects the trio, compiles the bridge/shim, and
+   enables `cfg(atlas_fi_gdn)`.

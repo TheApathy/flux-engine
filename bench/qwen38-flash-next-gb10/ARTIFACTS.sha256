@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Qwen3.8-Flash-Next (NVFP4-Offload + Inferact K=5 MTP) Artifact Digest Ledger
+# Hardware: NVIDIA Grace Blackwell GB10 (DGX Spark, sm_121a, 119.7 GiB UMA)
+# Verify with: sha256sum <artifact>
+
+# --- 1. Target & Draft Checkpoint Manifests ---
+# Qwen/Qwen3.8-Flash-Next-NVFP4-Offload (548-file directory manifest sha256; 10.67 GiB base + 123.59 GiB 512 PLE shard sidecars)
+ed8aa879996dc322e3720eb9848a4193c4cfc1d7c05e0421d85108429bd15869  checkpoint-manifest:Qwen3.8-Flash-Next-NVFP4-Offload
+# Upstream Hugging Face Revisions
+7b719225242aacd3dbd3f9407468c2ee9a9d2594  hf-revision:RadixArk/Qwen3.8-Flash-Next-NVFP4
+bcd9f01ddc9cff2316eb84281bebcd5b058bddce  hf-revision:Qwen/Qwen3.8-Flash-Next-FP8
+129972269565f7f4f664fdf8dd42268d3bbda9fd  hf-revision:Inferact/Qwen3.8-Flash-Next-MTP-Sidecar
+
+# --- 2. Pinned Unified13 Release Binaries (ATLAS_TARGET_MODEL=qwen3.8-flash-next) ---
+# Wave 11 head (ae58bc27efd8b35aa4272da15dd5f4c549ec332a) — K11-C2 fused QSA top-k gather + score_v2
+29e959d401137bb4da2248319cbddced0fefb66b5a3c91f55cdc2141bd98dab5  spark-qwen38-unified13-ae58bc27e-r1
+# Wave 10 head (0760867638160ad0496bb7de4293f8e93e40f597) — K12-2 MoE gate+up dual-pass L2 residency + K12-1 v17q
+187811ccc713df82385a8ca37a56fd97a9707b40a00bb3745a1b06686de01b5d  spark-qwen38-unified13-076086763-r1
+# Wave 9 head (63618f6619c0780401e9a4da86e7f4c3eec17e77) — K11-E2 GDN conv_v3 + norm_fp8_v2 + K11-D2/D5 MTP batch replay
+71252d2e13316dfbf02b5bcbd95fb01bc90dbeffcde5f0b7e944dd4b75c7943a  spark-qwen38-unified13-63618f661-r1
+# LIL v0.7.9 serve-v9-w4096 campaign binary (8275fb759-r1)
+84d629bda7c9aa291b806bb55b914df31e58fe793170e9574e43804a1ba387b4  spark-qwen38-unified13-8275fb759-r1
+# Estonia 136.6K Certificate 1 + LIL v0.7.9 serve-v9 campaign binary (64136c5d9-r1)
+c60fc35ced1ddfa1217c6dce8ed0968caa00417236e0d27573378200301a4e4f  spark-qwen38-unified13-64136c5d9-r1
+# Estonia 136.6K Certificate 2 binary (b80fbf309-r1)
+732911414fd9cbc15126c03e096ee309ddcd047e84bca4b192e21f7b9b9ddfaa  spark-qwen38-unified13-b80fbf309-r1
+# Lossless 10/10 K=5 MTP Token-Identity Gate binary (fbb58d75a-r1; 2,560/2,560 exact tokens)
+6017d6b21795dbcbedd023c663eec134bd6296d642de85ad50c4b01ec8b4fd2f  spark-qwen38-unified13-fbb58d75a-r1
+
+# --- 3. Certified Evidence Source Logs ---
+# M-0001 / 05e-serve-v9-gate (6,082.2 tok/s peak / 6,076.7 tok/s median @ 16K; 5,694.4 tok/s @ 128K)
+d20fbdf3156b26a670079a0f1875ba478f15c1374d2c7d94a86e2da41be07a14  evidence-source:05e-serve-v9-gate-results.log
+# M-0001 / 05f-serve-v9-w4096-gate (5,276.3 tok/s @ 8K; 11,907 MiB MemAvailable floor @ 128K)
+fb08245d314541a5290dcbf7d1273b8d9a4a1043e9e4a1f621b8be7be4ab89eb  evidence-source:05f-serve-v9-w4096-gate-results.log
+# M-0002 / decode-9ba k5all (57.4 tok/s peak / 56.3 tok/s median coding decode, 1.70x speedup)
+f27451b268fc1054e165bb6b40119918b35e733b5b5c0a8b46d915c9b04fb55f  evidence-source:decode-9ba-k5all-results.log
+# M-0002 / 05e-lossless-10p-gate (10/10 prompts = 2,560/2,560 exact greedy tokens vs Plain (ATLAS_DISABLE_SPECULATION=1))
+e529d1c2cf2989e29c19c8e2a98ca74ffdb2c3df6541734bd69b3a34ff92826c  evidence-source:05e-lossless-10p-gate-results.txt
+# M-0003 / 05g-lil-estonia-bench (5/5 = 100% PASS @ 136,584 tokens, 5,400.4 tok/s prefill, 48.2 tok/s decode)
+739570ba891e12661bf550330574d1b1ca357be1197ef911303de97eb5bfebbf  evidence-source:05g-lil-estonia-results.json
+# LIL v0.7.9 Full Campaign — serve-v9 (w16384)
+55d78c9586688688b76832d5db45d726139c4452ff57fb4b9b5f39b698ef69c5  evidence-source:lil-09c-serve-v9-summary.json
+# LIL v0.7.9 Full Campaign — serve-v9-w4096 (w4096)
+7c3cb881fb0854ca1cf92cb1d0a81dbdd969bb02d00f6605212eb3364b0a22d2  evidence-source:lil-09c-serve-v9-w4096-summary.json

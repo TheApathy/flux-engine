@@ -1,0 +1,59 @@
+name: File size advisory (≤500 LoC guideline)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-file-sizes:
+    name: Advisory check for >500 LoC Rust source files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Report oversized Rust source files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # Advisory maintainability check: flag newly added or modified .rs files
+          # exceeding the 500-LoC guideline with GitHub warning annotations without
+          # failing CI on existing legacy/monolithic modules.
+          over_cap=0
+
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_REF" ]]; then
+            git fetch --no-tags origin "$BASE_REF"
+            changed_raw="$(git diff --name-only --diff-filter=AM "origin/${BASE_REF}...HEAD" -- 'crates/**/*.rs')"
+            mapfile -t changed_files <<< "$changed_raw"
+            for file in "${changed_files[@]}"; do
+              [[ -n "$file" && -f "$file" ]] || continue
+              lines=$(wc -l < "$file")
+              if [[ "$lines" -gt 500 ]]; then
+                echo "::warning file=$file::$lines LoC exceeds the 500-line maintainability guideline. Consider splitting cohesive submodules where practical."
+                over_cap=$((over_cap + 1))
+              fi
+            done
+            echo "Advisory check complete: $over_cap PR-changed .rs file(s) exceed 500 LoC."
+          else
+            while IFS= read -r -d '' file; do
+              lines=$(wc -l < "$file")
+              if [[ "$lines" -gt 500 ]]; then
+                over_cap=$((over_cap + 1))
+              fi
+            done < <(find crates -name '*.rs' -not -name '*.bak' -not -path '*/target/*' -print0)
+            echo "Baseline inventory: $over_cap .rs file(s) in crates/ exceed the 500-LoC guideline."
+          fi

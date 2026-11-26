@@ -1,0 +1,236 @@
+[model]
+name = "qwen3.8-27b"
+hf_id = "Qwen/Qwen3.8-27B"
+params = "27B"
+active_params = "27B"
+architecture = "Hybrid Attention + GDN + Dense FFN + MRoPE"
+
+# Architecture mirrors the existing Qwen3.5-27B (hybrid GDN + full-attention,
+# 3:1 pattern, 248K vocab). Diff vs Qwen3.5-27B: MRoPE-interleaved is enabled
+# by default in the upstream config (Qwen3.5-27B picked up MRoPE only in
+# Kbenkhaled's NVFP4 re-upload; Qwen3.6/3.8-27B have it natively).
+layers_total = 64
+layers_full_attention = 16
+layers_linear_attention = 48
+
+hidden_dim = 5120
+head_dim = 256
+q_heads = 24
+kv_heads = 4
+intermediate_size = 17408
+
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+attn_output_gate = true
+partial_rotary_factor = 0.25
+
+# MRoPE (multi-modal rotary position embedding). Same configuration as
+# Qwen3.6-35B-A3B's full-attention layers — interleaved 3-axis rope. Text-only
+# serving keeps H/W position IDs at zero.
+mrope_interleaved = true
+mrope_section = [11, 11, 10]
+
+# Qwen3.8-27B ships a complete 1-layer MTP decoder block in-checkpoint
+# (mtp.* — self-attn + gated FFN + norms + mtp.fc fusion, 0.42B params).
+# qwen3.6-27b declared 0 and forced us to strip the shard; declaring 1 here
+# lets Atlas drive the native head instead of an external drafter.
+mtp_layers = 1
+
+# Effective context for agentic tasks. Mirrors Qwen3.5-27B's empirical bound
+# (Atlas's hybrid-GDN long-context behavior is consistent across 27B variants).
+effective_context = 24576
+
+# Qwen3.8 sampling keeps history penalties neutral in every category. The
+# previous Qwen3.6-derived presence/LZ/DRY stack was calibrated only for
+# stochastic prose at temperature 0.6. Atlas applies those processors before
+# the temperature-zero argmax too, where they can demote repeated whitespace
+# tokens and corrupt deterministic code indentation. Repetition=1 and the
+# zero values below make greedy decoding the target model's raw argmax while
+# preserving explicit per-request presence/frequency/repetition overrides.
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
+dry_base = 1.75
+dry_allowed_length = 2
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
+dry_base = 1.75
+dry_allowed_length = 2
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
+dry_base = 1.75
+dry_allowed_length = 2
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+# Deliberately no min_p override: the model card does not publish a tools
+# preset, so absence preserves the operator/server default for this category.
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
+dry_base = 1.75
+dry_allowed_length = 2
+
+[behavior]
+# Rollback+re-steer SPLICES the sequence when its repetition watchdog fires.
+# Code is inherently repetitive, so it false-positives on coding workloads
+# (e.g. mid-expression syntax errors caused by premature sequence splicing
+# with output budget remaining). Those splices and hard-stop truncations
+# share one root: the detectors false-positive on healthy code/reasoning at default sensitivity (observed firing at 56
+# thinking tokens). Re-steer is restored as the only mechanism that can break
+# a REAL loop and still finish the answer; the thresholds below are raised so
+# fires are rare enough that the splice risk is acceptable.
+rollback_resteer = true
+# Thinking-loop: require 12 repeats (default 3) before forcing </think>.
+think_loop_min_repeats = 12
+# Disable F2 confidence-run early-stop: deterministic algebraic/code runs inside
+# `<think>` routinely exceed 30 tokens at top-1 prob >= 0.95 after token 400.
+confidence_early_stop = false
+# Fuzzy content-repeat: tolerate pattern_len/18 mismatches (default /12) —
+# tighter match required before the content-loop watchdog fires.
+fuzzy_repeat_tolerance_div = 18
+# Content-loop watchdog OFF, as on Flash-Next. Its rule (any 8..64-token phrase
+# seen 3x in the last 280 tokens, not necessarily contiguous) fires on ordinary
+# lists and repeated code guard clauses, prematurely truncating Qwen3.8-27B
+# replies with `finish_reason=length` (see `FLAGS.md` §2.1). The always-on
+# catastrophic guard (>=512 tokens, 32 contiguous identical periods) still stops
+# genuine attractor loops; it is disabled only by `--disable-loop-watchdog`.
+# (The Qwen3.6-27B CSS/prose loops that motivated `true` were 3990-token contiguous repeats.)
+enable_loop_watchdog = false
+# Thinking on by default: dense Qwen3.6-27B is a reasoning model and
+# clients (Open WebUI etc.) send plain requests with no enable_thinking
+# flag. Without this the chat template injects an empty
+# `<think>\n\n</think>` (thinking-off marker) so reasoning_content is
+# always empty. An explicit per-request enable_thinking=false still wins.
+thinking_default = true
+# Qwen3.8's measured upstream agentic/tool profile keeps reasoning enabled
+# on tool-armed turns. The checkpoint template injects its effort contract;
+# cutting it to the copied Qwen3.6-era 512-token budget can force-close the
+# plan before tool selection.
+thinking_in_tools = true
+# Deep-think default matching native 262,144 context so long reasoning windows
+# scale cleanly with max_tokens via the 90% (70% with tools) safety cap.
+max_thinking_budget = 262144
+# `preserve_thinking` intentionally unset: Qwen3.8's checkpoint template
+# defaults to preserving historical think wrappers, while older dense-Qwen
+# templates keep their own default.
+default_num_drafts = 1
+
+# Upstream Qwen/Qwen3.8-27B reports `model_type = "qwen3_5"` in config.json.
+# Dense `qwen3_5` checkpoints stay `"qwen3_5"` in `atlas-core`
+# (`config/parsers/qwen_yarn.rs` / `config/dispatch.rs` — only MoE checkpoints
+# are rewritten to `"qwen3_6_moe"`). The `"qwen3_6_moe"` entry at
+# `hidden_size = 5120` is kept solely as a fallback for checkpoints declaring it
+# directly. The factory routes through `Qwen35WeightLoader`.
+[[model_types]]
+model_type = "qwen3_5"
+hidden_size = 5120
+
+[[model_types]]
+model_type = "qwen3_6_moe"
+hidden_size = 5120
+
+# DFlash block-diffusion speculative decoding pairing.
+# Drafter (`z-lab/Qwen3.6-27B-DFlash`) is a separate 8-layer Qwen3-arch
+# transformer that emits γ=16 tokens per step via bidirectional in-block
+# attention. The 27B target's hidden_size (5120) determines the drafter's
+# `fc` projection input dimension (5 * 5120 = 25600) — different from the
+# 35B-A3B target's drafter (5 * 2048 = 10240) but the drafter checkpoint
+# itself is the right shape per its own config.json.
+[dflash]
+draft_model = "z-lab/Qwen3.6-27B-DFlash"
+gamma = 16
+window_size = 4096
+mask_token_id = 248070
+# Verified 2026-05-03 against z-lab/Qwen3.6-27B-DFlash/config.json.
+# `dflash_loader::parse_dflash_config` reads these from the drafter's
+# config.json at runtime; this MODEL.toml field is the fallback default.
+target_layer_ids = [1, 16, 31, 46, 61]
+
+# Drafter pairing profiles (`[[dflash.profile]]`): the rows the engine's
+# drafter admission and the launcher's companion allow-list read. Schema and
+# semantics: crates/atlas-kernels/src/drafter_profile.rs. An `exact` row is
+# the complete checkpoint identity; every listed field is enforced and a
+# DFlash2-family checkpoint that matches no exact row is refused.
+#
+# z-lab/Qwen3.8-27B-DFlash2: the qualified 27B drafter and the launcher
+# default (GB10 mean 37.4 tok/s vs plain 13.3, drafter-bakeoff-20261014).
+[[dflash.profile]]
+name = "zlab-dflash2"
+kind = "dflash2"
+admission = "exact"
+qualified = true
+launcher_default = true
+capture_mode = "residual_slice"
+# Trained B8 verifies K<=8; B16/gamma15 only under ATLAS_DFLASH2_WIDTH_16=1.
+verify_k = [2, 8]
+wide_verify_k = 16
+allow_modelopt_nvfp4 = true
+allow_rtncal_w4a4 = true
+architecture = "DFlash2DraftModel"
+hidden_size = 5120
+intermediate_size = 17408
+num_hidden_layers = 5
+num_attention_heads = 32
+num_key_value_heads = 8
+head_dim = 128
+vocab_size = 248320
+draft_vocab_size = 248320
+block_size = 8
+mask_token_id = 248070
+target_layer_ids = [5, 19, 33, 47, 61]
+conv_kernel_size = 2
+conv_group_size = 16
+selector_rank = 256
+selector_top_k = 16
+layer_types = [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+]
+sliding_window = 2048
+is_causal = false
+rope_theta = 10000000.0
+rms_norm_eps = 1e-6
+hidden_act = "silu"
+tensor_count = 81
+
+# DFlash v1 block-16 drafters (the [dflash] default above): admitted by the
+# generic validator, unqualified. They fall to about 0.6x plain at 32K, so
+# the launcher ranks DFlash2 first.
+[[dflash.profile]]
+name = "generic-dflash"
+kind = "dflash"
+admission = "generic"

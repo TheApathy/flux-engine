@@ -1,0 +1,461 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Auto-extracted from `ops.rs` during refactor wave 4a.
+
+#![allow(unused_imports)]
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+use crate::layers::moe;
+use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight};
+
+use super::*;
+
+/// Fused weighted sum + sigmoid blend + gate scalar GEMV.
+///
+/// Computes gate_scalar = dot(input, gate_weight) inline, then:
+/// `output[j] = sum_e weights[e] * expert_out[e,j] + sigmoid(gate_scalar) * shared_out[j]`
+///
+/// Each block independently computes the gate scalar dot product (redundant but
+/// only 8KB per block for K=2048 — negligible). Eliminates the separate dense_gemv
+/// kernel for the shared expert gate scalar (saves 48 graph nodes).
+///
+/// Grid: (ceil(hidden/256), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_blend(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    output: DevicePtr,
+    expert_out: DevicePtr,
+    expert_weights: DevicePtr,
+    shared_out: DevicePtr,
+    input: DevicePtr,
+    gate_weight: DevicePtr,
+    hidden: u32,
+    top_k: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(hidden, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(output)
+        .arg_ptr(expert_out)
+        .arg_ptr(expert_weights)
+        .arg_ptr(shared_out)
+        .arg_ptr(input)
+        .arg_ptr(gate_weight)
+        .arg_u32(hidden)
+        .arg_u32(top_k)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// K=2 batch MoE variants — process 2 tokens in single kernel launches
+// ═══════════════════════════════════════════════════════════════════
+
+/// Fused gate+up expert GEMV for K=2 tokens with shared expert.
+///
+/// Expands blockIdx.y from (top_k+1) to 2*(top_k+1) to process both tokens.
+/// Token index = blockIdx.y / (top_k+1), expert slot = blockIdx.y % (top_k+1).
+/// Shared expert blocks use direct weight pointers; routed use pointer table.
+///
+/// Grid: (ceil(N/8), 2*(top_k+1), 2)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_batch2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr, // [2, H] BF16
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr, // [2*top_k, inter] BF16
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,         // [2*top_k, inter] BF16
+    expert_indices: DevicePtr, // [2*top_k] u32
+    sh_gate: &QuantizedWeight,
+    sh_gate_out: DevicePtr, // [2, inter] BF16
+    sh_up: &QuantizedWeight,
+    sh_up_out: DevicePtr, // [2, inter] BF16
+    n: u32,
+    k: u32,
+    top_k: u32,
+    block_size: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        block_size == 128,
+        "moe_expert_gate_up_shared_batch2 requires block_size == 128 (got {block_size}) matching CUDA BLOCK_SIZE=128"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 2 * (top_k + 1), 2])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate_packed_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_packed_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(up_out)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate.weight)
+        .arg_ptr(sh_gate.weight_scale)
+        .arg_f32(sh_gate.weight_scale_2)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(sh_up.weight)
+        .arg_ptr(sh_up.weight_scale)
+        .arg_f32(sh_up.weight_scale_2)
+        .arg_ptr(sh_up_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .launch(stream)
+}
+
+/// Fused SiLU+down expert GEMV for K=2 tokens with shared expert.
+///
+/// Grid: (ceil(N/8), 2*(top_k+1), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_batch2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_out: DevicePtr, // [2*top_k, inter] BF16
+    up_out: DevicePtr,   // [2*top_k, inter] BF16
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,         // [2*top_k, H] BF16
+    expert_indices: DevicePtr, // [2*top_k] u32
+    sh_gate_in: DevicePtr,     // [2, inter] BF16
+    sh_up_in: DevicePtr,       // [2, inter] BF16
+    sh_down: &QuantizedWeight,
+    sh_down_out: DevicePtr, // [2, H] BF16
+    n: u32,
+    k: u32,
+    top_k: u32,
+    block_size: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        block_size == 128,
+        "moe_expert_silu_down_shared_batch2 requires block_size == 128 (got {block_size}) matching CUDA BLOCK_SIZE=128"
+    );
+    // s_act is extern shared: K floats (issue #85 -- static 1024 overflowed
+    // for Mistral-Small-4's expert_hidden_dim=2048).
+    let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), 2 * (top_k + 1), 1])
+        .block([128, 1, 1])
+        .shared_mem(smem_bytes)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down.weight)
+        .arg_ptr(sh_down.weight_scale)
+        .arg_f32(sh_down.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .launch(stream)
+}
+
+/// Fused weighted sum + sigmoid blend for K=2 tokens.
+///
+/// blockIdx.y = token index (0 or 1). Each block computes gate scalar
+/// independently from per-token input and shared gate weight.
+///
+/// Grid: (ceil(hidden/256), 2, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_blend_batch2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    output: DevicePtr,         // [2, hidden] BF16
+    expert_out: DevicePtr,     // [2*top_k, hidden] BF16
+    expert_weights: DevicePtr, // [2*top_k] f32
+    shared_out: DevicePtr,     // [2, hidden] BF16
+    input: DevicePtr,          // [2, K] BF16
+    gate_weight: DevicePtr,    // [1, K] BF16 (shared)
+    hidden: u32,
+    top_k: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(hidden, 256), 2, 1])
+        .block([256, 1, 1])
+        .arg_ptr(output)
+        .arg_ptr(expert_out)
+        .arg_ptr(expert_weights)
+        .arg_ptr(shared_out)
+        .arg_ptr(input)
+        .arg_ptr(gate_weight)
+        .arg_u32(hidden)
+        .arg_u32(top_k)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Fused gate+up expert GEMV for `num_tokens` tokens with shared expert.
+///
+/// Grid: (ceil(N/8), num_tokens*(top_k+1), 2)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_batch3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr, // [num_tokens, H] BF16
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr, // [num_tokens*top_k, inter] BF16
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,         // [num_tokens*top_k, inter] BF16
+    expert_indices: DevicePtr, // [num_tokens*top_k] u32
+    sh_gate: &QuantizedWeight,
+    sh_gate_out: DevicePtr, // [num_tokens, inter] BF16
+    sh_up: &QuantizedWeight,
+    sh_up_out: DevicePtr, // [num_tokens, inter] BF16
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), num_tokens * (top_k + 1), 2])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate_packed_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_packed_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(up_out)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate.weight)
+        .arg_ptr(sh_gate.weight_scale)
+        .arg_f32(sh_gate.weight_scale_2)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(sh_up.weight)
+        .arg_ptr(sh_up.weight_scale)
+        .arg_f32(sh_up.weight_scale_2)
+        .arg_ptr(sh_up_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// Fused SiLU+down expert GEMV for `num_tokens` tokens with shared expert.
+///
+/// Grid: (ceil(N/8), num_tokens*(top_k+1), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_batch3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_out: DevicePtr, // [num_tokens*top_k, inter] BF16
+    up_out: DevicePtr,   // [num_tokens*top_k, inter] BF16
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,         // [num_tokens*top_k, H] BF16
+    expert_indices: DevicePtr, // [num_tokens*top_k] u32
+    sh_gate_in: DevicePtr,     // [num_tokens, inter] BF16
+    sh_up_in: DevicePtr,       // [num_tokens, inter] BF16
+    sh_down: &QuantizedWeight,
+    sh_down_out: DevicePtr, // [num_tokens, H] BF16
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    // s_act is extern shared: K floats (issue #85 -- static 1024 overflowed
+    // for expert inter dims > 1024).
+    let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), num_tokens * (top_k + 1), 1])
+        .block([128, 1, 1])
+        .shared_mem(smem_bytes)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down.weight)
+        .arg_ptr(sh_down.weight_scale)
+        .arg_f32(sh_down.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// Expert-deduplicated twin of [`moe_expert_gate_up_shared_batch3`]: same
+/// grid and per-row arithmetic, each distinct expert streamed once.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_dedup(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr,
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate: &QuantizedWeight,
+    sh_gate_out: DevicePtr,
+    sh_up: &QuantizedWeight,
+    sh_up_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    moe_expert_gate_up_shared_batch3(
+        gpu,
+        kernel,
+        input,
+        gate_packed_ptrs,
+        gate_scale_ptrs,
+        gate_scale2_vals,
+        gate_out,
+        up_packed_ptrs,
+        up_scale_ptrs,
+        up_scale2_vals,
+        up_out,
+        expert_indices,
+        sh_gate,
+        sh_gate_out,
+        sh_up,
+        sh_up_out,
+        n,
+        k,
+        top_k,
+        num_tokens,
+        stream,
+    )
+}
+
+/// Expert-deduplicated twin of [`moe_expert_silu_down_shared_batch3`]. The
+/// leader block stages SiLU(gate)*up for up to `rows_max` rows in shared
+/// memory, so the launch reserves `rows_max * k` floats.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_dedup(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    rows_max: u32,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_down: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        num_tokens <= rows_max,
+        "dedup MoE down: {num_tokens} rows exceed the kernel's {rows_max}-row cap"
+    );
+    let smem_bytes = rows_max as usize * k as usize * std::mem::size_of::<f32>();
+    anyhow::ensure!(
+        smem_bytes <= 48 * 1024,
+        "dedup MoE down: {smem_bytes} B of staged activations exceed 48 KiB"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), num_tokens * (top_k + 1), 1])
+        .block([128, 1, 1])
+        .shared_mem(smem_bytes as u32)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down.weight)
+        .arg_ptr(sh_down.weight_scale)
+        .arg_f32(sh_down.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// Fused weighted sum + sigmoid blend for `num_tokens` tokens.
+///
+/// Grid: (ceil(hidden/256), num_tokens, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_blend_batch3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    output: DevicePtr,         // [num_tokens, hidden] BF16
+    expert_out: DevicePtr,     // [num_tokens*top_k, hidden] BF16
+    expert_weights: DevicePtr, // [num_tokens*top_k] f32
+    shared_out: DevicePtr,     // [num_tokens, hidden] BF16
+    input: DevicePtr,          // [num_tokens, K] BF16
+    gate_weight: DevicePtr,    // [1, K] BF16 (shared)
+    hidden: u32,
+    top_k: u32,
+    k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(hidden, 256), num_tokens, 1])
+        .block([256, 1, 1])
+        .arg_ptr(output)
+        .arg_ptr(expert_out)
+        .arg_ptr(expert_weights)
+        .arg_ptr(shared_out)
+        .arg_ptr(input)
+        .arg_ptr(gate_weight)
+        .arg_u32(hidden)
+        .arg_u32(top_k)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+// ── MoE prefill (N-token batch) ──────────────────────────────────

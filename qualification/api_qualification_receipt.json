@@ -1,0 +1,100 @@
+{
+  "milestone": "Milestone 5 Container API Qualification Suite",
+  "verdict": "PASS",
+  "timestamp_utc": "2026-10-25T00:08:19Z",
+  "endpoint": "http://127.0.0.1:8899",
+  "lockfile_held": "$FLUX_LOCK_FILE",
+  "pre_flight_mem_gib": 105.18510055541992,
+  "readiness_time_seconds": 180.1,
+  "container_id": "d52a91fcb741006be69e83fa0e90d420b2d9ec0bfb063cda58c19adb2f3cc601",
+  "cases": {
+    "health": {
+      "status": "PASS",
+      "http_status": 200,
+      "body": {
+        "status": "ready",
+        "model": "qad5500"
+      }
+    },
+    "models": {
+      "status": "PASS",
+      "http_status": 200,
+      "models": [
+        "qad5500"
+      ],
+      "selected_model": "qad5500"
+    },
+    "chat_blocking": {
+      "status": "PASS",
+      "http_status": 200,
+      "content": "READY",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 19,
+        "completion_tokens": 2,
+        "total_tokens": 21,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        },
+        "time_to_first_token_ms": 514.1387010000001,
+        "response_token/s": 31.99368726157904
+      }
+    },
+    "chat_streaming_sse": {
+      "status": "PASS",
+      "chunks_count": 3,
+      "content": "1, 2, 3, 4, 5",
+      "done_seen": true
+    },
+    "tool_calling_blocking": {
+      "status": "PASS",
+      "finish_reason": "tool_calls",
+      "tool_call": {
+        "id": "call_0000000000000000",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Paris\"}"
+        }
+      },
+      "parsed_arguments": {
+        "city": "Paris"
+      }
+    },
+    "tool_calling_streaming": {
+      "status": "PASS",
+      "chunks_count": 4,
+      "function_name": "get_weather",
+      "assembled_arguments": "{\"city\":\"Paris\"}",
+      "parsed_arguments": {
+        "city": "Paris"
+      },
+      "finish_reason": "tool_calls"
+    },
+    "client_cancellation": {
+      "status": "PASS",
+      "chunks_before_cancellation": 8,
+      "abrupt_drop": true
+    },
+    "slot_reuse_and_recovery": {
+      "status": "PASS",
+      "http_status": 200,
+      "content": "OK",
+      "atlas_requests_active": 0.0
+    },
+    "raw_log_safety": {
+      "status": "PASS",
+      "total_log_lines": 9500,
+      "fatal_matches_count": 0,
+      "fatal_matches": []
+    }
+  },
+  "post_flight_mem_gib": 105.13398361206055
+}

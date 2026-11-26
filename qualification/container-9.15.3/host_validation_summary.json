@@ -1,0 +1,344 @@
+{
+  "binary_sha256": "a7d164092103048edffef502fe8ebe1589794359cf3e9978ce284768c2ccb78f",
+  "c1": {
+    "ready_s": 82.06,
+    "model_id": "Qwen3.8-Flash-Next-NVFP4-Offload",
+    "needle_issue_13": [
+      {
+        "target_tokens": 2017,
+        "pos": 0.5,
+        "rep": 0,
+        "prompt_tokens": 1977,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 0.64
+      },
+      {
+        "target_tokens": 2112,
+        "pos": 0.5,
+        "rep": 0,
+        "prompt_tokens": 2082,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 0.616
+      },
+      {
+        "target_tokens": 7710,
+        "pos": 0.5,
+        "rep": 0,
+        "prompt_tokens": 7443,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 1.502
+      },
+      {
+        "target_tokens": 7710,
+        "pos": 0.5,
+        "rep": 1,
+        "prompt_tokens": 7443,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 1.469
+      },
+      {
+        "target_tokens": 7710,
+        "pos": 0.5,
+        "rep": 2,
+        "prompt_tokens": 7443,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 1.466
+      },
+      {
+        "target_tokens": 7710,
+        "pos": 0.98,
+        "rep": 0,
+        "prompt_tokens": 7443,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 1.468
+      },
+      {
+        "target_tokens": 30647,
+        "pos": 0.5,
+        "rep": 0,
+        "prompt_tokens": 29362,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 5.115
+      },
+      {
+        "target_tokens": 65536,
+        "pos": 0.5,
+        "rep": 0,
+        "prompt_tokens": 62681,
+        "completion_tokens": 11,
+        "finish": "stop",
+        "answer": "4719-ALPHA-82",
+        "correct": true,
+        "wall_s": 10.655
+      }
+    ],
+    "decode_8prompts": [
+      {
+        "name": "code0",
+        "prompt_tokens": 64,
+        "completion_tokens": 256,
+        "ttft_ms": 160.9,
+        "decode_tok_s": 63.61,
+        "wall_s": 4.172,
+        "text": "assert torch.isfinite(o).all(), \"in_proj_qkv produced NaN/Inf\"\n    assert (o - li).abs().max().item() < 1e-5, \"in_proj_qkv is not a pure prefix of the fused GEMM\"\n    _STATS[\"in_proj_qkv\"] = (o.mean().item(), o.std().item())\n\n\ndef cap_in_proj_z(li, out):\n    assert torch.isfinite(out).all(), \"in_proj_z produced NaN/Inf\"\n\n\ndef cap_in_proj_b(li, out):\n    assert torch.isfinite(out).all(), \"in_proj_b produced NaN/Inf\"\n\n\ndef cap_in_proj_a(li, out):\n    assert torch.isfinite(out).all(), \"in_proj_a produced NaN/Inf\"\n\n\ndef cap_conv(x, cu, w, bias, conv_out):\n    _CONV_CALLS[\"n\"] += 1\n    _CONV_CALLS[\"x\"] = x.detach().float()\n    _CONV_CALLS[\"cu\"] = cu.detach().float()\n    _CONV_CALLS[\"w\"] = w.detach().float()\n    _CONV_CALLS[\"bias\"] = bias.detach()."
+      },
+      {
+        "name": "prose0",
+        "prompt_tokens": 64,
+        "completion_tokens": 133,
+        "ttft_ms": 170.2,
+        "decode_tok_s": 46.2,
+        "wall_s": 3.031,
+        "text": "signature of this bug class: the math is right, the\ncontract around the math is wrong.\n\n## Notes on the reference\n\n`reference.py` is a deliberate verbatim copy of the original. I left the\n`hidden_states.transpose(1, 2).transpose(1, 2)` no-op in place rather than\n\"fixing\" it, so the two files stay line-for-line comparable. The only\ndifferences between the two files are the three fixes, each marked with a\n`FIX (bug N)` comment at the site, plus a module docstring explaining them.\n\n</parameter>\n</function>\n</tool_call>"
+      },
+      {
+        "name": "chat0",
+        "prompt_tokens": 46,
+        "completion_tokens": 256,
+        "ttft_ms": 199.8,
+        "decode_tok_s": 62.72,
+        "wall_s": 4.267,
+        "text": "# Hash Map Collision Resolution: Open Addressing vs. Chaining\n\n## 1. The Core Problem\n\nWhen two distinct keys hash to the same bucket index, a **collision** occurs. The strategy for resolving collisions fundamentally changes the data structure's memory layout, performance characteristics, and cache behavior.\n\n---\n\n## 2. Chaining (Separate Chaining)\n\n### How It Works\n\n1. **Bucket Structure**: Each bucket holds a pointer to a linked list (or dynamic array) of entries.\n2. **Insertion**:\n   - Compute `index = hash(key) % table_size`.\n   - Append the `(key, value)` pair to the list at `buckets[index]`.\n3. **Lookup**:\n   - Compute `index = hash(key) % table_size`.\n   - Traverse the linked list at `buckets[index]`, comparing each entry's key.\n4. **Deletion**:\n   - Find the entry in the list and remove it from the chain.\n\n### Key Characteristics\n- **Load factor** can exceed 1.0 (more elements than buckets).\n- Collisions are **localized** to a single bucket's chain.\n- Each bucket is a **separate heap allocation**"
+      },
+      {
+        "name": "rep0",
+        "prompt_tokens": 104,
+        "completion_tokens": 256,
+        "ttft_ms": 181.9,
+        "decode_tok_s": 99.17,
+        "wall_s": 2.755,
+        "text": "- item 2: the quick brown fox jumps over the lazy dog\n- item 3: the quick brown fox jumps over the lazy dog\n- item 4: the quick brown fox jumps over the lazy dog\n- item 5: the quick brown fox jumps over the lazy dog\n\n2.\n- item 1: the quick brown fox jumps over the lazy dog\n- item 2: the quick brown fox jumps over the lazy dog\n- item 3: the quick brown fox jumps over the lazy dog\n- item 4: the quick brown fox jumps over the lazy dog\n- item 5: the quick brown fox jumps over the lazy dog\n\n3.\n- item 1: the quick brown fox jumps over the lazy dog\n- item 2: the quick brown fox jumps over the lazy dog\n- item 3: the quick brown fox jumps over the lazy dog\n- item 4: the quick brown fox jumps over the lazy dog\n- item 5: the quick brown fox jumps over the lazy dog\n\n4.\n- item 1: the quick brown fox jumps over the lazy dog\n- item 2: the quick brown fox jumps over the lazy dog\n- item 3: the quick"
+      },
+      {
+        "name": "prose8k",
+        "prompt_tokens": 8192,
+        "completion_tokens": 72,
+        "ttft_ms": 1468.0,
+        "decode_tok_s": 43.26,
+        "wall_s": 3.111,
+        "text": "256 247442544523085526274741422222222222222222222222222222222222222222"
+      },
+      {
+        "name": "legal32k",
+        "prompt_tokens": 32768,
+        "completion_tokens": 256,
+        "ttft_ms": 5411.5,
+        "decode_tok_s": 56.63,
+        "wall_s": 9.918,
+        "text": "Library does.\n\n  1. You may copy and distribute verbatim copies of the Library's\ncomplete source code as you receive it, in any medium, provided that\nyou conspicuously and appropriately publish on each copy an\nappropriate copyright notice and disclaimer of warranty; keep intact\nall the notices that refer to this License and to the absence of any\nwarranty; and distribute a copy of this License along with the\nLibrary.\n\n  You may charge a fee for the physical act of transferring a copy,\nand you may at your option offer warranty protection in exchange for a\nfee.\n\n  2. You may modify your copy or copies of the Library or any portion\nof it, thus forming a work based on the Library, and copy and\ndistribute such modifications or work under the terms of Section 1\nabove, provided that you also meet all of these conditions:\n\n    a) The modified work must itself be a software library.\n\n    b) You must cause the files modified to carry prominent notices\n    stating that you changed the files and the date of any change.\n\n    c) You must cause the whole of the work to be licensed at no\n    charge to all third parties under the terms of this License"
+      },
+      {
+        "name": "doc64k",
+        "prompt_tokens": 65536,
+        "completion_tokens": 256,
+        "ttft_ms": 10923.0,
+        "decode_tok_s": 54.55,
+        "wall_s": 15.606,
+        "text": "API handler after it has translated a Responses request into a\n/// ChatCompletionRequest.\npub(crate) async fn chat_completions_inner(\n    state: Arc<AppState>,\n    req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,\n    req: ChatCompletionRequest,\n    dump_seq: Option<u64>,\n) -> Response {\n    // 1. Rate-limit gate.\n    if let Some(ctx) = req_ctx.as_ref()\n        && !ctx.admitted.load(std::sync::atomic::Ordering::Relaxed)\n    {\n        return openai_error_response(\n            StatusCode::TOO_MANY_REQUESTS,\n            \"Server is at capacity. Retry later.\".to_string(),\n        );\n    }\n\n    // 2. Image admission gate.\n    let image_count = req.count_images();\n    if let Err(e) = image_admission::validate(\n        image_count,\n        state.has_vision,\n        state.max_concurrent_sequences,\n        state.yarn_context,\n    ) {\n        return openai_error_response(\n            StatusCode::BAD_REQUEST,\n            format!(\"Image request rejected: {"
+      },
+      {
+        "name": "mix128k",
+        "prompt_tokens": 126976,
+        "completion_tokens": 30,
+        "ttft_ms": 21562.8,
+        "decode_tok_s": 44.35,
+        "wall_s": 22.227,
+        "text": "API handler (`api/responses.rs`) which reuses the same\n/// pipeline.\npub(super) async fn chat_completions_inner("
+      }
+    ]
+  },
+  "interactive_w4096": {},
+  "c8": {
+    "ready_s": 69.05,
+    "ready_memavail_gib": 9.77,
+    "context_scaling": [
+      {
+        "target_ctx": 0,
+        "avg_prompt_tokens": 29.0,
+        "total_completion_tokens": 1024,
+        "wall_s": 7.827,
+        "agg_e2e_tok_s": 130.82,
+        "sum_decode_tok_s": 152.04,
+        "agg_decode_only_tok_s": 141.91,
+        "avg_ttft_ms": 611.65
+      },
+      {
+        "target_ctx": 1024,
+        "avg_prompt_tokens": 990.1,
+        "total_completion_tokens": 1024,
+        "wall_s": 16.38,
+        "agg_e2e_tok_s": 62.52,
+        "sum_decode_tok_s": 87.5,
+        "agg_decode_only_tok_s": 72.12,
+        "avg_ttft_ms": 2181.32
+      },
+      {
+        "target_ctx": 2048,
+        "avg_prompt_tokens": 1980.8,
+        "total_completion_tokens": 1024,
+        "wall_s": 17.063,
+        "agg_e2e_tok_s": 60.01,
+        "sum_decode_tok_s": 87.98,
+        "agg_decode_only_tok_s": 70.76,
+        "avg_ttft_ms": 2590.77
+      },
+      {
+        "target_ctx": 4096,
+        "avg_prompt_tokens": 3976.0,
+        "total_completion_tokens": 1024,
+        "wall_s": 18.739,
+        "agg_e2e_tok_s": 54.64,
+        "sum_decode_tok_s": 90.37,
+        "agg_decode_only_tok_s": 67.85,
+        "avg_ttft_ms": 3647.43
+      },
+      {
+        "target_ctx": 8192,
+        "avg_prompt_tokens": 7966.6,
+        "total_completion_tokens": 1024,
+        "wall_s": 23.684,
+        "agg_e2e_tok_s": 43.24,
+        "sum_decode_tok_s": 91.75,
+        "agg_decode_only_tok_s": 60.96,
+        "avg_ttft_ms": 6885.1
+      }
+    ]
+  },
+  "prefill_grid": {
+    "w16384": [
+      {
+        "ctx": 8192,
+        "n": 1,
+        "status": "ok",
+        "tokens": 8192,
+        "ttft_s": 1.395227316999808,
+        "tok_s": 5871.4446744172565,
+        "tok_s_min": 5871.4446744172565,
+        "tok_s_max": 5871.4446744172565,
+        "server_ttft_ms_median": 1393.780949,
+        "cached_tokens_max": 0
+      },
+      {
+        "ctx": 16384,
+        "n": 1,
+        "status": "ok",
+        "tokens": 16384,
+        "ttft_s": 2.7300174098927528,
+        "tok_s": 6001.426928864764,
+        "tok_s_min": 6001.426928864764,
+        "tok_s_max": 6001.426928864764,
+        "server_ttft_ms_median": 2727.044817,
+        "cached_tokens_max": 0
+      },
+      {
+        "ctx": 32768,
+        "n": 1,
+        "status": "ok",
+        "tokens": 32768,
+        "ttft_s": 5.703068746021017,
+        "tok_s": 5745.678591523547,
+        "tok_s_min": 5745.678591523547,
+        "tok_s_max": 5745.678591523547,
+        "server_ttft_ms_median": 5698.904439999999,
+        "cached_tokens_max": 0
+      },
+      {
+        "ctx": 65536,
+        "n": 1,
+        "status": "ok",
+        "tokens": 65536,
+        "ttft_s": 10.861899740062654,
+        "tok_s": 6033.56701574765,
+        "tok_s_min": 6033.56701574765,
+        "tok_s_max": 6033.56701574765,
+        "server_ttft_ms_median": 10855.005192,
+        "cached_tokens_max": 0
+      },
+      {
+        "ctx": 131072,
+        "n": 1,
+        "status": "ok",
+        "tokens": 131072,
+        "ttft_s": 22.284551087999716,
+        "tok_s": 5881.742893648981,
+        "tok_s_min": 5881.742893648981,
+        "tok_s_max": 5881.742893648981,
+        "server_ttft_ms_median": 22270.44684,
+        "cached_tokens_max": 0
+      }
+    ]
+  },
+  "native262k": {
+    "milestone": "Milestone 2 \u2014 Native 262K Context Qualification (R2)",
+    "verdict": "PASS",
+    "timestamp_utc": "2026-10-26T22:56:54Z",
+    "needle_retrieval": {
+      "prompt_tokens": 262080,
+      "passkeys": {
+        "ALPHA": "alpha-0731826",
+        "BETA": "beta-0492175",
+        "GAMMA": "gamma-0863204",
+        "DELTA": "delta-0184932",
+        "EPSILON": "epsilon-0952174"
+      },
+      "depths": [
+        0.01,
+        0.25,
+        0.5,
+        0.75,
+        0.99
+      ],
+      "all_retrieved": true,
+      "repeat_identical": true,
+      "forced_endpoint_fill_passkeys_retrieved": true
+    },
+    "forced_fill": {
+      "prompt_tokens": 262080,
+      "output_tokens": 64,
+      "total_tokens": 262144,
+      "succeeded": true
+    },
+    "boundary_and_overflow": {
+      "control_token_id": 15,
+      "boundary_tokens": 262143,
+      "boundary_output_tokens": 1,
+      "boundary_total_tokens": 262144,
+      "boundary_token_id": 15,
+      "boundary_matches_control": true,
+      "overflow_tokens": 262144,
+      "overflow_output_tokens": 1,
+      "overflow_http_status": 400,
+      "overflow_error_type": "invalid_request_error",
+      "overflow_scheduler_dispatch": 0
+    },
+    "canary_recovery": {
+      "canary_tokens": 262080,
+      "canary_token_id": 15,
+      "canary_matches_control": true,
+      "delta_tokens": 262080,
+      "delta_chunks": 16,
+      "recovered": true
+    }
+  }
+}

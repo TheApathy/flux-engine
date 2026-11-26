@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+cff-version: 1.2.0
+message: "If you use Flux Engine in your research, benchmarks, or production systems, please cite it using the metadata below."
+type: software
+title: "Flux Engine"
+version: "1.0.3"
+license: AGPL-3.0-only
+repository-code: "https://github.com/TheApathy/flux-engine"
+url: "https://github.com/TheApathy/flux-engine"
+authors:
+  - alias: "TheApathy"
+abstract: >-
+  Flux Engine is a pure-Rust and custom CUDA/PTX large language model inference
+  runtime optimized for NVIDIA Grace Blackwell (GB10 SM121a), discrete Blackwell
+  (SM120a / SM103a), and experimental Apple Metal targets, featuring native
+  block-scaled NVFP4/MXFP8 Tensor Core kernels, Gated DeltaNet and Query-Sparse
+  Attention, TurboQuant+ KV cache compression, and lossless multi-token
+  speculative decoding.
+keywords:
+  - llm
+  - inference
+  - rust
+  - cuda
+  - blackwell
+  - nvfp4
+  - speculative-decoding
+  - moe
+  - kv-cache-quantization

@@ -1,0 +1,26 @@
+XGrammar Pure-Rust Port — Third-Party Attribution & Modification Notice
+
+This crate (`crates/xgrammar`) is a pure-Rust derivative port translated from
+the upstream C++ implementation of MLC-AI XGrammar:
+
+  Upstream Project:   mlc-ai/xgrammar (https://github.com/mlc-ai/xgrammar)
+  Upstream Version:   v0.1.32
+  Upstream Copyright: Copyright (c) 2024 MLC-AI Contributors
+  Upstream License:   Apache License, Version 2.0 (Apache-2.0)
+
+A full copy of the Apache License, Version 2.0 is provided at the repository
+root in `LICENSES/Apache-2.0.txt` (and online at
+https://www.apache.org/licenses/LICENSE-2.0).
+
+Modification Notice (Apache License 2.0 Section 4(b)):
+  - Ported from the upstream C++ core (`mlc-ai/xgrammar` v0.1.32) to 100% safe
+    Rust (`#![forbid(unsafe_code)]`) for the Atlas / Flux Engine workspace,
+    replacing C++ support utilities with Rust ecosystem crates (`bitvec`,
+    `rayon`, `dashmap`, `serde`, `serde_json`, `ahash`, `thiserror`).
+  - Extended with Rust-native public API facades and additional XML tool-calling
+    grammar converters (Qwen, DeepSeek, MiniMax) for Flux Engine.
+  - Modified and combined work Copyright (c) 2026 TheApathy Contributors and
+    upstream Atlas Contributors, distributed as part of Flux Engine under the
+    GNU Affero General Public License v3.0 only (`AGPL-3.0-only`; see `LICENSE`
+    at the repository root), consistent with Apache-2.0 one-way compatibility
+    with GPLv3/AGPLv3.

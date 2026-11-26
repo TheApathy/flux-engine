@@ -1,0 +1,655 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! N-token prefill body for [`super::super::Qwen3AttentionLayer`],
+//! split out of the trait impl for file-size budget. Trait impl delegates
+//! to [`Qwen3AttentionLayer::prefill_inner`].
+
+use std::sync::OnceLock;
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
+use spark_runtime::kv_cache::PagedKvCache;
+
+use super::super::Qwen3AttentionLayer;
+use super::diag_norm;
+use crate::layer::{BatchedAttnMetadata, ForwardContext, LayerState};
+use crate::layers::ops;
+use crate::layers::qwen4_qsa::Qwen4QsaIndexer;
+
+static ATTN_PREFILL_BATCH: OnceLock<bool> = OnceLock::new();
+static QSA_PREFILL_GEMM: OnceLock<bool> = OnceLock::new();
+static ATTN_PREFILL_HYBRID_OFF: OnceLock<bool> = OnceLock::new();
+static HYPER_PREFILL_GEMM: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn env_eq_cached(cell: &OnceLock<bool>, name: &str, expected: &str) -> bool {
+    *cell.get_or_init(|| std::env::var(name).ok().as_deref() == Some(expected))
+}
+
+impl Qwen3AttentionLayer {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefill_inner(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        _state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len_start: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_write_start: usize,
+        // Q12 Path B: when Some, the attention compute step uses the
+        // batched paged-prefill kernel. Stacked-input semantics apply —
+        // `num_tokens` must equal `batched_meta.total_tokens` and the
+        // hidden/residual buffers contain N streams' data concatenated
+        // at offsets `b * chunk_len * H * dtype`.
+        batched_meta: Option<&BatchedAttnMetadata>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let n = num_tokens as u32;
+
+        // Reject unsafe optional index batching before this attention layer
+        // prepares hyperconnection buffers or changes its cache/state.
+        if self.qwen4_attn_hyper.is_some()
+            && self.qwen4_qsa.is_some()
+            && ctx
+                .attn_metadata
+                .is_some_and(|meta| meta.qwen4_qsa_required)
+            && env_eq_cached(&ATTN_PREFILL_BATCH, "ATLAS_QWEN4_ATTN_PREFILL_BATCH", "1")
+            && env_eq_cached(&QSA_PREFILL_GEMM, "ATLAS_QWEN4_QSA_PREFILL_GEMM", "1")
+        {
+            Qwen4QsaIndexer::validate_prefill_index_batch(num_tokens, seq_len_start)?;
+        }
+
+        if crate::layers::qwen4_prefill_moe::selected()? && num_tokens > 1 {
+            return self.prefill_moe_only(
+                hidden,
+                residual,
+                num_tokens,
+                kv_cache,
+                seq_len_start,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                batched_meta,
+                ctx,
+                stream,
+            );
+        }
+
+        // Qwen4 prefill: full-prompt hyper GEMMs + the existing batched
+        // attention/MoE path. QSA side-cache updates remain token ordered so
+        // their compression groups match decode exactly.
+        if let Some(attn_hyper) = self.qwen4_attn_hyper.as_ref() {
+            if batched_meta.is_some() {
+                anyhow::bail!("qwen4_exp batched multi-sequence prefill is not yet supported");
+            }
+            let base_meta = ctx
+                .attn_metadata
+                .ok_or_else(|| anyhow::anyhow!("qwen4_exp prefill requires metadata"))?;
+            anyhow::ensure!(
+                base_meta.block_table != DevicePtr::NULL && base_meta.seq_len != DevicePtr::NULL,
+                "qwen4_exp prefill requires paged block-table and sequence-length metadata"
+            );
+            let mlp_hyper = self.qwen4_mlp_hyper.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("qwen4_exp attention layer missing MLP hyperconnection")
+            })?;
+            if !env_eq_cached(&ATTN_PREFILL_BATCH, "ATLAS_QWEN4_ATTN_PREFILL_BATCH", "1") {
+                if !env_eq_cached(
+                    &ATTN_PREFILL_HYBRID_OFF,
+                    "ATLAS_QWEN4_ATTN_PREFILL_HYBRID",
+                    "0",
+                ) {
+                    return self.prefill_qwen4_suppressed(
+                        hidden,
+                        residual,
+                        num_tokens,
+                        _state,
+                        kv_cache,
+                        seq_len_start,
+                        block_table,
+                        disk_block_ids,
+                        disk_last_offloaded_per_layer,
+                        base_meta,
+                        ctx,
+                        stream,
+                    );
+                }
+                let row_bytes = ctx.config.residual_width() * 2;
+                for t in 0..num_tokens {
+                    let seq_len = (seq_len_start + t + 1) as u32;
+                    let seq_len_bytes = seq_len.to_ne_bytes();
+                    ctx.gpu.copy_h2d_group_on_stream(
+                        &[HostToDeviceCopy::new(&seq_len_bytes, base_meta.seq_len)],
+                        stream,
+                    )?;
+                    let token_meta = crate::layer::AttnMetadataDev {
+                        positions: base_meta.positions.offset(t * 4),
+                        positions_h: base_meta.positions_h.offset(t * 4),
+                        positions_w: base_meta.positions_w.offset(t * 4),
+                        slot: base_meta.slot.offset(t * 8),
+                        seq_len: base_meta.seq_len,
+                        ..base_meta
+                    };
+                    let token_ctx = crate::layer::ForwardContext {
+                        attn_metadata: Some(token_meta),
+                        ..*ctx
+                    };
+                    self.decode_inner(
+                        hidden.offset(t * row_bytes),
+                        residual.offset(t * row_bytes),
+                        _state,
+                        kv_cache,
+                        seq_len_start + t,
+                        false,
+                        block_table,
+                        disk_block_ids,
+                        disk_last_offloaded_per_layer,
+                        &token_ctx,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
+            let mixed_attn =
+                if env_eq_cached(&HYPER_PREFILL_GEMM, "ATLAS_QWEN4_HYPER_PREFILL_GEMM", "1") {
+                    attn_hyper.prepare_prefill(
+                        hidden,
+                        residual,
+                        num_tokens,
+                        ctx.buffers,
+                        ctx.gpu,
+                        eps,
+                        stream,
+                    )?
+                } else {
+                    attn_hyper.prepare_prefill_exact(
+                        hidden,
+                        residual,
+                        num_tokens,
+                        ctx.buffers,
+                        ctx.gpu,
+                        eps,
+                        stream,
+                    )?
+                };
+            if base_meta.qwen4_qsa_required
+                && let Some(qsa) = self.qwen4_qsa.as_ref()
+            {
+                if env_eq_cached(&QSA_PREFILL_GEMM, "ATLAS_QWEN4_QSA_PREFILL_GEMM", "1") {
+                    let raw_keys = ctx.buffers.ssm_qkvz();
+                    let pooled_keys = ctx.buffers.qkv_output();
+                    let max_groups = num_tokens.div_ceil(4);
+                    let first_positions = pooled_keys.offset(max_groups * 128 * 2);
+                    anyhow::ensure!(
+                        num_tokens * 128 * 2 <= ctx.buffers.sizes().ssm_qkvz,
+                        "QSA raw-key prefill scratch exceeds SSM QKVZ arena"
+                    );
+                    anyhow::ensure!(
+                        max_groups * (128 * 2 + 4) <= ctx.buffers.sizes().qkv_output,
+                        "QSA pooled-key prefill scratch exceeds QKV arena"
+                    );
+                    qsa.update_prefill_index(
+                        mixed_attn,
+                        num_tokens,
+                        seq_len_start,
+                        raw_keys,
+                        pooled_keys,
+                        first_positions,
+                        kv_cache,
+                        base_meta,
+                        h as u32,
+                        eps,
+                        ctx.config.rope_theta as f32,
+                        ctx.config.rotary_dim() as u32,
+                        ctx.gpu,
+                        stream,
+                    )?;
+                } else {
+                    for t in 0..num_tokens {
+                        let token_meta = crate::layer::AttnMetadataDev {
+                            positions: base_meta.positions.offset(t * 4),
+                            positions_h: base_meta.positions_h.offset(t * 4),
+                            positions_w: base_meta.positions_w.offset(t * 4),
+                            slot: base_meta.slot.offset(t * 8),
+                            ..base_meta
+                        };
+                        qsa.update_and_select(
+                            mixed_attn.offset(t * h * 2),
+                            seq_len_start + t,
+                            seq_len_start + t + 1,
+                            kv_cache,
+                            token_meta,
+                            h as u32,
+                            eps,
+                            ctx.config.rope_theta as f32,
+                            ctx.config.rotary_dim() as u32,
+                            ctx.gpu,
+                            stream,
+                        )?;
+                    }
+                }
+            }
+            let attn_out = if seq_len_start == 0 {
+                self.prefill_attention_with_cache_skip(
+                    mixed_attn,
+                    num_tokens,
+                    kv_write_start,
+                    kv_cache,
+                    ctx,
+                    stream,
+                )?
+            } else {
+                self.prefill_attention_paged(
+                    mixed_attn,
+                    num_tokens,
+                    seq_len_start,
+                    kv_cache,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    None,
+                    ctx,
+                    stream,
+                )?
+            };
+            if ctx.config.tp_world_size > 1
+                && let Some(comm) = ctx.comm
+            {
+                comm.all_reduce_async(attn_out.0, num_tokens * h * 2, stream)?;
+            }
+            attn_hyper
+                .inject_saved_batched(hidden, attn_out, residual, num_tokens, ctx.gpu, stream)?;
+            let ffn_inputs =
+                if env_eq_cached(&HYPER_PREFILL_GEMM, "ATLAS_QWEN4_HYPER_PREFILL_GEMM", "1") {
+                    mlp_hyper.prepare_prefill(
+                        hidden,
+                        residual,
+                        num_tokens,
+                        ctx.buffers,
+                        ctx.gpu,
+                        eps,
+                        stream,
+                    )?
+                } else {
+                    mlp_hyper.prepare_prefill_exact(
+                        hidden,
+                        residual,
+                        num_tokens,
+                        ctx.buffers,
+                        ctx.gpu,
+                        eps,
+                        stream,
+                    )?
+                };
+            self.ffn
+                .forward_prefill(ffn_inputs, num_tokens, ctx, stream)?;
+            mlp_hyper.inject_saved_batched(
+                hidden,
+                ctx.buffers.moe_output(),
+                residual,
+                num_tokens,
+                ctx.gpu,
+                stream,
+            )?;
+            crate::model::qwen4_prefill_engagement::engage(
+                crate::model::qwen4_prefill_engagement::PrefillPath::Attention,
+                num_tokens,
+            )?;
+            return Ok(());
+        }
+
+        // ── 1. RMS norm + residual for N tokens ──
+        let normed = ctx.buffers.norm_output();
+        ops::rms_norm_residual(
+            ctx.gpu,
+            self.rms_norm_residual_k,
+            hidden,
+            &self.input_norm,
+            normed,
+            residual,
+            n,
+            h as u32,
+            eps,
+            stream,
+        )
+        .map_err(|e| anyhow::anyhow!("rms_norm_residual failed: {e}"))?;
+
+        // DIAGNOSTIC: dump norms for L0 and L35 of Mistral
+        let is_mistral_diag = ctx.profile
+            && ctx.config.model_type == "mistral"
+            && (self.attn_layer_idx == 0 || self.attn_layer_idx == 35);
+        if is_mistral_diag {
+            diag_norm(
+                ctx.gpu,
+                hidden,
+                h,
+                stream,
+                &format!("L{} hidden_in", self.attn_layer_idx),
+            );
+            diag_norm(
+                ctx.gpu,
+                normed,
+                h,
+                stream,
+                &format!("L{} normed", self.attn_layer_idx),
+            );
+        }
+
+        // ── 2. Attention ──
+        // Q12 Path B: batched mode requires seq_len_start > 0 (paged path).
+        // The non-paged BR=32 batched kernel is not yet shipped, so caller
+        // must constrain to paged-path workloads (which is the natural Q12
+        // case after prefix-cache lookup).
+        if batched_meta.is_some() && seq_len_start == 0 {
+            anyhow::bail!(
+                "prefill_inner: batched mode requires seq_len_start > 0 (paged path); \
+                 got seq_len_start=0. Caller must fall back to per-stream for this chunk."
+            );
+        }
+        let attn_out = if seq_len_start == 0 {
+            // Chunk 0 (or non-chunked): Flash Attention on contiguous Q/K/V.
+            self.prefill_attention_with_cache_skip(
+                normed,
+                num_tokens,
+                kv_write_start,
+                kv_cache,
+                ctx,
+                stream,
+            )?
+        } else {
+            // Chunk 1+: GEMM-batched Q/K/V + per-token paged decode attention.
+            // batched_meta is threaded so prefill_attention_paged uses the
+            // batched kernel + block_table_ptrs when set.
+            self.prefill_attention_paged(
+                normed,
+                num_tokens,
+                seq_len_start,
+                kv_cache,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                batched_meta,
+                ctx,
+                stream,
+            )?
+        };
+
+        // (Two earlier attempts to overlap the lazy down transpose on
+        // `prefill_stream` regressed cold TTFT by 30 % — both when
+        // overlapping with compute-bound MoE GEMMs AND when overlapping
+        // with the TP allreduce window. GB10 either has SM-contention
+        // costs from the second stream or stream-event sync overhead
+        // that exceeds the transpose savings. Keeping the synchronous
+        // path in `forward_prefill` for now.)
+        // TP all-reduce on attn_out after o_proj (Megatron row-parallel
+        // pattern). When tp_world_size==1 this is a no-op. The o_proj GEMM
+        // produced this rank's partial output on the full hidden dim; the
+        // reduction across TP ranks gives the full attention output ready
+        // for the residual add.
+        if ctx.config.tp_world_size > 1
+            && let Some(comm) = ctx.comm
+        {
+            let bytes = num_tokens * h * 2; // BF16
+            let _t0 = if ctx.profile {
+                ctx.gpu.synchronize(stream)?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            comm.all_reduce_async(attn_out.0, bytes, stream)?;
+            if let Some(t0) = _t0 {
+                ctx.gpu.synchronize(stream)?;
+                tracing::info!(
+                    "  TP allreduce (attn out) N={} L{:02}: {}µs",
+                    num_tokens,
+                    self.attn_layer_idx,
+                    t0.elapsed().as_micros(),
+                );
+            }
+        }
+
+        // Phase 6.2.a: after prefill writes K/V to the cache, mirror every
+        // new block to disk so future decode steps can read them via the
+        // orchestrator. Sliding-window eviction is NOT triggered here —
+        // prefill grows HBM monotonically; the cap kicks in during decode.
+        // For prefill writes that exceed cache_blocks_per_seq in one shot
+        // (long single-chunk prompts), the user must size cache_blocks_per_seq
+        // to fit the prefill. Phase 6.2.b will route chunked-prefill reads
+        // through the orchestrator and remove this constraint.
+        if batched_meta.is_some() && self.high_speed_swap_engaged(kv_cache) {
+            anyhow::bail!(
+                "prefill_inner: batched mode does not support HSS-engaged layers \
+                 (layer {}). Caller should fall back to per-stream for this chunk.",
+                self.attn_layer_idx
+            );
+        }
+        if self.high_speed_swap_engaged(kv_cache) {
+            let nq = self
+                .num_q_heads_override
+                .unwrap_or(ctx.config.num_attention_heads) as u32;
+            let nkv = self
+                .num_kv_heads_override
+                .unwrap_or(ctx.config.num_key_value_heads) as u32;
+            let hd = self.head_dim_override.unwrap_or(ctx.config.head_dim) as u32;
+            let bs = kv_cache.block_size();
+            let _ = nq; // silence unused
+            self.high_speed_swap_offload_new_blocks(
+                kv_cache,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                ctx,
+                stream,
+                nkv,
+                hd,
+                bs,
+            )?;
+            // Touch nq once to keep the existing variable binding's compile error away.
+            let _ = nq;
+        }
+
+        // DIAGNOSTIC: attention output for L0 and L35
+        if is_mistral_diag {
+            diag_norm(
+                ctx.gpu,
+                attn_out,
+                h,
+                stream,
+                &format!("L{} attn_out", self.attn_layer_idx),
+            );
+        }
+
+        // ── 3. Post-attention norm (Gemma-4: normalize attn output before residual add) ──
+        if let Some(ref post_norm) = self.post_attn_out_norm {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                attn_out,
+                post_norm,
+                attn_out,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
+
+        // ── 4. Batched residual + pre-FFN norm + FFN ──
+        if self.ffn.is_none() {
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                attn_out,
+                (num_tokens * h) as u32,
+                stream,
+            )?;
+            return Ok(());
+        }
+
+        ops::residual_add_rms_norm(
+            ctx.gpu,
+            self.residual_add_rms_norm_k,
+            hidden,
+            attn_out,
+            &self.post_attn_norm,
+            ctx.buffers.norm_output(),
+            residual,
+            n,
+            h as u32,
+            eps,
+            stream,
+        )
+        .map_err(|e| anyhow::anyhow!("residual_add_rms_norm failed: n={n} h={h}: {e}"))?;
+
+        self.ffn
+            .forward_prefill(ctx.buffers.norm_output(), num_tokens, ctx, stream)
+            .map_err(|e| anyhow::anyhow!("ffn.forward_prefill failed: {e}"))?;
+
+        let dense_out = ctx.buffers.moe_output();
+
+        // DIAGNOSTIC: MoE output for L0 and L35
+        if is_mistral_diag {
+            diag_norm(
+                ctx.gpu,
+                dense_out,
+                h,
+                stream,
+                &format!("L{} moe_out", self.attn_layer_idx),
+            );
+        }
+
+        // Gemma-4 26B MoE dual FFN (prefill): match HF Gemma4TextDecoderLayer.forward
+        if let (Some(moe_ffn), Some(_pre_norm), Some(post_norm), Some(dense_norm)) = (
+            &self.moe_ffn,
+            &self.pre_moe_norm,
+            &self.post_moe_out_norm,
+            &self.post_dense_ffn_norm,
+        ) {
+            // 1. Norm dense MLP output with post_feedforward_layernorm_1
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                dense_out,
+                dense_norm,
+                dense_out,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+
+            // 2. Save normed dense_out to scratch
+            let scratch = ctx.buffers.attn_output();
+            let nbytes = num_tokens * h * 2;
+            ctx.gpu.copy_d2d_async(dense_out, scratch, nbytes, stream)?;
+
+            // 3. MoE path: pass raw residual (router has internal norm+scale)
+            moe_ffn
+                .forward_prefill(hidden, num_tokens, ctx, stream)
+                .map_err(|e| anyhow::anyhow!("moe_ffn.forward_prefill failed: {e}"))?;
+            let moe_out = ctx.buffers.moe_output();
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                moe_out,
+                post_norm,
+                moe_out,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+
+            // 4. Combine: dense_normed + moe_normed → moe_out
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                moe_out,
+                scratch,
+                (num_tokens * h) as u32,
+                stream,
+            )?;
+
+            // 5. post_feedforward_layernorm on combined
+            if let Some(ref combined_norm) = self.post_ffn_out_norm {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    moe_out,
+                    combined_norm,
+                    moe_out,
+                    n,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+
+            // 6. Residual add
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                (num_tokens * h) as u32,
+                stream,
+            )?;
+        } else {
+            // Non-MoE: post_ffn_out_norm on dense output, then residual add
+            if let Some(ref post_norm) = self.post_ffn_out_norm {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    dense_out,
+                    post_norm,
+                    dense_out,
+                    n,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                dense_out,
+                (num_tokens * h) as u32,
+                stream,
+            )
+            .map_err(|e| anyhow::anyhow!("residual_add failed: n={num_tokens} h={h}: {e}"))?;
+        }
+
+        // Gemma-4: hidden *= layer_scalar at end of layer (applied to ALL tokens)
+        if let Some(scalar) = self.layer_scalar {
+            self.apply_layer_scalar(
+                ctx.gpu,
+                hidden,
+                num_tokens * h,
+                scalar,
+                stream,
+                ctx.config.use_fp32_residual(),
+            )?;
+        }
+
+        // DIAGNOSTIC: residual after L0 and L35
+        if is_mistral_diag {
+            diag_norm(
+                ctx.gpu,
+                hidden,
+                h,
+                stream,
+                &format!("L{} residual", self.attn_layer_idx),
+            );
+        }
+
+        Ok(())
+    }
+}

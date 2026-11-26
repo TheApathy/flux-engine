@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 500" width="1160" height="500">
+  <rect x="2" y="2" width="1156" height="496" rx="16" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+
+  <!-- Header -->
+  <text x="36" y="38" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="800" fill="#F0F6FC">Single-Stream GB10 Decode Throughput vs. 273 GB/s LPDDR5x Bandwidth Ceiling</text>
+  <text x="36" y="60" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" fill="#8B949E">Speculative verification (Inferact MTP K=5 &amp; DFlash γ=15) breaks the non-speculative memory bandwidth wall</text>
+
+  <!-- Bars -->
+  
+  <g transform="translate(0, 88)">
+    <text x="356" y="15" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#F0F6FC" text-anchor="end">Qwen3.8-27B NVFP4 · DFlash γ=15</text>
+    <text x="356" y="32" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" fill="#8B949E" text-anchor="end">BF16-KV DFlash Qualified Profile</text>
+    <rect x="374" y="4" width="750" height="28" rx="6" fill="#161b22"/>
+    <rect x="374" y="4" width="434.5" height="28" rx="6" fill="#A855F7" opacity="0.9"/>
+    <text x="820.5" y="23" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" font-weight="700" fill="#F0F6FC">63.9 tok/s (4.6× 27B Roofline)</text>
+  </g>
+  <g transform="translate(0, 136)">
+    <text x="356" y="15" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#F0F6FC" text-anchor="end">Qwen3.8-Flash-Next · MTP K=5</text>
+    <text x="356" y="32" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" fill="#8B949E" text-anchor="end">Lossless 2,560/2,560 Exact vs K=1 (57.4 peak)</text>
+    <rect x="374" y="4" width="750" height="28" rx="6" fill="#161b22"/>
+    <rect x="374" y="4" width="384.2" height="28" rx="6" fill="#10B981" opacity="0.9"/>
+    <text x="770.2" y="23" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" font-weight="700" fill="#F0F6FC">56.5 tok/s med · 57.4 peak</text>
+  </g>
+  <g transform="translate(0, 184)">
+    <text x="356" y="15" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#F0F6FC" text-anchor="end">Qwen3.8-Flash-Next · Estonia 136.5K</text>
+    <text x="356" y="32" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" fill="#8B949E" text-anchor="end">136,576-Token 6-Hop Needle (5/5 = 100% PASS)</text>
+    <rect x="374" y="4" width="750" height="28" rx="6" fill="#161b22"/>
+    <rect x="374" y="4" width="327.8" height="28" rx="6" fill="#38BDF8" opacity="0.9"/>
+    <text x="713.8" y="23" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" font-weight="700" fill="#F0F6FC">48.2 tok/s client (48.6 srv)</text>
+  </g>
+  <g transform="translate(0, 232)">
+    <text x="356" y="15" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#F0F6FC" text-anchor="end">Qwen3.8-27B NVFP4 · DFlash2 γ=7</text>
+    <text x="356" y="32" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" fill="#8B949E" text-anchor="end">Public incoai/Qwen3.8-27B-DFlash2 Drafter</text>
+    <rect x="374" y="4" width="750" height="28" rx="6" fill="#161b22"/>
+    <rect x="374" y="4" width="298.5" height="28" rx="6" fill="#6366F1" opacity="0.9"/>
+    <text x="684.5" y="23" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" font-weight="700" fill="#F0F6FC">43.9 tok/s (block_size=8)</text>
+  </g>
+  <g transform="translate(0, 280)">
+    <text x="356" y="15" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#F0F6FC" text-anchor="end">Qwen3.8-Flash-Next · K=1 Exact Ref</text>
+    <text x="356" y="32" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" fill="#8B949E" text-anchor="end">Non-Speculative 125B+51B PLE (6B Active) Roofline</text>
+    <rect x="374" y="4" width="750" height="28" rx="6" fill="#161b22"/>
+    <rect x="374" y="4" width="227.8" height="28" rx="6" fill="#F59E0B" opacity="0.9"/>
+    <text x="613.8" y="23" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" font-weight="700" fill="#F0F6FC">33.5 tok/s (K=1 Oracle)</text>
+  </g>
+  <g transform="translate(0, 328)">
+    <text x="356" y="15" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#F0F6FC" text-anchor="end">Qwen3.8-27B NVFP4 · No Speculation</text>
+    <text x="356" y="32" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" fill="#8B949E" text-anchor="end">Non-Speculative 27B Dense Roofline (~273 GB/s)</text>
+    <rect x="374" y="4" width="750" height="28" rx="6" fill="#161b22"/>
+    <rect x="374" y="4" width="94.5" height="28" rx="6" fill="#94A3B8" opacity="0.9"/>
+    <text x="480.5" y="23" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" font-weight="700" fill="#F0F6FC">13.9 tok/s (LPDDR5x Ceiling)</text>
+  </g>
+  <g transform="translate(0, 376)">
+    <text x="356" y="15" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#F0F6FC" text-anchor="end">Qwen3.8-27B NVFP4 · Untuned Verify</text>
+    <text x="356" y="32" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" fill="#8B949E" text-anchor="end">Speculation On Without Fused Verify Kernels</text>
+    <rect x="374" y="4" width="750" height="28" rx="6" fill="#161b22"/>
+    <rect x="374" y="4" width="59.8" height="28" rx="6" fill="#F43F5E" opacity="0.9"/>
+    <text x="445.8" y="23" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" font-weight="700" fill="#F0F6FC">8.8 tok/s (Untuned Verify)</text>
+  </g>
+
+  <!-- Roofline Reference Lines -->
+  <line x1="468.5" y1="82" x2="468.5" y2="432" stroke="#94A3B8" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <line x1="601.8" y1="82" x2="601.8" y2="432" stroke="#F59E0B" stroke-width="1.6" stroke-dasharray="5 4"/>
+
+  <!-- Non-Overlapping Roofline Callout Pills (Left-Aligned vs Right-Aligned with 150px gap!) -->
+  <rect x="230.5" y="440" width="246" height="32" rx="8" fill="#161b22" stroke="#94A3B8" stroke-width="1.2"/>
+  <text x="353.5" y="460" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#C9D1D9" text-anchor="middle">27B Dense Roofline (13.9 tok/s) ▲</text>
+
+  <rect x="593.8" y="440" width="276" height="32" rx="8" fill="#161b22" stroke="#F59E0B" stroke-width="1.2"/>
+  <text x="731.8" y="460" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#FBBF24" text-anchor="middle">▲ Flash-Next K=1 Roofline (33.5 tok/s)</text>
+</svg>

@@ -1,0 +1,688 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Prefill phase A — non-chunked single-pass path.
+//!
+//! Uses inline-documented `unsafe` blocks for POD-slice byte views
+//! (`std::slice::from_raw_parts`) and page-locked metadata staging
+//! (`std::ptr::copy_nonoverlapping` + `copy_h2d_pinned_async`).
+
+#![allow(unused_imports, dead_code, clippy::too_many_arguments)]
+
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::{Result, bail};
+use atlas_core::config::{LayerType, ModelConfig};
+use spark_runtime::buffers::BufferArena;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
+use spark_runtime::kv_cache::PagedKvCache;
+
+use super::super::block_mgmt::{
+    apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
+    extract_layer_refs, reuse_prefix_match_disk_ids,
+};
+use super::super::ssm_pool::SsmStatePool;
+use super::super::ssm_snapshot::SsmSnapshotPool;
+use super::super::types::{PinnedMetaStaging, TransformerModel};
+use crate::layer::{
+    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
+};
+use crate::layers::ops;
+use crate::speculative::DraftProposer;
+use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
+use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+
+impl TransformerModel {
+    pub(super) fn prepare_vision_embed_dispatch(
+        &self,
+        images: &[(Vec<f32>, usize, usize)],
+    ) -> Result<()> {
+        self.prepare_vision_aggregate(images)
+    }
+
+    pub(super) fn prefill_dispatch(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        crate::model::verify_failure::check()?;
+        let n = tokens.len();
+        self.validate_vision_prompt(tokens, 0, n)?;
+        let (block_size, high_speed_swap) = {
+            let kv_cache = self.kv_cache.lock();
+            (
+                kv_cache.block_size(),
+                kv_cache.config().cache_blocks_per_seq.is_some(),
+            )
+        };
+        let lineage_selected = crate::layers::qwen4_prefill_moe::multi_chunk_selected()?;
+        let selected_route_ordinary = lineage_selected
+            && crate::layers::qwen4_prefill_moe::attn16::mark_ordinary_for_selected_route(
+                &mut seq.qwen4_prefill_lineage,
+                n,
+            );
+        let _route_suppressed =
+            selected_route_ordinary.then(crate::layers::qwen4_prefill_moe::attn16::suppress_family);
+        let _surface_admission = crate::layers::qwen4_prefill_moe::attn16::admit_or_suppress(
+            self.vision_prompt_present(tokens),
+            seq.seq_len,
+            0,
+            n,
+            n,
+            true,
+            || {
+                crate::layers::qwen4_prefill_moe::attn16::request_chain_matches(
+                    tokens,
+                    &seq.tokens,
+                    seq.seq_len,
+                    seq.prompt_len,
+                    0,
+                )
+            },
+            || {
+                let page_meta = seq.chunked_prefill_meta.as_ref().map(|meta| {
+                    (
+                        meta.block_capacity,
+                        meta.uploaded_blocks,
+                        !high_speed_swap
+                            && seq.hss_window_start() == 0
+                            && !meta.block_table.is_null()
+                            && !meta.seq_len.is_null(),
+                    )
+                });
+                crate::layers::qwen4_prefill_moe::attn16::continuation_state_ready(
+                    0,
+                    n,
+                    block_size,
+                    seq.block_table.len(),
+                    page_meta,
+                )
+            },
+            high_speed_swap,
+        )?;
+        self.admit_rotary_prompt(tokens, seq, 0)?;
+        if (self.config.mrope_interleaved && self.vision_prompt_present(tokens))
+            || self.multi_rank_prefill_active()
+        {
+            return self.prefill_chunk(tokens, seq, 0, n, true, stream);
+        }
+        crate::layers::qwen4_prefill_moe::admit_request(&self.config, n, seq.seq_len)?;
+        if crate::layers::qwen4_prefill_moe::attn16::selected()? {
+            let kv_cache = self.kv_cache.lock();
+            for layer in &self.layers {
+                layer.preflight_qwen4_attn16(&kv_cache, self.gpu.as_ref(), stream)?;
+            }
+        }
+        if self.config.is_qwen4_exp()
+            && seq.seq_len.saturating_add(n) > 2048
+            && !self.config.qwen4_qsa
+        {
+            anyhow::bail!(
+                "Qwen4 QSA is disabled: exact full-attention fallback is limited to 2048 tokens"
+            );
+        }
+        if n <= 1 {
+            // Single token: use decode path (CUDA graph optimized)
+            for &token in tokens {
+                self.decode(token, seq, stream)?;
+            }
+            return Ok(self.decode_logits_ptr());
+        }
+
+        // Guard: prompt must not exceed buffer arena capacity.
+        let arena_cap = self.buffers.max_batch_tokens();
+        if n > arena_cap {
+            anyhow::bail!(
+                "Prompt ({n} tokens) exceeds buffer arena capacity ({arena_cap} tokens). \
+                 Use chunked prefill (--max-prefill-tokens) or reduce prompt length."
+            );
+        }
+
+        let stream = self.gpu.default_stream();
+        let h = self.config.hidden_size;
+        let _bf16 = 2usize;
+        let fp32 = if self.config.use_fp32_residual() {
+            4usize
+        } else {
+            2usize
+        };
+        let hidden = self.buffers.hidden_states();
+        let residual = self.buffers.residual();
+
+        // Zero arena buffers to clear stale data from prior requests across both
+        // single-GPU and EP execution.
+        self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+
+        let mut kv_cache = self.kv_cache.lock();
+
+        // ── 1. Prefix cache lookup (BEFORE embedding — Marconi may skip tokens) ──
+        let bs = kv_cache.block_size();
+        let prefix_match = if self.tokens_have_vision_pad(tokens) {
+            spark_runtime::prefix_cache::PrefixMatch::empty()
+        } else {
+            self.lookup_prefill_prefix(tokens, bs, seq.session_hash)
+        };
+        let mut kv_write_start = prefix_match.matched_tokens;
+        seq.cached_prefix_tokens = prefix_match.matched_tokens;
+        // Record the original prompt length — cache_sequence() uses it later
+        // to avoid double-bumping ref_counts on the prompt portion.
+        seq.prompt_len = n;
+
+        // Reuse cached blocks (inc_ref for shared ownership).
+        for &block_idx in &prefix_match.matched_blocks {
+            kv_cache.inc_ref(block_idx);
+            seq.block_table.push(block_idx);
+        }
+        reuse_prefix_match_disk_ids(
+            &prefix_match.matched_disk_block_ids,
+            &mut seq.disk_block_ids,
+        );
+
+        // Allocate new blocks for the remaining (uncached) tokens.
+        let blocks_needed = (n - 1) / bs + 1;
+        // Phase 6.3: single-shot prefill cannot stream long prompts because
+        // the K/V for ALL prompt tokens must be HBM-resident before the
+        // single Flash Attention pass runs (no per-chunk offload window).
+        // Bail with a clear message directing to chunked prefill.
+        if let Some(cap) = kv_cache.config().cache_blocks_per_seq
+            && blocks_needed > cap as usize
+        {
+            anyhow::bail!(
+                "high-speed-swap: prompt of {} blocks exceeds \
+                     --high-speed-swap-cache-blocks-per-seq={}; this single-shot \
+                     prefill path requires the whole prompt fit in HBM. Use \
+                     chunked prefill (set --max-prefill-tokens ≤ {} × block_size) \
+                     to stream long prompts to disk.",
+                blocks_needed,
+                cap,
+                cap
+            );
+        }
+        ensure_blocks_through_prefill(
+            seq,
+            blocks_needed - 1,
+            &mut kv_cache,
+            self.prefix_cache.as_ref(),
+            self.gpu.as_ref(),
+            stream,
+        )?;
+
+        // ── Marconi: try to restore SSM state and skip cached prefix ──
+        // With intermediate checkpoints, ssm_snapshot_tokens may be less than
+        // matched_tokens. Use ssm_snapshot_tokens as the skip point.
+        // Session isolation: only restore snapshots belonging to this session.
+        let marconi_skip = if let Some(snap_id) = prefix_match.ssm_snapshot {
+            let snap_tok = prefix_match.ssm_snapshot_tokens;
+            if snap_tok > 0
+                && kv_write_start <= n
+                && super::prefill_b::should_restore_ssm_snapshot(snap_tok, kv_write_start, n)
+                && self
+                    .ssm_snapshots
+                    .session_matches(snap_id, seq.session_hash)
+            {
+                self.ssm_snapshots.restore(
+                    snap_id,
+                    seq.slot_idx,
+                    &self.ssm_pool,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
+                if snap_tok < kv_write_start {
+                    tracing::info!(
+                        "Marconi intermediate hit: restored from checkpoint at token {} \
+                         (skipping {} tokens, recomputing {} SSM tokens to match point {})",
+                        snap_tok,
+                        snap_tok,
+                        kv_write_start - snap_tok,
+                        kv_write_start,
+                    );
+                } else {
+                    tracing::info!(
+                        "Marconi SSM cache hit: {} tokens skipped ({} blocks), snapshot {}",
+                        kv_write_start,
+                        prefix_match.matched_blocks.len(),
+                        snap_id,
+                    );
+                }
+                // The KV match may be deeper than this SSM checkpoint. Resume
+                // recurrent execution at the state we actually restored.
+                kv_write_start =
+                    super::prefill_b::restored_prefix_skip_tokens(true, snap_tok, kv_write_start);
+                true
+            } else {
+                if snap_tok == kv_write_start && kv_write_start == n {
+                    tracing::info!(
+                        "Exact full-prompt SSM snapshot bypassed; recomputing recurrent state \
+                         (ATLAS_MARCONI_EXACT=1 re-enables the unsafe shortcut)"
+                    );
+                }
+                if kv_write_start > 0 {
+                    tracing::info!(
+                        "Prefix cache hit: {} tokens ({} blocks) reused (KV only)",
+                        kv_write_start,
+                        prefix_match.matched_blocks.len(),
+                    );
+                }
+                false
+            }
+        } else {
+            let has_ssm_layers = self.config.num_ssm_layers() > 0;
+            if kv_write_start > 0 && has_ssm_layers {
+                // SSM models cannot skip recurrent work without a snapshot.
+                // Recompute recurrent state from zero while retaining the
+                // content-addressed cached KV rows.
+                tracing::info!(
+                    "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing recurrent state",
+                    kv_write_start,
+                    prefix_match.matched_blocks.len(),
+                );
+                kv_write_start = 0;
+                false
+            } else if kv_write_start > 0 && kv_write_start < n {
+                // Pure attention (MLA/GQA) — no SSM state needed, KV cache is self-contained.
+                // Skip cached tokens entirely: only embed + forward uncached suffix.
+                tracing::info!(
+                    "Prefix cache hit: {} tokens ({} blocks) reused, processing {} new tokens (no SSM in this model)",
+                    kv_write_start,
+                    prefix_match.matched_blocks.len(),
+                    n - kv_write_start,
+                );
+                true
+            } else {
+                false
+            }
+        };
+
+        // Determine tokens to actually process
+        let (proc_tokens, proc_count, seq_len_start) = if marconi_skip && kv_write_start >= n {
+            // Exact match: entire prompt cached with SSM snapshot.
+            // Process only the last token through decode path to produce logits.
+            (&tokens[n - 1..], 1, n - 1)
+        } else if marconi_skip {
+            // Partial match: skip cached prefix, process uncached suffix.
+            (
+                &tokens[kv_write_start..],
+                n - kv_write_start,
+                kv_write_start,
+            )
+        } else {
+            // Original path: process all tokens
+            (tokens, n, 0usize)
+        };
+
+        // ── 2. Embed tokens → [proc_count, H] contiguous ──
+        {
+            if self.config.is_qwen4_exp() {
+                let row_bytes = self.config.residual_width() * 2;
+                if Self::qwen4_embed_batch_selected() {
+                    self.embed_qwen4_batch(proc_tokens, hidden, stream)?;
+                } else {
+                    for (row, &token) in proc_tokens.iter().enumerate() {
+                        self.embed(token, hidden.offset(row * row_bytes), stream)?;
+                    }
+                }
+            } else {
+                // SAFETY: `proc_tokens` is a valid initialized `&[u32]` slice;
+                // `u8` has alignment 1 and `size_of_val` matches its exact
+                // initialized byte length for `copy_h2d_group_fast`.
+                let token_ids_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        proc_tokens.as_ptr() as *const u8,
+                        std::mem::size_of_val(proc_tokens),
+                    )
+                };
+                let token_ids_dev = self.buffers.scratch();
+                self.copy_h2d_group_fast(
+                    &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+                    stream,
+                )?;
+                ops::batched_embed(
+                    self.gpu.as_ref(),
+                    self.batched_embed_kernel,
+                    token_ids_dev,
+                    self.embed_tokens.weight,
+                    hidden,
+                    proc_count as u32,
+                    h as u32,
+                    stream,
+                )?;
+                self.scale_embeddings(hidden, proc_count, stream)?;
+            }
+        }
+        self.splice_vision_embeddings(tokens, seq_len_start, proc_count, hidden, stream)?;
+
+        // ── 3. Upload attention metadata via pinned staging (one H2D copy) ──
+        let moe_scratch_bytes = proc_count * self.config.num_experts_per_tok * 4 * 2;
+        let meta_offset = (moe_scratch_bytes + 7) & !7;
+        let meta_base = self.buffers.scratch().offset(meta_offset);
+
+        let slot_offset = (proc_count * 4 + 7) & !7;
+
+        // Lock staging, validate total byte extent BEFORE writing, pack, and upload.
+        let (block_table_dev, seq_len_dev) = {
+            let mut stg = self.pinned_staging.lock();
+            stg.positions.clear();
+            stg.positions
+                .extend(seq_len_start as u32..(seq_len_start + proc_count) as u32);
+            stg.slots.clear();
+            stg.slots
+                .extend((seq_len_start..seq_len_start + proc_count).map(|i| {
+                    let block_idx = seq
+                        .physical_block_for(i / bs)
+                        .unwrap_or(self.dummy_kv_block);
+                    (block_idx as i64) * (bs as i64) + ((i % bs) as i64)
+                }));
+
+            let pos_bytes = std::mem::size_of_val(stg.positions.as_slice());
+            let slots_bytes = std::mem::size_of_val(stg.slots.as_slice());
+            let include_paged = marconi_skip || self.config.is_qwen4_exp();
+            let bt_start = ((slot_offset + slots_bytes) + 3) & !3;
+            let bt_len = std::mem::size_of_val(seq.block_table.as_slice());
+            let sl_start = (bt_start + bt_len + 3) & !3;
+            let sl_len = if self.config.is_qwen4_exp() {
+                proc_count * 4
+            } else {
+                4
+            };
+            let total_bytes = if include_paged {
+                sl_start + sl_len
+            } else {
+                slot_offset + slots_bytes
+            };
+            let scratch_end = meta_offset
+                .checked_add(total_bytes)
+                .ok_or_else(|| anyhow::anyhow!("prefill metadata scratch offset overflow"))?;
+            anyhow::ensure!(
+                scratch_end <= self.buffers.sizes().scratch,
+                "prefill metadata ends at byte {scratch_end}, beyond the {}-byte scratch arena",
+                self.buffers.sizes().scratch
+            );
+            // Validate pinned host buffer capacity BEFORE any copy_nonoverlapping write.
+            stg.buffer.pinned_slice_range(0, total_bytes)?;
+
+            let pinned = stg.buffer.as_mut_ptr();
+            // SAFETY: `total_bytes <= stg.buffer.len()` was verified above and covers
+            // `[0..pos_bytes)`; `stg.positions` holds `pos_bytes` initialized bytes and
+            // does not overlap `stg.buffer`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    stg.positions.as_ptr() as *const u8,
+                    pinned,
+                    pos_bytes,
+                );
+            }
+            // SAFETY: `total_bytes <= stg.buffer.len()` covers
+            // `[slot_offset..slot_offset + slots_bytes)`; `stg.slots` holds
+            // `slots_bytes` initialized bytes and does not overlap `stg.buffer`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    stg.slots.as_ptr() as *const u8,
+                    pinned.add(slot_offset),
+                    slots_bytes,
+                );
+            }
+
+            let devs = if include_paged {
+                // SAFETY: `total_bytes <= stg.buffer.len()` covers `[bt_start..bt_start + bt_len)`;
+                // `seq.block_table` holds `bt_len` initialized bytes and does not overlap `stg.buffer`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        seq.block_table.as_ptr() as *const u8,
+                        pinned.add(bt_start),
+                        bt_len,
+                    );
+                }
+                if self.config.is_qwen4_exp() {
+                    for t in 0..proc_count {
+                        let seq_len_val = (seq_len_start + t + 1) as u32;
+                        // SAFETY: `total_bytes <= stg.buffer.len()` covers
+                        // `[sl_start..sl_start + proc_count * 4)` and `t < proc_count`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                &seq_len_val as *const u32 as *const u8,
+                                pinned.add(sl_start + t * 4),
+                                4,
+                            );
+                        }
+                    }
+                } else {
+                    let seq_len_val = n as u32;
+                    // SAFETY: `total_bytes <= stg.buffer.len()` covers `[sl_start..sl_start + 4)`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            &seq_len_val as *const u32 as *const u8,
+                            pinned.add(sl_start),
+                            4,
+                        );
+                    }
+                }
+                (meta_base.offset(bt_start), meta_base.offset(sl_start))
+            } else {
+                (DevicePtr::NULL, DevicePtr::NULL)
+            };
+
+            let pinned_slice = stg.buffer.pinned_slice_range(0, total_bytes)?;
+            // SAFETY: `pinned_slice` points into page-locked `stg.buffer` (model
+            // lifetime), `[meta_offset..scratch_end)` fits in `buffers.scratch()`,
+            // and `stg` is protected by `self.pinned_staging` mutex.
+            unsafe {
+                self.gpu
+                    .copy_h2d_pinned_async(pinned_slice, meta_base, stream)?;
+            }
+            devs
+        };
+
+        let attn_metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
+            positions: meta_base,
+            positions_h: meta_base,
+            positions_w: meta_base,
+            slot: meta_base.offset(slot_offset),
+            seq_len: seq_len_dev,
+            block_table: block_table_dev,
+            max_blocks_per_seq: seq.block_table.len() as u32,
+            num_seqs: 1,
+        };
+
+        let ctx = ForwardContext {
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            attn_metadata: Some(attn_metadata),
+            profile: self.profile,
+            comm: self.comm_ref(),
+            graph_capture: false,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
+            ffn_defer: None,
+        };
+
+        // ── 4. Forward through all layers ──
+        // SSM replay may begin before the deepest cached KV match. Preserve the
+        // already-cached rows and write only the genuinely uncached suffix.
+        let layer_kv_write_start = super::prefill_b::cached_kv_rows_in_slice(
+            seq.cached_prefix_tokens,
+            seq_len_start,
+            proc_count,
+        );
+        let diag_prefill = self.profile && proc_count > 1; // Only with --profile
+        if crate::layers::qwen4_hyper::pending::discard_stale() {
+            tracing::warn!("dropped a stale pending HC injection from a failed prefill chunk");
+        }
+        if crate::layers::moe::qwen4_moe_status::discard_stale() {
+            tracing::warn!("dropped deferred compact-MoE status words from a failed prefill chunk");
+        }
+        let prefill_receipt =
+            crate::model::qwen4_prefill_engagement::begin(&self.config, proc_count)?;
+        let readers_every_layer = self.profile;
+        self.pp_stage_enter(hidden, proc_count, stream)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if i == 1
+                && let Some(ple) = &self.qwen4_ple
+            {
+                crate::layers::qwen4_hyper::pending::flush(self.gpu.as_ref(), stream)?;
+                let row_bytes = self.config.residual_width() * 2;
+                let mut prior = seq.tokens.clone();
+                prior.extend_from_slice(&tokens[..seq_len_start.min(tokens.len())]);
+                let parity_prior = prior.clone();
+                if std::env::var("ATLAS_QWEN4_PLE_PREFILL_BATCH")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    ple.forward_prefill(
+                        proc_tokens,
+                        &prior,
+                        hidden,
+                        seq.slot_idx,
+                        seq_len_start == 0,
+                        self.gpu.as_ref(),
+                        stream,
+                        None,
+                    )?;
+                } else {
+                    for (row, &token) in proc_tokens.iter().enumerate() {
+                        ple.forward_token(
+                            token,
+                            &prior,
+                            hidden.offset(row * row_bytes),
+                            seq.slot_idx,
+                            seq_len_start == 0 && row == 0,
+                            self.gpu.as_ref(),
+                            stream,
+                        )?;
+                        prior.push(token);
+                    }
+                }
+                ple.capture_post_prefill_parity(
+                    hidden,
+                    tokens,
+                    &parity_prior,
+                    proc_tokens,
+                    seq_len_start,
+                    seq.slot_idx,
+                    seq_len_start == 0,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
+            }
+            layer
+                .prefill(
+                    hidden,
+                    residual,
+                    proc_count,
+                    seq.layer_states[i].as_mut(),
+                    &mut kv_cache,
+                    seq_len_start,
+                    &mut seq.block_table,
+                    &mut seq.disk_block_ids,
+                    &mut seq.disk_last_offloaded_per_layer,
+                    layer_kv_write_start,
+                    &ctx,
+                    stream,
+                )
+                .map_err(|e| anyhow::anyhow!("Prefill layer {i} failed: {e}"))?;
+            if readers_every_layer || self.dflash_capture_layers.contains(&i) {
+                crate::layers::qwen4_hyper::pending::flush(self.gpu.as_ref(), stream)?;
+            }
+            // DFlash prefill capture: writes layer i's hidden output for
+            // all `proc_count` tokens into the seq's accumulator at absolute
+            // positions [seq_len_start .. seq_len_start + proc_count].
+            // No-op when DFlash is disabled.
+            self.try_dflash_prefill_capture_layer(seq, i, seq_len_start, proc_count, stream)?;
+
+            // MLA diagnostic: dump per-layer hidden state norm (once per session)
+            static DIAG_DONE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if self.profile
+                && self.config.model_type == "mistral"
+                && !DIAG_DONE.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.gpu.synchronize(stream)?;
+                // Read last token's hidden state (matching residual width and dtype)
+                let rw = self.config.residual_width();
+                let last_offset = (proc_count - 1) * rw * fp32;
+                let norm_res = if fp32 == 4 {
+                    self.readback_f32(hidden.offset(last_offset), rw)
+                        .map(|(_, norm)| norm)
+                } else {
+                    self.readback_bf16(hidden.offset(last_offset), rw)
+                        .map(|(_, norm)| norm)
+                };
+                if let Ok(norm) = norm_res {
+                    tracing::info!("LAYER_NORM L{i}: hidden_norm={norm:.4}");
+                    if i == self.layers.len() - 1 {
+                        DIAG_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // Diagnostic: check last token's hidden state norm at every layer.
+            // This is what goes to the LM head — divergence here causes bad logits.
+            if diag_prefill {
+                self.gpu.synchronize(stream)?;
+                let rw = self.config.residual_width();
+                let last_offset = (proc_count - 1) * rw * fp32;
+                let (last_vals, last_norm) = if fp32 == 4 {
+                    self.readback_f32(hidden.offset(last_offset), rw.min(64))?
+                } else {
+                    self.readback_bf16(hidden.offset(last_offset), rw.min(64))?
+                };
+                let last_nan = last_vals.iter().filter(|v| v.is_nan()).count();
+                let last_inf = last_vals.iter().filter(|v| v.is_infinite()).count();
+                let lt = self.config.layer_type(i);
+                // Print every 4th layer + first/last to keep output manageable
+                if i % 4 == 0 || i == self.layers.len() - 1 || last_nan > 0 || last_inf > 0 {
+                    tracing::warn!(
+                        "DIAG L{i} ({lt:?}) last_tok: norm={last_norm:.4} nan={last_nan} inf={last_inf} first4={:.4?}",
+                        &last_vals[..4.min(last_vals.len())]
+                    );
+                }
+            }
+        }
+
+        crate::layers::qwen4_hyper::pending::flush(self.gpu.as_ref(), stream)?;
+        crate::layers::moe::qwen4_moe_status::flush(self.gpu.as_ref(), stream)?;
+        self.pp_stage_exit(hidden, proc_count, stream)?;
+        if let Some(receipt) = prefill_receipt {
+            receipt.finish()?;
+        }
+
+        if self.config.pp_rank == 0 {
+            // ── 5. Final norm on LAST token only ──
+            let persistent_width = self.config.residual_width();
+            let last_hidden = hidden.offset((proc_count - 1) * persistent_width * fp32);
+            let last_residual = residual.offset((proc_count - 1) * persistent_width * fp32);
+            let normed = self.buffers.norm_output();
+            let final_input = self
+                .qwen4_final_hidden_nvfp4(last_hidden, last_residual, stream)?
+                .unwrap_or(last_hidden);
+            self.final_norm_rows(final_input, normed, 1, stream)?;
+
+            // ── 6. LM head on last token → logits ──
+            self.lm_head(normed, stream)?;
+        }
+
+        // ── 7. Update sequence state ──
+        seq.tokens.extend_from_slice(tokens);
+        seq.seq_len = n;
+
+        // ── 8. Insert into prefix cache + save SSM snapshot for Marconi ──
+        self.prefill_save_snapshot_with_vision_gate(tokens, seq, &mut kv_cache, bs, stream);
+
+        // DFlash: advance the seq's `ctx_len` to span all just-prefilled
+        // positions so the next propose() can read them.
+        self.update_dflash_ctx_len_after_prefill(seq, seq_len_start, proc_count)?;
+
+        // DFlash drafter-retrain teacher-forced hidden capture (default-OFF).
+        // No-op unless ATLAS_DUMP_CTX_HIDDEN is set. Dumps the full-sequence
+        // 5-layer NVFP4 hiddens now resident in ctx_hidden_acc.
+        self.dump_ctx_hidden_after_prefill(seq, tokens, stream)?;
+
+        Ok(self.decode_logits_ptr())
+    }
+}

@@ -1,0 +1,147 @@
+[package]
+name = "spark-model"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Flux Engine model forward-pass orchestration, layers, and weight loaders"
+
+[features]
+default = ["cuda"]
+# GPU-only GLM-5.3 bring-up examples (opt-in; never built by --all-targets).
+gpu-examples = []
+# The `cuda` feature forwards atlas-core/cuda + spark-runtime/cuda so the
+# default Linux build activates CUDA while `atlas-core` stays backend-neutral.
+cuda = [
+    "atlas-core/cuda",
+    "spark-runtime/cuda",
+    "spark-storage/cuda",
+    "spark-comm/cuda",
+    # Served DeepSeek-V4.1 (`model::dsv41`) builds its engram hash state from the
+    # checkpoint's tokenizer.json at alloc_sequence.
+    "engram-tokenizer",
+]
+metal = [
+    "atlas-core/metal",
+    "spark-runtime/metal",
+    "spark-storage/metal",
+    "spark-comm/metal",
+]
+# Pulls in the host-side example deps (tokenizers, safetensors).
+# Kept off the bare `metal` feature so a metal-feature library build
+# doesn't drag in the tokenizer or safetensors crates.
+metal-example = ["metal", "dep:tokenizers", "dep:safetensors"]
+engram-tokenizer = ["dep:tokenizers"]
+
+[dependencies]
+atlas-core = { workspace = true }
+atlas-kernels = { workspace = true }
+# `default-features = false` so the metal feature can opt out of
+# spark-runtime's `cuda` default — otherwise the dep line silently
+# re-enables cudarc on every build.
+spark-runtime = { path = "../spark-runtime", default-features = false }
+spark-comm = { path = "../spark-comm", default-features = false }
+# Same opt-out pattern as spark-runtime above — keeps metal builds
+# from silently re-enabling spark-storage's cuda default.
+spark-storage = { path = "../spark-storage", default-features = false }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = "0.1"
+half = "2"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+parking_lot = { workspace = true }
+ring = { workspace = true }
+# Non-optional (was `optional = true`, metal-example only):
+# `weight_loader::transform_cache` mmaps the post-transform blob on every
+# start when ATLAS_WEIGHT_CACHE=1, so it is needed by the library itself.
+memmap2 = "0.9"
+
+# `tokenizers` is enabled by `engram-tokenizer` (pulled in by the default `cuda`
+# feature for DeepSeek-V4.1) and by `metal-example`.
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+# Used by the `metal_qwen35_inference` example only — gated by
+# `required-features = ["metal-example"]` on the `[[example]]` block below so
+# default Linux `cuda` builds don't pull it in.
+safetensors = { version = "0.7", optional = true }
+
+# End-to-end Qwen3.5-4B-MLX-8bit decode driver. Loads weights via
+# `MlxInt8Weight`, kernel handles via `Qwen35Kernels::resolve`, and
+# routes every per-layer kernel-launch sequence through
+# `spark_model::forward::qwen3_5::forward_*`. The same forward path
+# is what a future CUDA / ROCm / WebGPU end-to-end driver would
+# call — the example just owns the per-backend weight type and
+# kernel directory.
+[[example]]
+name = "metal_qwen35_inference"
+path = "examples/metal_qwen35_inference/main.rs"
+required-features = ["metal-example"]
+
+# Bit-parity oracle for the single-warp decode GEMVs. Needs a live CUDA
+# device and the compiled PTX, so it is feature-gated off a metal build
+# rather than left to cargo's example auto-discovery.
+[[example]]
+name = "w4a16_gemv_sw_microtest"
+path = "examples/w4a16_gemv_sw_microtest.rs"
+required-features = ["cuda"]
+
+# Live CUDA exactness oracle for the DSpark static Markov add-argmax. This is
+# a mandatory post-build qualification gate: a successful compile alone does
+# not establish numerical or tie-break parity on the device.
+[[example]]
+name = "dspark_argmax_add_microtest"
+path = "examples/dspark_argmax_add_microtest.rs"
+required-features = ["cuda"]
+
+# Live raw-BF16 parity oracle for the exact dynamic-M NVFP4 LM-head GEMV.
+[[example]]
+name = "w4a16_exact_lm_head_microtest"
+path = "examples/w4a16_exact_lm_head_microtest.rs"
+required-features = ["cuda"]
+
+# Live raw-BF16 parity oracle for the multi-row NVFP4 attention QKV
+# projections at the Qwen3.8-27B gated shapes (Q half AND output-gate half).
+[[example]]
+name = "w4a16_exact_attention_qkv_microtest"
+path = "examples/w4a16_exact_attention_qkv_microtest.rs"
+required-features = ["cuda"]
+
+# Isolated throughput probe for the exact attention QKV projections, with the
+# LM-head kernel as an in-process control.
+[[example]]
+name = "w4a16_attention_qkv_throughput_probe"
+path = "examples/w4a16_attention_qkv_throughput_probe.rs"
+required-features = ["cuda"]
+
+# Prints the device's real SM count and the split-K slice counts it implies.
+[[example]]
+name = "gpu_sm_count_probe"
+path = "examples/gpu_sm_count_probe.rs"
+required-features = ["cuda"]
+
+[dev-dependencies]
+# `default-features = false` so a metal-feature build of spark-model doesn't
+# inadvertently pull cudarc back in via the dev-dep chain.
+spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "glm53_dflash2_kv_parity"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm53_projection_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm53_partial_replay_parity"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm53_exl3_private_device"
+required-features = ["cuda", "gpu-examples"]
+

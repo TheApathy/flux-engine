@@ -1,0 +1,12 @@
+{
+  "image_ref": "flux-engine:9.15.3",
+  "image_id": "sha256:04a1e514c257380433df7fc8e7403bd57b9edec91d4e1716e87daf749753085d",
+  "files_scanned": 9458,
+  "bytes_scanned": 4593819053,
+  "violations_count": 0,
+  "host_path_violations": 0,
+  "secret_violations": 0,
+  "state_token_violations": 0,
+  "violations": [],
+  "status": "PASS"
+}

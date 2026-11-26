@@ -1,0 +1,214 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 820" width="1240" height="820">
+  <rect x="6" y="6" width="1228" height="808" rx="18" fill="#0b0f17" stroke="#222c3c" stroke-width="2"/>
+  <!-- macOS window dots -->
+  <circle cx="38" cy="36" r="7.5" fill="#ff5f56"/>
+  <circle cx="62" cy="36" r="7.5" fill="#ffbd2e"/>
+  <circle cx="86" cy="36" r="7.5" fill="#27c93f"/>
+  <text x="112" y="41" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" fill="#64748b">ghcr.io/theapathy/flux-engine:v0.9.15 (9.15 · digest sha256:728e9410c37f...) — Native-MTP (K=5, 4 Drafts)</text>
+  <text x="32" y="80" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="22" font-weight="700" fill="#5eead4">flux-engine v0.9.15 (9.15) — Native-MTP Arm (K=5 · Lossless Speculative)</text>
+  <text x="32" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="13" fill="#94a3b8">Model: Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid + Native MTP Head | 1× NVIDIA DGX Spark GB10 (sm_121a · 128 GB UMA)</text>
+  <text x="32" y="128" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="13" fill="#94a3b8">Speculation: Fixed K=5 (4 Drafts, Confidence=0) | 100% 0-ULP Greedy Token-Identical to Plain K=1 | Batched Multi-Row Verify (C=1..8)</text>
+
+  <text x="32" y="168" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="15.5" font-weight="700" fill="#5eead4">Prefill Speed — Native-MTP K=5 (W16384 vs W4096)</text>
+  <text x="614" y="168" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="15.5" font-weight="700" fill="#5eead4">Single-Stream (C=1) Lossless K=5 Decode (Workloads &amp; Ctx)</text>
+<g transform="translate(32, 184)">
+  <rect x="0" y="0" width="554" height="203" fill="#0d131c" stroke="#243040" stroke-width="1"/>
+  <rect x="0" y="0" width="554" height="29" fill="#111924"/>
+  <line x1="0" y1="29" x2="554" y2="29" stroke="#4a7c9b" stroke-width="1.2"/>
+  <text x="28.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">ctx</text>
+  <text x="97.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">tokens</text>
+  <line x1="56" y1="0" x2="56" y2="203" stroke="#243040" stroke-width="1"/>
+  <text x="190.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">W16384 Med</text>
+  <line x1="138" y1="0" x2="138" y2="203" stroke="#243040" stroke-width="1"/>
+  <text x="296.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">W16384 Peak</text>
+  <line x1="242" y1="0" x2="242" y2="203" stroke="#243040" stroke-width="1"/>
+  <text x="400.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">W4096 Med</text>
+  <line x1="350" y1="0" x2="350" y2="203" stroke="#243040" stroke-width="1"/>
+  <text x="502.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">W4096 Peak</text>
+  <line x1="450" y1="0" x2="450" y2="203" stroke="#243040" stroke-width="1"/>
+  <text x="28.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">8k</text>
+  <text x="97.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">8,192</text>
+  <text x="190.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">6,028.5</text>
+  <text x="296.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#34d399" text-anchor="middle">6,050.1</text>
+  <text x="400.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">5,447.7</text>
+  <text x="502.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">5,449.8</text>
+  <rect x="1" y="58" width="552" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="58" x2="554" y2="58" stroke="#243040" stroke-width="1"/>
+  <text x="28.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">16k</text>
+  <text x="97.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">16,384</text>
+  <text x="190.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">6,291.0</text>
+  <text x="296.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">6,420.3*</text>
+  <text x="400.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">5,326.8</text>
+  <text x="502.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">5,340.9</text>
+  <line x1="0" y1="87" x2="554" y2="87" stroke="#243040" stroke-width="1"/>
+  <text x="28.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">32k</text>
+  <text x="97.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">32,768</text>
+  <text x="190.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">6,168.5</text>
+  <text x="296.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#34d399" text-anchor="middle">6,233.5</text>
+  <text x="400.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">5,294.8</text>
+  <text x="502.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">5,294.8</text>
+  <rect x="1" y="116" width="552" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="116" x2="554" y2="116" stroke="#243040" stroke-width="1"/>
+  <text x="28.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">64k</text>
+  <text x="97.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">65,536</text>
+  <text x="190.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">6,006.5</text>
+  <text x="296.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#34d399" text-anchor="middle">6,035.1</text>
+  <text x="400.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">5,158.2</text>
+  <text x="502.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">5,174.5</text>
+  <line x1="0" y1="145" x2="554" y2="145" stroke="#243040" stroke-width="1"/>
+  <text x="28.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">128k</text>
+  <text x="97.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">131,072</text>
+  <text x="190.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">5,905.6</text>
+  <text x="296.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#34d399" text-anchor="middle">5,925.5</text>
+  <text x="400.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">5,063.0</text>
+  <text x="502.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">5,068.6</text>
+  <rect x="1" y="174" width="552" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="174" x2="554" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="28.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">262k</text>
+  <text x="97.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">262,080</text>
+  <text x="190.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">5,524.7</text>
+  <text x="296.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#34d399" text-anchor="middle">5,570.6</text>
+  <text x="400.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">4,990.7</text>
+  <text x="502.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">5,003.1</text>
+</g>
+<g transform="translate(614, 184)">
+  <rect x="0" y="0" width="594" height="261" fill="#0d131c" stroke="#243040" stroke-width="1"/>
+  <rect x="0" y="0" width="594" height="29" fill="#111924"/>
+  <line x1="0" y1="29" x2="594" y2="29" stroke="#4a7c9b" stroke-width="1.2"/>
+  <text x="78.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">workload / ctx</text>
+  <text x="207.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">Plain K=1</text>
+  <line x1="156" y1="0" x2="156" y2="261" stroke="#243040" stroke-width="1"/>
+  <text x="317.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">MTP K=5</text>
+  <line x1="258" y1="0" x2="258" y2="261" stroke="#243040" stroke-width="1"/>
+  <text x="429.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">speedup</text>
+  <line x1="376" y1="0" x2="376" y2="261" stroke="#243040" stroke-width="1"/>
+  <text x="538.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">parity vs K=1</text>
+  <line x1="482" y1="0" x2="482" y2="261" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">tf_streams_code_256</text>
+  <text x="207.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">35.2</text>
+  <text x="317.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">91.95</text>
+  <text x="429.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#fbbf24" text-anchor="middle">2.61×</text>
+  <text x="538.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+  <rect x="1" y="58" width="592" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="58" x2="594" y2="58" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">sparkdash_code_400</text>
+  <text x="207.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">35.2</text>
+  <text x="317.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">87.72</text>
+  <text x="429.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#fbbf24" text-anchor="middle">2.49×</text>
+  <text x="538.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+  <line x1="0" y1="87" x2="594" y2="87" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">rep0 (256 tok)</text>
+  <text x="207.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">35.2</text>
+  <text x="317.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">86.86</text>
+  <text x="429.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#fbbf24" text-anchor="middle">2.47×</text>
+  <text x="538.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+  <rect x="1" y="116" width="592" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="116" x2="594" y2="116" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">sparkdash_prose_400</text>
+  <text x="207.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">35.1</text>
+  <text x="317.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">66.20</text>
+  <text x="429.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#fbbf24" text-anchor="middle">1.89×</text>
+  <text x="538.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+  <line x1="0" y1="145" x2="594" y2="145" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">tf_streams_prose_256</text>
+  <text x="207.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">35.1</text>
+  <text x="317.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">65.42</text>
+  <text x="429.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#fbbf24" text-anchor="middle">1.86×</text>
+  <text x="538.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+  <rect x="1" y="174" width="592" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="174" x2="594" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">8K / 16K Long Ctx</text>
+  <text x="207.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">35.2 / 34.8</text>
+  <text x="317.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">55.27 / 49.10</text>
+  <text x="429.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">1.57× / 1.41×</text>
+  <text x="538.0" y="193.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+  <line x1="0" y1="203" x2="594" y2="203" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="222.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">32K / 64K Long Ctx</text>
+  <text x="207.0" y="222.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">34.7 / 34.2</text>
+  <text x="317.0" y="222.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">53.72 / 53.03</text>
+  <text x="429.0" y="222.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">1.55× / 1.55×</text>
+  <text x="538.0" y="222.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+  <rect x="1" y="232" width="592" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="232" x2="594" y2="232" stroke="#243040" stroke-width="1"/>
+  <text x="78.0" y="251.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">128K / 262K Long Ctx</text>
+  <text x="207.0" y="251.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">33.2 / 32.0</text>
+  <text x="317.0" y="251.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">46.10 / 41.83</text>
+  <text x="429.0" y="251.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">1.39× / 1.31×</text>
+  <text x="538.0" y="251.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% Exact</text>
+</g>
+  <g transform="translate(32, 396)">
+    <rect x="0" y="0" width="554" height="44" rx="8" fill="#101b24" stroke="#10b981" stroke-width="1.2"/>
+    <text x="14" y="27" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="11.5" font-weight="700" fill="#34d399">*16K chunk kernel peak: 6,420.3 tok/s (2,551.9 ms) · stage: 6,318.8</text>
+  </g>
+  <text x="32" y="476" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="15.5" font-weight="700" fill="#5eead4">Multi-Stream Concurrent Native-MTP K=5 Decode (Aggregate tok/s · 100% Greedy Parity · 0 Fallbacks)</text>
+<g transform="translate(32, 492)">
+  <rect x="0" y="0" width="1176" height="174" fill="#0d131c" stroke="#243040" stroke-width="1"/>
+  <rect x="0" y="0" width="1176" height="29" fill="#111924"/>
+  <line x1="0" y1="29" x2="1176" y2="29" stroke="#4a7c9b" stroke-width="1.2"/>
+  <text x="110.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">suite / workload</text>
+  <text x="277.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">C=1</text>
+  <line x1="220" y1="0" x2="220" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="391.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">C=2</text>
+  <line x1="334" y1="0" x2="334" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="505.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">C=3</text>
+  <line x1="448" y1="0" x2="448" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="619.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">C=4</text>
+  <line x1="562" y1="0" x2="562" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="736.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">C=5</text>
+  <line x1="676" y1="0" x2="676" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="871.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">C=8 (mixed)</text>
+  <line x1="796" y1="0" x2="796" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="1061.0" y="19.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#7dd3fc" text-anchor="middle">parity / fallback</text>
+  <line x1="946" y1="0" x2="946" y2="174" stroke="#243040" stroke-width="1"/>
+  <text x="110.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">tf_streams_code_256</text>
+  <text x="277.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">91.95</text>
+  <text x="391.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">173.55</text>
+  <text x="505.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">258.22</text>
+  <text x="619.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">342.07</text>
+  <text x="736.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">420.28</text>
+  <text x="871.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="1061.0" y="48.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% True (0 fallback)</text>
+  <rect x="1" y="58" width="1174" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="58" x2="1176" y2="58" stroke="#243040" stroke-width="1"/>
+  <text x="110.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">tf_streams_prose_256</text>
+  <text x="277.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">65.42</text>
+  <text x="391.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">122.66</text>
+  <text x="505.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">181.90</text>
+  <text x="619.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">241.71</text>
+  <text x="736.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="middle">298.15</text>
+  <text x="871.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="1061.0" y="77.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% True (0 fallback)</text>
+  <line x1="0" y1="87" x2="1176" y2="87" stroke="#243040" stroke-width="1"/>
+  <text x="110.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">sparkdash_code_400</text>
+  <text x="277.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">87.72</text>
+  <text x="391.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">105.89</text>
+  <text x="505.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">121.71</text>
+  <text x="619.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">128.66</text>
+  <text x="736.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">137.00</text>
+  <text x="871.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="1061.0" y="106.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% True (0 fallback)</text>
+  <rect x="1" y="116" width="1174" height="29" fill="#101823" opacity="0.65"/>
+  <line x1="0" y1="116" x2="1176" y2="116" stroke="#243040" stroke-width="1"/>
+  <text x="110.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">sparkdash_prose_400</text>
+  <text x="277.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">66.20</text>
+  <text x="391.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">82.57</text>
+  <text x="505.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">95.83</text>
+  <text x="619.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">98.53</text>
+  <text x="736.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#38bdf8" text-anchor="middle">103.67</text>
+  <text x="871.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="1061.0" y="135.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% True (0 fallback)</text>
+  <line x1="0" y1="145" x2="1176" y2="145" stroke="#243040" stroke-width="1"/>
+  <text x="110.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">8-Stream Mixed Cohort</text>
+  <text x="277.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">140.90</text>
+  <text x="391.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="505.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="619.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="736.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="400" fill="#e2e8f0" text-anchor="middle">—</text>
+  <text x="871.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="700" fill="#fbbf24" text-anchor="middle">580.66 (4.12×)</text>
+  <text x="1061.0" y="164.7" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" font-weight="600" fill="#4ade80" text-anchor="middle">100% True (0 fallback)</text>
+</g>
+  <text x="32" y="694" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="16" font-weight="700" fill="#94a3b8">Acceptance &amp; Qualification</text>
+  <text x="32" y="720" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="13" font-weight="600" fill="#4ade80">PASS rc=0 | 20/20 Concurrency Cells parity=True (1,468 batched verify frames, 0 serial fallbacks) | Cold-Start: 139.23s med</text>
+  <text x="32" y="752" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12.5" fill="#cbd5e1">Recipes: recipes/flux-k5-lossless-decode.env · docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md</text>
+  <text x="32" y="782" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', Consolas, monospace" font-size="12" fill="#64748b">GHCR Digest: sha256:728e9410c37fa42ecbbf1d991cf58dec298811f0b2e08e7d2a54e318cb9d2214 · Captured 2026-10-25 UTC</text>
+</svg>

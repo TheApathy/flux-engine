@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+ENGINE_STABLE_PIN.json
+CONTAINER_BUILD_RECEIPT.json
+llm-inference-bench/tools/amd_fabric/llm_amd_fabric
+llm-inference-bench/tools/p2pmark/llm_p2pmark
+llm-inference-bench/screenshot.png

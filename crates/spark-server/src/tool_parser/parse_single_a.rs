@@ -1,0 +1,396 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+#![allow(unused_imports, dead_code)]
+
+use super::*;
+
+/// Locate the end (byte offset past `</function>`) of a single `<function=...>`
+/// block, ignoring `</function>` inside closed `<parameter=...>...</parameter>`
+/// regions. Returns `None` if an open `<parameter=...>` has not been closed yet
+/// (suitable for streaming callers that must wait for more tokens).
+pub(super) fn find_function_block_end_strict(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut param_depth: i32 = 0;
+    while i < bytes.len() {
+        if s[i..].starts_with("</function>") && param_depth == 0 {
+            return Some(i + "</function>".len());
+        }
+        if s[i..].starts_with("<parameter=") {
+            param_depth += 1;
+            i += "<parameter=".len();
+            continue;
+        }
+        if s[i..].starts_with("</parameter>") {
+            if param_depth > 0 {
+                param_depth -= 1;
+            }
+            i += "</parameter>".len();
+            continue;
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// Locate the end (byte offset past `</function>`) of a single `<function=...>`
+/// block, ignoring `</function>` inside closed `<parameter=...>...</parameter>`
+/// regions. Falls back to the first `</function>` when a parameter is unclosed
+/// at end-of-input.
+pub(super) fn find_function_block_end(s: &str) -> Option<usize> {
+    find_function_block_end_strict(s)
+        .or_else(|| s.find("</function>").map(|p| p + "</function>".len()))
+}
+
+fn starts_with_attr_function(s: &str) -> bool {
+    s.starts_with("<function=")
+        || s.starts_with("<|function=")
+        || s.starts_with("<function ")
+        || s.starts_with("<|function ")
+}
+
+fn find_attr_function_start(s: &str) -> Option<usize> {
+    ["<function=", "<|function=", "<function ", "<|function "]
+        .into_iter()
+        .filter_map(|marker| s.find(marker))
+        .min()
+}
+
+/// Parse one or more tool calls from the inner body of a single envelope
+/// (`<tool_call>`, `<|tool_call>`, `<minimax:tool_call>`, or `<minimax:_call>`).
+///
+/// Handles multiple MiniMax `<invoke name=...>` blocks, multiple consecutive
+/// Qwen `<function=...>` blocks delimited by `</function>`, and falls back to
+/// `parse_one_call` for all single-call formats.
+pub(super) fn parse_envelope_calls(body: &str, start_idx: u32) -> Vec<ToolCall> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() || glm_xml_scan::native_prefix(trimmed) {
+        return Vec::new();
+    }
+
+    // Multiple or single MiniMax `<invoke name=...>` blocks.
+    // Guarded so literal `<invoke name=...>` inside JSON, Gemma-4, or Qwen
+    // code parameters cannot hijack another format.
+    if trimmed.starts_with("<invoke name=\"")
+        || trimmed.starts_with("<invoke name='")
+        || (!trimmed.starts_with('{')
+            && !trimmed.starts_with("call:")
+            && !trimmed.starts_with("_call:")
+            && !trimmed.starts_with("<function")
+            && !trimmed.starts_with("<|function")
+            && trimmed.contains("<invoke name="))
+    {
+        return parse_minimax_xml_calls_all(trimmed);
+    }
+
+    // Multiple (or single) consecutive `<function=...>` blocks in one envelope.
+    if !trimmed.starts_with('{')
+        && !trimmed.starts_with("call:")
+        && !trimmed.starts_with("_call:")
+        && !trimmed.starts_with("<function>")
+        && let Some(first_pos) = find_attr_function_start(trimmed)
+    {
+        let mut out = Vec::new();
+        let mut rest = &trimmed[first_pos..];
+        let mut idx = start_idx;
+        while starts_with_attr_function(rest) {
+            let (block, next_rest) = match find_function_block_end(rest) {
+                Some(end) => (&rest[..end], rest[end..].trim_start()),
+                None => (rest, ""),
+            };
+            if let Some(tc) = parse_one_call(block.trim(), idx) {
+                out.push(tc);
+                idx += 1;
+            }
+            if next_rest.is_empty() || next_rest.len() == rest.len() {
+                break;
+            }
+            rest = next_rest;
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
+    parse_one_call(trimmed, start_idx).into_iter().collect()
+}
+
+/// Auto-detect and parse inner content of a `<tool_call>` block.
+/// Tries Gemma-4 native, JSON (hermes), qwen3_coder XML, then tag-style XML fallback.
+pub(super) fn parse_one_call(text: &str, idx: u32) -> Option<ToolCall> {
+    // GLM requires proof of a complete native envelope from its dispatcher.
+    // A body handed to a legacy salvage path must not be reinterpreted using
+    // JSON/function/invoke fragments that happen to occur inside its values.
+    if glm_xml_scan::native_prefix(text) {
+        return None;
+    }
+    // Try Gemma-4 native: call:fn_name{...} or _call:fn_name{...}
+    if text.starts_with("call:") || text.starts_with("_call:") {
+        return parse_gemma4_native_call(text);
+    }
+    // Try JSON (hermes format) — complete JSON first
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        let name = v.get("name")?.as_str()?.to_string();
+        let args = v
+            .get("arguments")
+            .map(|a| {
+                // If arguments is already a string (pre-serialized JSON), use directly.
+                // Otherwise serialize the object/array value to a JSON string.
+                if let Some(s) = a.as_str() {
+                    s.to_string()
+                } else {
+                    serde_json::to_string(a).unwrap_or_else(|_| "{}".into())
+                }
+            })
+            .unwrap_or_else(|| "{}".into());
+        return Some(ToolCall {
+            id: next_tool_call_id(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name,
+                arguments: args,
+            },
+        });
+    }
+    // Try truncated JSON — max_tokens may have cut the response mid-tool-call.
+    // Extract function name and whatever arguments are available.
+    if text.contains("\"name\"") && text.contains("\"arguments\"") {
+        // Extract name via simple string search (avoid regex dependency)
+        let name = extract_json_string(text, "name");
+        if let Some(name) = name {
+            // Try to extract arguments — may be truncated JSON
+            let args = if let Some(args_start) = text.find("\"arguments\"") {
+                let after = &text[args_start + "\"arguments\"".len()..];
+                let colon = after.find(':').map(|p| p + 1).unwrap_or(0);
+                let args_text = after[colon..].trim();
+                // Try full JSON parse first
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_text) {
+                    serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
+                } else {
+                    // Truncated — try truncating at the last `}` or `]` boundary
+                    let mut best = "{}".to_string();
+                    for (i, ch) in args_text.char_indices().rev() {
+                        if (ch == '}' || ch == ']')
+                            && serde_json::from_str::<serde_json::Value>(&args_text[..=i]).is_ok()
+                        {
+                            best = args_text[..=i].to_string();
+                            break;
+                        }
+                    }
+                    best
+                }
+            } else {
+                "{}".to_string()
+            };
+            return Some(ToolCall {
+                id: next_tool_call_id(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name,
+                    arguments: args,
+                },
+            });
+        }
+    }
+    // Try MiniMax XML invoke/parameter shape: <invoke name="NAME"><parameter name="K">V</parameter></invoke>
+    if let Some(tc) = parse_minimax_xml_call(text, idx) {
+        return Some(tc);
+    }
+    // Try XML attribute-style (qwen3_coder format): <function=NAME>
+    if let Some(tc) = parse_qwen3_coder_call(text, idx) {
+        return Some(tc);
+    }
+    // Try XML tag-style fallback: <function>NAME</function>
+    parse_tag_style_call(text, idx)
+}
+
+/// Parse MiniMax XML inner content:
+/// `<invoke name="NAME"><parameter name="K">V</parameter>...</invoke>`.
+///
+/// The outer `<minimax:tool_call>` wrapper is already stripped by
+/// `parse_tool_calls` (normalized to plain `<tool_call>` on entry and
+/// then dropped by the outer loop). This function only sees the
+/// inner body.
+fn parse_minimax_xml_call(text: &str, idx: u32) -> Option<ToolCall> {
+    let _ = idx;
+    let invoke_start = text
+        .find("<invoke name=\"")
+        .or_else(|| text.find("<invoke name='"))?;
+    let after = &text[invoke_start + "<invoke name=".len()..];
+    let quote = after.as_bytes().first().copied()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let name_start = 1; // skip opening quote
+    let name_end = after[name_start..]
+        .find(quote as char)
+        .map(|p| p + name_start)?;
+    let func_name = after[name_start..name_end].trim().to_string();
+    if func_name.is_empty() {
+        return None;
+    }
+
+    let mut rest = &after[name_end + 1..];
+    // Skip to end of `<invoke ...>` open tag.
+    if let Some(gt) = rest.find('>') {
+        rest = &rest[gt + 1..];
+    } else {
+        return None;
+    }
+
+    let mut args = serde_json::Map::new();
+    while let Some(p) = rest.find("<parameter name=") {
+        rest = &rest[p + "<parameter name=".len()..];
+        let q = rest.as_bytes().first().copied()?;
+        if q != b'"' && q != b'\'' {
+            break;
+        }
+        let key_start = 1;
+        let key_end = rest[key_start..].find(q as char).map(|p| p + key_start)?;
+        let param_name = rest[key_start..key_end].trim().to_string();
+        rest = &rest[key_end + 1..];
+        // Skip to end of `<parameter ...>` open tag.
+        let gt = rest.find('>')?;
+        rest = &rest[gt + 1..];
+
+        // Stop at the LEAST of: `</parameter>` (proper close),
+        // `<parameter name=` (next MiniMax param — recovery for a missing close),
+        // or `</invoke>` (invoke ended without closing this param).
+        let proper = rest.find("</parameter>");
+        let next_param = rest.find("<parameter name=");
+        let invoke_close = rest.find("</invoke>");
+        let mut val_end = rest.len();
+        let mut consumed_close = false;
+        if let Some(p) = proper {
+            val_end = p;
+            consumed_close = true;
+        }
+        for cand in [next_param, invoke_close].into_iter().flatten() {
+            if cand < val_end {
+                val_end = cand;
+                consumed_close = false;
+            }
+        }
+        // Preserve significant leading/trailing spaces in code payloads by
+        // stripping at most one outer formatting newline around closed tags.
+        let raw_slice = &rest[..val_end];
+        let raw_no_lead = raw_slice
+            .strip_prefix("\r\n")
+            .or_else(|| raw_slice.strip_prefix('\n'))
+            .unwrap_or(raw_slice);
+        let raw_value = if consumed_close {
+            raw_no_lead
+                .strip_suffix("\r\n")
+                .or_else(|| raw_no_lead.strip_suffix('\n'))
+                .unwrap_or(raw_no_lead)
+        } else {
+            raw_no_lead.trim_end()
+        };
+        rest = if consumed_close {
+            &rest[val_end + "</parameter>".len()..]
+        } else if val_end < rest.len() {
+            // Recovery path: leave the next `<parameter=` / `</function>`
+            // in place so the surrounding loop sees it.
+            &rest[val_end..]
+        } else {
+            ""
+        };
+
+        // Keep as string — matches qwen3_coder behavior. Clients
+        // validate against the tool's JSON schema and coerce.
+        args.insert(param_name, serde_json::Value::String(raw_value.to_string()));
+    }
+
+    // Empty path-like parameters on file-mutation tools indicate model
+    // self-truncation (the model emits long content for the first parameter
+    // and then emits `<parameter name="filePath"></parameter>`, causing the
+    // client's write tool to fail with EISDIR). Drop the call here so the
+    // streaming detector treats it as a parse failure and falls back to text.
+    // Downstream validation also enforces this invariant (defense in depth).
+    //
+    // Conservative scope: only path-like keys on file-mutation tools
+    // get this treatment; bash/curl/etc. are unaffected.
+    const PATH_KEYS: &[&str] = &["file_path", "filePath", "path"];
+    let is_write_tool = matches!(
+        func_name.as_str(),
+        "Write" | "write" | "Edit" | "edit" | "MultiEdit" | "multiEdit" | "multi_edit",
+    );
+    if is_write_tool {
+        for key in PATH_KEYS {
+            if let Some(serde_json::Value::String(v)) = args.get(*key)
+                && v.trim().is_empty()
+            {
+                tracing::warn!(
+                    tool = %func_name,
+                    key = key,
+                    "dropping minimax_xml call with empty required path; \
+                     model self-truncation"
+                );
+                return None;
+            }
+        }
+    }
+
+    Some(ToolCall {
+        id: next_tool_call_id(),
+        call_type: "function".into(),
+        function: FunctionCall {
+            name: func_name,
+            arguments: serde_json::to_string(&serde_json::Value::Object(args))
+                .unwrap_or_else(|_| "{}".into()),
+        },
+    })
+}
+
+/// Extract every `<invoke name="...">…</invoke>` block from a MiniMax
+/// envelope's inner content. The streaming detector hands us the body
+/// between `<minimax:tool_call>` (or its broken `<minimax:_call>`
+/// variant) and the matching close tag. MiniMax's format allows multiple
+/// `<invoke>` blocks in a single envelope; returning all of them preserves
+/// multi-call responses instead of dropping subsequent invocations.
+pub(crate) fn parse_minimax_xml_calls_all(text: &str) -> Vec<ToolCall> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    let mut idx: u32 = 0;
+    while let Some(start) = rest.find("<invoke name=") {
+        let chunk = &rest[start..];
+        // Bound the search for this invoke to its own `</invoke>` close
+        // so a malformed second block can't run into the first's body.
+        let end = match chunk.find("</invoke>") {
+            Some(e) => e + "</invoke>".len(),
+            None => chunk.len(),
+        };
+        if let Some(tc) = parse_minimax_xml_call(&chunk[..end], idx) {
+            out.push(tc);
+            idx += 1;
+        }
+        rest = &chunk[end..];
+    }
+    out
+}
+
+/// Parse qwen3_coder XML: `<function=NAME><parameter=KEY>VALUE</parameter></function>`
+/// Extract a JSON string value by key from potentially truncated JSON.
+/// Simple substring search — no full JSON parsing needed.
+fn extract_json_string(text: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let key_pos = text.find(&pattern)?;
+    let after_key = &text[key_pos + pattern.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let val_start = 1; // skip opening quote
+    let mut i = val_start;
+    let bytes = after_colon.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // skip escaped char
+        } else if bytes[i] == b'"' {
+            return Some(after_colon[val_start..i].to_string());
+        } else {
+            i += 1;
+        }
+    }
+    None
+}

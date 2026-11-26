@@ -1,0 +1,732 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Tests split out of `config.rs` for file-size budget.
+
+#![allow(unused_imports)]
+
+use super::*;
+
+#[test]
+fn test_qwen3_default_config() {
+    let cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    assert!(!cfg.final_norm_is_identity());
+    assert_eq!(cfg.num_hidden_layers, 48);
+    assert_eq!(cfg.num_experts, 512);
+    assert_eq!(cfg.num_attention_layers(), 12);
+    assert_eq!(cfg.num_ssm_layers(), 36);
+    assert_eq!(cfg.gqa_ratio(), 8);
+    assert_eq!(cfg.rotary_dim(), 64);
+    assert_eq!(cfg.vocab_size, 151936);
+    assert_eq!(cfg.layer_type(2), LayerType::LinearAttention);
+    assert_eq!(cfg.layer_type(3), LayerType::FullAttention);
+    assert_eq!(cfg.layer_type(47), LayerType::FullAttention);
+    assert_eq!(cfg.ssm_qkvz_size(), 2048 + 2048 + 4096 + 4096);
+    assert_eq!(cfg.ssm_ba_size(), 64);
+}
+
+#[test]
+fn test_parse_actual_config() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen3_config.json"
+    ));
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.hidden_size, 2048);
+    assert_eq!(cfg.num_experts, 512);
+    assert_eq!(cfg.num_hidden_layers, 48);
+    assert_eq!(cfg.layer_types.len(), 48);
+    assert_eq!(cfg.layer_types[0], LayerType::LinearAttention);
+    assert_eq!(cfg.layer_types[3], LayerType::FullAttention);
+    assert_eq!(cfg.vocab_size, 151936);
+    assert_eq!(cfg.rope_theta, 10_000_000.0);
+    assert!(cfg.norm_topk_prob);
+    assert!(!cfg.tie_word_embeddings);
+    assert_eq!(cfg.rms_norm_eps, 1e-6);
+    assert_eq!(cfg.partial_rotary_factor, 0.25);
+    assert_eq!(cfg.model_type, "qwen3_next");
+    assert!(cfg.weight_prefix.is_empty());
+}
+
+#[test]
+fn test_parse_qwen38_flash_next_config() {
+    let json = r#"{
+        "model_type": "qwen4_exp",
+        "image_token_id": 248056,
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "moe_intermediate_size": 640,
+            "shared_expert_intermediate_size": 640,
+            "vocab_size": 248320,
+            "eos_token_id": 248044,
+            "layer_types": [
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention"
+            ],
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [2],
+            "ple_embed_dim": 2560,
+            "ple_conv_kernel_size": 4,
+            "ngram_size": 3,
+            "heads_per_ngram": 8,
+            "ngram_vocab_size_base": 20000000,
+            "make_ngram_vocab_size_divisible_by": 128,
+            "seed": 1234,
+            "split_ngram_parts": 128,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+            "output_gate_type": "sigmoid",
+            "mtp_num_hidden_layers": 1,
+            "rope_parameters": {
+                "rope_theta": 10000000,
+                "partial_rotary_factor": 0.25,
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10]
+            }
+        },
+        "vision_config": {
+            "depth": 27,
+            "hidden_size": 1152,
+            "num_heads": 16,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "intermediate_size": 4304,
+            "out_hidden_size": 2560
+        }
+    }"#;
+    let cfg = parse_config(json).expect("official Flash-Next geometry parses");
+    assert_eq!(cfg.model_type, "qwen4_exp");
+    assert_eq!(cfg.weight_prefix, "model.language_model");
+    assert_eq!(cfg.hidden_size, 2560);
+    assert_eq!(cfg.residual_width(), 10_240);
+    assert_eq!(cfg.num_attention_layers(), 12);
+    assert_eq!(cfg.num_ssm_layers(), 36);
+    assert_eq!(cfg.hc_lowrank, 320);
+    assert_eq!(cfg.ple_layer_ids, vec![2]);
+    assert_eq!(cfg.indexer_budget, 2048);
+    assert_eq!(cfg.rotary_dim(), 64);
+    assert_eq!(cfg.mrope_section, [11, 11, 10]);
+    assert!(cfg.mrope_interleaved);
+    assert!(cfg.vision.is_some());
+    assert!(cfg.is_qwen4_exp());
+    assert!(cfg.final_norm_is_identity());
+}
+
+#[test]
+fn test_qwen4_exp_rejects_partial_qsa_geometry() {
+    let json = r#"{
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "hidden_size": 2560,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "layer_types": ["linear_attention"],
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [1],
+            "ple_embed_dim": 2560,
+            "ngram_size": 3,
+            "heads_per_ngram": 8,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1
+        }
+    }"#;
+    let err = parse_config(json).expect_err("partial QSA geometry must fail closed");
+    assert!(err.to_string().contains("complete non-zero QSA"));
+}
+
+#[test]
+fn test_parse_qwen38_flash_next_alias_and_mixed_precision() {
+    let json = r#"{
+        "model_type": "qwen3_8_flash_next",
+        "text_config": {
+            "model_type": "qwen3_8_flash_next_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "layer_types": ["linear_attention"],
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [1],
+            "ple_embed_dim": 2560,
+            "ngram_size": 3,
+            "heads_per_ngram": 8,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4
+        },
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "config_groups": {
+                "experts": {
+                    "weights": {
+                        "type": "float",
+                        "num_bits": 4,
+                        "group_size": 16,
+                        "dynamic": false
+                    },
+                    "targets": ["re:.*mlp.experts.*"]
+                },
+                "attention": {
+                    "weights": {
+                        "type": "float",
+                        "num_bits": 8,
+                        "group_size": 32,
+                        "dynamic": false
+                    },
+                    "targets": ["re:.*self_attn.*"]
+                }
+            }
+        }
+    }"#;
+
+    let cfg = parse_config(json).expect("pinned Qwen3.8 architecture aliases must parse");
+    assert_eq!(cfg.model_type, "qwen4_exp");
+    assert!(cfg.is_qwen4_exp());
+    let qc = cfg
+        .quantization_config
+        .expect("mixed config must be retained");
+    assert_eq!(qc.config_groups.len(), 2);
+    assert!(
+        qc.config_groups
+            .iter()
+            .any(|group| group.weight_format == ModelOptWeightFormat::Mxfp8)
+    );
+}
+
+#[test]
+fn test_qwen38_flash_next_alias_rejects_wrong_nested_type() {
+    let json = r#"{
+        "model_type": "qwen3_8_flash_next",
+        "text_config": { "model_type": "qwen4_exp_text" }
+    }"#;
+    let err = parse_config(json).expect_err("alias must validate its nested architecture");
+    assert!(err.to_string().contains("qwen3_8_flash_next_text"));
+}
+
+#[test]
+fn test_parse_qwen35_nested_config() {
+    let json = r#"{
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "partial_rotary_factor": 0.25,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "vocab_size": 248320,
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "layer_types": [
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention"
+            ],
+            "rope_parameters": {
+                "rope_theta": 10000000,
+                "rope_type": "default"
+            },
+            "mtp_num_hidden_layers": 1
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_5_moe");
+    assert_eq!(cfg.hidden_size, 2048);
+    assert_eq!(cfg.num_hidden_layers, 40);
+    assert_eq!(cfg.num_experts, 256);
+    assert_eq!(cfg.num_experts_per_tok, 8);
+    assert_eq!(cfg.vocab_size, 248320);
+    assert_eq!(cfg.num_attention_layers(), 10);
+    assert_eq!(cfg.num_ssm_layers(), 30);
+    assert_eq!(cfg.layer_types.len(), 40);
+    assert_eq!(cfg.eos_token_id, 248044);
+    assert_eq!(cfg.rope_theta, 10_000_000.0);
+    assert!(cfg.is_qwen35());
+    assert!(cfg.norm_topk_prob); // Qwen3.5 unconditionally normalizes
+    assert_eq!(cfg.ssm_qkv_size(), 2048 + 2048 + 4096); // 8192
+    assert_eq!(cfg.ssm_z_size(), 4096);
+    assert_eq!(cfg.mtp_num_hidden_layers, 1);
+}
+
+#[test]
+fn test_parse_qwen3_vl_config() {
+    let json = r#"{
+        "model_type": "qwen3_vl_moe",
+        "text_config": {
+            "model_type": "qwen3_vl_moe_text",
+            "hidden_size": 2048,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 768,
+            "vocab_size": 151936,
+            "rope_theta": 5000000,
+            "norm_topk_prob": true
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_vl_moe");
+    assert!(cfg.is_qwen3_vl());
+    assert!(!cfg.is_qwen35());
+    assert!(cfg.capabilities().has_nested_config);
+    assert_eq!(cfg.hidden_size, 2048);
+    assert_eq!(cfg.head_dim, 128);
+    assert_eq!(cfg.num_attention_heads, 32);
+    assert_eq!(cfg.num_key_value_heads, 4);
+    assert_eq!(cfg.num_experts, 128);
+    assert_eq!(cfg.num_hidden_layers, 48);
+    // Pure attention: all layers are FullAttention (full_attention_interval defaults to 1)
+    assert_eq!(cfg.num_attention_layers(), 48);
+    assert_eq!(cfg.num_ssm_layers(), 0);
+    assert_eq!(cfg.gqa_ratio(), 8);
+    // Full rotary: partial_rotary_factor defaults to 1.0
+    assert_eq!(cfg.rotary_dim(), 128);
+    assert_eq!(cfg.rope_theta, 5_000_000.0);
+    assert!(cfg.norm_topk_prob);
+}
+
+/// Qwen3.5-VL detection: the trunk `model_type` stays `qwen3_5`
+/// (same as the text-only variant) but the upstream config ships a
+/// `vision_config` block plus `architectures =
+/// ["Qwen3_5ForConditionalGeneration"]`. `is_qwen3_vl()` must
+/// distinguish via the parsed `config.vision` so the factory routes
+/// the checkpoint to the VL weight loader instead of the dense LLM
+/// loader.
+#[test]
+fn test_parse_qwen3_5_vl_config() {
+    let json = r#"{
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": {
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "intermediate_size": 9216,
+            "vocab_size": 248320,
+            "rope_theta": 10000000.0
+        },
+        "vision_config": {
+            "hidden_size": 1024,
+            "num_hidden_layers": 27,
+            "num_attention_heads": 16,
+            "intermediate_size": 4096,
+            "patch_size": 16,
+            "spatial_merge_size": 2
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_5");
+    assert!(
+        cfg.is_qwen3_vl(),
+        "Qwen3.5-VL detected via model_type=qwen3_5 + vision_config presence"
+    );
+    assert!(cfg.vision.is_some());
+}
+
+/// Counter-test: a text-only `qwen3_5` config WITHOUT `vision_config`
+/// must NOT be misclassified as VL. Pins the gate condition is
+/// actually using `vision.is_some()`, not just model_type.
+#[test]
+fn test_qwen3_5_text_only_not_vl() {
+    let json = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 151936,
+            "rope_theta": 10000000.0
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_5");
+    assert!(
+        !cfg.is_qwen3_vl(),
+        "qwen3_5 without vision_config must not be classified as VL"
+    );
+}
+
+/// Regression for the alpha-2.99 dispatch bug:
+/// Kbenkhaled/Qwen3.5-27B-NVFP4 is a *dense* hybrid (top model_type
+/// "qwen3_5", num_experts=0) that nonetheless enables MRoPE in
+/// text_config.rope_parameters. Pre-c0cde18, the MRoPE detector
+/// rewrote model_type → "qwen3_6_moe" unconditionally, then the
+/// kernel dispatcher couldn't find a target for
+/// (qwen3_6_moe, hidden_size=5120) — only (qwen3_6_moe, 2048) for
+/// qwen3.6-35b-a3b exists. The fix gates the rewrite on
+/// is_moe(top_model_type). This test pins that contract.
+#[test]
+fn test_kbenkhaled_qwen35_27b_dense_mrope_no_rewrite() {
+    let json = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "intermediate_size": 17408,
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "vocab_size": 248320,
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "rope_parameters": {
+                "rope_theta": 10000000,
+                "rope_type": "default",
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10]
+            }
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    // Critical: dense + MRoPE must NOT be rewritten to qwen3_6_moe,
+    // or the dispatcher won't find the qwen3.5-27b kernel target.
+    assert_eq!(cfg.model_type, "qwen3_5");
+    assert_eq!(cfg.hidden_size, 5120);
+    assert_eq!(cfg.num_experts, 0);
+    // MRoPE flags still parsed so the kernel uses the right rope path.
+    assert!(cfg.mrope_interleaved);
+    assert_eq!(cfg.mrope_section, [11, 11, 10]);
+}
+
+#[test]
+fn test_qwen38_dense_static_yarn_1m_recipe() {
+    let json = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "intermediate_size": 17408,
+            "partial_rotary_factor": 0.25,
+            "vocab_size": 248320,
+            "max_position_embeddings": 262144,
+            "rope_parameters": {
+                "rope_theta": 10000000,
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 262144,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "attention_factor": 1.138629436111989,
+                "partial_rotary_factor": 0.25,
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10]
+            }
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_5");
+    assert_eq!(cfg.rope_theta, 10_000_000.0);
+    assert_eq!(cfg.partial_rotary_factor, 0.25);
+    assert_eq!(cfg.yarn_factor, 4.0);
+    assert_eq!(cfg.yarn_beta_fast, 32.0);
+    assert_eq!(cfg.yarn_beta_slow, 1.0);
+    assert_eq!(cfg.yarn_original_max_position_embeddings, 262_144);
+    assert!(cfg.mrope_interleaved);
+    assert_eq!(cfg.mrope_section, [11, 11, 10]);
+
+    for (from, to) in [
+        ("\"rope_type\": \"yarn\"", "\"rope_type\": \"linear\""),
+        ("\"factor\": 4.0", "\"factor\": 2.0"),
+        (
+            "\"original_max_position_embeddings\": 262144",
+            "\"original_max_position_embeddings\": 0",
+        ),
+        ("\"beta_fast\": 32.0", "\"beta_fast\": 1.0"),
+        (
+            "\"attention_factor\": 1.138629436111989",
+            "\"attention_factor\": 1.0",
+        ),
+        (
+            "\"mrope_interleaved\": true",
+            "\"mrope_interleaved\": false",
+        ),
+        (
+            "\"mrope_section\": [11, 11, 10]",
+            "\"mrope_section\": [12, 10, 10]",
+        ),
+    ] {
+        assert!(
+            parse_config(&json.replace(from, to)).is_err(),
+            "accepted mutation {to}"
+        );
+    }
+}
+
+#[test]
+fn test_qwen_yarn_requires_factor_and_origin() {
+    let missing_factor = r#"{
+        "model_type":"qwen3_5",
+        "text_config":{"hidden_size":5120,"rope_parameters":{"rope_type":"yarn"}}
+    }"#;
+    assert!(parse_config(missing_factor).is_err());
+
+    let non_object = r#"{
+        "model_type":"qwen3_5",
+        "text_config":{"hidden_size":5120,"rope_parameters":"yarn"}
+    }"#;
+    assert!(parse_config(non_object).is_err());
+
+    let conflicting_theta = r#"{
+        "model_type":"qwen3_5",
+        "text_config":{
+            "hidden_size":5120,
+            "rope_theta":5000000,
+            "rope_parameters":{"rope_type":"default","rope_theta":10000000}
+        }
+    }"#;
+    assert!(parse_config(conflicting_theta).is_err());
+}
+
+#[test]
+fn test_layer_prefix() {
+    let cfg80b = ModelConfig::qwen3_next_80b_nvfp4();
+    assert_eq!(cfg80b.layer_prefix(3), "model.layers.3");
+
+    let mut cfg35 = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg35.weight_prefix = "model.language_model".to_string();
+    assert_eq!(cfg35.layer_prefix(3), "model.language_model.layers.3");
+}
+
+#[test]
+fn test_parse_nemotron_h_config() {
+    let json = r#"{
+        "model_type": "nemotron_h",
+        "hidden_size": 2688,
+        "num_hidden_layers": 52,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 1856,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 1856,
+        "moe_shared_expert_intermediate_size": 3712,
+        "vocab_size": 131072,
+        "hybrid_override_pattern": "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME",
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 128,
+        "n_groups": 8,
+        "expand": 2,
+        "conv_kernel": 4,
+        "norm_eps": 1e-5,
+        "rope_theta": 10000,
+        "routed_scaling_factor": 2.5,
+        "norm_topk_prob": true
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "nemotron_h");
+    assert_eq!(cfg.hidden_size, 2688);
+    assert_eq!(cfg.num_hidden_layers, 52);
+    assert_eq!(cfg.num_experts, 128);
+    assert_eq!(cfg.num_experts_per_tok, 6);
+    assert_eq!(cfg.shared_expert_intermediate_size, 3712);
+    assert_eq!(cfg.rms_norm_eps, 1e-5);
+    assert_eq!(cfg.linear_conv_kernel_dim, 4);
+    assert_eq!(cfg.mamba2_d_inner(), 4096); // 64*64, NOT expand*hidden
+    // Pattern: 23 M + 23 E + 6 * = 52
+    assert_eq!(cfg.layer_types.len(), 52);
+    assert_eq!(cfg.num_ssm_layers(), 23);
+    assert_eq!(cfg.num_moe_layers(), 23);
+    assert_eq!(cfg.num_attention_layers(), 6);
+    assert_eq!(cfg.layer_type(0), LayerType::LinearAttention); // M
+    assert_eq!(cfg.layer_type(1), LayerType::Moe); // E
+    assert_eq!(cfg.layer_type(5), LayerType::FullAttention); // *
+    assert_eq!(cfg.gqa_ratio(), 16); // 32/2
+    assert_eq!(cfg.rotary_dim(), 128); // partial_rotary_factor=1.0
+    assert_eq!(cfg.routed_scaling_factor, 2.5);
+}
+
+#[test]
+fn test_expert_parallelism_range() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    // Single GPU: all experts local
+    assert_eq!(cfg.local_expert_range(), (0, 512));
+    assert!(cfg.is_local_expert(0));
+    assert!(cfg.is_local_expert(511));
+
+    // EP=2, rank 0: experts 0..256
+    cfg.ep_rank = 0;
+    cfg.ep_world_size = 2;
+    assert_eq!(cfg.local_expert_range(), (0, 256));
+    assert!(cfg.is_local_expert(0));
+    assert!(cfg.is_local_expert(255));
+    assert!(!cfg.is_local_expert(256));
+    assert!(!cfg.is_local_expert(511));
+
+    // EP=2, rank 1: experts 256..512
+    cfg.ep_rank = 1;
+    assert_eq!(cfg.local_expert_range(), (256, 512));
+    assert!(!cfg.is_local_expert(0));
+    assert!(!cfg.is_local_expert(255));
+    assert!(cfg.is_local_expert(256));
+    assert!(cfg.is_local_expert(511));
+}
+
+#[test]
+fn test_tensor_parallelism_range() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+
+    // Single rank: full range, full dim.
+    assert_eq!(cfg.tp_shard_range(2048), (0, 2048));
+    assert_eq!(cfg.tp_shard_dim(2048), 2048);
+
+    // TP=2, rank 0: lower half.
+    cfg.tp_world_size = 2;
+    cfg.tp_rank = 0;
+    assert_eq!(cfg.tp_shard_range(2048), (0, 1024));
+    assert_eq!(cfg.tp_shard_dim(2048), 1024);
+
+    // TP=2, rank 1: upper half.
+    cfg.tp_rank = 1;
+    assert_eq!(cfg.tp_shard_range(2048), (1024, 2048));
+    assert_eq!(cfg.tp_shard_dim(2048), 1024);
+
+    // TP=4, rank 2: third quarter.
+    cfg.tp_world_size = 4;
+    cfg.tp_rank = 2;
+    assert_eq!(cfg.tp_shard_range(2048), (1024, 1536));
+}
+
+#[test]
+fn test_parse_gemma4_config() {
+    let json = r#"{
+        "model_type": "gemma4",
+        "tie_word_embeddings": true,
+        "final_logit_softcapping": 30.0,
+        "text_config": {
+            "hidden_size": 5376,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 16,
+            "head_dim": 256,
+            "intermediate_size": 21504,
+            "vocab_size": 262144,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "sliding_window": 1024,
+            "attention_pattern": [
+                "sliding_attention", "sliding_attention",
+                "full_attention", "sliding_attention"
+            ],
+            "full_attention_config": {
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25
+            },
+            "sliding_attention_config": {
+                "rope_theta": 10000.0
+            },
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 262144
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "gemma4");
+    assert_eq!(cfg.hidden_size, 5376);
+    assert_eq!(cfg.num_hidden_layers, 4);
+    assert_eq!(cfg.num_attention_heads, 32);
+    assert_eq!(cfg.num_key_value_heads, 16);
+    assert_eq!(cfg.head_dim, 256);
+    assert_eq!(cfg.intermediate_size, 21504);
+    assert_eq!(cfg.vocab_size, 262144);
+    assert_eq!(cfg.rms_norm_eps, 1e-6);
+    assert_eq!(cfg.max_position_embeddings, 262144);
+    assert_eq!(cfg.rope_theta, 10000.0); // sliding theta
+    assert_eq!(cfg.partial_rotary_factor, 0.25);
+    assert!(cfg.tie_word_embeddings);
+    assert!(!cfg.attn_gated);
+    assert!(cfg.nested_config);
+    // All 4 layers are FullAttention (no SSM)
+    assert_eq!(cfg.layer_types.len(), 4);
+    assert_eq!(cfg.num_attention_layers(), 4);
+    assert_eq!(cfg.num_ssm_layers(), 0);
+    // No MoE
+    assert_eq!(cfg.num_experts, 0);
+    // No MTP
+    assert_eq!(cfg.mtp_num_hidden_layers, 0);
+    // No SSM fields
+    assert_eq!(cfg.linear_num_key_heads, 0);
+    // GQA ratio
+    assert_eq!(cfg.gqa_ratio(), 2); // 32/16
+    // Rotary dim
+    assert_eq!(cfg.rotary_dim(), 64); // 0.25 * 256
+}

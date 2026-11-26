@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Reference completion hashes for the Qwen3.6-27B champion stack, so that a",
+    "reproduction can be checked against OUR result and not merely against",
+    "itself. Without this file a reproducer can only prove self-consistency:",
+    "run twice, get the same answer, learn nothing about whether it is the same",
+    "answer we got.",
+    "",
+    "Each sha is sha256(completion_text)[:16] -- the same value decode_bench.py",
+    "writes to its --json-out. Produced at 256 max_tokens, temperature 0,",
+    "enable_thinking=false, gamma=16, single stream (--max-batch-size 1).",
+    "Confirmed across two independently built binaries and four passes.",
+    "",
+    "IMPORTANT, both halves. The TARGET is public and pinnable:",
+    "AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP at",
+    "revision 6f31471e2e1c3462420f14af9a9a0046bae3d9eb -- pin it, because the",
+    "repo head has since moved and its model.safetensors has the same byte",
+    "length but a different content hash. The DRAFTER is an in-house DFlash",
+    "retrain and is NOT published, so these hashes cannot be reached without it.",
+    "CORRECTION 2026-07-31: an earlier version of this note said no public",
+    "drafter is a drop-in. That holds for the 5-layer family (KingsonHO and",
+    "deepsweet Qwen3.6-27B-DFlash: target layers [1,16,31,46,61], mask 248070)",
+    "but is FALSE for z-lab/Qwen3.5-27B-DFlash at revision 25ee0025, which is 6",
+    "layers on [1,10,18,27,35,44,52,61] with mask 248077 -- wiring identical to",
+    "ours. Measured head to head, it is +7.2% accept and +4.8% tok/s, i.e.",
+    "BETTER than ours, against an A/A floor of 0.35%/2.36%. So the",
+    "tok/s in README section 5 IS reachable with public checkpoints only.",
+    "These HASHES are not: they are a property of our drafter, and substituting",
+    "any other one makes this file report MISMATCH on every stable row, which",
+    "is the CORRECT result for a different drafter and is NOT evidence your",
+    "build is broken.",
+    "",
+    "Do NOT use hash equality to grade a drafter swap on this stack. At",
+    "temperature 0 the committed tokens are the target's argmax and ought to be",
+    "drafter-independent; here they are not. Three rows are byte-stable across",
+    "two runs of one drafter yet change when the drafter changes. Mechanism",
+    "unidentified. Grade acceptance; report hashes without grading them.",
+    "For a decode reference checkable end to end, use the laguna branch: both",
+    "of its checkpoints are public. See README section 1.",
+    "",
+    "Check a run with:  python3 bench/qwen/check_repro.py <json-out file>"
+  ],
+  "suite_tokens": 256,
+  "gamma": 16,
+  "arms": {
+    "champion": {
+      "description": "The champion configuration launched by serve_champion.sh.",
+      "prompts": {
+        "repetitive":  { "stable": true,  "sha": "c9f270a964bca544" },
+        "easy-code":   { "stable": true,  "sha": "0dd8f2b7e02cb3c3" },
+        "common-algo": { "stable": true,  "sha": "1007997cc9909ac0" },
+        "novel-logic": { "stable": true,  "sha": "89524f70c87146ea" },
+        "math":        { "stable": true,  "sha": "4c974dd8533817b4" },
+        "prose": {
+          "stable": false,
+          "observed": ["b9dd90c67c391cfc", "28a49937e6e6d5f3"],
+          "note": "Intermittently nondeterministic: 3 of 4 observed passes gave the first hash, 1 gave the second. Lowest-acceptance row (1.60/16). Both outputs are fluent and on-topic, diverging mid-sentence into different phrasing rather than into corruption. A mismatch here is NOT evidence your build is wrong. See README section 5."
+        }
+      }
+    }
+  }
+}

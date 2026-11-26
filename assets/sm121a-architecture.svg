@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 480" width="1280" height="480">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#8B949E"/>
+    </marker>
+  </defs>
+
+  <rect x="2" y="2" width="1276" height="476" rx="16" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+
+  <!-- Header -->
+  <text x="32" y="38" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="800" fill="#F0F6FC">SM121a Layer Execution Pipeline — Qwen3.8-Flash-Next-NVFP4 (48 Layers)</text>
+  <text x="32" y="62" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12" fill="#8B949E">Zero-spill PTX/SASS pipeline (-arch=sm_121a -Xptxas -v -fmad=false) · 1,348 ms total per 8,192-token prefill chunk</text>
+
+  <!-- Pipeline Boxes -->
+  
+  <g transform="translate(29, 92)">
+    <rect x="0" y="0" width="154" height="196" rx="12" fill="#161b22" stroke="#38BDF8" stroke-width="1.8"/>
+    <rect x="0" y="0" width="154" height="34" rx="12" fill="#38BDF8" opacity="0.18"/>
+    <text x="77" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="800" fill="#38BDF8" text-anchor="middle">1. NVMe PLE Ring4</text>
+    <text x="77" y="64" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">128 NVFP4 Shards</text>
+    <text x="77" y="90" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#C9D1D9" text-anchor="middle">4-Ring H2D DMA</text>
+    <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">[128, 2560] E2M1</text>
+    <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
+    <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#38BDF8" stroke-width="1.1"/>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#38BDF8" text-anchor="middle">0.0 ms exposed</text>
+  </g><path d="M 186 190 H 204" stroke="#8B949E" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <g transform="translate(207, 92)">
+    <rect x="0" y="0" width="154" height="196" rx="12" fill="#161b22" stroke="#10B981" stroke-width="1.8"/>
+    <rect x="0" y="0" width="154" height="34" rx="12" fill="#10B981" opacity="0.18"/>
+    <text x="77" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="800" fill="#10B981" text-anchor="middle">2. mHC Pre-Attn</text>
+    <text x="77" y="64" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">4-Stream Sinkhorn</text>
+    <text x="77" y="90" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#C9D1D9" text-anchor="middle">t128 BF16+MXFP8</text>
+    <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">[T, 4, 2560] BF16</text>
+    <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
+    <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#10B981" stroke-width="1.1"/>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#10B981" text-anchor="middle">Fused Pre-Norm</text>
+  </g><path d="M 364 190 H 382" stroke="#8B949E" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <g transform="translate(385, 92)">
+    <rect x="0" y="0" width="154" height="196" rx="12" fill="#161b22" stroke="#76B900" stroke-width="1.8"/>
+    <rect x="0" y="0" width="154" height="34" rx="12" fill="#76B900" opacity="0.18"/>
+    <text x="77" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="800" fill="#76B900" text-anchor="middle">3. 36× GDN / 12× QSA</text>
+    <text x="77" y="64" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">conv1d_v3 + UMMA</text>
+    <text x="77" y="90" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#C9D1D9" text-anchor="middle">QSA ldmatrix.x4</text>
+    <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">5 CTAs/SM · 0 Spill</text>
+    <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
+    <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#76B900" stroke-width="1.1"/>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#76B900" text-anchor="middle">418 ms / 8K</text>
+  </g><path d="M 542 190 H 560" stroke="#8B949E" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <g transform="translate(563, 92)">
+    <rect x="0" y="0" width="154" height="196" rx="12" fill="#161b22" stroke="#10B981" stroke-width="1.8"/>
+    <rect x="0" y="0" width="154" height="34" rx="12" fill="#10B981" opacity="0.18"/>
+    <text x="77" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="800" fill="#10B981" text-anchor="middle">4. mHC Post-Attn</text>
+    <text x="77" y="64" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">4-Stream Combine</text>
+    <text x="77" y="90" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#C9D1D9" text-anchor="middle">Fused Residual</text>
+    <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">RMSNorm + E4M3</text>
+    <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
+    <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#10B981" stroke-width="1.1"/>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#10B981" text-anchor="middle">196 ms / 8K</text>
+  </g><path d="M 720 190 H 738" stroke="#8B949E" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <g transform="translate(741, 92)">
+    <rect x="0" y="0" width="154" height="196" rx="12" fill="#161b22" stroke="#F59E0B" stroke-width="1.8"/>
+    <rect x="0" y="0" width="154" height="34" rx="12" fill="#F59E0B" opacity="0.18"/>
+    <text x="77" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="800" fill="#F59E0B" text-anchor="middle">5. Router + Planner</text>
+    <text x="77" y="64" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">512→Top-10 Sigmoid</text>
+    <text x="77" y="90" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#C9D1D9" text-anchor="middle">v8 4-Kernel Plan</text>
+    <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">Zero Host Sync</text>
+    <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
+    <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#F59E0B" stroke-width="1.1"/>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#F59E0B" text-anchor="middle">No Host Sync</text>
+  </g><path d="M 898 190 H 916" stroke="#8B949E" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <g transform="translate(919, 92)">
+    <rect x="0" y="0" width="154" height="196" rx="12" fill="#161b22" stroke="#A855F7" stroke-width="1.8"/>
+    <rect x="0" y="0" width="154" height="34" rx="12" fill="#A855F7" opacity="0.18"/>
+    <text x="77" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="800" fill="#A855F7" text-anchor="middle">6. W4A8 MoE GEMM</text>
+    <text x="77" y="64" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">Shared + Routed</text>
+    <text x="77" y="90" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#C9D1D9" text-anchor="middle">v28q / v17q MMA</text>
+    <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">m16n8k32 W4A8</text>
+    <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
+    <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#A855F7" stroke-width="1.1"/>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#A855F7" text-anchor="middle">512 ms / 8K</text>
+  </g><path d="M 1076 190 H 1094" stroke="#8B949E" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <g transform="translate(1097, 92)">
+    <rect x="0" y="0" width="154" height="196" rx="12" fill="#161b22" stroke="#38BDF8" stroke-width="1.8"/>
+    <rect x="0" y="0" width="154" height="34" rx="12" fill="#38BDF8" opacity="0.18"/>
+    <text x="77" y="22" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10.5" font-weight="800" fill="#38BDF8" text-anchor="middle">7. MTP K=5 Verify</text>
+    <text x="77" y="64" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">5-Row Target Verify</text>
+    <text x="77" y="90" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#C9D1D9" text-anchor="middle">2,560/2,560 Exact</text>
+    <text x="77" y="114" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="10" fill="#8B949E" text-anchor="middle">γ=4 · 3.1 Accept</text>
+    <line x1="16" y1="134" x2="138" y2="134" stroke="#30363d" stroke-width="1"/>
+    <rect x="14" y="148" width="126" height="30" rx="8" fill="#0d1117" stroke="#38BDF8" stroke-width="1.1"/>
+    <text x="77" y="167" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#38BDF8" text-anchor="middle">56.5 tok/s</text>
+  </g>
+
+  <!-- Bottom 8K Stage Census Card (x=29, y=314, width=1222, height=138) -->
+  <g transform="translate(29, 314)">
+    <rect x="0" y="0" width="1222" height="138" rx="12" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <text x="24" y="28" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="12.5" font-weight="800" fill="#F0F6FC">8,192-TOKEN STAGE CENSUS — 1,348 ms TOTAL (6,076.7 tok/s MEDIAN / 6,082.2 tok/s PEAK @ 16K)</text>
+
+    <!-- Proportional Bar: Total width 1174 (x=24..1198) -->
+    <!-- MoE: 38% (446px), GDN/QSA: 31% (364px), mHC/Norm: 14.5% (170px), PLE/Router: 16.5% (188px) -->
+    <rect x="24" y="42" width="446" height="32" rx="6" fill="#A855F7" opacity="0.88"/>
+    <text x="247" y="63" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11.5" font-weight="700" fill="#F0F6FC" text-anchor="middle">W4A8 MoE v28q/v17q (38% · 512 ms)</text>
+
+    <rect x="472" y="42" width="364" height="32" rx="6" fill="#76B900" opacity="0.88"/>
+    <text x="654" y="63" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11.5" font-weight="700" fill="#0d1117" text-anchor="middle">36× GDN + 12× QSA (31% · 418 ms)</text>
+
+    <rect x="838" y="42" width="170" height="32" rx="6" fill="#10B981" opacity="0.88"/>
+    <text x="923" y="63" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#0d1117" text-anchor="middle">mHC Roof (196 ms)</text>
+
+    <rect x="1010" y="42" width="188" height="32" rx="6" fill="#38BDF8" opacity="0.88"/>
+    <text x="1104" y="63" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="700" fill="#0d1117" text-anchor="middle">PLE + Router (222 ms)</text>
+
+    <!-- Bottom Telemetry Sub-Strip -->
+    <text x="24" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">PTX Occupancy Gate: <tspan fill="#34D399" font-weight="700">≤124 Regs/Thread (2–5 CTAs/SM)</tspan></text>
+    <text x="396" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">Spill Stores/Loads: <tspan fill="#38BDF8" font-weight="700">0 B / 0 B across 1,954 Kernels</tspan></text>
+    <text x="790" y="106" font-family="'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" fill="#8B949E">Speculative Verify: <tspan fill="#FBBF24" font-weight="700">LOSSLESS 10/10 (2,560/2,560 Exact)</tspan></text>
+  </g>
+</svg>

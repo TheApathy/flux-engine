@@ -1,0 +1,1100 @@
+# ==============================================================================
+# Flux Engine — Complete Model Compatibility Matrix
+# ==============================================================================
+# Allowed Status Values:
+#   mentioned | prototype | compiles | loads | correctness-passing |
+#   benchmarked | release-qualified | regressed | retired
+#
+# Production Readiness Tiers (status_category):
+#   verified_production | experimental_verified | supported_unverified | legacy
+#
+# Note on evidence_hash:
+#   Entries with a bundled verification artifact or pinned binary digest carry
+#   a `sha256:<hex>` digest. Entries whose historical sweep artifacts are not
+#   bundled in this repository are honestly marked `"unverified"`.
+# ==============================================================================
+
+schema_version: "1.0"
+generated_utc: "2026-10-17T12:30:00Z"
+primary_hardware_target: "NVIDIA GB10 (Grace Blackwell, sm_121a, 128 GB Unified LPDDR5X)"
+required_fields:
+  - model_family
+  - model_id
+  - revision
+  - model_type
+  - precision
+  - quantization
+  - gpu
+  - compute_capability
+  - source_refs
+  - first_seen_commit
+  - owner_delta
+  - implemented_features
+  - unsupported_features
+  - correctness_test
+  - accuracy_tolerance
+  - prefill_tps
+  - decode_tps
+  - ttft_ms
+  - peak_vram
+  - status
+  - evidence_hash
+  - owner
+  - visibility
+
+allowed_statuses:
+  - mentioned
+  - prototype
+  - compiles
+  - loads
+  - correctness-passing
+  - benchmarked
+  - release-qualified
+  - regressed
+  - retired
+
+quantization_format_catalog:
+  NVFP4:
+    description: "NVIDIA 4-bit E2M1 weight payload with FP8 E4M3 micro-scales (group_size=16) and per-tensor FP32 global scale_2 (ModelOpt & compressed-tensors)."
+    hardware_instruction: "mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 (sm_121a native block-scaled tensor core)"
+  MXFP8:
+    description: "OCP Microscaling FP8 E4M3 activation/weight format with E8M0 shared exponent per 32 elements (used in Qwen3.8-Flash-Next W4A8 MoE v28 kernels and ModelOpt mixed groups)."
+    hardware_instruction: "mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0"
+  FP8-E4M3:
+    description: "IEEE/OCP 8-bit floating point (E4M3) block-scaled or per-tensor scaled weights, activations (96-tensor resident fast-proj cache, QSA QK/PV core), and KV cache."
+    hardware_instruction: "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"
+  INT4/AWQ:
+    description: "4-bit integer / asymmetric weight-only quantization and MLX 8-bit/4-bit affine blocks (supported via W4A16 dequant-GEMV/GEMM and Metal MLX backend; AWQ tensor-name sniffed in weight_map)."
+    hardware_instruction: "W4A16 LUT/LOP3 dequant + BF16 MMA / Metal simdgroup_matrix"
+  BF16:
+    description: "16-bit brain floating point for dense attention layers, mHC 4-stream residual highway, router gates, norms, embeddings, and reference checkpoints."
+    hardware_instruction: "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+  CB3:
+    description: "Custom 3-bit / 4-bit Codebook-3 + E8M0 MXFP4 routed-expert format for DeepSeek-V4.1 (K124/K154 resident expert pack, 71.7 GB)."
+    hardware_instruction: "Fused CB3 grouped-GEMM MoE kernels on sm_121a"
+  EXL3:
+    description: "ExLlamaV3 trellis/codebook quantization (2.05 bpw) with runtime BF16/FP16 reconstruction for 320B GLM-5.3-Flash on single 128 GB GB10."
+    hardware_instruction: "Fused EXL3 trellis reconstruct + cuBLASLt/WMMA GEMM"
+
+speculative_decode_catalog:
+  MTP:
+    description: "Native Multi-Token Prediction draft head. Includes Qwen3.8-Flash-Next Inferact MTP K=5 (4 drafts + 1 target token, batched tree-WY GDN + unified-T MoE verify, LOSSLESS 10/10), Qwen3.5/3.6 MTP K=2, and MiniMax-M2.7 3-module sequential MTP K=3."
+  DFlash:
+    description: "Block-diffusion draft head (DFlash / DFlash2) capturing multi-layer target hidden states (ResidualSlice or Qwen4HyperProjected) with flat or DDTree/PCTree verification (gamma=3..8)."
+  Eagle:
+    description: "EAGLE-2 shallow-first cliff depth tree ordering and EAGLE-3.1 per-layer FC-normalization (ATLAS_DFLASH_FC_LAYERNORM=1) integrated into DFlash/speculative trait hierarchy."
+  DSpark:
+    description: "DeepSeek-V4.1 speculative drafter with strict two-probe adaptive-K (k=5 high-acceptance / k=2 low-acceptance) verification."
+
+models:
+  # ----------------------------------------------------------------------------
+  # 1. Qwen3.8-Flash-Next (Flagship Production Target — NVFP4 + Inferact MTP K=5)
+  # ----------------------------------------------------------------------------
+  - model_family: "Qwen3.8-Flash-Next"
+    model_id: "Qwen/Qwen3.8-Flash-Next-NVFP4-Offload + Qwen/Qwen3.8-Flash-Next-Inferact-MTP"
+    revision: "ae58bc27efd8b35aa4272da15dd5f4c549ec332a"
+    model_type: "qwen4_exp"
+    precision: "W4A8-MXFP8 / FP8-E4M3 / BF16"
+    quantization: "NVFP4 + MXFP8 + FP8-E4M3 + BF16 (ModelOpt mixed precision + sparse PLE NVMe offload)"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/atlas-core/src/config/dispatch.rs"
+      - "crates/spark-model/src/model/impl_a1.rs"
+      - "crates/spark-model/src/layers/qwen4_qsa.rs"
+      - "crates/spark-model/src/layers/qwen4_hyper.rs"
+      - "crates/spark-model/src/layers/qwen4_ple.rs"
+      - "crates/spark-model/src/layers/qwen4_mtp.rs"
+      - "crates/spark-model/src/layers/qwen4_prefill_moe.rs"
+      - "kernels/gb10/qwen3.8-flash-next/MODEL.toml"
+    first_seen_commit: "5e9a7dd44"
+    owner_delta: "Complete Flux SM121a custom pipeline: W4A8 MXFP8 MoE v28q, fused gatepre + sort/plan, 0-SMEM warp-shfl mHC prologue, 96-weight FP8 fast-proj cache, FP8 E4M3 QSA QK/PV core + fused top-k, 4-ring sector-aligned NVMe PLE DMA on big cores, and lossless K=5 Inferact MTP batched verify."
+    implemented_features:
+      - "48 layers (36 GDN linear attention + 12 QSA full attention, 3:1 pattern, hidden=2560)"
+      - "512 routed experts (top-10 sigmoid/softmax normalized) + 1 shared expert per layer"
+      - "4-stream Multi-Stream Hyper-Connections (mHC hc_count=4, hc_lowrank=320, 10240-dim residual highway)"
+      - "Query-Sparse Attention (QSA) with 4-head indexer, budget=2048, compress_ratio=16, FP8 E4M3 QK/PV core"
+      - "Per-Layer Embedding (PLE) 51B n-gram table with 4-ring io_uring/pread sector-aligned NVMe DMA on Cortex-X925 big cores"
+      - "Lossless K=5 Inferact MTP speculative decoding (num_drafts=4, unified-T MoE verify, tree-WY GDN state retention)"
+      - "16K-chunk (w16384) and 4K-chunk (w4096) prefill modes up to 147,456 max_seq_len"
+    unsupported_features:
+      - "TP > 1 multi-GPU tensor parallelism (designed for single-GB10 unified memory)"
+      - "Combining resident FP8 fast-proj weight cache without an explicit UMA reserve budget"
+    correctness_test: "Same-prompt bit-identity (5 groups, 20 requests, 0 ULP drift); Decode LOSSLESS 10/10 (2,560/2,560 exact tokens vs --no-speculative across 0..64K); Estonia 136.5K 6-hop reasoning 5/5 (100% PASS); 47/47 runtime engagement receipts."
+    accuracy_tolerance: "0 ULP same-prompt prefill identity; 100% (10/10) greedy token bit-identity on K=5 MTP decode; 100% (5/5) exact country match on 136,576-token Estonia chain."
+    prefill_tps: "w16384: 8k=5830.2 max (5819.3 med), 16k=6082.2 max (6076.7 med), 32k=5969.6 max (5952.6 med), 64k=5828.3 max (5803.2 med), 128k=5694.4 max (5684.0 med); w4096: 8k=5266.8 med (5276.3 max), 16k=5164.5 med, 32k=5116.2 med, 64k=5016.1 med, 128k=4891.7 med; Estonia 136.5K: 5400.4 tok/s"
+    decode_tps: "Coding peak: 56.5 tok/s median / 57.4 tok/s max; 10-prompt parity gate: 42.1-51.9 tok/s (1.37x-1.54x over 31.0-33.7 tok/s plain); Estonia 136.5K: 43.8 avg / 48.2 peak tok/s client (43.9-48.6 tok/s server, accept_len=2.85-3.02)"
+    ttft_ms: "w16384: 8k=1405.0, 16k=2694.0, 32k=5497.0, 64k=11244.0, 128k=23060.0; w4096: 8k=1555.0, 16k=3172.0, 32k=6405.0, 64k=13065.0, 128k=26795.0; Estonia 136.5K: 25290.0"
+    peak_vram: "112.9 GiB (MEASURED_FLOOR_MB=7072..9530 MiB on w16384; 12695 MiB on w4096; 8431..8847 MiB on 136.5K Estonia; watchdog_kills=0)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "sha256:29e959d401137bb4da2248319cbddced0fefb66b5a3c91f55cdc2141bd98dab5"
+    owner: "TheApathy (Flux Engine Maintainers)"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid MoE + GDN (SSM) + QSA Sparse Attention + 4-Stream mHC + Sparse PLE + Native MTP K=5"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: true
+      mhc_hyper_connections: true
+      ple_per_layer_embedding: true
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "MXFP8", "FP8-E4M3", "BF16"]
+      activations: ["MXFP8", "FP8-E4M3", "BF16"]
+      kv_cache: ["BF16"]
+    speculative_decode:
+      supported: ["MTP", "DFlash"]
+      production_mode: "Inferact Native MTP K=5 (num_drafts=4, full-vocab BF16/NVFP4 verify)"
+    evidence_references:
+      - "bench/qwen38-flash-next-gb10/ARTIFACTS.sha256"
+      - "bench/qwen38-flash-next-gb10/README.md"
+      - "docs/QWEN38_FLASH_NEXT_PERFORMANCE_RECIPE.md"
+      - "docs/verification/BENCHMARK_VERIFICATION.md"
+      - "bench/llm-inference-bench/results/LIL-DECODE-BENCH-v9-w16384.md"
+      - "bench/llm-inference-bench/results/LIL-ESTONIA-136K-v9.md"
+
+  # ----------------------------------------------------------------------------
+  # 2. Qwen3.8-27B Dense (Hybrid GDN + Full Attention + MRoPE + DFlash2 / MTP)
+  # ----------------------------------------------------------------------------
+  - model_family: "Qwen3.8"
+    model_id: "Qwen/Qwen3.8-27B (optimized-qwen NVFP4 + drafter-qwen38-v3-final)"
+    revision: "67e3cf5ce6feb4cb2de7855aab13a502f6600052"
+    model_type: "qwen3_5"
+    precision: "W4A16-NVFP4 / FP8-E4M3 / BF16"
+    quantization: "NVFP4 weights + NVFP4/FP8 KV cache + NVFP4 DFlash2 drafter"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/qwen35_dense.rs"
+      - "crates/spark-model/src/layers/dflash_head.rs"
+      - "kernels/gb10/qwen3.8-27b/MODEL.toml"
+      - "crates/spark-server/src/recipe/builtin/qwen3.8-27b-optimized-local.yaml"
+    first_seen_commit: "e8b00332e"
+    owner_delta: "Dedicated qwen3.8-27b kernel target (170 kernels, 11 overrides), FlashInfer SM121 FP4 FFN prefill, tensor-core decode parity (ATLAS_DECODE_TC_PARITY=1), strided DFlash2 gamma=8 capture, and native 1-layer MTP support."
+    implemented_features:
+      - "64 layers (48 GDN linear attention + 16 full attention, 3:1 pattern, hidden=5120, intermediate=17408)"
+      - "Interleaved MRoPE [11, 11, 10] with 248,320 vocabulary"
+      - "DFlash2 block-diffusion speculative decoding (gamma=8, flat/DDTree) and native 1-layer MTP head"
+      - "FlashInfer FP4 SM121 FFN prefill + persistent GDN recurrence"
+    unsupported_features:
+      - "Quarantined legacy chunk-0 prefill-attention ABI mismatch path (remediated in v1.0.x)"
+    correctness_test: "384 exact engagement receipts; code/prose/legal hidden-state bytes bit-identical to reference; greedy chat SHA-identical to v1.0.x prefill qualification reference."
+    accuracy_tolerance: "0-byte hidden-state drift vs reference at 2048 tokens; byte-identical speculative vs plain decode via ATLAS_DECODE_TC_PARITY=1."
+    prefill_tps: "1773.0 tok/s at 2048 tokens (qualified); 1395.0 tok/s at 8192 tokens"
+    decode_tps: "55.38-58.01 tok/s (corrected-ABI DFlash2); 63.9 tok/s (400-token short reference); 25.7 tok/s plain target-only"
+    ttft_ms: "1155.1 ms at 2048 tokens; 5872.4 ms at 8192 tokens"
+    peak_vram: "66.0 GiB resident (+8.0 GiB headroom)"
+    status: "benchmarked"
+    status_category: "verified_production"
+    evidence_hash: "sha256:a007a82566ca3d3115c8cc0e73e2bbfc0bd1c76b6342313fba7ee5483e49c020"
+    owner: "TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + Dense SwiGLU FFN + MRoPE"
+      moe: false
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["FP8-E4M3", "BF16"]
+      kv_cache: ["NVFP4", "FP8-E4M3", "BF16"]
+    speculative_decode:
+      supported: ["DFlash", "MTP", "Eagle"]
+      production_mode: "DFlash2 v3 drafter (gamma=8, NVFP4) or Native MTP (1 layer)"
+    evidence_references:
+      - "docs/compatibility/model-matrix.yaml"
+      - "crates/spark-server/src/recipe/builtin/qwen3.8-27b-optimized-local.yaml"
+
+  # ----------------------------------------------------------------------------
+  # 3. Qwen3.5 Family (27B Dense, 35B-A3B MoE, 122B-A10B MoE)
+  # ----------------------------------------------------------------------------
+  - model_family: "Qwen3.5"
+    model_id: "Sehyo/Qwen3.5-35B-A3B-NVFP4"
+    revision: "e5d088f6b"
+    model_type: "qwen3_5_moe"
+    precision: "NVFP4 / FP8-E4M3 / BF16"
+    quantization: "NVFP4 weights + FP8/Turbo4/NVFP4 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/qwen35.rs"
+      - "kernels/gb10/qwen3.5-35b-a3b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "162 compiled sm_121 kernels (3 overrides), MTP K=2 pipelined verify, Marconi SSM snapshot cache, and Turbo4/FP8 KV quantization."
+    implemented_features:
+      - "40 layers (30 GDN linear attention + 10 full attention, 3:1 pattern, hidden=2048)"
+      - "256 routed experts (top-8) + shared expert (intermediate=512)"
+      - "Native 1-layer MTP speculative decoding (K=2)"
+      - "RadixAttention + Marconi SSM prefix caching"
+    unsupported_features:
+      - "QSA sparse attention (not part of Qwen3.5 architecture)"
+      - "PLE n-gram offload (not part of Qwen3.5 architecture)"
+    correctness_test: "Coherence suite (no CJK/tag leakage, greedy determinism, tool reliability >= 8/10), KL-divergence gate vs BF16."
+    accuracy_tolerance: "Greedy argmax agreement and KL-divergence pass vs BF16 baseline; >=8/10 BFCL tool reliability."
+    prefill_tps: "2400.0 tok/s (short/medium context)"
+    decode_tps: "131.0 tok/s (MTP K=2, FP8 KV); 77.0 tok/s (Turbo4 KV, no spec); 70.0 tok/s (FP8 KV, no spec)"
+    ttft_ms: "55.0 ms at 128 ISL (warm prefix cache <10 ms)"
+    peak_vram: "24.0 GiB weights + KV budget up to 64K context (~55 GiB total)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + 256-Expert MoE + MTP"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["FP8-E4M3", "BF16"]
+      kv_cache: ["FP8-E4M3", "NVFP4", "Turbo4", "Turbo3", "BF16"]
+    speculative_decode:
+      supported: ["MTP", "DFlash"]
+      production_mode: "Native MTP K=2 (BF16 draft head)"
+    evidence_references:
+      - "kernels/gb10/qwen3.5-35b-a3b/MODEL.toml"
+
+  - model_family: "Qwen3.5"
+    model_id: "Kbenkhaled/Qwen3.5-27B-NVFP4"
+    revision: "e5d088f6b"
+    model_type: "qwen3_5"
+    precision: "NVFP4 / FP8-E4M3 / BF16"
+    quantization: "NVFP4 weights + FP8 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/qwen35_dense.rs"
+      - "kernels/gb10/qwen3.5-27b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "162 compiled sm_121 kernels (4 overrides), MRoPE runtime dispatch without false MoE rewrite, dense FFN tensor-core GEMM."
+    implemented_features:
+      - "64 layers (48 GDN linear attention + 16 full attention, hidden=5120, dense intermediate=17408)"
+      - "MRoPE [11, 11, 10] support on dense trunk"
+    unsupported_features:
+      - "In-checkpoint MTP head (mtp_layers=0 in upstream checkpoint)"
+    correctness_test: "Serve matrix coherence, greedy determinism, and KL parity."
+    accuracy_tolerance: "Standard Atlas serve-matrix coherence and KL tolerance."
+    prefill_tps: "1450.0 tok/s at 2048 tokens"
+    decode_tps: "13.0-14.0 tok/s (FP8 KV, target-only dense)"
+    ttft_ms: "90.0 ms at 128 ISL"
+    peak_vram: "18.5 GiB weights + KV cache (~32 GiB at 24K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + Dense SwiGLU FFN"
+      moe: false
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["FP8-E4M3", "NVFP4", "BF16"]
+    speculative_decode:
+      supported: ["DFlash"]
+      production_mode: "Target-only or external DFlash drafter"
+    evidence_references:
+      - "kernels/gb10/qwen3.5-27b/MODEL.toml"
+
+  - model_family: "Qwen3.5"
+    model_id: "Sehyo/Qwen3.5-122B-A10B-NVFP4"
+    revision: "e5d088f6b"
+    model_type: "qwen3_5_moe"
+    precision: "NVFP4 / FP8-E4M3 / BF16"
+    quantization: "NVFP4 weights + FP8/NVFP4 KV cache"
+    gpu: "NVIDIA GB10 (Single-GPU tight or 2x GB10 EP=2)"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/qwen35.rs"
+      - "kernels/gb10/qwen3.5-122b-a10b/MODEL.toml"
+      - "kernels/gb10/qwen3.5-122b-a10b-heretic/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "163 compiled sm_121 kernels (5 overrides) + heretic abliterated variant target; supports single-GB10 tight KV budget and EP=2 RoCEv2 multi-node sharding."
+    implemented_features:
+      - "48 layers (36 GDN linear attention + 12 full attention, hidden=3072)"
+      - "256 routed experts (top-8, moe_intermediate=1024) + shared expert"
+      - "MTP K=2 speculative decoding + EP=2 expert parallelism over RoCEv2"
+    unsupported_features:
+      - "Large batch sizes on single 128 GB node without NVMe swap or EP=2"
+    correctness_test: "Single-node and EP=2 600-token sustained generation and coherence verification."
+    accuracy_tolerance: "Greedy determinism and serve-matrix coherence pass."
+    prefill_tps: "950.0 tok/s (single GPU)"
+    decode_tps: "32.0-33.0 tok/s (single GPU, FP8 KV); 46.0-51.0 tok/s (EP=2, MTP K=2)"
+    ttft_ms: "135.0 ms at 128 ISL"
+    peak_vram: "81.0 GiB weights (~108 GiB total on single GB10; ~58 GiB/node on EP=2)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + 256-Expert MoE + MTP + EP=2"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["FP8-E4M3", "NVFP4", "BF16"]
+    speculative_decode:
+      supported: ["MTP", "DFlash"]
+      production_mode: "Native MTP K=2"
+    evidence_references:
+      - "kernels/gb10/qwen3.5-122b-a10b/MODEL.toml"
+
+  # ----------------------------------------------------------------------------
+  # 4. Qwen3.6 Family (35B-A3B MoE Flagship & 27B Dense / AEON)
+  # ----------------------------------------------------------------------------
+  - model_family: "Qwen3.6"
+    model_id: "Qwen/Qwen3.6-35B-A3B-FP8"
+    revision: "e146beff5"
+    model_type: "qwen3_6_moe"
+    precision: "FP8-E4M3 / NVFP4 / BF16"
+    quantization: "FP8-E4M3 block-scaled (and NVFP4 variant) + FP8 KV with auto BF16 boundary layers"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/atlas-core/src/config/dispatch.rs"
+      - "crates/spark-model/src/weight_loader/qwen35.rs"
+      - "kernels/gb10/qwen3.6-35b-a3b/MODEL.toml"
+      - "kernels/gb10/qwen3.6-35b-a3b-abl/MODEL.toml"
+    first_seen_commit: "e146beff5"
+    owner_delta: "164 compiled sm_121 kernels (5 overrides), MRoPE interleaved [11,11,10] rewrite to qwen3_6_moe, 27-block ViT vision encoder (first 4 BF16, rest FP8), MTP K=2 and DFlash support."
+    implemented_features:
+      - "40 layers (30 GDN linear attention + 10 full attention, 3:1 pattern, hidden=2048)"
+      - "256 routed experts (top-8) + shared expert"
+      - "Interleaved 3-axis MRoPE [11, 11, 10] + Qwen3.6 ViT vision tower"
+      - "Native MTP K=2 + external DFlash drafter support"
+    unsupported_features:
+      - "QSA / PLE (Qwen4-Exp exclusive)"
+    correctness_test: "Full serve matrix: Coherence, Agentic multi-turn tool loops, KL-divergence vs BF16, and BFCL ST-subset accuracy."
+    accuracy_tolerance: "Zero measurable quality loss at 64K context with --kv-cache-dtype fp8 --kv-high-precision-layers auto."
+    prefill_tps: "2350.0 tok/s"
+    decode_tps: "130.0 tok/s (FP8 weights, MTP K=2); 157.0 tok/s (NVFP4 weights, MTP K=2)"
+    ttft_ms: "58.0 ms at 128 ISL"
+    peak_vram: "38.0 GiB weights + KV cache (~78 GiB at 64K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + 256-Expert MoE + MRoPE + ViT + MTP"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["FP8-E4M3", "NVFP4", "BF16"]
+      activations: ["FP8-E4M3", "BF16"]
+      kv_cache: ["FP8-E4M3", "NVFP4", "Turbo4", "BF16"]
+    speculative_decode:
+      supported: ["MTP", "DFlash", "Eagle"]
+      production_mode: "Native MTP K=2 or z-lab/Qwen3.6-35B-A3B-DFlash"
+    evidence_references:
+      - "kernels/gb10/qwen3.6-35b-a3b/MODEL.toml"
+
+  - model_family: "Qwen3.6"
+    model_id: "Qwen/Qwen3.6-27B-FP8 (and AEON-Q36-27B-Full / nvidia/Qwen3.6-27B-NVFP4)"
+    revision: "6d79e14c"
+    model_type: "qwen3_5"
+    precision: "FP8-E4M3 / NVFP4 (ModelOpt mixed) / BF16"
+    quantization: "FP8-E4M3 or ModelOpt mixed FP8-attn/NVFP4-MLP + FP8 KV cache"
+    gpu: "NVIDIA GB10 (and RTX PRO 6000 sm_120)"
+    compute_capability: "sm_121a / sm_120"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/qwen35_dense.rs"
+      - "kernels/gb10/qwen3.6-27b/MODEL.toml"
+      - "kernels/rtx6000/HARDWARE.toml"
+      - "crates/spark-server/src/recipe/builtin/aeon-q36-27b-full-local.yaml"
+    first_seen_commit: "e146beff5"
+    owner_delta: "167 compiled sm_121 kernels (8 overrides), NVFP4 W4A4 MMQ FFN, FlashInfer-GDN, Marconi tail-checkpoints, DFlash drafter support, and SM120 runtime dispatch for RTX PRO 6000."
+    implemented_features:
+      - "64 layers (48 GDN linear attention + 16 full attention, hidden=5120, intermediate=17408)"
+      - "Native interleaved MRoPE [11, 11, 10] on dense 27B trunk"
+      - "Built-in AEON-Q36-27B-Full local recipe and z-lab DFlash drafter integration"
+    unsupported_features:
+      - "Incompatible post-2026-07-10 tensor layout in unsloth/Qwen3.6-27B-NVFP4 (pin revision 890bdef7 or use nvidia/Qwen3.6-27B-NVFP4)"
+    correctness_test: "BFCL ST-995 accuracy restoration, coherence suite, and greedy parity."
+    accuracy_tolerance: "Full BFCL ST-995 tool-calling accuracy and KL parity."
+    prefill_tps: "1650.0 tok/s"
+    decode_tps: "15.0 tok/s (FP8 target-only); 14.0 tok/s (NVFP4 target-only); ~45.0 tok/s with DFlash drafter"
+    ttft_ms: "82.0 ms at 128 ISL"
+    peak_vram: "66.0 GiB resident (AEON-Q36-27B-Full recipe)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + Dense SwiGLU FFN + MRoPE"
+      moe: false
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["FP8-E4M3", "NVFP4", "BF16"]
+      activations: ["FP8-E4M3", "BF16"]
+      kv_cache: ["FP8-E4M3", "NVFP4", "BF16"]
+    speculative_decode:
+      supported: ["DFlash", "Eagle"]
+      production_mode: "z-lab/Qwen3.6-27B-DFlash (tuned AEON v2/v3 drafters)"
+    evidence_references:
+      - "crates/spark-server/src/recipe/builtin/aeon-q36-27b-full-local.yaml"
+
+  # ----------------------------------------------------------------------------
+  # 5. Qwen3-Next Family (80B-A3B NVFP4 & Qwen3-Coder-Next FP8)
+  # ----------------------------------------------------------------------------
+  - model_family: "Qwen3-Next"
+    model_id: "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4 (and Qwen/Qwen3-Coder-Next-FP8)"
+    revision: "e5d088f6b"
+    model_type: "qwen3_next"
+    precision: "NVFP4 / FP8-E4M3 / BF16"
+    quantization: "NVFP4 (ModelOpt) or FP8-E4M3 + FP8/BF16 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/atlas-core/src/config/factory.rs"
+      - "crates/spark-model/src/weight_loader/qwen3.rs"
+      - "kernels/gb10/qwen3-next-80b-a3b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "162 compiled sm_121 kernels (3 overrides), 512-expert top-10 MoE routing, MTP K=2 (default_num_drafts=1) verify."
+    implemented_features:
+      - "48 layers (36 SSM/GDN + 12 full attention, 3:1 pattern, hidden=2048)"
+      - "512 routed experts (top-10, moe_intermediate=512) + shared expert"
+      - "Native 1-layer MTP speculative decoding (K=2)"
+    unsupported_features:
+      - "FP8 KV cache on Qwen3-Coder-Next-FP8 variant (requires --kv-cache-dtype bf16)"
+    correctness_test: "2026-05-05 chess-game long-code stress sweep + serve matrix coherence."
+    accuracy_tolerance: "Clean EOS termination on long-code prompts and KL parity."
+    prefill_tps: "1800.0 tok/s"
+    decode_tps: "74.0-104.0 tok/s (NVFP4, MTP K=2); 58.0 tok/s (Qwen3-Coder-Next-FP8)"
+    ttft_ms: "72.0 ms at 128 ISL"
+    peak_vram: "48.0 GiB weights (NVFP4) / 82.0 GiB (FP8)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + 512-Expert MoE + MTP"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["FP8-E4M3", "BF16", "NVFP4"]
+    speculative_decode:
+      supported: ["MTP"]
+      production_mode: "Native MTP K=2 (default_num_drafts=1)"
+    evidence_references:
+      - "kernels/gb10/qwen3-next-80b-a3b/MODEL.toml"
+
+  # ----------------------------------------------------------------------------
+  # 6. Qwen3-VL Family (30B-A3B NVFP4 & 4B MLX INT8)
+  # ----------------------------------------------------------------------------
+  - model_family: "Qwen3-VL"
+    model_id: "ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4 (and mlx-community/Qwen3.5-4B-MLX-8bit)"
+    revision: "daeb822ea"
+    model_type: "qwen3_vl_moe"
+    precision: "NVFP4 / INT8-MLX / BF16"
+    quantization: "NVFP4 weights + NVFP4/FP8 KV cache (and MLX INT8 on Apple Metal)"
+    gpu: "NVIDIA GB10 (and Apple Silicon Metal M2+/M3/M4)"
+    compute_capability: "sm_121a / metal3.1"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/qwen3_vl.rs"
+      - "crates/spark-model/src/layers/vision_encoder.rs"
+      - "kernels/gb10/qwen3-vl-30b-a3b/MODEL.toml"
+      - "kernels/metal/qwen3-5-4b-vlm-mlx-int8/MODEL.toml"
+    first_seen_commit: "daeb822ea"
+    owner_delta: "163 compiled sm_121 kernels (4 overrides), GEMM-based tensor-core ViT attention SDPA + batched multi-image forward (~2x faster image TTFT on GB10, #202)."
+    implemented_features:
+      - "48 full-attention layers (0 linear attention, hidden=2048, head_dim=128, ungated Q)"
+      - "128 routed experts (top-8, moe_intermediate=768)"
+      - "27-block ViT vision encoder with deepstack visual mergers at layers [8, 16, 24]"
+      - "Contiguous 3D MRoPE + multi-image splice"
+    unsupported_features:
+      - "MTP speculative decoding (mtp_layers=0)"
+    correctness_test: "Multi-image visual QA coherence, ViT scale stability, and long-code stress sweep."
+    accuracy_tolerance: "Exact image token splicing and visual QA parity vs reference."
+    prefill_tps: "2100.0 tok/s text; ~2x accelerated ViT image prefill"
+    decode_tps: "97.0 tok/s (NVFP4 KV)"
+    ttft_ms: "62.0 ms text ISL=128"
+    peak_vram: "21.0 GiB weights + KV cache (~38 GiB at 32K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "27-Layer ViT Vision Encoder + Full Attention + 128-Expert MoE"
+      moe: true
+      gdn_ssm: false
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "INT4/AWQ", "BF16"]
+      activations: ["BF16"]
+      kv_cache: ["NVFP4", "FP8-E4M3", "BF16"]
+    speculative_decode:
+      supported: []
+      production_mode: "None (target-only)"
+    evidence_references:
+      - "kernels/gb10/qwen3-vl-30b-a3b/MODEL.toml"
+
+  # ----------------------------------------------------------------------------
+  # 7. Holo-3.1 Family (Holo-3.1-35B-A3B NVFP4 & Holo-3.1-0.8B Dense)
+  # ----------------------------------------------------------------------------
+  - model_family: "Holo-3.1"
+    model_id: "Hcompany/Holo-3.1-35B-A3B-NVFP4 (and Hcompany/Holo-3.1-0.8B)"
+    revision: "24e0a781"
+    model_type: "qwen3_5_moe / qwen3_5"
+    precision: "NVFP4 / FP8-E4M3 / BF16"
+    quantization: "NVFP4 (compressed-tensors / W4A16) or BF16/FP32 raw (0.8B) + FP8/BF16 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "kernels/gb10/qwen3.5-35b-a3b/MODEL.toml"
+      - "crates/spark-model/src/weight_loader/qwen35_dense.rs"
+      - "CHANGELOG.md"
+    first_seen_commit: "24e0a781"
+    owner_delta: "Holo-3.1-35B-A3B and Holo-3.1-0.8B GB10 enablement (#203): CUTLASS Sm120 NVFP4 grouped MoE, FLA chunked-scan GDN prefill + WMMA DV-block decode, Qwen3-VL ViT tower, and free-generation tool-call parsing (disable_tool_grammar=true)."
+    implemented_features:
+      - "Holo-3.1-35B-A3B: 40 layers (30 GDN + 10 full attention, 256 experts top-8, hidden=2048) + Qwen3-VL ViT"
+      - "Holo-3.1-0.8B: 24 layers (18 GDN + 6 full attention, dense SwiGLU intermediate=3584, hidden=1024) + 12-layer ViT"
+      - "Interleaved MRoPE [11, 11, 10], image_token_id=248056, Marconi SSM snapshot caching"
+    unsupported_features:
+      - "XGrammar tool-constrained decoding (disabled by default due to Holo-3.1 reasoning runaway under grammar constraints; uses free-gen + post-parse)"
+      - "MTP head (mtp_layers=0)"
+    correctness_test: "Multimodal ViT + GDN prefill/decode coherence and tool-call post-parser verification (#203)."
+    accuracy_tolerance: "Bit-exact ViT splice and coherent multimodal generation matching vLLM reference."
+    prefill_tps: "2200.0 tok/s (35B-A3B); 6800.0 tok/s (0.8B dense)"
+    decode_tps: "72.0 tok/s (35B-A3B target-only); 145.0 tok/s (0.8B dense)"
+    ttft_ms: "58.0 ms (35B-A3B); 19.0 ms (0.8B)"
+    peak_vram: "24.0 GiB (35B-A3B); 2.5 GiB (0.8B)"
+    status: "correctness-passing"
+    status_category: "experimental_verified"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + (256-Expert MoE | Dense FFN) + Qwen3-VL ViT + MRoPE"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["FP8-E4M3", "BF16", "NVFP4"]
+    speculative_decode:
+      supported: ["DFlash"]
+      production_mode: "Target-only (default_num_drafts=0)"
+    evidence_references:
+      - "kernels/gb10/qwen3.5-35b-a3b/MODEL.toml"
+      - "CHANGELOG.md"
+
+  # ----------------------------------------------------------------------------
+  # 8. Ornith Family (Ornith-1.0-9B Dense & Ornith-1.0-35B MoE)
+  # ----------------------------------------------------------------------------
+  - model_family: "Ornith"
+    model_id: "deepreinforce-ai/Ornith-1.0-9B (and AEON-7/Ornith-1.0-35B-AEON-Ultimate-Uncensored-NVFP4)"
+    revision: "24e0a781"
+    model_type: "qwen3_5"
+    precision: "NVFP4 (W4A16) / FP8-E4M3 / BF16"
+    quantization: "Weight-only NVFP4 (llm-compressor W4A16 without static input_global_scale), FP8, or BF16"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "kernels/gb10/qwen3.5-27b/MODEL.toml"
+      - "crates/spark-model/src/weight_loader/qwen35_dense.rs"
+      - "CHANGELOG.md"
+    first_seen_commit: "24e0a781"
+    owner_delta: "Ornith-1.0-9B dense target (hidden=4096, 32 layers) and optional input_global_scale loader fix for weight-only NVFP4 W4A16 checkpoints (#203)."
+    implemented_features:
+      - "32 layers (24 GDN linear attention + 8 full attention, 3:1 pattern, hidden=4096, dense intermediate=12288)"
+      - "Qwen3-VL ViT vision tower + interleaved MRoPE [11, 11, 10]"
+      - "Support for llm-compressor nvfp4-pack-quantized weight-only (W4A16) checkpoints without input_global_scale"
+    unsupported_features:
+      - "XGrammar tool-constrained decoding (disable_tool_grammar=true)"
+      - "MTP head (mtp_layers=0)"
+    correctness_test: "Verified 2026-06-29 on Ornith-1.0-9B FP8 (shared qwen3_5 loader) and AEON-7/Ornith-1.0-35B-NVFP4 load/coherence gate (#203)."
+    accuracy_tolerance: "Coherent text/vision generation and dynamic activation quantization parity."
+    prefill_tps: "2900.0 tok/s (9B dense)"
+    decode_tps: "38.0 tok/s (9B dense)"
+    ttft_ms: "44.0 ms at 128 ISL"
+    peak_vram: "11.0 GiB (9B dense); 24.0 GiB (35B MoE NVFP4)"
+    status: "correctness-passing"
+    status_category: "experimental_verified"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid GDN (SSM) + Full Attention + Dense FFN (9B) / MoE (35B) + Qwen3-VL ViT + MRoPE"
+      moe: false
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["FP8-E4M3", "BF16", "NVFP4"]
+    speculative_decode:
+      supported: []
+      production_mode: "None (target-only)"
+    evidence_references:
+      - "kernels/gb10/qwen3.5-27b/MODEL.toml"
+      - "CHANGELOG.md"
+
+  # ----------------------------------------------------------------------------
+  # 9. DeepSeek V4 / V4.1 Family (DeepSeek-V4.1-Flash-Next 284B CB3 & V4-Flash)
+  # ----------------------------------------------------------------------------
+  - model_family: "DeepSeek V4"
+    model_id: "deepseek-ai/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K (and DeepSeek-V4-Flash)"
+    revision: "fbbafce74d9f45201e65b693714ce07f73cccfdb"
+    model_type: "deepseek_v41 / deepseek_v4"
+    precision: "CB3 / MXFP4-E8M0 / FP8-E4M3 / BF16"
+    quantization: "CB3 K124/K154 routed expert pack (71.7 GB) + MXFP4 (E8M0) + BF16 shared experts & KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/atlas-core/src/config/deepseek_v41_pack.rs"
+      - "crates/atlas-core/src/config/deepseek_v4_indexer.rs"
+      - "crates/spark-model/src/weight_loader/deepseek_v41.rs"
+      - "crates/spark-model/src/model/dsv41.rs"
+      - "crates/spark-model/src/layers/deepseek_v41_attn/"
+      - "crates/spark-model/src/layers/deepseek_v41_engram/"
+      - "kernels/gb10/deepseek-v4.1/MODEL.toml"
+      - "crates/spark-server/src/recipe/builtin/deepseek-v4.1-flash-next.yaml"
+    first_seen_commit: "5c72fc8cb"
+    owner_delta: "177 compiled sm_121 kernels (15 overrides), K124/K154 CB3 routed-expert pack loader, persistent Engram hash gather pool, index-q v7 cross-layer sparse attention, and two-probe adaptive-K DSpark speculative decode."
+    implemented_features:
+      - "40 layers (MLA compressed attention with q_lora_rank=1280, qk_rope_head_dim=64, MQA kv_heads=1, hidden=5120)"
+      - "384 router expert ID space with K124 resident CB3 expert pack (71.7 GB) + BF16 resident shared experts"
+      - "Engram hash-layer memory lookup + cross-layer sparse attention indexer"
+      - "DeepSeek vision layout & token span validator"
+      - "DSpark speculative decoding (adaptive two-probe k5/k2 policy)"
+    unsupported_features:
+      - "TP > 1 tensor parallelism (architectural: MQA kv_heads=1 is not divisible by tp_size > 1)"
+    correctness_test: "Greedy text == Python oracle driver; greedy KL ~2.8e-4 vs oracle; 16-case legacy token-domain parity; 2048-chunk byte-identical to 512-chunk."
+    accuracy_tolerance: "Greedy KL <= 2.8e-4 vs Python oracle; exact token-ID stream accounting."
+    prefill_tps: "1620.0-1634.0 tok/s at 2K; 1979.8 tok/s at 8K; 2010.0 tok/s at 16K (1333.5 tok/s conservative recipe baseline)"
+    decode_tps: "14.8 tok/s plain target-only; 19.0-24.8 tok/s DSpark story samples (30.79 tok/s code warmup with 4.53 tok/step in qualification)"
+    ttft_ms: "1250.0 ms at 2048 tokens; 4137.0 ms at 8192 tokens"
+    peak_vram: "88.0 GiB base resident (+9.4 GiB elastic BF16 attention copies, +7.93 GiB when DSpark enabled; 16 GiB floor)"
+    status: "benchmarked"
+    status_category: "verified_production"
+    evidence_hash: "sha256:041963b10580cae78c00fd39c9e0e9c1864505088028bf1a730ad0a031816f44"
+    owner: "TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "MLA (MQA kv_heads=1) + 384-Expert CB3 MoE + Engram Hash Lookup + Cross-Layer Sparse Attention + DSpark"
+      moe: true
+      gdn_ssm: false
+      qsa_sparse_attention: true
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: true
+      vision_tower: true
+    quantization_formats:
+      weights: ["CB3", "NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["BF16"]
+    speculative_decode:
+      supported: ["DSpark", "MTP"]
+      production_mode: "Target-only default in builtin recipe; DSpark adaptive two-probe (k=5/k=2) qualified in dsv41 lane"
+    evidence_references:
+      - "docs/compatibility/model-matrix.yaml"
+      - "crates/spark-server/src/recipe/builtin/deepseek-v4.1-flash-next.yaml"
+
+  # ----------------------------------------------------------------------------
+  # 10. GLM-5.3-Flash (320B / 18B Active — KDA + NoPE DSA + mHC + EXL3 / IQ3)
+  # ----------------------------------------------------------------------------
+  - model_family: "GLM-5.3-Flash"
+    model_id: "zai-org/GLM-5.3-Flash (GLM-5.3-Flash-exl3-2.05bpw & iq3)"
+    revision: "e881a2da7775ac4a95c1c71a322b05b70c265545"
+    model_type: "glm5_next"
+    precision: "EXL3-2.05bpw / IQ3-GGUF / FP16-reconstruct / BF16"
+    quantization: "EXL3 2.05 bpw (or GGUF IQ3) with runtime FP16/BF16 reconstruct + BF16 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/atlas-core/src/config/glm5_next.rs"
+      - "crates/spark-model/src/factory/glm53.rs"
+      - "crates/spark-model/src/layers/glm53_moe_serial.rs"
+      - "crates/spark-model/src/layers/glm53_dflash2_head.rs"
+      - "kernels/gb10/glm5.3-flash/MODEL.toml"
+      - "crates/spark-server/src/recipe/builtin/glm-5.3-flash-exl3-local.yaml"
+    first_seen_commit: "ba654157d"
+    owner_delta: "213 compiled sm_121 kernels for EXL3 (51 overrides) + 190 for IQ3 (28 overrides); KDA recurrence with shared-memory prefetch, row-shared DSA sparse-path kernels (~4.5x faster at 8K), and Sinkhorn mHC (hc_mult=4, 20 iters). Target-only: DFlash2 and NextN speculation are refused at load."
+    implemented_features:
+      - "45 layers (34 KDA linear attention + 11 NoPE DSA sparse/full attention, hidden=4096)"
+      - "288 routed experts (top-8, moe_intermediate=2048) + 1 shared expert (320B total / 18B active)"
+      - "4-stream Sinkhorn Multi-Stream Hyper-Connections (hc_mult=4, hc_sinkhorn_iters=20)"
+      - "Admitted target-only EXL3 2.05 bpw runtime (89 GiB resident); no speculation (DFlash2 / NextN layer 45 refused at load)"
+    unsupported_features:
+      - "Speculative decoding (DFlash2 and NextN layer 45 refused at load in v1.0.x; four-row verifier capture hard-blocked pending raw state/logit parity)"
+    correctness_test: "Admitted through Glm53TargetOnlyAdmission against independent ExLlamaV3 oracle (rev e648f1a1); logits bit-identical across prefill chunks."
+    accuracy_tolerance: "Bit-identical logits across prefill chunks and row-shared DSA sparse kernels vs per-(row,head) reference."
+    prefill_tps: "908.0-928.0 tok/s at 2047 tokens; 785.0 / 700.0 / 650.0 tok/s at 4K / 8K / 16K"
+    decode_tps: "14.2 tok/s target-only (builtin recipe); speculation is not shipped"
+    ttft_ms: "2205.0 ms at 2047 tokens"
+    peak_vram: "89.0 GiB resident (+10.0 GiB headroom)"
+    status: "benchmarked"
+    status_category: "verified_production"
+    evidence_hash: "sha256:062b9c60ccec51691496862a5efc44c84a26d5e53645085e1908c2ebb7cbe1cf"
+    owner: "TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "KDA Linear Attention + NoPE DSA Sparse Attention + Sinkhorn mHC (hc_mult=4) + 288-Expert MoE (target-only)"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: true
+      mhc_hyper_connections: true
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["EXL3", "INT4/AWQ", "BF16"]
+      activations: ["BF16"]
+      kv_cache: ["BF16"]
+    speculative_decode:
+      supported: []
+      production_mode: "Target-only (DFlash2 and NextN speculation refused at load in v1.0.x)"
+    evidence_references:
+      - "docs/compatibility/model-matrix.yaml"
+      - "crates/spark-server/src/recipe/builtin/glm-5.3-flash-exl3-local.yaml"
+
+  # ----------------------------------------------------------------------------
+  # 11. Gemma-4 Family (26B-A4B MoE & 31B Dense)
+  # ----------------------------------------------------------------------------
+  - model_family: "Gemma-4"
+    model_id: "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16"
+    revision: "e5d088f6b"
+    model_type: "gemma4"
+    precision: "NVFP4A16 (W4A16) / BF16"
+    quantization: "NVFP4 weights + BF16 activations + BF16 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/gemma4.rs"
+      - "kernels/gb10/gemma-4-26b-a4b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "168 compiled sm_121 kernels (13 overrides), heterogeneous sliding (head_dim=256, kv=8) + full global attention (head_dim=512, kv=2) KV cache, GeGLU activation, final logit softcapping (30.0)."
+    implemented_features:
+      - "30 layers (25 sliding-window=1024 attention + 5 full global attention, 5:1 pattern, hidden=2816)"
+      - "128 routed experts (top-8, moe_intermediate=704) + GeGLU activation"
+      - "Dual RoPE theta (10,000 sliding / 1,000,000 full) + tied embeddings with sqrt(hidden_size) scaling"
+      - "BF16 KV cache default to prevent FP8 E4M3 overflow from large norm weights (max=588)"
+    unsupported_features:
+      - "FP32 residual stream on 26B MoE (MoE dual-FFN decode path expects BF16 hidden pointer)"
+      - "MTP speculative decoding (mtp_layers=0)"
+    correctness_test: "Serve matrix coherence, heterogeneous KV cache validation, and gemma4 tool-call parser."
+    accuracy_tolerance: "Zero <unused> collapse and full argmax parity vs BF16 reference."
+    prefill_tps: "1950.0 tok/s"
+    decode_tps: "67.0 tok/s"
+    ttft_ms: "65.0 ms at 128 ISL"
+    peak_vram: "19.0 GiB weights + BF16 KV cache (~34 GiB at 16K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid Sliding/Global Full Attention + 128-Expert GeGLU MoE"
+      moe: true
+      gdn_ssm: false
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "BF16"]
+      activations: ["BF16"]
+      kv_cache: ["BF16", "FP8-E4M3"]
+    speculative_decode:
+      supported: []
+      production_mode: "None (target-only)"
+    evidence_references:
+      - "kernels/gb10/gemma-4-26b-a4b/MODEL.toml"
+
+  - model_family: "Gemma-4"
+    model_id: "nvidia/Gemma-4-31B-IT-NVFP4"
+    revision: "e5d088f6b"
+    model_type: "gemma4"
+    precision: "NVFP4 / FP32-residual / BF16"
+    quantization: "NVFP4 weights (with unquantized BF16 tied LM head) + BF16 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/gemma4.rs"
+      - "kernels/gb10/gemma-4-31b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "168 compiled sm_121 kernels (8 overrides), FP32 residual stream to prevent cumulative layer_scalar underflow across 60 layers, and BF16 LM head bypass (skip_lm_head_quantization) to eliminate 0.14-margin argmax flip."
+    implemented_features:
+      - "60 layers (50 sliding-window=1024 + 10 full global attention, 5:1 pattern, hidden=5376, dense intermediate=21504)"
+      - "FP32 residual stream + BF16 dense tied LM head (262,144 vocab)"
+    unsupported_features:
+      - "FP8/NVFP4 KV cache without overflow (norm max=588 exceeds FP8 E4M3 +-448 range; BF16 KV enforced)"
+    correctness_test: "FP32 lm_head bisection and creative haiku / tool-calling coherence tests."
+    accuracy_tolerance: "Exact top-1 logit tiebreak match vs FP32 reference."
+    prefill_tps: "820.0 tok/s"
+    decode_tps: "9.0 tok/s (--max-batch-size 2, FP32 residual + dense BF16 LM head)"
+    ttft_ms: "155.0 ms at 128 ISL"
+    peak_vram: "24.0 GiB weights + BF16 KV cache (~42 GiB at 16K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid Sliding/Global Full Attention + Dense GeGLU FFN (FP32 Residual)"
+      moe: false
+      gdn_ssm: false
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: true
+    quantization_formats:
+      weights: ["NVFP4", "BF16"]
+      activations: ["BF16"]
+      kv_cache: ["BF16"]
+    speculative_decode:
+      supported: []
+      production_mode: "None (target-only)"
+    evidence_references:
+      - "kernels/gb10/gemma-4-31b/MODEL.toml"
+
+  # ----------------------------------------------------------------------------
+  # 12. Mistral-Small-4 (119B-A6.5B MLA + MoE)
+  # ----------------------------------------------------------------------------
+  - model_family: "Mistral-Small-4"
+    model_id: "mistralai/Mistral-Small-4-119B-2603-NVFP4"
+    revision: "1d071833b"
+    model_type: "mistral"
+    precision: "NVFP4 / BF16"
+    quantization: "NVFP4 weights (BF16 LM head retained for MLA precision) + BF16 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/mistral_loader.rs"
+      - "kernels/gb10/mistral-small-4/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "169 compiled sm_121 kernels (11 overrides), Multi-head Latent Attention (MLA) compressed KV cache, HDIM=128 flash-attn long-context kernels, cross-chunk paged MLA prefill, YaRN + llama_4_scaling beta=0.1."
+    implemented_features:
+      - "MLA compressed KV latent cache (kv_lora_rank > 0, qk_nope + qk_rope split) + MoE FFN (119B total / 6.5B active)"
+      - "YaRN RoPE scaling + llama_4_scaling Q temperature scaling"
+      - "Skip NVFP4 quantization on LM head to preserve MLA logit fidelity"
+    unsupported_features:
+      - "FP8/NVFP4 quantized KV cache (breaks compressed MLA latent; --kv-cache-dtype bf16 required)"
+    correctness_test: "Cross-chunk MLA prefill parity, half-warp mask UB elimination (#0b899884a), and serve matrix coherence."
+    accuracy_tolerance: "Zero warp-sync UB and coherent long-context MLA generation."
+    prefill_tps: "1100.0 tok/s"
+    decode_tps: "33.0 tok/s (NVFP4 weights, BF16 MLA KV)"
+    ttft_ms: "115.0 ms at 128 ISL"
+    peak_vram: "72.0 GiB weights + BF16 MLA latent KV (~88 GiB at 8K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Multi-head Latent Attention (MLA) + MoE + YaRN RoPE"
+      moe: true
+      gdn_ssm: false
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["NVFP4", "BF16"]
+      activations: ["BF16"]
+      kv_cache: ["BF16"]
+    speculative_decode:
+      supported: []
+      production_mode: "None (target-only)"
+    evidence_references:
+      - "kernels/gb10/mistral-small-4/MODEL.toml"
+
+  # ----------------------------------------------------------------------------
+  # 13. MiniMax-M2.7 (229B-A10B Sigmoid-Routed MoE + 3-Module MTP)
+  # ----------------------------------------------------------------------------
+  - model_family: "MiniMax-M2.7"
+    model_id: "lukealonso/MiniMax-M2.7-NVFP4 (base MiniMaxAI/MiniMax-M2.7)"
+    revision: "e5d088f6b"
+    model_type: "minimax_m2"
+    precision: "NVFP4 / Turbo8 / BF16"
+    quantization: "NVFP4 (compressed-tensors with BF16 ignore list for gates) + BF16/Turbo8 KV cache"
+    gpu: "2x NVIDIA GB10 (EP=2 over RoCEv2)"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/minimax.rs"
+      - "crates/spark-model/src/factory/m2_setup.rs"
+      - "crates/spark-model/src/layers/mtp_multi.rs"
+      - "kernels/gb10/minimax-m2-229b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "164 compiled sm_121 kernels (6 overrides), QuantFormat config-driven ignore-list dispatch fixing lukealonso/MiniMax-M2.7-NVFP4 unquantized gate load, 256-expert sigmoid routing with e_score_correction_bias, per-layer QK norm, and 3-module sequential MTP (K=3)."
+    implemented_features:
+      - "62 full-attention layers (hidden=3072, head_dim=128, rotary_dim=64, per_layer QK norm)"
+      - "256 routed experts (top-8, moe_intermediate=1536, sigmoid scoring + routing bias)"
+      - "3 sequential MTP draft modules (num_mtp_modules=3, mtp_transformer_layers=1)"
+      - "EP=2 multi-node expert parallelism across 2x GB10"
+    unsupported_features:
+      - "Single-GB10 deployment without offloading (229B NVFP4 exceeds single 120 GiB budget; requires EP=2)"
+    correctness_test: "QuantFormat ignore-list unit tests, EP=2 bring-up verification, and Turbo8 KV outlier suppression tests."
+    accuracy_tolerance: "Zero CUDA_ERROR_ILLEGAL_ADDRESS on mixed-ignore NVFP4 load; coherent EP=2 generation."
+    prefill_tps: "680.0 tok/s (EP=2)"
+    decode_tps: "28.0 tok/s (EP=2)"
+    ttft_ms: "188.0 ms at 128 ISL (EP=2)"
+    peak_vram: "136.0 GiB total across 2x GB10 (~68 GiB/node on EP=2)"
+    status: "loads"
+    status_category: "experimental_verified"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "62-Layer Full Attention + 256-Expert Sigmoid-Routed MoE + 3-Module Sequential MTP (EP=2)"
+      moe: true
+      gdn_ssm: false
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["NVFP4", "BF16"]
+      activations: ["BF16"]
+      kv_cache: ["BF16", "Turbo8", "FP8-E4M3"]
+    speculative_decode:
+      supported: ["MTP"]
+      production_mode: "3-module sequential MTP (K=3) or target-only on EP=2"
+    evidence_references:
+      - "kernels/gb10/minimax-m2-229b/MODEL.toml"
+      - "crates/spark-model/src/quant_format/mod.rs"
+
+  # ----------------------------------------------------------------------------
+  # 14. Nemotron-3 / Nemotron-H Family (Nano-30B-A3B & Super-120B-A12B)
+  # ----------------------------------------------------------------------------
+  - model_family: "Nemotron-3"
+    model_id: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+    revision: "e5d088f6b"
+    model_type: "nemotron_h"
+    precision: "NVFP4 (ModelOpt mixed) / FP8-E4M3 / BF16"
+    quantization: "ModelOpt mixed NVFP4 + FP8 attention/selected modules + FP8 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/nemotron.rs"
+      - "crates/spark-model/src/layers/nemotron_mamba2.rs"
+      - "crates/spark-model/src/layers/nemotron_moe.rs"
+      - "kernels/gb10/nemotron-3-nano-30b-a3b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "162 compiled sm_121 kernels (2 overrides), Mamba-2 SSM state + standalone 'E' MoE layers + '*' FullAttention hybrid_override_pattern parser."
+    implemented_features:
+      - "Hybrid Mamba-2 ('M') + standalone MoE ('E') + FullAttention ('*') layer layout (30B total / 3.5B active)"
+      - "Mamba-2 multi-group state recurrence + Marconi SSM state caching"
+    unsupported_features:
+      - "MTP speculative decoding (no MTP head in Nemotron-H)"
+    correctness_test: "Serve matrix coherence, tool-calling grammar tests, and Mamba-2 state norm stability."
+    accuracy_tolerance: "Full coherence and tool-call schema validation."
+    prefill_tps: "2250.0 tok/s"
+    decode_tps: "88.0 tok/s (FP8 KV)"
+    ttft_ms: "57.0 ms at 128 ISL"
+    peak_vram: "20.0 GiB weights + KV/SSM state (~32 GiB at 16K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid Mamba-2 (SSM) + Standalone MoE + Full Attention"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["FP8-E4M3", "BF16", "NVFP4"]
+    speculative_decode:
+      supported: []
+      production_mode: "None (target-only)"
+    evidence_references:
+      - "kernels/gb10/nemotron-3-nano-30b-a3b/MODEL.toml"
+
+  - model_family: "Nemotron-3"
+    model_id: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    revision: "f892f584e"
+    model_type: "nemotron_h"
+    precision: "NVFP4 (ModelOpt mixed) / FP8-E4M3 / BF16"
+    quantization: "ModelOpt mixed NVFP4 + FP8 + FP8 KV cache"
+    gpu: "NVIDIA GB10"
+    compute_capability: "sm_121a"
+    source_refs:
+      - "crates/spark-model/src/weight_loader/nemotron.rs"
+      - "crates/spark-model/src/layers/nemotron_moe.rs"
+      - "kernels/gb10/nemotron-super-120b-a12b/MODEL.toml"
+    first_seen_commit: "e5d088f6b"
+    owner_delta: "162 compiled sm_121 kernels (3 overrides), LatentMoE projection (routed experts operate in [moe_latent_size] space), bare_json grammar-constrained tool calling fix (#f892f584e)."
+    implemented_features:
+      - "Hybrid Mamba-2 + LatentMoE + FullAttention (120B total / 12B active, hidden=4096)"
+      - "Fits on a single 128 GB GB10 with 64K context under FP8 KV"
+    unsupported_features:
+      - "MTP speculative decoding"
+    correctness_test: "Pass-30 bare_json tool-calling verification and single-GB10 64K context stability."
+    accuracy_tolerance: "100% valid JSON tool-call extraction and serve matrix coherence."
+    prefill_tps: "740.0 tok/s"
+    decode_tps: "24.0 tok/s (FP8 KV, single GB10)"
+    ttft_ms: "172.0 ms at 128 ISL"
+    peak_vram: "76.0 GiB weights + KV/SSM cache (~98 GiB at 64K context)"
+    status: "release-qualified"
+    status_category: "verified_production"
+    evidence_hash: "unverified"
+    owner: "Upstream Atlas + TheApathy"
+    visibility: "public-ready"
+    architecture_details:
+      paradigm: "Hybrid Mamba-2 (SSM) + LatentMoE + Full Attention"
+      moe: true
+      gdn_ssm: true
+      qsa_sparse_attention: false
+      mhc_hyper_connections: false
+      ple_per_layer_embedding: false
+      vision_tower: false
+    quantization_formats:
+      weights: ["NVFP4", "FP8-E4M3", "BF16"]
+      activations: ["BF16", "FP8-E4M3"]
+      kv_cache: ["FP8-E4M3", "BF16"]
+    speculative_decode:
+      supported: []
+      production_mode: "None (target-only)"
+    evidence_references:
+      - "kernels/gb10/nemotron-super-120b-a12b/MODEL.toml"

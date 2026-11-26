@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Phase 3: stage and upload positions (T,H,W for MRoPE) + slot table
+//! into the per-chunk metadata buffer carved out of `scratch`. Returns
+//! the layout descriptor used by phase 3b/4.
+
+#![allow(unused_imports, dead_code, clippy::too_many_arguments)]
+
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kv_cache::PagedKvCache;
+
+use super::super::super::types::TransformerModel;
+use crate::traits::SequenceState;
+
+pub(in crate::model) struct MetaLayout {
+    pub meta_base: DevicePtr,
+    pub slot_offset: usize,
+    pub pos_stream_bytes: usize,
+    pub use_mrope: bool,
+    pub needs_paged: bool,
+}
+
+impl MetaLayout {
+    /// Exact page-locked host range retained by this async upload.
+    pub fn pinned_bytes(&self, proc_count: usize) -> Result<usize> {
+        if self.needs_paged {
+            self.pos_stream_bytes
+                .checked_mul(if self.use_mrope { 3 } else { 1 })
+                .ok_or_else(|| anyhow::anyhow!("pinned metadata size overflow"))
+        } else {
+            self.slot_offset
+                .checked_add(
+                    proc_count
+                        .checked_mul(std::mem::size_of::<i64>())
+                        .ok_or_else(|| anyhow::anyhow!("pinned slot metadata size overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("pinned metadata size overflow"))
+        }
+    }
+}
+
+impl TransformerModel {
+    pub(super) fn prefill_b_upload_meta(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        proc_start: usize,
+        proc_count: usize,
+        effective_seq_len_start: usize,
+        kv_cache: &PagedKvCache,
+        stream: u64,
+    ) -> Result<MetaLayout> {
+        // Single-stream entry point: lay metadata at the default offset
+        // after the MoE topk staging area.
+        let moe_scratch_bytes = proc_count * self.config.num_experts_per_tok * 4 * 2;
+        let meta_offset = (moe_scratch_bytes + 7) & !7;
+        let meta_base = self.buffers.scratch().offset(meta_offset);
+        let pinned_offset = if Self::fast_host_h2d_enabled() {
+            self.reserve_pinned_h2d_range(proc_count.saturating_mul(20).saturating_add(64))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.prefill_b_upload_meta_at(
+            tokens,
+            seq,
+            chunk_start,
+            chunk_len,
+            proc_start,
+            proc_count,
+            effective_seq_len_start,
+            kv_cache,
+            meta_base,
+            pinned_offset,
+            stream,
+        )
+    }
+
+    /// Build positions + slots metadata for `proc_count` tokens and upload
+    /// to the caller-provided `meta_base` device pointer. Used by both the
+    /// single-stream entry point above and Q12 batched prefill (multiple
+    /// per-stream metadata blocks concatenated in one big scratch region).
+    pub(in crate::model) fn prefill_b_upload_meta_at(
+        &self,
+        _tokens: &[u32],
+        seq: &mut SequenceState,
+        _chunk_start: usize,
+        _chunk_len: usize,
+        proc_start: usize,
+        proc_count: usize,
+        effective_seq_len_start: usize,
+        kv_cache: &PagedKvCache,
+        meta_base: DevicePtr,
+        pinned_offset: usize,
+        stream: u64,
+    ) -> Result<MetaLayout> {
+        // MRoPE-interleaved packs three u32 position streams (T, H, W).
+        let use_mrope = self.config.mrope_interleaved;
+        let pos_stream_bytes = proc_count * 4;
+        let slot_offset = if use_mrope {
+            (pos_stream_bytes * 3 + 7) & !7
+        } else {
+            (pos_stream_bytes + 7) & !7
+        };
+        // Qwen4 prefill attention (`attn16`) reads paged `block_table` and
+        // `seq_len` metadata starting at chunk zero, whereas ordinary chunk-zero
+        // prefill uses contiguous flash attention without paged metadata.
+        let needs_paged = effective_seq_len_start > 0 || self.config.is_qwen4_exp();
+        let layout = MetaLayout {
+            meta_base,
+            slot_offset,
+            pos_stream_bytes,
+            use_mrope,
+            needs_paged,
+        };
+        let pinned_bytes = layout.pinned_bytes(proc_count)?;
+
+        // Lock staging, build positions plus non-paged slots, and upload.
+        {
+            let mut stg_guard = self.pinned_staging.lock();
+            let stg = &mut *stg_guard;
+            stg.positions.clear();
+            stg.positions
+                .extend(proc_start as u32..(proc_start + proc_count) as u32);
+
+            // Build (T, H, W) streams matching HF Qwen3-VL's
+            // `get_rope_index`/`get_vision_position_ids`:
+            //   - text token: T = H = W = current_pos, increment current_pos by 1.
+            //   - image-pad run (post-merge grid gh×gw at base = current_pos):
+            //       patch k ∈ [0, gh*gw): T = base, H = base + k/gw, W = base + k%gw.
+            //     After the run, current_pos += max(gh, gw).
+            // This matters because Qwen3-VL/3.6 was trained with T constant
+            // across one image and subsequent text tokens shifted by the
+            // image's max spatial extent — Atlas's previous "T=linear over
+            // all tokens" scheme produced out-of-distribution position IDs
+            // for every post-image token.
+            if use_mrope {
+                stg.positions_h.clear();
+                stg.positions_w.clear();
+                if !seq.rotary_positions.is_identity() {
+                    let rows = seq.rotary_positions.range(proc_start, proc_count)?;
+                    stg.positions.clear();
+                    for [t, h, w] in rows {
+                        stg.positions.push(t);
+                        stg.positions_h.push(h);
+                        stg.positions_w.push(w);
+                    }
+                } else {
+                    stg.positions_h.extend_from_slice(&stg.positions);
+                    stg.positions_w.extend_from_slice(&stg.positions);
+                }
+            }
+
+            // Validate the complete range before writing any bytes. In the
+            // kernel-batched path each outstanding async H2D receives a
+            // disjoint range of this one stable pinned allocation.
+            stg.buffer.pinned_slice_range(pinned_offset, pinned_bytes)?;
+            // SAFETY: `pinned_slice_range(pinned_offset, pinned_bytes)` above
+            // verified `pinned_offset + pinned_bytes <= stg.buffer.len()`, so
+            // `pinned` points within the page-locked staging allocation.
+            let pinned = unsafe { stg.buffer.as_mut_ptr().add(pinned_offset) };
+            let mut cursor = pos_stream_bytes;
+
+            // SAFETY: `pinned[0..pinned_bytes)` is in bounds and covers
+            // `pos_stream_bytes` (or `3 * pos_stream_bytes` under MRoPE); the
+            // position vectors each hold `pos_stream_bytes` initialized bytes
+            // and do not overlap `stg.buffer`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    stg.positions.as_ptr() as *const u8,
+                    pinned,
+                    pos_stream_bytes,
+                );
+                if use_mrope {
+                    std::ptr::copy_nonoverlapping(
+                        stg.positions_h.as_ptr() as *const u8,
+                        pinned.add(cursor),
+                        pos_stream_bytes,
+                    );
+                    cursor += pos_stream_bytes;
+                    std::ptr::copy_nonoverlapping(
+                        stg.positions_w.as_ptr() as *const u8,
+                        pinned.add(cursor),
+                        pos_stream_bytes,
+                    );
+                    cursor += pos_stream_bytes;
+                }
+            }
+
+            if !needs_paged {
+                let bs = kv_cache.block_size();
+                stg.slots.clear();
+                stg.slots
+                    .extend((proc_start..proc_start + proc_count).map(|i| {
+                        let block_idx = seq
+                            .physical_block_for(i / bs)
+                            .unwrap_or(self.dummy_kv_block);
+                        (block_idx as i64) * (bs as i64) + ((i % bs) as i64)
+                    }));
+                cursor = slot_offset;
+                // SAFETY: `pinned_bytes == slot_offset + proc_count * 8` was
+                // validated above, `stg.slots` holds `proc_count` initialized
+                // `i64` elements, and source/destination do not overlap.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        stg.slots.as_ptr() as *const u8,
+                        pinned.add(cursor),
+                        proc_count * 8,
+                    );
+                }
+                cursor += proc_count * 8;
+            }
+
+            assert_eq!(cursor, pinned_bytes, "pinned metadata layout drift");
+            let pinned_slice = stg.buffer.pinned_slice_range(pinned_offset, pinned_bytes)?;
+            // SAFETY: `pinned_slice` points into page-locked `stg.buffer` (model
+            // lifetime) at a disjoint `pinned_offset`, and callers synchronize
+            // `stream` before reusing the staging range.
+            unsafe {
+                self.gpu
+                    .copy_h2d_pinned_async(pinned_slice, meta_base, stream)?;
+            }
+        }
+
+        Ok(layout)
+    }
+}

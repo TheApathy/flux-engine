@@ -1,0 +1,140 @@
+# Built-in recipe: Qwen3.8-Flash-Next with its external native-MTP checkpoint
+# and the bounded-copy reliability contract.  It is intentionally a separate
+# card from the target-only and historical champion profiles.
+recipe_version: "2"
+model: Qwen3.8-Flash-Next-NVFP4-Offload
+runtime: atlas
+container: local
+metadata:
+  maintainer: atlas-radix
+  category: agent
+  model_params: 35B
+  quantization: nvfp4
+  kv_dtype: bf16
+  description: |
+    Qwen3.8-Flash-Next with /models/Qwen3.8-Flash-Next-Inferact-MTP,
+    full-vocabulary K=5 native-MTP verify and the sealed cache-disabled candidate environment.
+    The resident transformed-weight cache is disabled because it crossed the sealed
+    watchdog margin after native MTP had engaged. Prefix caching and async DFlash are
+    off, and every blocking host transfer uses bounded pinned staging. This named
+    profile keeps the target-only cards unchanged. Its receipt proves configuration identity,
+    not speculative engagement, quality, throughput, or endurance.
+defaults:
+  port: 8888
+  host: 127.0.0.1
+  kernel_target: qwen3.8-flash-next
+  gpu_memory_utilization: 0.85
+  kv_cache_dtype: bf16
+  max_model_len: 135168
+  max_prefill_tokens: 16384
+  max_batch_size: 1
+  max_num_seqs: 1
+  ssm_cache_slots: 0
+  qwen4_qsa: true
+  oom_guard_mb: 4096
+  request_timeout: 300
+  enable_prefix_caching: false
+  speculative: true
+  mtp_from_path: /models/Qwen3.8-Flash-Next-Inferact-MTP
+  num_drafts: 4
+  mtp_vocab: 0
+  mtp_quantization: bf16
+atlas:
+  model_type: qwen4_exp
+  resident_gb: 100
+  headroom_gb: 10
+  run_alone: true
+  environment_policy: sealed-v1
+  profile_kind: flash-next-native-mtp-memory-safe
+  environment_sha256: 281a35c55b3f792d973b9bc1e0c4ca1dd1c8bbfe87fcbd3552eaf7b5f6306755
+  forbidden_env:
+    - ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE_RESERVE_GB
+    - ATLAS_DFLASH_BRANCH
+    - ATLAS_DFLASH_BATCHED_VERIFY
+    - ATLAS_DFLASH_DEEPLOOP
+    - ATLAS_DDTREE_ENABLE
+  env:
+    ATLAS_BOUNDED_HOST_COPY: "1"
+    ATLAS_H2D_LEGACY_DRAIN: "0"
+    ATLAS_DFLASH_ASYNC: "0"
+    ATLAS_DFLASH_SPEC_CYCLE_V2: "1"
+    ATLAS_CUBLAS_TUNED: "0"
+    ATLAS_PLE_CACHE_MB: "0"
+    ATLAS_PLE_HALF_PAGE: "1"
+    ATLAS_QWEN4_K16_EXACT: "1"
+    ATLAS_QWEN4_PLE_IO_QUEUE_DEPTH: "256"
+    ATLAS_QWEN4_PLE_IO_TIMEOUT_MS: "30000"
+    ATLAS_QWEN4_PLE_PREFILL_BATCH: "1"
+    ATLAS_QWEN4_PLE_PREFILL_COMBINE: "1"
+    ATLAS_QWEN4_PLE_PREFILL_STREAM: "3"
+    ATLAS_QWEN4_PREFILL_ATTN_CORE16: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_CORE32: "0"
+    ATLAS_QWEN4_PREFILL_ATTN_DEVICE16: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_FI: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_FLASH: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_FULLROW: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_GQA: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_HC16: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_O16: "1"
+    ATLAS_QWEN4_PREFILL_ATTN_QKV16: "1"
+    ATLAS_QWEN4_PREFILL_BA_GEMM: "1"
+    ATLAS_QWEN4_PREFILL_CONV_PARALLEL: "1"
+    ATLAS_QWEN4_PREFILL_EMBED_BATCH: "1"
+    ATLAS_QWEN4_PREFILL_FAST_PROJ: "all"
+    ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8: "ssm,attn"
+    ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_SCALE: "tensor"
+    ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_SHARED_ACT: "1"
+    ATLAS_QWEN4_PREFILL_FAST_PROJ_FP8_WEIGHT_CACHE: "0"
+    ATLAS_QWEN4_PREFILL_GDN_FI: "2"
+    ATLAS_QWEN4_PREFILL_GDN_LAZYFINAL: "4"
+    ATLAS_QWEN4_PREFILL_GDN_NORM_FP8: "1"
+    ATLAS_QWEN4_PREFILL_HC_EXACT: "1"
+    ATLAS_QWEN4_PREFILL_HC_FUSED: "2"
+    ATLAS_QWEN4_PREFILL_MHC_FUSED: "inject,cross,combine,nostage,upmix,injgemm"
+    ATLAS_QWEN4_PREFILL_MOE_BATCH: "1"
+    ATLAS_QWEN4_PREFILL_MOE_COMPACT: "1"
+    ATLAS_QWEN4_PREFILL_MOE_COMPACT_K32: "1"
+    ATLAS_QWEN4_PREFILL_MOE_COMPACT_T: "1"
+    ATLAS_QWEN4_PREFILL_MOE_COMPACT_V2: "8"
+    ATLAS_QWEN4_PREFILL_MOE_STATUS_ASYNC: "1"
+    ATLAS_QWEN4_PREFILL_MOE_W4A8: "1"
+    ATLAS_QWEN4_PREFILL_MOE_W4A8_K64: "1"
+    ATLAS_QWEN4_PREFILL_MOE_W4A8_WIDE: "2"
+    ATLAS_QWEN4_PREFILL_MULTI_CHUNK: "1"
+    ATLAS_QWEN4_PREFILL_QSA: "1"
+    ATLAS_QWEN4_PREFILL_QSA_KEY_GEMM: "1"
+    ATLAS_QWEN4_PREFILL_QSA_TILE: "1"
+    ATLAS_QWEN4_PREFILL_QSA_V2: "1"
+    ATLAS_QWEN4_PREFILL_SHARED_W4A8: "1"
+    ATLAS_QWEN4_PREFILL_SSM_EXACT: "1"
+    ATLAS_QWEN4_PREFILL_SSM_GRID32: "1"
+    ATLAS_QWEN4_PREFILL_WIDE: "16384"
+    ATLAS_QWEN4_PREFILL_ATTN_PREP_FUSED: "1"
+    ATLAS_QWEN4_RELEASE_BF16_QKVZ: "1"
+    ATLAS_QWEN4_RELEASE_SPEC_UNUSED: "1"
+    ATLAS_QWEN4_RELEASE_UNUSED: "1"
+    ATLAS_QWEN4_QSA_SELECT_PAR: "1"
+    ATLAS_QWEN4_PLE_WARM_READ: "2"
+    ATLAS_QWEN4_QSA_ATTN_V2: "1"
+    ATLAS_QWEN4_QSA_SCORE_V2: "1"
+    ATLAS_QWEN4_HC_GEMV_V2: "1"
+    ATLAS_UNIFIED_MOE_LAYOUT: "1"
+    ATLAS_W4A16_GEMV_RT2: "1"
+    ATLAS_W4A16_EXACT_ROWPAR: "1"
+    ATLAS_W4A16_EXACT_SWK: "1"
+    ATLAS_MOE_T_LANES: "1"
+    ATLAS_QWEN4_K5_HYBRID: "1"
+    ATLAS_QWEN4_K5_NATIVE_MOE: "1"
+    ATLAS_QWEN4_K5_BATCH_ATTN_QKV: "1"
+    ATLAS_QWEN4_K5_BATCH_GDN: "1"
+    ATLAS_QWEN4_K5_BATCH_HYPER: "1"
+    ATLAS_QWEN4_K5_BATCH_SSM: "1"
+    ATLAS_QWEN4_K4_HYBRID: "1"
+    ATLAS_QWEN4_HYBRID_ALL_K: "1"
+    ATLAS_QWEN4_VERIFY_GRAPH: "1"
+    ATLAS_MTP_ACCEPT_LOG: "1"
+    ATLAS_MTP_THINK_SPEC: "1"
+    ATLAS_QWEN4_MOE_DEDUP: "1"
+    ATLAS_QWEN4_MOE_DOWN_ACT: "1"
+    ATLAS_QWEN4_MTP_CHAIN: "1"
+    ATLAS_SSM_GDN_LAZY: "1"

@@ -1,0 +1,15 @@
+[package]
+name = "atlas-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+description = "Flux Engine: quantization helpers (NVFP4 / FP8 / W4A16) — placeholder layer for future host-side quant routines."
+repository.workspace = true
+
+[dependencies]
+atlas-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

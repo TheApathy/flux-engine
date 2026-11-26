@@ -1,0 +1,12 @@
+{
+  "image_ref": "ghcr.io/theapathy/flux-engine:9.15.2",
+  "image_id": "sha256:bd9d738995a35d75cac417e196acdd2f6fe8caf8f1ed5c498d0774cf74c786c4",
+  "files_scanned": 9458,
+  "bytes_scanned": 4589555208,
+  "violations_count": 0,
+  "host_path_violations": 0,
+  "secret_violations": 0,
+  "state_token_violations": 0,
+  "violations": [],
+  "status": "PASS"
+}

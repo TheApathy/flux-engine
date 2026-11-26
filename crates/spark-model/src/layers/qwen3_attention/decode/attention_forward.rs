@@ -1,0 +1,1169 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Split out of `super::super::decode.rs` for file-size budget.
+
+#![allow(unused_imports)]
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::kv_dequant::{
+    NVFP4_E2M1_LUT, TURBO4_LUT, dequant_4bit_block_to_bf16, dequant_fp8_to_bf16,
+    dequant_turbo3_block_to_bf16, dequant_turbo8_block_to_bf16,
+};
+
+use super::super::Qwen3AttentionLayer;
+use crate::layer::ForwardContext;
+use crate::layers::ops;
+use crate::layers::qwen3_attention::{Qwen4DeviceAttentionRoute, Qwen4DeviceAttentionRow};
+
+impl Qwen3AttentionLayer {
+    pub(in super::super) fn attention_forward(
+        &self,
+        normed: DevicePtr,
+        seq_len: usize,
+        transactional_qsa: bool,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            None,
+            Some(seq_len),
+            None,
+            false,
+            None,
+            transactional_qsa,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Populate KV cache for one token without Q projection, attention over KV,
+    /// sigmoid gate, or O projection. Used for MTP replay rows whose hidden
+    /// state output is discarded (`!emit_draft`).
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_kv_only(
+        &self,
+        normed: DevicePtr,
+        preprojected_qkv: Option<DevicePtr>,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size as u32;
+        let nq = self
+            .num_q_heads_override
+            .unwrap_or(ctx.config.num_attention_heads) as u32;
+        let nkv = self
+            .num_kv_heads_override
+            .unwrap_or(ctx.config.num_key_value_heads) as u32;
+        let hd = self.head_dim_override.unwrap_or(ctx.config.head_dim) as u32;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let bs = kv_cache.block_size();
+        let blocks_needed = (seq_len / bs) + 1;
+        let expected_window_size = match kv_cache.config().cache_blocks_per_seq {
+            Some(cap) => blocks_needed.min(cap as usize),
+            None => blocks_needed,
+        };
+        debug_assert!(
+            block_table.len() >= expected_window_size,
+            "Qwen3AttentionLayer::decode_kv_only entered with under-allocated block_table \
+             ({}/{} blocks)",
+            block_table.len(),
+            expected_window_size,
+        );
+
+        let q_out = preprojected_qkv.unwrap_or_else(|| ctx.buffers.qkv_output());
+        let q_dim = nq * hd;
+        let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim };
+        let q_proj_bytes = q_proj_dim as usize * 2;
+        let k_out = q_out.offset(q_proj_bytes);
+        let v_out = k_out.offset((nkv * hd) as usize * 2);
+        let meta = ctx
+            .attn_metadata
+            .expect("attention layer requires pre-uploaded metadata");
+
+        if preprojected_qkv.is_none() {
+            self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
+            if let Some(ref k_norm_full) = self.attn.k_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    k_norm_full,
+                    k_out,
+                    1,
+                    nkv * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    &self.attn.k_norm,
+                    k_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+            if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    v_out,
+                    v_norm_w,
+                    v_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+        }
+
+        if !self.qwen4_yarn_inv_freq.is_null() {
+            ops::rope_yarn_scaled(
+                ctx.gpu,
+                self.rope_yarn_scaled_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                0,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.qwen4_yarn_inv_freq,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                self.qwen4_yarn_attention_factor,
+                stream,
+            )?;
+        } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
+            let rope_angles = self
+                .rotary_dim_override
+                .unwrap_or(ctx.config.rotary_dim() as u32);
+            ops::rope_proportional(
+                ctx.gpu,
+                self.rope_proportional_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                0,
+                nkv,
+                hd,
+                rope_angles,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        } else if self.mrope_interleaved {
+            self.apply_mrope(
+                ctx.gpu,
+                q_out,
+                k_out,
+                meta.positions,
+                meta.positions_h,
+                meta.positions_w,
+                1,
+                0,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        } else {
+            ops::rope(
+                ctx.gpu,
+                self.rope_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                0,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        }
+
+        let kv_stride = nkv * hd;
+        self.write_kv_cache(
+            ctx.gpu,
+            k_out,
+            v_out,
+            kv_cache,
+            meta.slot,
+            1,
+            nkv,
+            hd,
+            bs as u32,
+            kv_stride,
+            kv_stride,
+            stream,
+            ctx.graph_capture,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        transactional_qsa: bool,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            Some(seq_len),
+            None,
+            false,
+            None,
+            transactional_qsa,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Run the ordinary token-ordered attention/QSA/KV/gate core but leave
+    /// its H-wide result unprojected so an exact multi-row O projection can
+    /// be scheduled by the admitted prefill caller.
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected_raw(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            Some(seq_len),
+            None,
+            true,
+            None,
+            false,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// [`attention_forward_preprojected`] stopping before its O projection
+    /// (the gated H-wide row, as [`attention_forward_preprojected_raw`]
+    /// returns it) with the verify QSA transaction flag kept, so the K-row
+    /// verify can project every row in one exact multi-row launch.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub(in super::super) fn attention_forward_preprojected_deferred(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        transactional_qsa: bool,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_preprojected_deferred_into(
+            normed,
+            qkv_row,
+            seq_len,
+            None,
+            transactional_qsa,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+        .map(|(output, _)| output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected_deferred_into(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        defer_oproj_out: Option<DevicePtr>,
+        transactional_qsa: bool,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, crate::layers::qwen4_qsa::VerifyRowAttentionRoute)> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            Some(seq_len),
+            None,
+            true,
+            defer_oproj_out,
+            transactional_qsa,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected_device(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        device_row: Qwen4DeviceAttentionRow,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, crate::layers::qwen4_qsa::VerifyRowAttentionRoute)> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            None,
+            Some(device_row),
+            false,
+            None,
+            true,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    /// Execute one serial verifier row and return the route selected by the
+    /// dispatch site after that route completes its host launches. This is
+    /// exact for mixed dense/sparse boundary frames and HSS overrides.
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_verify_host_row_with_route(
+        &self,
+        normed: DevicePtr,
+        preprojected_qkv: Option<DevicePtr>,
+        seq_len: usize,
+        transactional_qsa: bool,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, crate::layers::qwen4_qsa::VerifyRowAttentionRoute)> {
+        self.attention_forward_impl(
+            normed,
+            preprojected_qkv,
+            Some(seq_len),
+            None,
+            false,
+            None,
+            transactional_qsa,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_forward_impl(
+        &self,
+        normed: DevicePtr,
+        preprojected_qkv: Option<DevicePtr>,
+        host_seq_len: Option<usize>,
+        device_row: Option<Qwen4DeviceAttentionRow>,
+        defer_oproj: bool,
+        defer_oproj_out: Option<DevicePtr>,
+        transactional_qsa: bool,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, crate::layers::qwen4_qsa::VerifyRowAttentionRoute)> {
+        anyhow::ensure!(
+            host_seq_len.is_some() != device_row.is_some(),
+            "attention requires exactly one host or device-metadata route"
+        );
+        anyhow::ensure!(
+            !defer_oproj || preprojected_qkv.is_some(),
+            "deferred O projection requires preprojected QKV"
+        );
+        let h = ctx.config.hidden_size as u32;
+        // Per-layer dimension overrides for heterogeneous models (Gemma-4)
+        let nq = self
+            .num_q_heads_override
+            .unwrap_or(ctx.config.num_attention_heads) as u32;
+        let nkv = self
+            .num_kv_heads_override
+            .unwrap_or(ctx.config.num_key_value_heads) as u32;
+        let hd = self.head_dim_override.unwrap_or(ctx.config.head_dim) as u32;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let bs = kv_cache.block_size();
+
+        // Phase 6.3: caller (model.rs::TransformerModel::decode and friends)
+        // is responsible for block allocation via `ensure_blocks_through_decode`,
+        // which handles HSS sliding-window eviction before this layer-internal
+        // entry point. Defensive alloc here is incompatible with rolling-window
+        // semantics (no access to disk_block_ids).
+        if let Some(seq_len) = host_seq_len {
+            let blocks_needed = (seq_len / bs) + 1;
+            let expected_window_size = match kv_cache.config().cache_blocks_per_seq {
+                Some(cap) => blocks_needed.min(cap as usize),
+                None => blocks_needed,
+            };
+            debug_assert!(
+                block_table.len() >= expected_window_size,
+                "Qwen3AttentionLayer::decode entered with under-allocated block_table \
+                 ({}/{} blocks) — caller must call ensure_blocks_through_decode",
+                block_table.len(),
+                expected_window_size,
+            );
+        }
+
+        // Q/K/V projections into separate regions of qkv_output (GEMV for M=1)
+        let q_out = preprojected_qkv.unwrap_or_else(|| ctx.buffers.qkv_output());
+        let q_dim = nq * hd; // actual Q dimension
+        let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim }; // gated: Q + gate
+        let q_proj_bytes = q_proj_dim as usize * 2;
+        let k_out = q_out.offset(q_proj_bytes);
+        let v_out = k_out.offset((nkv * hd) as usize * 2);
+        let meta = ctx
+            .attn_metadata
+            .expect("attention layer requires pre-uploaded metadata");
+
+        // ── MLA 2-step decode ── (extracted to attention_forward_mla.rs)
+        if self.mla.is_some() {
+            let args = super::attention_forward_mla::DecodeMlaArgs {
+                normed,
+                q_out,
+                k_out,
+                v_out,
+                q_dim,
+                h,
+                nq,
+                hd,
+                eps,
+                bs,
+                stream,
+            };
+            let output = self.attention_forward_mla(kv_cache, ctx, &args)?;
+            return Ok((
+                output,
+                crate::layers::qwen4_qsa::VerifyRowAttentionRoute::Mla,
+            ));
+        }
+
+        // ATLAS_QWEN4_QSA_OVERLAP: fork the plain-decode indexer onto its side
+        // stream. It reads only `normed` (the main stream only reads it too) and
+        // writes only the QSA cache; the main stream joins before sparse attention.
+        let qsa_overlap = if device_row.is_none()
+            && meta.qwen4_qsa_required
+            && !transactional_qsa
+            && !spark_runtime::cublaslt::stage_timer::decode_enabled()
+            && !self
+                .qwen4_qsa
+                .as_ref()
+                .is_some_and(|qsa| qsa.has_precomputed_verify_rows())
+        {
+            self.qwen4_qsa.as_ref().and_then(|qsa| qsa.overlap())
+        } else {
+            None
+        };
+        let early_qsa = if let Some(ov) = qsa_overlap {
+            ctx.gpu.record_event(ov.fork, stream)?;
+            ctx.gpu.stream_wait_event(ov.stream, ov.fork)?;
+            let indices = self.qwen4_qsa_indices(
+                normed,
+                host_seq_len,
+                device_row,
+                kv_cache,
+                ctx,
+                h,
+                eps,
+                ov.stream,
+            )?;
+            ctx.gpu.record_event(ov.join, ov.stream)?;
+            Some(indices)
+        } else {
+            None
+        };
+        if preprojected_qkv.is_none() && self.gated {
+            // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
+            if let Some(q_bf16) = self.q_dense_bf16_decode.as_ref() {
+                // `ATLAS_QWEN4_ATTN_BF16=1` (decode-only): `q_weight` is
+                // untouched by this control, so prefill is unaffected.
+                anyhow::ensure!(
+                    !q_bf16.weight.is_null(),
+                    "ATLAS_QWEN4_ATTN_BF16 decode q copy is null"
+                );
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    normed,
+                    q_bf16,
+                    q_out,
+                    q_proj_dim,
+                    h,
+                    stream,
+                )?;
+                ops::deinterleave_qg(
+                    ctx.gpu,
+                    self.deinterleave_qg_k,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    nq * hd * 2,
+                    stream,
+                )?;
+            } else if let Some(fp8_decode) =
+                self.qwen4_fp8_q(ctx, normed, q_out, q_proj_dim, h, nq, hd, stream)
+            {
+                fp8_decode?;
+            } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
+                // FP8 native: w8a16_gemv + separate deinterleave (no fused QG variant yet)
+                ops::w8a16_gemv(
+                    ctx.gpu,
+                    self.w8a16_gemv_k,
+                    normed,
+                    fp8.weight,
+                    fp8.row_scale,
+                    q_out,
+                    q_proj_dim,
+                    h,
+                    stream,
+                )?;
+                ops::deinterleave_qg(
+                    ctx.gpu,
+                    self.deinterleave_qg_k,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    nq * hd * 2,
+                    stream,
+                )?;
+            } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {
+                ops::w4a16_gemv_qg(
+                    ctx.gpu,
+                    self.w4a16_gemv_qg_k,
+                    normed,
+                    nvfp4,
+                    q_out,
+                    q_proj_dim,
+                    h,
+                    nq,
+                    hd,
+                    stream,
+                )?;
+            } else {
+                anyhow::ensure!(
+                    !self.attn.q_proj.weight.is_null(),
+                    "attention BF16 fallback weight was released at load (ATLAS_QWEN4_DENSE_DEDUP)"
+                );
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    normed,
+                    &self.attn.q_proj,
+                    q_out,
+                    q_proj_dim,
+                    h,
+                    stream,
+                )?;
+                ops::deinterleave_qg(
+                    ctx.gpu,
+                    self.deinterleave_qg_k,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    nq * hd * 2,
+                    stream,
+                )?;
+            }
+        } else if preprojected_qkv.is_none() {
+            // Ungated: Q projection only (no gate)
+            if let Some(q_bf16) = self.q_dense_bf16_decode.as_ref() {
+                // `ATLAS_QWEN4_ATTN_BF16=1` (decode-only).
+                anyhow::ensure!(
+                    !q_bf16.weight.is_null(),
+                    "ATLAS_QWEN4_ATTN_BF16 decode q copy is null"
+                );
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    normed,
+                    q_bf16,
+                    q_out,
+                    q_dim,
+                    h,
+                    stream,
+                )?;
+            } else if let Some(fp8_decode) =
+                self.qwen4_fp8_q(ctx, normed, q_out, q_dim, h, nq, hd, stream)
+            {
+                fp8_decode?;
+            } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
+                ops::w8a16_gemv(
+                    ctx.gpu,
+                    self.w8a16_gemv_k,
+                    normed,
+                    fp8.weight,
+                    fp8.row_scale,
+                    q_out,
+                    q_dim,
+                    h,
+                    stream,
+                )?;
+            } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {
+                ops::w4a16_decode_gemv(
+                    ctx.gpu,
+                    self.w4a16_gemv_k,
+                    self.w4a16_gemv_sw_k,
+                    self.gemv_sw,
+                    normed,
+                    nvfp4,
+                    q_out,
+                    q_dim,
+                    h,
+                    stream,
+                )?;
+            } else {
+                anyhow::ensure!(
+                    !self.attn.q_proj.weight.is_null(),
+                    "attention BF16 fallback weight was released at load (ATLAS_QWEN4_DENSE_DEDUP)"
+                );
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    normed,
+                    &self.attn.q_proj,
+                    q_out,
+                    q_dim,
+                    h,
+                    stream,
+                )?;
+            }
+        }
+
+        // DIAG: dump normed input and Q output for L0
+        if preprojected_qkv.is_none() && self.attn_layer_idx == 0 && ctx.profile {
+            ctx.gpu.synchronize(stream)?;
+            let mut input_buf = vec![0u8; 16]; // first 8 BF16 values
+            ctx.gpu.copy_d2h(normed, &mut input_buf)?;
+            let input_vals: Vec<f32> = input_buf
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect();
+            let mut q_buf = vec![0u8; 16];
+            ctx.gpu.copy_d2h(q_out, &mut q_buf)?;
+            let q_vals: Vec<f32> = q_buf
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect();
+            tracing::info!(
+                "GEMV_DIAG L0: input[0:8]={:.4?} q_out[0:8]={:.4?} nq={nq} hd={hd} h={h}",
+                input_vals,
+                q_vals
+            );
+        }
+
+        if preprojected_qkv.is_none() {
+            self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
+
+            // Q/K RMS norms — three mutually-exclusive paths:
+            //  1. MiniMax M2 style: RMSNorm over full projected hidden
+            //     `[nq*hd]` per token, single learned weight of that shape.
+            //     Reached only for MiniMax — every other loader leaves
+            //     `q_norm_full` as `None` (see `AttentionWeights`).
+            //  2. Qwen3-family per-head: rows=nq, cols=hd.
+            //  3. Nemotron-H standalone attn: both weights NULL, skip.
+            //
+            // Applied BEFORE RoPE (MiniMaxM2Attention.forward reference).
+            // This codepath never runs for Mistral/DeepSeek-style MLA
+            // models — they early-return in the MLA branch above.
+            if let Some(ref q_norm_full) = self.attn.q_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    q_out,
+                    q_norm_full,
+                    q_out,
+                    1,
+                    nq * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.q_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    q_out,
+                    &self.attn.q_norm,
+                    q_out,
+                    nq,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+            if let Some(ref k_norm_full) = self.attn.k_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    k_norm_full,
+                    k_out,
+                    1,
+                    nkv * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    &self.attn.k_norm,
+                    k_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+
+            // Gemma-4 v_norm (applied at EVERY layer, not just K=V). HF
+            // `Gemma4TextAttention.forward()` modeling_gemma4.py:1220 applies
+            // `value_states = self.v_norm(value_states)` with
+            // `Gemma4RMSNorm(with_scale=False)` = pure `x * rms` regardless of
+            // K=V mode. For full-attention K=V layers, v_out holds raw K (V
+            // GEMV against aliased K weights). For sliding layers, v_out holds
+            // V projection output. Either way, normalize in place. V does NOT
+            // receive RoPE. Ones (not zeros) because Gemma-4's rms_norm uses
+            // the absolute formula `out = x * rms * weight`.
+            if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    v_out,
+                    v_norm_w,
+                    v_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+        }
+
+        if self.mla.is_some() {
+            // MLA: RoPE already applied inside the MLA block (to rope portions only).
+            // Skip the shared RoPE to avoid double-rotation.
+        } else if !self.qwen4_yarn_inv_freq.is_null() {
+            ops::rope_yarn_scaled(
+                ctx.gpu,
+                self.rope_yarn_scaled_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.qwen4_yarn_inv_freq,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                self.qwen4_yarn_attention_factor,
+                stream,
+            )?;
+        } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
+            // Gemma-4 full-attention: proportional RoPE with rotation pairs
+            // (i, i + head_dim/2) for i < rope_angles. rotary_dim_override
+            // here holds `rope_angles` (64 for 31B full attn).
+            let rope_angles = self
+                .rotary_dim_override
+                .unwrap_or(ctx.config.rotary_dim() as u32);
+            ops::rope_proportional(
+                ctx.gpu,
+                self.rope_proportional_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                nq,
+                nkv,
+                hd,
+                rope_angles,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        } else if self.mrope_interleaved {
+            self.apply_mrope(
+                ctx.gpu,
+                q_out,
+                k_out,
+                meta.positions,
+                meta.positions_h,
+                meta.positions_w,
+                1,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        } else {
+            ops::rope(
+                ctx.gpu,
+                self.rope_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        }
+
+        // K/V are contiguous (separate dense_gemm outputs), stride = nkv * hd
+        let kv_stride = nkv * hd;
+        self.write_kv_cache(
+            ctx.gpu,
+            k_out,
+            v_out,
+            kv_cache,
+            meta.slot,
+            1,
+            nkv,
+            hd,
+            bs as u32,
+            kv_stride,
+            kv_stride,
+            stream,
+            ctx.graph_capture,
+        )?;
+
+        spark_runtime::cublaslt::stage_timer::mark("qkv_kvw", stream);
+        let qsa_indices = match (early_qsa, qsa_overlap) {
+            (Some(indices), Some(ov)) => {
+                ctx.gpu.stream_wait_event(stream, ov.join)?;
+                indices
+            }
+            _ => self.qwen4_qsa_indices(
+                normed,
+                host_seq_len,
+                device_row,
+                kv_cache,
+                ctx,
+                h,
+                eps,
+                stream,
+            )?,
+        };
+
+        spark_runtime::cublaslt::stage_timer::mark("qsa", stream);
+        // Turbo KV cache: apply WHT(Q) and post-WHT InnerQ `scale_inv` before paged
+        // decode when K is stored in a rotated Turbo format (including Turbo2).
+        // Both are bypassed when `TQ_PLUS_WEIGHT_ROTATION=1`.
+        self.apply_turbo_q_wht_and_innerq(ctx.gpu, q_out, nq, hd, stream)?;
+
+        let attn_out = defer_oproj_out.unwrap_or_else(|| ctx.buffers.attn_output());
+        let inv_sqrt_d = self.effective_attn_scale(hd);
+
+        // --high-speed-swap dispatch (Phase 6.2.c — proper).
+        // Routes attention through the orchestrator's tile-streaming kernel
+        // when engaged for this layer. Engagement requires:
+        //   • `--high-speed-swap` + `--high-speed-swap-cache-blocks-per-seq`
+        //     CLI flags (PagedKvCache::config().cache_blocks_per_seq.is_some()).
+        //   • The thread-local orchestrator was installed by the scheduler.
+        //   • The layer's KV dtype is one of {BF16, FP8, NVFP4, Turbo3/4/8}
+        //     (every supported quant has a host-side dequant path that
+        //     produces BF16 for the orchestrator's tiled-attention kernel).
+        // For Turbo: WHT(Q) was applied just above (line 1542) and iWHT(out)
+        // is applied just below (line 1669); the cache holds WHT(K)/WHT(V)
+        // so the streaming kernel sees a self-consistent WHT-domain attention
+        // and the bookend kernels recover real-V.
+        let use_orchestrator = self.high_speed_swap_engaged(kv_cache);
+        anyhow::ensure!(
+            device_row.is_none() || !use_orchestrator,
+            "device-metadata attention cannot enter high-speed-swap dispatch"
+        );
+
+        let dispatch_route = if use_orchestrator {
+            crate::layers::qwen4_qsa::VerifyRowAttentionRoute::HighSpeedSwap
+        } else if matches!(
+            device_row.map(|row| row.route),
+            Some(Qwen4DeviceAttentionRoute::SparseQsa)
+        ) || (ctx.config.is_qwen4_exp()
+            && meta.qwen4_qsa_required
+            && host_seq_len.is_some_and(|seq_len| seq_len >= 2048))
+        {
+            crate::layers::qwen4_qsa::VerifyRowAttentionRoute::SparseQsa
+        } else {
+            crate::layers::qwen4_qsa::VerifyRowAttentionRoute::DensePaged
+        };
+
+        if matches!(
+            dispatch_route,
+            crate::layers::qwen4_qsa::VerifyRowAttentionRoute::HighSpeedSwap
+        ) {
+            // Phase 6.3: per-layer K/V offload to disk. The alloc-time
+            // helper (`ensure_blocks_through_decode`) already grew
+            // `disk_block_ids` and may have already slid the window for
+            // this step's new block; here we just push this layer's K/V
+            // bytes to the on-disk file under each block's disk_id.
+            self.high_speed_swap_offload_new_blocks(
+                kv_cache,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                ctx,
+                stream,
+                nkv,
+                hd,
+                bs,
+            )?;
+            // Streaming attention over the full disk-side history.
+            spark_storage::with_local(|hss| {
+                hss.attend_layer_on_stream(
+                    stream,
+                    self.attn_layer_idx as u32,
+                    disk_block_ids,
+                    q_out.0,
+                    attn_out.0,
+                )
+            })
+            .expect("local installed checked in high_speed_swap_engaged")?;
+            spark_runtime::cublaslt::stage_timer::mark("core", stream);
+            self.apply_turbo_out_iwht(ctx.gpu, attn_out, nq, hd, stream)?;
+            if self.gated {
+                let gate_ptr = q_out.offset(q_dim as usize * 2);
+                ops::sigmoid_gate_mul(
+                    ctx.gpu,
+                    self.sigmoid_gate_mul_k,
+                    attn_out,
+                    gate_ptr,
+                    attn_out,
+                    nq * hd,
+                    stream,
+                )?;
+            }
+        } else {
+            let needs_iwht = self.needs_turbo_out_iwht(hd);
+            let gate_opt = (self.gated && !needs_iwht).then(|| q_out.offset(q_dim as usize * 2));
+            let gate_fused = if matches!(
+                dispatch_route,
+                crate::layers::qwen4_qsa::VerifyRowAttentionRoute::SparseQsa
+            ) {
+                // Only Qwen4 switches to sparse attention at 2048. Without the
+                // model check every other model's host-route decode past 2048
+                // (e.g. Qwen3.8's DFlash bootstrap decode after a long prompt)
+                // failed here for want of a QSA indexer it never has.
+                let qsa = self
+                    .qwen4_qsa
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Qwen4 context beyond 2048 requires QSA"))?;
+                qsa.sparse_attention_bf16_gated(
+                    q_out,
+                    qsa_indices.expect("QSA index update ran above"),
+                    attn_out,
+                    kv_cache,
+                    meta,
+                    self.attn_layer_idx,
+                    nq,
+                    nkv,
+                    hd,
+                    inv_sqrt_d,
+                    gate_opt,
+                    ctx.gpu,
+                    stream,
+                )?
+            } else {
+                let max_seq_len_host = if let Some(row) = device_row {
+                    anyhow::ensure!(
+                        matches!(
+                            row.route,
+                            Qwen4DeviceAttentionRoute::DensePaged { num_splits: 2 }
+                        ),
+                        "invalid device-metadata dense-paged topology"
+                    );
+                    0
+                } else {
+                    host_seq_len
+                        .expect("host dense-paged route checked above")
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("attention sequence length overflow"))?
+                        as u32
+                };
+                // Single-sequence decode path: tree-aware indirection is only
+                // active in K=γ verify (decode_multi_seq path), so always pass
+                // null here.
+                self.run_paged_decode_with_gate(
+                    ctx.gpu,
+                    q_out,
+                    kv_cache,
+                    attn_out,
+                    meta.block_table,
+                    meta.seq_len,
+                    meta.max_blocks_per_seq,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    bs as u32,
+                    inv_sqrt_d,
+                    nq * hd,
+                    ctx.buffers.splitk_workspace(),
+                    spark_runtime::gpu::DevicePtr::NULL,
+                    spark_runtime::gpu::DevicePtr::NULL,
+                    0,
+                    // The device-metadata route seals legacy two-way split-K and
+                    // therefore has no frame-varying host scalar in the launch.
+                    max_seq_len_host,
+                    gate_opt.map(|ptr| (ptr, nq * hd)),
+                    stream,
+                )?
+            };
+
+            spark_runtime::cublaslt::stage_timer::mark("core", stream);
+            if needs_iwht {
+                use spark_runtime::kernel_args::KernelLaunch;
+                KernelLaunch::new(ctx.gpu, self.wht_bf16_k_inv)
+                    .grid([nq, 1, 1])
+                    .block([32, 1, 1])
+                    .arg_ptr(attn_out)
+                    .arg_u32(hd)
+                    .launch(stream)?;
+            }
+            if self.gated && !gate_fused {
+                let gate_ptr = q_out.offset(q_dim as usize * 2);
+                ops::sigmoid_gate_mul(
+                    ctx.gpu,
+                    self.sigmoid_gate_mul_k,
+                    attn_out,
+                    gate_ptr,
+                    attn_out,
+                    nq * hd,
+                    stream,
+                )?;
+            }
+        }
+
+        let output = if defer_oproj {
+            attn_out
+        } else {
+            // O projection ── (extracted to attention_forward_oproj.rs)
+            let output = self.attention_forward_oproj(attn_out, nq, hd, h, ctx, stream)?;
+            spark_runtime::cublaslt::stage_timer::mark("o_proj", stream);
+            output
+        };
+        Ok((output, dispatch_route))
+    }
+}
+
+#[cfg(test)]
+mod qsa_route_tests {
+    /// Only Qwen4 switches host-route decode to QSA at 2048. Without the model
+    /// check every other model's decode past 2048 (e.g. Qwen3.8's DFlash
+    /// bootstrap and plain decode after a long prompt) failed with "Qwen4
+    /// context beyond 2048 requires QSA".
+    #[test]
+    fn host_route_qsa_switch_is_qwen4_only() {
+        let src = include_str!("attention_forward.rs");
+        let branch = src
+            .split_once("let dispatch_route =")
+            .expect("QSA dispatch predicate present")
+            .1
+            .split_once(";\n\n        if matches!")
+            .expect("QSA dispatch predicate terminates")
+            .0;
+        assert!(branch.contains("seq_len >= 2048"), "{branch}");
+        assert!(
+            branch.contains("ctx.config.is_qwen4_exp()"),
+            "the 2048 QSA switch must be gated on Qwen4: {branch}"
+        );
+    }
+}

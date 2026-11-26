@@ -1,0 +1,124 @@
+name: CUDA Kernel Compile & PTX ISA Gate
+
+# GPU-less CUDA kernel compilation and binary ISA verification using the
+# official NVIDIA CUDA 13.0 devel container (matching docker/sm120/Dockerfile
+# and docker/gb10/Dockerfile). Compiles critical Blackwell kernels with `nvcc`
+# and proves zero register spills, block-scaled FP8 MMA emission, L2 discard
+# instructions, and zero illegal odd `desc[UR]` SASS descriptors without
+# requiring a physical GPU runner.
+
+on:
+  pull_request:
+    paths:
+      - 'kernels/**'
+      - 'crates/atlas-kernels/**'
+      - 'repro-kit/formal/verify_ptx_isa_contracts.py'
+      - '.github/workflows/kernel-compile.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'kernels/**'
+      - 'crates/atlas-kernels/**'
+      - 'repro-kit/formal/verify_ptx_isa_contracts.py'
+      - '.github/workflows/kernel-compile.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: kernel-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ptx-isa-compile:
+    name: nvcc PTX/SASS Compile & Zero-Spill Gate (sm_121a & sm_120a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    container:
+      image: nvidia/cuda:13.0.0-devel-ubuntu24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify CUDA toolchain and ensure Python 3 is available
+        run: |
+          set -euo pipefail
+          if ! command -v python3 >/dev/null 2>&1; then
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends python3
+            rm -rf /var/lib/apt/lists/*
+          fi
+          nvcc --version
+          cuobjdump --version
+          python3 --version
+
+      - name: Run sm_121a (GB10) PTX & SASS formal ISA / zero-spill contracts
+        run: |
+          set -euo pipefail
+          python3 -B repro-kit/formal/verify_ptx_isa_contracts.py
+
+      - name: Compile flagship sm_120a (discrete Blackwell) kernels & assert zero spills
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          from pathlib import Path
+          import re, subprocess, tempfile
+
+          ROOT = Path(".").resolve()
+          COMMON_INC = ROOT / "kernels/gb10/common"
+          SPILL_RE = re.compile(
+              r"(\d+)\s+bytes\s+stack\s+frame,\s*(\d+)\s+bytes\s+spill\s+stores,\s*(\d+)\s+bytes\s+spill\s+loads"
+          )
+          SM120_KERNELS = (
+              "kernels/gb10/common/paged_decode_attn_fp8.cu",
+              "kernels/gb10/common/paged_decode_attn_nvfp4.cu",
+              "kernels/gb10/common/quantize_bf16_to_nvfp4.cu",
+              "kernels/gb10/common/w3a16_gemm.cu",
+              "kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4_qsa_prefill_attn_fp8.cu",
+              "kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4_moe_compact_t_k32_v28.cu",
+              "kernels/gb10/qwen3.8-flash-next/nvfp4/w4a16_gemm.cu",
+          )
+
+          with tempfile.TemporaryDirectory(prefix="flux-sm120a-ci-") as tmp:
+              tmpdir = Path(tmp)
+              total_entries = 0
+              for rel in SM120_KERNELS:
+                  src = ROOT / rel
+                  out = tmpdir / (src.stem + ".sm120a.cubin")
+                  cmd = [
+                      "nvcc",
+                      "-O3",
+                      "--fmad=false",
+                      "-gencode",
+                      "arch=compute_120a,code=sm_120a",
+                      "--ptxas-options=-v",
+                      "-c",
+                      f"-I{src.parent}",
+                      f"-I{COMMON_INC}",
+                      str(src),
+                      "-o",
+                      str(out),
+                  ]
+                  proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                  if proc.returncode != 0:
+                      raise SystemExit(f"sm_120a compile failed for {rel}:\n{proc.stderr}")
+                  matches = SPILL_RE.findall(proc.stderr)
+                  if not matches:
+                      raise SystemExit(f"sm_120a ptxas -v emitted no entry stats for {rel}:\n{proc.stderr}")
+                  max_stack = max(int(m[0]) for m in matches)
+                  max_stores = max(int(m[1]) for m in matches)
+                  max_loads = max(int(m[2]) for m in matches)
+                  if max_stack != 0 or max_stores != 0 or max_loads != 0:
+                      raise SystemExit(
+                          f"sm_120a non-zero spills in {rel}: stack={max_stack}, "
+                          f"spill_stores={max_stores}, spill_loads={max_loads}\n{proc.stderr}"
+                      )
+                  total_entries += len(matches)
+                  print(f"[PASS] sm_120a {rel} ({len(matches)} entries, 0 stack/spills)")
+              print(f"Verified {len(SM120_KERNELS)} flagship sm_120a kernels ({total_entries} entries): 0 spills.")
+          PY

@@ -1,0 +1,200 @@
+{
+  "milestone": "Milestone 5 \u2014 Packaging, Provenance, Privacy, and API Suite (R5)",
+  "verdict": "PASS",
+  "timestamp_utc": "2026-10-25T17:01:49Z",
+  "hardware": "NVIDIA DGX Spark (GB10, SM121a, 128 GB unified memory)",
+  "model": "Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+  "head_commit": "b47b9fe6b0c5826df769277bb306f5b41e2372c7",
+  "container_image": {
+    "tags": [
+      "flux-engine:r17-candidate",
+      "ghcr.io/theapathy/flux-engine:v0.9.14",
+      "ghcr.io/theapathy/flux-engine:v0.9.14-r17",
+      "ghcr.io/theapathy/flux-engine:gb10",
+      "ghcr.io/theapathy/flux-engine:latest"
+    ],
+    "image_id": "sha256:7bf7806eae0d7cd7cbad5c8c345ad91215ce7033c57506a493785bf508ae157c",
+    "base_image": "nvidia/cuda:13.0.0-runtime-ubuntu24.04",
+    "release_version": "v0.9.14",
+    "build_args": {
+      "BASE_IMAGE": "nvidia/cuda:13.0.0-runtime-ubuntu24.04",
+      "RELEASE_VERSION": "v0.9.14",
+      "FLUX_BINARY_PATH": "repro-kit/bin/flux-server-real",
+      "BINARY_SHA256": "a3b49aa3e1e3eb41b20bc28c4193026522865ee083d2d3e0cc1135d333da8b5e",
+      "RECIPE_HIGH_PREFILL_SHA256": "00ef1a839bcfd2d2b65799846efe3441dcd267857354e48e5f0335f2f54aa3c6",
+      "RECIPE_INTERACTIVE_SHA256": "dce6f9e14fc03f908eab406bfbb4f24755bf4447e198faec16dc37bc5f861869"
+    }
+  },
+  "provenance_verification": {
+    "status": "PASS",
+    "standoff_byte_extraction": {
+      "binary": {
+        "container_path": "/opt/flux/bin/flux-server-real",
+        "sha256": "a3b49aa3e1e3eb41b20bc28c4193026522865ee083d2d3e0cc1135d333da8b5e",
+        "match": true
+      },
+      "recipe_high_prefill": {
+        "container_path": "/opt/flux/repro-kit/recipes/flux-v9-max-prefill.env",
+        "sha256": "00ef1a839bcfd2d2b65799846efe3441dcd267857354e48e5f0335f2f54aa3c6",
+        "match": true
+      },
+      "recipe_interactive": {
+        "container_path": "/opt/flux/repro-kit/recipes/flux-v9-w4096-interactive.env",
+        "sha256": "dce6f9e14fc03f908eab406bfbb4f24755bf4447e198faec16dc37bc5f861869",
+        "match": true
+      }
+    },
+    "test_suites": {
+      "test_image_provenance": {
+        "total": 24,
+        "passed": 24,
+        "failed": 0
+      },
+      "test_r17_release_binding_successor": {
+        "total": 12,
+        "passed": 12,
+        "failed": 0
+      },
+      "test_release_metadata": {
+        "total": 5,
+        "passed": 5,
+        "failed": 0
+      },
+      "total_tests": 41,
+      "total_passed": 41,
+      "total_failed": 0
+    }
+  },
+  "privacy_audit": {
+    "status": "PASS",
+    "engine": "docker export tar streaming scanner",
+    "files_scanned": 9455,
+    "bytes_scanned": 2955569430,
+    "host_path_violations": 0,
+    "secret_violations": 0,
+    "state_token_violations": 0,
+    "total_violations": 0
+  },
+  "api_qualification_suite": {
+    "status": "PASS",
+    "endpoint": "http://127.0.0.1:8899",
+    "hardware_lock": "$FLUX_LOCK_FILE",
+    "pre_flight_mem_gib": 105.19,
+    "post_flight_mem_gib": 105.13,
+    "readiness_time_seconds": 180.1,
+    "total_assertions": 9,
+    "passed_assertions": 9,
+    "assertions": {
+      "health": {
+        "status": "PASS",
+        "http_status": 200,
+        "body": {
+          "status": "ready",
+          "model": "qad5500"
+        }
+      },
+      "models": {
+        "status": "PASS",
+        "http_status": 200,
+        "models": [
+          "qad5500"
+        ],
+        "selected_model": "qad5500"
+      },
+      "chat_blocking": {
+        "status": "PASS",
+        "http_status": 200,
+        "content": "READY",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 19,
+          "completion_tokens": 2,
+          "total_tokens": 21,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "audio_tokens": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0,
+            "audio_tokens": 0,
+            "accepted_prediction_tokens": 0,
+            "rejected_prediction_tokens": 0
+          },
+          "time_to_first_token_ms": 514.1387010000001,
+          "response_token/s": 31.99368726157904
+        }
+      },
+      "chat_streaming_sse": {
+        "status": "PASS",
+        "chunks_count": 3,
+        "content": "1, 2, 3, 4, 5",
+        "done_seen": true
+      },
+      "tool_calling_blocking": {
+        "status": "PASS",
+        "finish_reason": "tool_calls",
+        "tool_call": {
+          "id": "call_0000000000000000",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}"
+          }
+        },
+        "parsed_arguments": {
+          "city": "Paris"
+        }
+      },
+      "tool_calling_streaming": {
+        "status": "PASS",
+        "chunks_count": 4,
+        "function_name": "get_weather",
+        "assembled_arguments": "{\"city\":\"Paris\"}",
+        "parsed_arguments": {
+          "city": "Paris"
+        },
+        "finish_reason": "tool_calls"
+      },
+      "client_cancellation": {
+        "status": "PASS",
+        "chunks_before_cancellation": 8,
+        "abrupt_drop": true
+      },
+      "slot_reuse_and_recovery": {
+        "status": "PASS",
+        "http_status": 200,
+        "content": "OK",
+        "atlas_requests_active": 0.0
+      },
+      "raw_log_safety": {
+        "status": "PASS",
+        "total_log_lines": 9500,
+        "fatal_matches_count": 0,
+        "fatal_matches": []
+      }
+    }
+  },
+  "artifacts": {
+    "api_qualification_receipt": {
+      "path": "qualification/api_qualification_receipt.json",
+      "sha256": "8d1e2a219f1093201ad66bfe36b87794bcb3a95f41acf191bdb01dce587005fd",
+      "historical_pre_sanitization_sha256": "a86b42f728cf1d3c6d5811e7640d410fac63a91011e4781a4e8152a7711fc7a9"
+    },
+    "audit_rootfs_privacy_script": {
+      "path": "qualification/audit_rootfs_privacy.py",
+      "sha256": "f0abd645e463ef5c5041e58b80c1d5b4654c039e54a27fa0c42bf4a39071dde7",
+      "historical_pre_sanitization_sha256": "edf07d05b0aa5f0b22e893b99287d5ade02238f6866b0bab7f495d76a2f01923"
+    },
+    "privacy_scan_results": {
+      "status": "historical_overwritten_by_later_release",
+      "historical_path": "qualification/privacy_scan_results.json",
+      "historical_v0_9_14_sha256": "c575a600bf7595db430e7801444e7badaa82903cad1e8e2f304725887e6705fc",
+      "note": "Original v0.9.14 privacy scan receipt (9,455 files, 2,955,569,430 bytes, 0 violations) was overwritten on disk when a subsequent 9.15.2 scan wrote to the shared path; that 9.15.2 scan has been relocated to qualification/container-9.15.2/rootfs-privacy-audit-7b6b57df.json."
+    },
+    "run_m5_api_qualification_script": {
+      "path": "qualification/run_m5_api_qualification.py",
+      "sha256": "ee17fb9036ea70c3ac0a7a3b9cf9589dcccc9b3c7e8285b9c71b6a138ab33d84",
+      "historical_pre_sanitization_sha256": "ad4706e4f6cc02f6d7466a5f7e54e4747aad571f7014863c1c30d7b795234bb1"
+    }
+  }
+}

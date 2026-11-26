@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""flux-router: multi-Spark data parallelism (DP) for N single-Spark flux-servers (TRACKER K2).
+
+This is NOT native single-engine C64 (rows64 P2). Each backend is an independent
+flux-server. HAProxy balances by least outstanding requests, caps every backend
+at its concurrency so none answers 429 (admission is try_send,
+api/inference_impl.rs), queues overflow at the router, and removes a backend
+whose /health is not 200 within 3 s. Stored-object routes (responses or chat
+completions by id, conversations, files, batches) live on one backend under a
+random UUID, so they get 501 instead of being misrouted.
+
+  FLUX_ROUTER_BACKENDS="spark-a:8888=32,spark-b:8888=32" flux-router [--port 8888]
+  flux-router --backends spark-a:8888=32 --render-only    # print the HAProxy config
+
+A cap may be omitted ("spark-a:8888") once the backend publishes
+/flux/modes -> serving.concurrency (see README); an explicit cap must then match it.
+"""
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+from typing import NamedTuple
+
+NATIVE_MAX_ROWS = 128  # Router/launcher default per-backend cap (engine hard ceiling is 256 in crates/spark-model/src/layers/mod.rs)
+DEFAULT_QUEUE_TIMEOUT_S = 120
+REQUEST_TIMEOUT_S = 1800
+STATEFUL_PREFIXES = ("/v1/conversations", "/v1/files", "/v1/batches")
+STATEFUL_BY_ID = r"^/v1/(chat/completions|responses)/[^/]+"
+DISAGG_PREFIX = "/v1/disagg"
+SETTINGS_PATH = "/v1/flux/settings"
+DEFAULT_RUN_DIR = Path("/run/flux-router")
+HAPROXY_HARD_STOP_AFTER = "30s"
+# POSIX sh supervisor that traps SIGTERM/SIGINT/SIGUSR1 and forwards SIGUSR1 to
+# HAProxy (`-W` master-worker mode) so active SSE streams drain gracefully up to
+# `hard-stop-after` instead of being severed immediately on SIGTERM.
+HAPROXY_SOFT_STOP_WRAPPER = (
+    'haproxy="$1"; cfg="$2"; '
+    '"$haproxy" -W -f "$cfg" & pid=$!; '
+    'sig_seen=0; '
+    'trap \'sig_seen=1; kill -USR1 "$pid" 2>/dev/null || true\' TERM INT USR1; '
+    'wait "$pid"; status=$?; '
+    'while [ "$sig_seen" -eq 1 ]; do sig_seen=0; wait "$pid"; status=$?; done; '
+    'exit "$status"'
+)
+_SAFE_PATH = re.compile(r"/[A-Za-z0-9._/-]+")
+BODY_503 = json.dumps({
+    "error": {
+        "message": "all backends are busy or unavailable; retry after a short delay",
+        "type": "server_error",
+    }
+})
+# POST /v1/responses bodies are classified by flux_state.lua (a top-level JSON
+# scan with serde-equivalent name decoding): a non-null previous_response_id or
+# conversation resolves against one server's local store (api/responses.rs) -> 501;
+# a body that is not one complete JSON object -> 400 (fail closed).
+LUA_FILE = Path(__file__).resolve().parent / "flux_state.lua"
+# The body check needs the whole body in one buffer: /v1/responses bodies larger
+# than this are refused (413) rather than forwarded unchecked.
+RESPONSES_BODY_MAX = 256 * 1024
+_HOSTNAME = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                       r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+
+
+class Backend(NamedTuple):
+    host: str           # canonical: lower-case name, or an IP literal (IPv6 without brackets)
+    port: int
+    cap: int | None     # None = discover from /flux/modes
+
+    @property
+    def addr(self) -> str:
+        return f"[{self.host}]:{self.port}" if ":" in self.host else f"{self.host}:{self.port}"
+
+
+def _canonical_host(raw: str) -> str:
+    """Reject anything that is not a plain hostname or IP literal: the value is
+    written into the HAProxy config, so whitespace or newlines would inject directives."""
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            return str(ipaddress.IPv6Address(raw[1:-1]))
+        except ValueError:
+            raise ValueError(f"bad IPv6 literal {raw!r}") from None
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        if not _HOSTNAME.fullmatch(raw):  # `$` would accept a trailing newline
+            raise ValueError(f"bad host {raw!r}: hostname, IPv4 or [IPv6] only") from None
+        return raw.lower()
+    if ip.version == 6:
+        raise ValueError(f"IPv6 host {raw!r} must be bracketed: [{raw}]:port")
+    return str(ip)
+
+
+def _parse_int(s: str, what: str, lo: int, hi: int) -> int:
+    if not re.fullmatch(r"[0-9]+", s):
+        raise ValueError(f"{what} must be an integer, got {s!r}")
+    n = int(s)
+    if not lo <= n <= hi:
+        raise ValueError(f"{what} must be {lo}..{hi}, got {n}")
+    return n
+
+
+def parse_backends(spec: str, default_cap: int | None = None) -> list[Backend]:
+    out: list[Backend] = []
+    for raw in (s.strip() for s in spec.split(",")):
+        if not raw:
+            raise ValueError(f"empty backend entry in {spec!r}")
+        addr, eq, cap_s = raw.partition("=")
+        host_s, sep, port_s = addr.rpartition(":")
+        if not sep or not host_s:
+            raise ValueError(f"backend {raw!r} must be host:port[=cap]")
+        host = _canonical_host(host_s)
+        port = _parse_int(port_s, f"port in {raw!r}", 1, 65535)
+        cap = _parse_int(cap_s, f"cap in {raw!r}", 1, NATIVE_MAX_ROWS) if eq else default_cap
+        if any((b.host, b.port) == (host, port) for b in out):
+            raise ValueError(f"backend {host}:{port} listed twice")
+        out.append(Backend(host, port, cap))
+    return out
+
+
+def _validate_path(path: str, label: str) -> None:
+    if not _SAFE_PATH.fullmatch(path):
+        raise ValueError(f"{label} {path!r} must be a plain absolute path")
+
+
+def render_errorfile_503() -> bytes:
+    """Raw HTTP/1.1 503 response for HAProxy `errorfile 503` (queue timeout / no backends)."""
+    body = BODY_503.encode("utf-8")
+    return (
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Cache-Control: no-cache\r\n"
+        b"Connection: close\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Retry-After: 5\r\n"
+        + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        + body
+    )
+
+
+def render_config(backends: list[Backend], bind_port: int = 8888,
+                  queue_timeout_s: int = DEFAULT_QUEUE_TIMEOUT_S,
+                  stats_port: int | None = None,
+                  lua_path: str = "/etc/flux-router/flux_state.lua",
+                  errorfile_503_path: str = "/etc/flux-router/503.http") -> str:
+    _validate_path(lua_path, "lua_path")
+    _validate_path(errorfile_503_path, "errorfile_503_path")
+    if stats_port is not None:
+        if type(stats_port) is not int or not 1 <= stats_port <= 65535:
+            raise ValueError(f"stats_port must be 1..65535, got {stats_port!r}")
+    if any(b.cap is None for b in backends):
+        raise ValueError("every backend needs a cap before rendering")
+    servers = "\n".join(
+        f"  server b{i} {b.addr} check inter 2s fall 2 rise 3 maxconn {b.cap} maxqueue 0"
+        for i, b in enumerate(backends))
+    body_501 = json.dumps({"error": {"message": "stored objects are not routable in multi-Spark mode",
+                                     "type": "not_supported"}})
+    body_501_disagg = json.dumps({"error": {
+        "message": "disaggregated serving routes (/v1/disagg/*) are not routable in multi-Spark mode",
+        "type": "not_supported"}})
+    body_501_settings = json.dumps({"error": {
+        "message": "mutating /v1/flux/settings is not supported in multi-Spark mode; update each backend directly",
+        "type": "not_supported"}})
+    body_400 = json.dumps({"error": {"message": "multi-Spark mode needs a complete JSON object body on /v1/responses",
+                                     "type": "invalid_request_error"}})
+    body_413 = json.dumps({"error": {"message": "multi-Spark mode inspects /v1/responses bodies up to "
+                                     f"{RESPONSES_BODY_MAX} bytes; use /v1/chat/completions for larger requests",
+                                     "type": "request_too_large"}})
+    stats = (f"frontend stats\n  bind 127.0.0.1:{stats_port}\n  stats enable\n  stats uri /stats\n"
+             if stats_port is not None else "")
+    return f"""# rendered by flux-router; do not edit
+global
+  log stdout format raw local0
+  hard-stop-after {HAPROXY_HARD_STOP_AFTER}
+  tune.bufsize {RESPONSES_BODY_MAX + 65536}
+  lua-load {lua_path}
+defaults
+  mode http
+  log global
+  option httplog
+  timeout connect 5s
+  timeout http-request 30s
+  timeout http-keep-alive 10s
+  timeout client {REQUEST_TIMEOUT_S}s
+  timeout server {REQUEST_TIMEOUT_S}s
+  timeout queue {queue_timeout_s}s
+  timeout check 3s
+  option http-buffer-request
+  errorfile 503 {errorfile_503_path}
+frontend flux
+  bind :{bind_port}
+  monitor-uri /health
+  monitor fail if {{ nbsrv(sparks) lt 1 }}
+  acl is_ready path /ready
+  acl no_healthy_backends nbsrv(sparks) lt 1
+  http-request return status 503 content-type application/json hdr Retry-After 5 string '{BODY_503}' if is_ready no_healthy_backends
+  http-request return status 200 content-type application/json string '{{"status":"ready"}}' if is_ready
+  acl is_get method GET
+  acl is_post method POST
+  acl is_options method OPTIONS
+  acl stateful path_beg {" ".join(STATEFUL_PREFIXES)}
+  acl by_id path_reg {STATEFUL_BY_ID}
+  acl disagg path {DISAGG_PREFIX}
+  acl disagg path_beg {DISAGG_PREFIX}/
+  acl flux_settings path {SETTINGS_PATH}
+  acl flux_settings path_beg {SETTINGS_PATH}/
+  acl responses path /v1/responses
+  acl responses_too_big req.hdr_val(content-length) gt {RESPONSES_BODY_MAX}
+  acl responses_too_big req.body_size gt {RESPONSES_BODY_MAX}
+  acl state_ref var(txn.flux_state) -m str 1
+  acl body_bad var(txn.flux_state) -m str bad
+  http-request return status 501 content-type application/json string '{body_501}' if !is_options stateful or !is_options by_id
+  http-request return status 501 content-type application/json string '{body_501_disagg}' if !is_options disagg
+  http-request return status 501 content-type application/json string '{body_501_settings}' if !is_options !is_get flux_settings
+  http-request return status 413 content-type application/json string '{body_413}' if is_post responses responses_too_big
+  http-request set-var(txn.flux_state) lua.flux_state_ref if is_post responses
+  http-request return status 400 content-type application/json string '{body_400}' if is_post responses body_bad
+  http-request return status 501 content-type application/json string '{body_501}' if is_post responses state_ref
+  default_backend sparks
+{stats}backend sparks
+  balance leastconn
+  option httpchk GET /health
+  http-check expect status 200
+  retries 1
+  option redispatch
+  retry-on conn-failure
+  http-response set-header X-Flux-Backend %s
+{servers}
+"""
+
+
+def _discovery_key() -> str | None:
+    """Bearer key for the router's own startup checks against --require-auth
+    backends. Never rendered into the HAProxy config or logged."""
+    path = os.environ.get("FLUX_ROUTER_DISCOVERY_KEY_FILE")
+    if path:
+        return Path(path).read_text().strip() or None
+    return os.environ.get("FLUX_ROUTER_DISCOVERY_KEY") or None
+
+
+def _get_json(b: Backend, path: str):
+    req = urllib.request.Request(f"http://{b.addr}{path}")
+    key = _discovery_key()
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def resolve_caps(backends: list[Backend], fetch=_get_json) -> list[Backend]:
+    """Fill or verify each cap against the backend's published serving.concurrency: the scheduler's
+    batch width resolved at load (after the EP clamp), never the ingress queue size."""
+    out = []
+    for b in backends:
+        modes = fetch(b, "/flux/modes")
+        if modes is None:
+            modes = {}
+        if not isinstance(modes, dict):
+            sys.exit(f"flux-router: REFUSING: {b.addr} publishes a non-object modes response")
+        serving = modes.get("serving", {})
+        if not isinstance(serving, dict):
+            sys.exit(f"flux-router: REFUSING: {b.addr} publishes a non-object serving block")
+        # only `concurrency` (the scheduler's resolved batch width) is capacity; max_num_seqs /
+        # ingress_queue size the ingress channel and must never cap a backend
+        published = "concurrency" in serving
+        served = serving.get("concurrency")
+        if published and (type(served) is not int or not 0 < served <= NATIVE_MAX_ROWS):
+            sys.exit(f"flux-router: REFUSING: {b.addr} publishes invalid serving concurrency {served!r}")
+        if b.cap is None:
+            if not isinstance(served, int):
+                sys.exit(f"flux-router: REFUSING: {b.addr} publishes no serving.concurrency; "
+                         f"give its cap explicitly as {b.addr}=N")
+            if not 0 < served <= NATIVE_MAX_ROWS:
+                sys.exit(f"flux-router: REFUSING: {b.addr} concurrency={served} is outside 1..{NATIVE_MAX_ROWS}")
+            b = b._replace(cap=served)
+        elif isinstance(served, int) and served != b.cap:
+            sys.exit(f"flux-router: REFUSING: {b.addr} cap {b.cap} != its published concurrency {served}")
+        out.append(b)
+    return out
+
+
+def check_same_model(ids: dict[str, str | None]) -> None:
+    missing = [k for k, v in ids.items() if not v]
+    if missing:
+        sys.exit(f"flux-router: REFUSING: no model from {', '.join(missing)} (/v1/models)")
+    if len(set(ids.values())) > 1:
+        sys.exit(f"flux-router: REFUSING: backends serve different models: {ids}")
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    try:
+        return _parse_int(v, name, lo, hi)
+    except ValueError as e:
+        sys.exit(f"flux-router: {e}")
+
+
+def _is_usable_dir(p: Path) -> bool:
+    return (
+        p.is_absolute()
+        and not p.is_symlink()
+        and p.is_dir()
+        and os.access(p, os.W_OK | os.X_OK)
+        and bool(_SAFE_PATH.fullmatch(str(p)))
+    )
+
+
+def _resolve_run_dir(port: int, *, create: bool = True,
+                     default_dir: Path | None = None) -> Path:
+    """Prefer /run/flux-router (if writable), then $XDG_RUNTIME_DIR/flux-router,
+    then a private mkdtemp directory instead of predictable /tmp/flux-router-{uid}."""
+    base = DEFAULT_RUN_DIR if default_dir is None else default_dir
+    if _is_usable_dir(base):
+        return base
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        xdg_path = Path(xdg)
+        if _is_usable_dir(xdg_path):
+            sub = xdg_path / "flux-router"
+            if not sub.is_symlink() and _SAFE_PATH.fullmatch(str(sub)):
+                if not create:
+                    return sub
+                try:
+                    sub.mkdir(mode=0o700, exist_ok=True)
+                except OSError:
+                    pass
+                else:
+                    if _is_usable_dir(sub):
+                        return sub
+    if create:
+        return Path(tempfile.mkdtemp(prefix=f"flux-router-{port}-"))
+    return Path("/etc/flux-router")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--port", type=int, default=_env_int("FLUX_ROUTER_PORT", 8888, 1, 65535))
+    ap.add_argument("--backends", default=os.environ.get("FLUX_ROUTER_BACKENDS", ""))
+    ap.add_argument("--queue-timeout", type=int,
+                    default=_env_int("FLUX_ROUTER_QUEUE_TIMEOUT_S", DEFAULT_QUEUE_TIMEOUT_S, 1, 86400))
+    ap.add_argument("--stats-port", type=int, default=None, help="localhost-only HAProxy stats page")
+    ap.add_argument("--render-only", action="store_true")
+    ap.add_argument("--skip-backend-checks", action="store_true", help="offline rendering/tests only")
+    a = ap.parse_args(argv)
+    for name, v, lo, hi in (("--port", a.port, 1, 65535), ("--queue-timeout", a.queue_timeout, 1, 86400)):
+        if not lo <= v <= hi:
+            sys.exit(f"flux-router: {name} must be {lo}..{hi}")
+    if a.stats_port is not None and not 1 <= a.stats_port <= 65535:
+        sys.exit("flux-router: --stats-port must be 1..65535")
+    try:
+        backends = parse_backends(a.backends)
+    except ValueError as e:
+        sys.exit(f"flux-router: {e}")
+    if not a.skip_backend_checks:
+        check_same_model({b.addr: ((_get_json(b, "/v1/models") or {}).get("data") or [{}])[0].get("id")
+                          for b in backends})
+        backends = resolve_caps(backends)
+    elif any(b.cap is None for b in backends):
+        sys.exit("flux-router: --skip-backend-checks needs an explicit cap on every backend")
+    if a.render_only:
+        run_dir = _resolve_run_dir(a.port, create=False)
+        lua_path = run_dir / f"flux_state-{a.port}.lua"
+        errorfile_503_path = run_dir / f"503-{a.port}.http"
+        try:
+            cfg = render_config(backends, a.port, a.queue_timeout, a.stats_port,
+                                str(lua_path), str(errorfile_503_path))
+        except ValueError as e:
+            sys.exit(f"flux-router: {e}")
+        print(cfg, end="")
+        return 0
+    haproxy = shutil.which("haproxy")
+    if not haproxy:
+        sys.exit("flux-router: haproxy not found on PATH (apt install haproxy, or use the haproxy:2.8 image)")
+    run_dir = _resolve_run_dir(a.port, create=True)
+    lua_path = run_dir / f"flux_state-{a.port}.lua"
+    errorfile_503_path = run_dir / f"503-{a.port}.http"
+    try:
+        cfg = render_config(backends, a.port, a.queue_timeout, a.stats_port,
+                            str(lua_path), str(errorfile_503_path))
+    except ValueError as e:
+        sys.exit(f"flux-router: {e}")
+    shutil.copyfile(LUA_FILE, lua_path)
+    errorfile_503_path.write_bytes(render_errorfile_503())
+    path = run_dir / f"flux-router-{a.port}.cfg"
+    path.write_text(cfg)
+    print(f"flux-router: {len(backends)} backends, total cap {sum(b.cap for b in backends)}, "
+          f"port {a.port}, config {path}", file=sys.stderr)
+    os.execv(
+        "/bin/sh",
+        ["/bin/sh", "-c", HAPROXY_SOFT_STOP_WRAPPER, "flux-router-supervisor", haproxy, str(path)],
+    )
+    return 0  # unreachable
+
+
+if __name__ == "__main__":
+    sys.exit(main())

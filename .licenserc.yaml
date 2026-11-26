@@ -1,0 +1,17 @@
+header:
+  license:
+    spdx-id: AGPL-3.0-only
+    content: |
+      SPDX-License-Identifier: AGPL-3.0-only
+  paths:
+    - 'crates/**/*.rs'
+    - 'kernels/**/*.{cu,cuh,h,hpp,cpp}'
+  paths-ignore:
+    - 'target/**'
+    - 'target-*/**'
+    - 'LICENSES/**'
+    - 'kernels/gb10/qwen3.6-27b/nvfp4/q4k_vendor/**'
+    - 'kernels/gb10/glm5.3-flash/exl3/glm53_exl3_moe_private.cu'
+    - 'kernels/gb10/glm5.3-flash/exl3/glm53_exl3_moe_private_hadamard.cuh'
+    - 'repro-kit/llm-inference-bench/**'
+  comment: on-failure

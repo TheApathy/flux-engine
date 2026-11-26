@@ -1,0 +1,22 @@
+{
+  "chunked_prefill_covered": false,
+  "control_extra_row_fails_identity": false,
+  "control_extra_row_fails_state": false,
+  "control_legacy_restage_fails_identity": false,
+  "control_legacy_restage_fails_state": false,
+  "engine": "flux-engine",
+  "identity_binary_sha256": "",
+  "identity_prompts": [],
+  "identity_trials_differ": 0,
+  "identity_trials_equal": 0,
+  "kernel_harness_bit_identical": false,
+  "perturbed_prompt_control_differs": false,
+  "schema": "atlas.glm53.speculative_admission.v1",
+  "scope": "greedy",
+  "spec_source_fnv1a64": "91450abd80196d85",
+  "state_binary_sha256": "",
+  "state_full_positions_equal": 0,
+  "state_gate_passed": false,
+  "state_layers": "",
+  "state_prefix_positions_equal": 0
+}

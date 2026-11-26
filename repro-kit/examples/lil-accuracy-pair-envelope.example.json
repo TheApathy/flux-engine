@@ -1,0 +1,90 @@
+{
+  "schema": "flux-lil-accuracy-pair-envelope-v1",
+  "model": "qwen38-qad5500-r9",
+  "artifacts": {
+    "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "binary_path": "/opt/flux/bin/flux-server-real",
+    "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_revision": "0000000000000000000000000000000000000000",
+    "source_inventory_path": "/results/r9-source-inventory.json",
+    "source_inventory_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "checkpoint_id": "JMNI-Labs/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+    "checkpoint_revision": "0000000000000000000000000000000000000000",
+    "checkpoint_inventory_path": "/results/qad5500-checkpoint-inventory.json",
+    "checkpoint_inventory_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "arms": {
+    "no_spec": {
+      "mode": "none",
+      "recipe_path": "/results/r9-qad5500-no-spec.env",
+      "recipe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "argv": [
+        "/opt/flux/bin/flux-server-real",
+        "serve",
+        "--model-from-path",
+        "/models/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+        "--model-name",
+        "qwen38-qad5500-r9",
+        "--max-batch-size",
+        "1",
+        "--max-num-seqs",
+        "1",
+        "--max-seq-len",
+        "135168",
+        "--kv-cache-dtype",
+        "bf16"
+      ],
+      "argv_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "reports": {
+        "gsm8k": {
+          "path": "/results/r9-plain-gsm8k.json",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "mmlu-pro": {
+          "path": "/results/r9-plain-mmlu-pro.json",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    },
+    "k5": {
+      "mode": "native-mtp-k5",
+      "recipe_path": "/results/r9-qad5500-k5.env",
+      "recipe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "argv": [
+        "/opt/flux/bin/flux-server-real",
+        "serve",
+        "--model-from-path",
+        "/models/Qwen3.8-Flash-Next-NVFP4-QAD5500-Hybrid",
+        "--model-name",
+        "qwen38-qad5500-r9",
+        "--max-batch-size",
+        "1",
+        "--max-num-seqs",
+        "1",
+        "--max-seq-len",
+        "135168",
+        "--kv-cache-dtype",
+        "bf16",
+        "--speculative",
+        "--num-drafts",
+        "4",
+        "--mtp-vocab",
+        "0",
+        "--mtp-quantization",
+        "bf16"
+      ],
+      "argv_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "reports": {
+        "gsm8k": {
+          "path": "/results/r9-k5-gsm8k.json",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "mmlu-pro": {
+          "path": "/results/r9-k5-mmlu-pro.json",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,326 @@
+[model]
+name = "qwen3.8-flash-next"
+hf_id = "Qwen/Qwen3.8-Flash-Next"
+params = "125B+51B PLE"
+active_params = "6B"
+architecture = "Qwen4-Exp Hyperconnection + QSA + GDN + MoE + sparse PLE"
+
+layers_total = 48
+layers_full_attention = 12
+layers_linear_attention = 36
+hidden_dim = 2560
+head_dim = 256
+q_heads = 24
+kv_heads = 2
+v_heads = 48
+experts = 512
+experts_per_token = 10
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+mtp_layers = 1
+
+[[model_types]]
+model_type = "qwen4_exp"
+hidden_size = 2560
+
+# Thinking presets are the checkpoint's generation_config.json (T=1.0,
+# top_p=0.95, top_k=20). Greedy decoding of long reasoning spans is a known
+# failure mode for this family (repetition loops, early think-close), so only
+# the thinking-off presets stay greedy. Thinking is on by default (matching the
+# checkpoint chat_template.jinja, vLLM, and SGLang); explicit request fields
+# still win field by field, and enable_thinking=false selects non_thinking/tools.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 0.0
+top_p = 0.8
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 0.0
+top_p = 0.8
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[behavior]
+# The checkpoint Jinja template and native emissions use Qwen3-Coder XML:
+#   <tool_call><function=fn><parameter=k>v</parameter></function></tool_call>
+# Pin the parser at target metadata level so direct binary launches and the
+# container launch-plan wrapper resolve the same wire contract.
+tool_call_parser = "qwen3_coder"
+# The checkpoint template treats omitted thinking as xhigh, renders its
+# reasoning instructions into both tool and non-tool system turns, and opens
+# every generated assistant turn with `<think>`. Match that native default;
+# callers may still explicitly disable thinking per request or CLI.
+thinking_default = true
+thinking_in_tools = true
+# A tool turn that enables thinking samples with thinking_text (the
+# generation_config values) instead of the greedy tools preset. Tool turns
+# with thinking off keep the tools preset.
+thinking_sampling_in_tools = true
+# This checkpoint can sample EOS before emitting its native `</think>` close.
+# Swallowing that EOS leaves it without a natural continuation and can turn a
+# short reasoning answer into template simulation or a length-capped runaway.
+# Discard the first EOS while implicitly closing thought; the next EOS then
+# terminates normally. This remains opt-in for this qualified target only.
+honor_eos_inside_thinking = true
+# Deep-think ceiling for a thinking request that sends no explicit budget.
+# Set to the native 262,144 context window so 64K/128K/256K requests are never
+# prematurely capped at 57,344 while thinking.rs's 90% (70% with tools) safety
+# cap still reserves 10% (30% with tools) for the final answer.
+max_thinking_budget = 262144
+# Disable the extra 15%/1024-token omitted-budget tax: the 90% (70% with tools)
+# safety cap already preserves guaranteed answer room across every max_tokens.
+thinking_answer_reserve = 0
+# Keep KV exact through the target's native 262K context geometry. Operators
+# may still explicitly select a quantized KV cache when capacity is preferred.
+default_kv_dtype = "bf16"
+# Disable F2 confidence-run early-stop: algebraic derivations, modular tables,
+# and DP recurrences inside `<think>` routinely run >30 tokens at p >= 0.95 and
+# must not force-inject `</think>` mid-proof.
+confidence_early_stop = false
+# These thresholds leave the watchdog conservative when an operator enables
+# it; the target keeps watchdog intervention disabled by default.
+think_loop_min_repeats = 12
+fuzzy_repeat_tolerance_div = 18
+
+# Drafter pairing profiles (`[[dflash.profile]]`); schema in
+# crates/atlas-kernels/src/drafter_profile.rs. `incoai-dflash2-b8` is qualified
+# and promoted to launcher default when mounted alongside Flash-Next; native
+# MTP remains the built-in fallback when no companion drafter is mounted, and
+# the older `native-v3` / `native-dflash2` / `pixelml-qwen3dspark` rows stay
+# unqualified behind `ATLAS_EXPERIMENTAL_NATIVE_QWEN4_DFLASH=1`.
+#
+# Native V3 drafter (6L/8704/B16/gamma15). A `quorum` row claims any
+# checkpoint that matches two of {num_target_layers, hidden/intermediate/
+# layers, target_layer_ids}; a claimed checkpoint must then match every field,
+# so one-field mutations fail closed. Unqualified: pairing also requires
+# ATLAS_EXPERIMENTAL_NATIVE_QWEN4_DFLASH=1.
+[[dflash.profile]]
+name = "native-v3"
+kind = "dflash"
+admission = "quorum"
+capture_mode = "qwen4_hyper_projected"
+verify_k = [16, 16]
+target_hidden_size = 2560
+target_residual_width = 10240
+target_num_layers = 48
+# Physical V248320 and the tokenizer's canonical logical V248077.
+target_vocab_sizes = [248320, 248077]
+architecture = "DFlashDraftModel"
+model_type = "qwen3"
+hidden_size = 2560
+intermediate_size = 8704
+num_hidden_layers = 6
+num_target_layers = 48
+num_attention_heads = 20
+num_key_value_heads = 4
+head_dim = 128
+vocab_size = 248320
+draft_vocab_size = 0
+block_size = 16
+root_block_size_explicit = true
+mask_token_id = 248077
+target_layer_ids = [1, 7, 13, 20, 26, 33, 39, 46]
+conv_kernel_size = 0
+conv_group_size = 0
+selector_rank = 0
+selector_top_k = 0
+selector_vocab_size = 0
+is_causal = false
+tie_word_embeddings = false
+tensor_count = 69
+parameter_count = 547918336
+bare_tensor_names = true
+
+# Native DFlash2 drafter: the V3 identity plus conv/selector, 5 SWA + 1 full
+# layers, and a selector trained over the logical V248077 proposal vocabulary.
+# Its DFlash2 architecture plus a declared selector_vocab_size also claims it.
+[[dflash.profile]]
+name = "native-dflash2"
+kind = "dflash2"
+admission = "quorum"
+capture_mode = "qwen4_hyper_projected"
+verify_k = [16, 16]
+proposal_vocab = 248077
+target_hidden_size = 2560
+target_residual_width = 10240
+target_num_layers = 48
+target_vocab_sizes = [248320, 248077]
+architecture = "DFlash2DraftModel"
+model_type = "qwen3"
+hidden_size = 2560
+intermediate_size = 8704
+num_hidden_layers = 6
+num_target_layers = 48
+num_attention_heads = 20
+num_key_value_heads = 4
+head_dim = 128
+vocab_size = 248320
+draft_vocab_size = 0
+block_size = 16
+root_block_size_explicit = true
+mask_token_id = 248077
+target_layer_ids = [1, 7, 13, 20, 26, 33, 39, 46]
+conv_kernel_size = 2
+conv_group_size = 16
+selector_rank = 256
+selector_top_k = 16
+selector_vocab_size = 248077
+forbid_unknown_fields = true
+layer_types = [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+]
+sliding_window = 4096
+is_causal = false
+tie_word_embeddings = false
+tensor_count = 96
+parameter_count = 695497216
+bare_tensor_names = true
+
+# PixelML Qwen3DSparkModel drafter (5L/7680/HD256/B7/gamma7, verify K2..=K8).
+# Captures each tapped layer's 4H residual contracted through the next layer's
+# `attn_hyper_connection` mixer (`qwen4_layer_attn_hc`), sharing target
+# `embed_tokens` and `lm_head`.
+[[dflash.profile]]
+name = "pixelml-qwen3dspark"
+kind = "dspark"
+admission = "quorum"
+capture_mode = "qwen4_layer_attn_hc"
+verify_k = [2, 8]
+allow_markov = true
+target_hidden_size = 2560
+target_residual_width = 10240
+target_num_layers = 48
+target_vocab_sizes = [248320, 248077]
+architecture = "Qwen3DSparkModel"
+model_type = "qwen3"
+hidden_size = 2560
+intermediate_size = 7680
+num_hidden_layers = 5
+num_target_layers = 48
+num_attention_heads = 24
+num_key_value_heads = 2
+head_dim = 256
+vocab_size = 248320
+draft_vocab_size = 0
+block_size = 7
+root_block_size_explicit = true
+mask_token_id = 248077
+target_layer_ids = [3, 15, 23, 35, 43]
+conv_kernel_size = 0
+conv_group_size = 0
+selector_rank = 0
+selector_top_k = 0
+selector_vocab_size = 0
+layer_types = [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+]
+tie_word_embeddings = false
+rms_norm_eps = 1e-6
+hidden_act = "silu"
+tensor_count = 58
+parameter_count = 498106880
+bare_tensor_names = true
+
+# incoai W=8 DFlash2 drafter for Flash-Next (5L/7680/32Q:8KV/HD128/B8, 5x SWA
+# 2048, verify K2..=K9, optional Markov head). Captures the four-stream HC mean
+# (`qwen4_hc_mean`). Qualified and promoted to launcher default when mounted
+# alongside Flash-Next (C=1..16); native MTP remains the fallback when absent.
+[[dflash.profile]]
+name = "incoai-dflash2-b8"
+kind = "dflash2"
+admission = "quorum"
+qualified = true
+launcher_default = true
+capture_mode = "qwen4_hc_mean"
+verify_k = [2, 9]
+allow_markov = true
+target_hidden_size = 2560
+target_residual_width = 10240
+target_num_layers = 48
+target_vocab_sizes = [248320, 248077]
+architecture = "DFlash2DraftModel"
+model_type = "qwen3"
+hidden_size = 2560
+intermediate_size = 7680
+num_hidden_layers = 5
+num_target_layers = 48
+num_attention_heads = 32
+num_key_value_heads = 8
+head_dim = 128
+vocab_size = 248320
+draft_vocab_size = 0
+block_size = 8
+mask_token_id = 248077
+target_layer_ids = [5, 15, 25, 35, 45]
+conv_kernel_size = 2
+conv_group_size = 16
+selector_rank = 256
+selector_top_k = 16
+layer_types = [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+]
+sliding_window = 2048
+is_causal = false
+tie_word_embeddings = false
+rms_norm_eps = 1e-6
+hidden_act = "silu"
+tensor_count = 81
+parameter_count = 603065600
+bare_tensor_names = true
+
+# Dense Qwen3.8 DFlash v1 drafter bridged through --dflash-donor-model
+# (capture depths remapped, BF16 residual slice). Experimental.
+[[dflash.profile]]
+name = "dense-donor-bridge"
+kind = "dflash"
+admission = "generic"
+
+# External Inferact MTP head (Qwen3.8-Flash-Next-Inferact-MTP), used when the
+# target checkpoint carries no in-checkpoint MTP experts.
+[[dflash.profile]]
+name = "inferact-mtp"
+kind = "mtp"
+admission = "generic"

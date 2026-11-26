@@ -1,0 +1,113 @@
+[package]
+name = "spark-server"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Flux Engine — High-Velocity Blackwell SM121a Rust LLM Inference Server (derived from Atlas)"
+
+[features]
+default = ["cuda"]
+# Forwards through to atlas-core/spark-runtime/spark-model so the default
+# Linux build still activates the cuda backend after atlas-core became
+# default-features = false at the workspace level.
+cuda = [
+    "atlas-core/cuda",
+    "spark-runtime/cuda",
+    "spark-model/cuda",
+    "spark-storage/cuda",
+    "spark-comm/cuda",
+]
+metal = [
+    "atlas-core/metal",
+    "spark-runtime/metal",
+    "spark-model/metal",
+    "spark-storage/metal",
+    "spark-comm/metal",
+]
+
+[[bin]]
+name = "flux-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "flux-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "spark"
+path = "src/main.rs"
+
+[dependencies]
+atlas-core = { workspace = true }
+atlas-kernels = { workspace = true }
+# Global allocator. mimalloc tends to be 5-10% faster than glibc's
+# ptmalloc on Vec-heavy / String-heavy Rust workloads on aarch64. We
+# allocate a LOT in the per-token scheduler hot path (Vec<u32> drafts,
+# Vec<u8> D2H buffers, String content sanitiser, accumulated_content,
+# etc.), so the allocator choice is on the critical path.
+mimalloc = { version = "0.1", default-features = false }
+# `default-features = false` on path-deps so the metal feature actually
+# disables the cuda default that each downstream crate inherits.
+spark-runtime = { path = "../spark-runtime", default-features = false }
+spark-model = { path = "../spark-model", default-features = false }
+spark-comm = { path = "../spark-comm", default-features = false }
+spark-storage = { path = "../spark-storage", default-features = false }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["json"] }
+http-body = "1"
+tokio = { version = "1", features = ["full", "parking_lot"] }
+# ── Atlas TUI (crates/spark-server/src/tui/) ──
+# ratatui pins its own crossterm; the version here MUST match ratatui 0.29's
+# (crossterm 0.28) or two raw-mode stacks fight over the terminal.
+ratatui = "0.29"
+crossterm = "0.28"
+# Single/multi-line inputs (log filter, library search, REPL, chat). MIT.
+tui-textarea = "0.7"
+unicode-width = "0.2"
+# stderr redirection while the TUI owns the screen (terminal_guard).
+libc = "0.2"
+# DeepSeek-V4.1 image input (crate::dsv41::vision) and the runtime dlopen of
+# libturbojpeg for JPEG parity with Pillow (optional at runtime).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libloading = "0.8"
+tokio-stream = "0.1"
+futures = "0.3"
+rayon = "1.12"
+parking_lot = { workspace = true }
+ring = { workspace = true }
+aho-corasick = "1.1.4"
+tracing = "0.1"
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+toml = "0.8"
+# `preserve_order`: minijinja stores `Value` maps as IndexMap (insertion
+# order) instead of BTreeMap, so `tojson` in chat templates keeps the tool
+# schema's key order like HF transformers.
+minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "loop_controls", "preserve_order"] }
+# Pure-Rust grammar-constrained decoding (`crates/xgrammar`).
+xgrammar = { path = "../xgrammar" }
+# REST-style retrieval draft store (CPU-only suffix-array lookup).
+rest-store = { path = "../rest-store" }
+prometheus = { version = "0.13", default-features = false }
+lazy_static = "1"
+tower-http = { version = "0.6", features = ["catch-panic", "cors"] }
+# Blocking HTTP client for the TUI Library recipe fetcher and issue reporter,
+# plus base64 credential/image encoding.
+ureq = { version = "3", features = ["json"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+# Unit tests consume `spark_runtime::gpu::mock`, which is exported only by
+# spark-runtime's non-production `test-utils` feature.
+spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+[build]
+# `--fmad=false`: the CB3 reconstruct does one multiply and no add, so it is
+# unaffected; the flag is here so the SHARED kernels this target inherits from
+# `kernels/gb10/common/` compile without FMA contraction for reference-matching
+# IEEE numerics.
+#
+# `--atlas-ieee-math`: `build_target.rs` passes `--use_fast_math` to every
+# target unless it opts out with this sentinel. DeepSeek-V4.1 requires IEEE
+# math (no ftz, precise div/sqrt/exp) to match the reference numerics and
+# byte-identity/KL validation gates.
+#
+# `-DTQ_PLUS_SIGNS`: per-target `KERNEL.toml` overrides (rather than merges)
+# the common `KERNEL.toml`'s `extra_nvcc_flags`, so repeat this flag here so
+# shared `common/` kernels compile with the same sign convention.
+extra_nvcc_flags = ["--fmad=false", "--atlas-ieee-math", "-DTQ_PLUS_SIGNS"]
+
+# Module-name overrides. Unlisted `.cu` files use their file stem, so
+# `cb3_reconstruct_bf16.cu` is reachable as module "cb3_reconstruct_bf16"
+# — spelled once in `weight_loader/deepseek_v41/cb3_arena.rs` as
+# `CB3_RECONSTRUCT_MODULE`.
+#
+# Names below map the shared `kernels/gb10/common/` stems to the module names
+# the shared Rust paths look up.
+[modules]
+e2m1_branchless = "e2m1"
+moe_permute = "moe"
+dense_gemm_bf16 = "gemm"
+dense_gemm_splitk = "gemm_splitk"
+dense_gemm_tc = "gemm_tc"
+rms_norm = "norm"
+argmax_bf16 = "argmax"
+dense_gemv_bf16 = "gemv"
+dense_gemv_fp8w = "gemv_fp8w"
+quantize_bf16_to_nvfp4 = "quantize_nvfp4"
+paged_decode_attn = "paged_decode"
+kv_cache_append = "kv_cache"
+moe_topk_sigmoid = "moe_topk_sig"
+moe_sorted_prefill = "moe_sorted"
+
+# DeepSeek-V4.1 vision tower: the 5 `deepseek_vision*` kernel files live
+# directly in `cb3/` (see spark-model layers/deepseek_vision `load_v41`).
+# Module names = file stems.

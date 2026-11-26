@@ -1,0 +1,364 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! CPU-side image preprocessing for Qwen3-VL vision inputs.
+//!
+//! Decodes base64 JPEG/PNG images, resizes to a grid snapped to
+//! `patch_size × spatial_merge_size`, normalizes with SigLIP (Qwen) or CLIP
+//! (GLM-5.3) stats, and produces a flat `f32` tensor ready for the GPU vision
+//! encoder.
+
+use std::io::Cursor;
+
+use anyhow::{Context, Result, ensure};
+use atlas_core::config::VisionConfig;
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
+
+/// SigLIP normalization — matches HF's Qwen2VLImageProcessor
+/// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
+const SIGLIP_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
+const SIGLIP_STD: [f32; 3] = [0.5, 0.5, 0.5];
+
+/// CLIP normalization shipped in GLM-5.3-Flash's pinned processor_config.json.
+const GLM53_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+const GLM53_STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
+
+/// Maximum encoded image payload accepted for decoding (20 MiB).
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// Maximum base64 character length corresponding to [`MAX_IMAGE_BYTES`].
+/// Checked before base64 decoding to avoid unbounded host allocations.
+const MAX_BASE64_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4;
+
+/// Maximum width or height accepted before full pixel decoding (decompression-bomb guard).
+const MAX_IMAGE_DIM: u32 = 16_384;
+
+/// Maximum total pixel count (`width * height`) accepted before full pixel decoding.
+const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+
+/// Maximum decoder buffer allocation enforced via [`image::Limits`] (256 MiB).
+const MAX_DECODE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Maximum allowed image dimension in pixels (longer side).
+const MAX_DIM: u32 = 1280;
+
+/// Minimum useful image dimension in pixels (longer side). Below this,
+/// Qwen3-VL produces too few visual tokens after `spatial_merge_size=2`
+/// reduction for confident recognition on natural images.
+///
+/// Empirical curve (Qwen3.6-VL):
+///   224×224 (49 tok)  — collapses to "blank" for natural images
+///   448×448 (196 tok) — partial recognition
+///   512×512 (256 tok) — solid colors + simple scenes recognized
+///   768×768 (576 tok) — confident recognition on complex scenes
+///   1024×1024 (1024 tok) — full quality
+///
+/// 512 is the speed/quality sweet spot. Vision-encoder TTFT scales
+/// with patch count P (attention is P², MLP is P×D), so dropping from
+/// 768 to 512 reduces vision encoder work ~2.3×.
+///
+/// Override with ATLAS_VISION_MIN_DIM=<pixels> for workload-specific
+/// trade-offs. Set to 0 to disable upscaling entirely.
+const DEFAULT_MIN_DIM: u32 = 512;
+
+/// Decode a base64 data URI or raw base64 string into a `DynamicImage`.
+///
+/// Enforces pre-decode byte, dimension, pixel-count, and allocation caps so
+/// crafted compressed payloads cannot trigger decompression-bomb OOMs.
+fn decode_image(data_uri: &str) -> Result<DynamicImage> {
+    // Strip optional "data:image/<fmt>;base64," prefix.
+    let b64 = if let Some(pos) = data_uri.find(",base64,") {
+        &data_uri[pos + 8..]
+    } else if data_uri.starts_with("data:") {
+        // "data:image/jpeg;base64,..."
+        data_uri
+            .find(',')
+            .map(|p| &data_uri[p + 1..])
+            .unwrap_or(data_uri)
+    } else {
+        data_uri
+    };
+
+    let trimmed = b64.trim();
+    ensure!(
+        trimmed.len() <= MAX_BASE64_BYTES,
+        "image base64 payload exceeds limit ({} > {MAX_BASE64_BYTES} bytes)",
+        trimmed.len()
+    );
+
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)
+        .context("base64 decode failed")?;
+    ensure!(
+        bytes.len() <= MAX_IMAGE_BYTES,
+        "decoded image payload exceeds limit ({} > {MAX_IMAGE_BYTES} bytes)",
+        bytes.len()
+    );
+
+    // Probe format from magic bytes and inspect header dimensions before decoding pixels.
+    let fmt = image::guess_format(&bytes).unwrap_or(ImageFormat::Jpeg);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIM);
+    limits.max_image_height = Some(MAX_IMAGE_DIM);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+
+    let mut reader = ImageReader::with_format(Cursor::new(&bytes), fmt);
+    reader.limits(limits);
+    let decoder = reader
+        .into_decoder()
+        .context("image header decode failed")?;
+    let (w, h) = decoder.dimensions();
+    let pixels = u64::from(w) * u64::from(h);
+    ensure!(
+        w >= 1 && h >= 1 && w <= MAX_IMAGE_DIM && h <= MAX_IMAGE_DIM && pixels <= MAX_IMAGE_PIXELS,
+        "image dimensions {w}x{h} ({pixels} px) exceed limits (max dim {MAX_IMAGE_DIM}, max pixels {MAX_IMAGE_PIXELS})"
+    );
+    DynamicImage::from_decoder(decoder).context("image decode failed")
+}
+
+/// GLM-5.3's resize, matching its pinned processor configuration:
+/// cap the longer side at `MAX_DIM`, never upscale except to guarantee 16 post-merge
+/// image tokens (one token spans a 2x2 block of 14x14 patches, hence 16 * 28 * 28
+/// pixels). The Qwen path's MIN_DIM upscale would otherwise double GLM's image tokens
+/// (117 -> 237 prompt tokens for a 336x224 image).
+fn glm_target_size(orig_h: u32, orig_w: u32, grid_unit: u32) -> (u32, u32) {
+    const MIN_PIXELS: f32 = (16 * 28 * 28) as f32;
+    let area = (orig_h as f32) * (orig_w as f32);
+    let dim_scale = (MAX_DIM as f32) / (orig_h.max(orig_w) as f32);
+    let min_scale = (MIN_PIXELS / area).sqrt();
+    let scale = dim_scale.min(1.0).max(min_scale);
+    let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    (target_h, target_w)
+}
+
+/// Compute the target (H, W) so that:
+/// - Longer side is in `[MIN_DIM, MAX_DIM]` (auto-upscale tiny images).
+/// - Both sides are multiples of `grid_unit = patch_size × spatial_merge_size`.
+/// - Aspect ratio is preserved (rounded to nearest grid_unit).
+///
+/// `MIN_DIM` is read from `ATLAS_VISION_MIN_DIM` (default 512). Set to
+/// 0 to disable upscaling entirely (legacy behaviour).
+fn target_size(orig_h: u32, orig_w: u32, grid_unit: u32) -> (u32, u32) {
+    let min_dim: u32 = std::env::var("ATLAS_VISION_MIN_DIM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MIN_DIM);
+    let longer = orig_h.max(orig_w) as f32;
+    // Scale the longer side into [min_dim, MAX_DIM]. Compute both bounds
+    // and pick whichever is needed (downscale, no-op, or upscale).
+    let scale_down = (MAX_DIM as f32) / longer;
+    let scale_up = if min_dim > 0 && longer > 0.0 {
+        (min_dim as f32) / longer
+    } else {
+        0.0
+    };
+    let scale = if scale_down < 1.0 {
+        scale_down
+    } else if scale_up > 1.0 {
+        scale_up
+    } else {
+        1.0
+    };
+    let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    (target_h, target_w)
+}
+
+/// Preprocess a single base64-encoded image for the Qwen3-VL encoder.
+///
+/// Returns:
+/// - `pixels`: flat `f32` tensor shaped `[P, C × T × H_p × W_p]` where:
+///   - `P = (H/patch_size) × (W/patch_size)` — number of patches
+///   - `C = 3` channels, `T = temporal_patch_size` (image duplicated), `H_p = W_p = patch_size`
+/// - `grid_h`: number of patches along height
+/// - `grid_w`: number of patches along width
+pub fn preprocess_image(data_uri: &str, vcfg: &VisionConfig) -> Result<(Vec<f32>, usize, usize)> {
+    let (mean, std) = if vcfg.model_type == "glm5_next_vision" {
+        (GLM53_MEAN, GLM53_STD)
+    } else {
+        (SIGLIP_MEAN, SIGLIP_STD)
+    };
+    let img = decode_image(data_uri)?;
+    let img = img.to_rgb8();
+    let (orig_w, orig_h) = (img.width(), img.height());
+
+    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
+    let (th, tw) = if vcfg.model_type == "glm5_next_vision" {
+        glm_target_size(orig_h, orig_w, grid_unit)
+    } else {
+        target_size(orig_h, orig_w, grid_unit)
+    };
+
+    // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
+    // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
+    let img = image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom);
+
+    let ps = vcfg.patch_size;
+    let tp = vcfg.temporal_patch_size;
+    let grid_h = (th as usize) / ps;
+    let grid_w = (tw as usize) / ps;
+    let num_patches = grid_h * grid_w;
+    // Flattened patch dim: C × temporal_patch_size × patch_size × patch_size
+    let patch_dim = 3 * tp * ps * ps;
+    let mut pixels = vec![0.0f32; num_patches * patch_dim];
+
+    // Build patches. The temporal dimension is handled by duplicating the image `tp` times.
+    // Layout: [P, C, T, Hp, Wp] → stored as [P, C*T*Hp*Wp] in row-major order.
+    for ph in 0..grid_h {
+        for pw in 0..grid_w {
+            // GLM consumes every spatial 2x2 block as four consecutive rows:
+            // the post tower `view(-1, 2, 2, hidden)` feeds its stride-2
+            // downsample directly. Qwen's encoder performs an explicit spatial
+            // gather later and therefore keeps ordinary row-major patch order.
+            let patch_idx = if vcfg.model_type == "glm5_next_vision" {
+                let sms = vcfg.spatial_merge_size;
+                ((ph / sms) * (grid_w / sms) + (pw / sms)) * sms * sms
+                    + (ph % sms) * sms
+                    + (pw % sms)
+            } else {
+                ph * grid_w + pw
+            };
+            for c in 0..3usize {
+                for t in 0..tp {
+                    for py in 0..ps {
+                        for px in 0..ps {
+                            let pixel_y = ph * ps + py;
+                            let pixel_x = pw * ps + px;
+                            let raw =
+                                img.get_pixel(pixel_x as u32, pixel_y as u32)[c] as f32 / 255.0;
+                            let norm = (raw - mean[c]) / std[c];
+                            // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
+                            let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
+                            pixels[patch_idx * patch_dim + off] = norm;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((pixels, grid_h, grid_w))
+}
+
+/// Number of image pad tokens produced per image after the vision
+/// encoder's spatial merger. Qwen3-VL / Qwen3.6 fold a 2×2 patch block
+/// into a single token, so the embedding stream has
+/// `(grid_h / sms) * (grid_w / sms)` rows — not `grid_h * grid_w`.
+pub fn image_pad_count(grid_h: usize, grid_w: usize, spatial_merge_size: usize) -> usize {
+    let sms = spatial_merge_size.max(1);
+    (grid_h / sms) * (grid_w / sms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_target_size_upscale_small() {
+        // Small image (longer side 150 < 512): should be upscaled
+        // toward ~512 on the longer side, preserving aspect ratio.
+        // Reads ATLAS_VISION_MIN_DIM at call time, defaults to 512.
+        let (h, w) = target_size(100, 150, 32);
+        assert!(h <= 1280 && w <= 1280);
+        assert!(
+            h.max(w) >= 480,
+            "expected longer side >= 480, got h={h} w={w}"
+        );
+        assert_eq!(h % 32, 0);
+        assert_eq!(w % 32, 0);
+    }
+
+    #[test]
+    fn test_target_size_downscale() {
+        // Large image: should be downscaled to <=1280.
+        let (h, w) = target_size(2000, 3000, 32);
+        assert!(h.max(w) <= 1280);
+        assert_eq!(h % 32, 0);
+        assert_eq!(w % 32, 0);
+    }
+
+    #[test]
+    fn test_image_pad_count_2x2_merge() {
+        // Standard Qwen3-VL: 2×2 spatial merger folds a patch block
+        // into one embedding token.
+        assert_eq!(image_pad_count(64, 64, 2), 32 * 32);
+        assert_eq!(image_pad_count(40, 80, 2), 20 * 40);
+    }
+
+    #[test]
+    fn test_image_pad_count_no_merge() {
+        // spatial_merge_size=1 → identity (each patch → one token).
+        assert_eq!(image_pad_count(64, 64, 1), 64 * 64);
+        assert_eq!(image_pad_count(8, 12, 1), 96);
+    }
+
+    #[test]
+    fn test_image_pad_count_zero_sms_clamps_to_one() {
+        // sms=0 is invalid; clamps to 1 so we never divide by zero.
+        assert_eq!(image_pad_count(64, 64, 0), 64 * 64);
+    }
+
+    #[test]
+    fn test_image_pad_count_non_divisible_floors() {
+        // Integer division truncates: 65/2 = 32 (not 33).
+        assert_eq!(image_pad_count(65, 64, 2), 32 * 32);
+    }
+
+    #[test]
+    fn glm53_uses_checkpoint_clip_normalization() {
+        assert_eq!(GLM53_MEAN, [0.481_454_66, 0.457_827_5, 0.408_210_73]);
+        assert_eq!(GLM53_STD, [0.268_629_55, 0.261_302_6, 0.275_777_1]);
+        assert_ne!(GLM53_MEAN, SIGLIP_MEAN);
+    }
+
+    #[test]
+    fn glm53_resize_matches_its_processor() {
+        // No upscale for an image already above the 16-token floor (the Qwen
+        // path would upscale 336x224 toward MIN_DIM).
+        assert_eq!(glm_target_size(224, 336, 28), (224, 336));
+        // The floor: a tiny image grows to exactly 16 merged tokens.
+        let (h, w) = glm_target_size(20, 20, 28);
+        assert_eq!((h, w), (112, 112));
+        assert_eq!((h / 14) * (w / 14) / 4, 16);
+        // Cap: longer side limited to MAX_DIM.
+        let (h, w) = glm_target_size(2000, 3000, 28);
+        assert!(h.max(w) <= MAX_DIM + 28);
+    }
+
+    #[test]
+    fn decode_image_rejects_oversized_base64_before_decoding() {
+        let huge = "A".repeat(MAX_BASE64_BYTES + 8);
+        let err = decode_image(&huge).unwrap_err().to_string();
+        assert!(err.contains("base64 payload exceeds limit"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_image_rejects_decompression_bomb_header_before_allocating() {
+        // Minimal PNG signature + IHDR chunk declaring 10_000 x 10_000 (100M px > 40M px cap).
+        let mut png = Vec::new();
+        png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]); // PNG signature
+        png.extend_from_slice(&13u32.to_be_bytes()); // IHDR length
+        let mut ihdr = Vec::with_capacity(17);
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&10_000u32.to_be_bytes()); // width
+        ihdr.extend_from_slice(&10_000u32.to_be_bytes()); // height
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, deflate, filter 0, non-interlaced
+        // Compute IEEE CRC-32 over "IHDR" + payload so the PNG header parser accepts IHDR.
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in &ihdr {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&(!crc).to_be_bytes());
+
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+        let err = decode_image(&encoded).unwrap_err().to_string();
+        assert!(
+            err.contains("exceed limits") || err.contains("image header decode failed"),
+            "expected pre-decode dimension/pixel rejection, got: {err}"
+        );
+    }
+}

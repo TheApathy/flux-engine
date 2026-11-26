@@ -1,0 +1,24 @@
+[package]
+name = "atlas-kernels"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Flux Engine: CUDA/Metal kernel PTX/metallib artifacts compiled from kernels/{hw}/{model}/{quant}/"
+
+[dependencies]
+atlas-core = { workspace = true }
+
+[build-dependencies]
+toml = "0.8"
+# SHA-256 of each kernel source/include for the PTX cache manifest.
+ring = { workspace = true }
+
+[dev-dependencies]
+ring = { workspace = true }
+# tests/build_profile.rs exercises the build-time [[dflash.profile]] parser.
+toml = "0.8"
+
+[lints]
+workspace = true

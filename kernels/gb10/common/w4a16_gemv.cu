@@ -1,0 +1,4216 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Atlas W4A16 GEMV — Fused NVFP4 weight dequant + BF16 GEMV for M=1 decode.
+//
+// out[n] = dot(A[0,:], dequant(B_fp4[n,:]))
+//
+// Specialized for M=1 decode: replaces w4a16_gemm which wastes ~98% of
+// threads at M=1 with 64x64 tiles + MMA tensor cores (MMA requires M>=16).
+//
+// Vectorized: reads 8 packed weight bytes (uint64_t = 16 FP4 values) and
+// 16 BF16 activations (2×uint4 = 32 bytes) per iteration for better bandwidth.
+//
+// NVFP4 weight format (HuggingFace/compressed-tensors):
+//   B_packed: [N, K/2] uint8 — byte at [n, j] holds W[n, 2j] (low) and W[n, 2j+1] (high)
+//   B_scale:  [N, K/GROUP_SIZE] FP8-E4M3 — one scale per group of 16 K-dim values
+//   scale2:   scalar FP32 — per-tensor second-level scale
+//
+// K-dim packing: each byte holds 2 consecutive input features for the same output.
+// Vectorized reads of 8 bytes = 16 weight values, coalesced across warps.
+//
+// 4 outputs per block, 64 threads (2 warps) per output. Cross-warp smem reduction.
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+#define BLOCK_SIZE 256
+#define N_PER_BLOCK 4
+#define WARP_SIZE 32
+#define GROUP_SIZE 16
+
+// E2M1 lookup table (same as w4a16_gemm.cu)
+__device__ __constant__ float E2M1_LUT[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+// PR #519: a data-dependent index into __constant__ memory serializes a
+// warp once per distinct nibble. Stage one bit-exact LUT copy per CUDA warp;
+// the SCALE/HIP symlinked builds keep their established constant-memory path
+// because they do not provide CUDA's __syncwarp intrinsic.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+#define ATLAS_WARP_LUT_STAGED 0
+#else
+#define ATLAS_WARP_LUT_STAGED 1
+#endif
+
+__device__ __forceinline__ void stage_e2m1_lut_warp(
+    float* s_lut, unsigned int lane)
+{
+#if ATLAS_WARP_LUT_STAGED
+    if (lane < 16u) s_lut[lane] = E2M1_LUT[lane];
+    __syncwarp();
+#else
+    (void)s_lut;
+    (void)lane;
+#endif
+}
+
+// One base-kernel lane's K16 partial.
+//
+// `orig_lane` is the 64-thread kernel's lane (0..63): the loop starts at
+// k16 = orig_lane and strides by threads_per_out = BLOCK_SIZE / N_PER_BLOCK = 64.
+//
+// SSOT: `w4a16_gemv` and `w4a16_gemv_sw` share this body so the single-warp
+// path cannot drift off the base K-chunk accumulation order (a divergent
+// association introduces 1 ULP drift against the base kernel).
+//
+// `lut` is either the base kernel's shared-memory E2M1 table or `E2M1_LUT`
+// itself; the 16 values are identical, so the arithmetic is bit-identical
+// whichever address space it comes from. Passing it keeps the base kernel's
+// existing shared-memory read untouched.
+//
+// NOTE: uses the sequential `acc += a*w` association matching the base kernel
+// so single-warp output remains bit-identical to `w4a16_gemv`.
+__device__ __forceinline__ float w4a16_gemv_partial(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    const float* lut,
+    unsigned int n, unsigned int half_K, unsigned int num_groups,
+    unsigned int K16, unsigned int orig_lane)
+{
+    float acc = 0.0f;
+
+    // Vectorized: process 16 K-values per iteration (2× uint4 activation + uint64 weight)
+    // One scale per GROUP_SIZE=16, so each iteration uses exactly 1 scale lookup.
+    for (unsigned int k16 = orig_lane; k16 < K16; k16 += 64u) {
+        const unsigned int base_k = k16 * 16;
+
+        // Load 16 BF16 activations as 2× uint4 (256-bit total)
+        uint4 a_lo = __ldg(&((const uint4*)A)[k16 * 2]);
+        uint4 a_hi = __ldg(&((const uint4*)A)[k16 * 2 + 1]);
+        const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                        a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+
+        // Load 8 packed weight bytes as uint64 (16 FP4 values)
+        unsigned long long packed8 = *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + k16 * 8);
+
+        // Load single FP8 scale — 16 values = exactly 1 group
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        // Unpack 8 bytes × 2 nibbles = 16 weight values, FMA with activations
+        #pragma unroll
+        for (int b = 0; b < 8; b++) {
+            unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
+            float w_lo = lut[byte_val & 0xF] * scale;
+            float w_hi = lut[byte_val >> 4] * scale;
+
+            __nv_bfloat16 a_lo_bf, a_hi_bf;
+            *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFF);
+            *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+            acc += __bfloat162float(a_lo_bf) * w_lo;
+            acc += __bfloat162float(a_hi_bf) * w_hi;
+        }
+    }
+    return acc;
+}
+
+// W4A16 GEMV: C[n] = sum_k A[k] * dequant(B_fp4[n, k])
+//
+// Vectorized via `w4a16_gemv_partial`: processes 16 K-values per iteration.
+// - 8 packed weight bytes (uint64_t) → 16 FP4 values via E2M1 LUT
+// - 16 BF16 activations (2 × uint4 = 256-bit load)
+// - 1 FP8 scale (all 16 values in the same group since GROUP_SIZE=16)
+//
+// Coalescing: within a warp, consecutive threads read consecutive 8-byte
+// weight chunks and consecutive 32-byte activation chunks. Perfectly coalesced.
+extern "C" __global__ void w4a16_gemv(
+    const __nv_bfloat16* __restrict__ A,        // [1, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [1, N]
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2];  // cross-warp reduction
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (valid) {
+        acc = w4a16_gemv_partial(A, B_packed, B_scale, scale2, s_lut,
+                                 n, half_K, num_groups, K16, lane);
+    }
+
+    // Warp shuffle reduction within each group of 64 threads
+    // First reduce within each warp (32 threads)
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    // threads_per_out=64 means 2 warps per output. Use shared memory for cross-warp reduce.
+    if (warp_lane == 0) {
+        // Each warp writes its partial sum
+        unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
+        smem[smem_idx] = acc;
+    }
+    __syncthreads();
+
+    // First thread of each output group writes final result
+    if (valid && lane == 0) {
+        float result = smem[local_out * 2] + smem[local_out * 2 + 1];
+        C[n] = __float2bfloat16(result);
+    }
+}
+
+// ============================================================
+// W4A16 exact multi-row GEMV for large-N LM-head verification.
+// ============================================================
+//
+// This family reads each NVFP4 weight row once while reproducing M independent
+// `w4a16_gemv` launches byte-for-byte. It deliberately keeps the base kernel's
+// K16 lane assignment, scaled-weight arithmetic, two ordered accumulator
+// updates per packed byte, two-warp shuffle trees, and ordered cross-warp add.
+// It must not be replaced with the numerically different K8 batch kernels or
+// the E4M3 tensor-core small-M GEMM.
+//
+// Four register-sized entry points avoid paying the MAX_M=32 register cost for
+// common smaller verify widths. Production selects the smallest fitting tier:
+//   M=2..4   -> w4a16_gemv_batch_logits_exact_m4
+//   M=5..8   -> w4a16_gemv_batch_logits_exact_m8
+//   M=9..17  -> w4a16_gemv_batch_logits_exact_m17
+//   M=18..32 -> w4a16_gemv_batch_logits_exact_m32
+//
+// A:         [M, K] BF16 contiguous
+// B_packed:  [N, K/2] NVFP4 packed, row-major
+// B_scale:   [N, K/16] FP8-E4M3
+// C:         [M, N] BF16 contiguous
+// Grid:      (ceil(N / 4), 1, 1)
+// Block:     (256, 1, 1), 64 threads / output
+//
+// Tail output groups never return before either block barrier. Invalid groups
+// take part in both barriers and both reductions with zero accumulators, while
+// all row-address formation and global loads/stores remain predicated.
+
+template <int MAX_M>
+__device__ __forceinline__ void w4a16_gemv_batch_logits_exact_body(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    float* s_lut,
+    float* smem)
+{
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int warp_lane = lane % WARP_SIZE;
+    const unsigned int warp_idx = lane / WARP_SIZE;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool rows_valid = M > 0 && M <= (unsigned int)MAX_M;
+    const bool valid = rows_valid && n < N;
+
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int row = 0; row < MAX_M; ++row) acc[row] = 0.0f;
+
+    if (valid) {
+        const unsigned int half_K = K / 2;
+        const unsigned int num_groups = K / GROUP_SIZE;
+        const unsigned int K16 = K / 16;
+
+        // Keep the ordinary K=1 lane ownership exactly: k16=lane, stride 64.
+        for (unsigned int k16 = lane; k16 < K16; k16 += 64u) {
+            const unsigned int base_k = k16 * 16;
+            const unsigned long long weight_row =
+                (unsigned long long)n * half_K;
+            const unsigned long long scale_row =
+                (unsigned long long)n * num_groups;
+            const unsigned long long packed8 =
+                *(const unsigned long long*)(B_packed + weight_row + k16 * 8);
+
+            const unsigned int scale_group = base_k / GROUP_SIZE;
+            const unsigned char scale_byte = B_scale[scale_row + scale_group];
+            __nv_fp8_e4m3 fp8;
+            *(unsigned char*)&fp8 = scale_byte;
+            const float scale = (float)fp8 * scale2;
+
+            // Unpack and scale once, then reuse the exact FP32 operands for
+            // every active activation row.
+            float w_lo[8];
+            float w_hi[8];
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const unsigned char byte_val =
+                    (unsigned char)(packed8 >> (b * 8));
+                w_lo[b] = s_lut[byte_val & 0xF] * scale;
+                w_hi[b] = s_lut[byte_val >> 4] * scale;
+            }
+
+            #pragma unroll
+            for (int row = 0; row < MAX_M; ++row) {
+                if ((unsigned int)row < M) {
+                    const __nv_bfloat16* __restrict__ A_row =
+                        A + (unsigned long long)row * K;
+                    const uint4 a_lo = __ldg(&((const uint4*)A_row)[k16 * 2]);
+                    const uint4 a_hi = __ldg(&((const uint4*)A_row)[k16 * 2 + 1]);
+                    const unsigned int a_raw[8] = {
+                        a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                        a_hi.x, a_hi.y, a_hi.z, a_hi.w
+                    };
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        __nv_bfloat16 a_lo_bf, a_hi_bf;
+                        *(unsigned short*)&a_lo_bf =
+                            (unsigned short)(a_raw[b] & 0xFFFF);
+                        *(unsigned short*)&a_hi_bf =
+                            (unsigned short)(a_raw[b] >> 16);
+                        acc[row] += __bfloat162float(a_lo_bf) * w_lo[b];
+                        acc[row] += __bfloat162float(a_hi_bf) * w_hi[b];
+                    }
+                }
+            }
+        }
+    }
+
+    // Reproduce the ordinary K=1 five-step tree independently for every row.
+    #pragma unroll
+    for (int row = 0; row < MAX_M; ++row) {
+        if ((unsigned int)row < M) {
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                acc[row] += __shfl_down_sync(0xFFFFFFFF, acc[row], offset);
+            }
+            if (warp_lane == 0) {
+                smem[(row * N_PER_BLOCK + local_out) * 2 + warp_idx] =
+                    acc[row];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        #pragma unroll
+        for (int row = 0; row < MAX_M; ++row) {
+            if ((unsigned int)row < M) {
+                const unsigned int base =
+                    (row * N_PER_BLOCK + local_out) * 2;
+                C[(unsigned long long)row * N + n] =
+                    __float2bfloat16(smem[base] + smem[base + 1]);
+            }
+        }
+    }
+}
+
+#define DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT(NAME, MAX_ROWS)                 \
+extern "C" __global__ void NAME(                                             \
+    const __nv_bfloat16* __restrict__ A,                                     \
+    const unsigned char* __restrict__ B_packed,                              \
+    const unsigned char* __restrict__ B_scale,                               \
+    const float scale2,                                                       \
+    __nv_bfloat16* __restrict__ C,                                            \
+    unsigned int M, unsigned int N, unsigned int K)                           \
+{                                                                            \
+    __shared__ float s_lut[16];                                               \
+    __shared__ float smem[(MAX_ROWS) * N_PER_BLOCK * 2];                      \
+    w4a16_gemv_batch_logits_exact_body<MAX_ROWS>(                             \
+        A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);              \
+}
+
+DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT(
+    w4a16_gemv_batch_logits_exact_m4, 4)
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_batch_logits_exact_m8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[16];
+    __shared__ float smem[8 * N_PER_BLOCK * 2];
+    if (M <= 5u) {
+        w4a16_gemv_batch_logits_exact_body<5>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    } else {
+        w4a16_gemv_batch_logits_exact_body<8>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    }
+}
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_batch_logits_exact_m17(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[16];
+    __shared__ float smem[17 * N_PER_BLOCK * 2];
+    if (M <= 10u) {
+        w4a16_gemv_batch_logits_exact_body<10>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    } else if (M <= 15u) {
+        w4a16_gemv_batch_logits_exact_body<15>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    } else {
+        w4a16_gemv_batch_logits_exact_body<17>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    }
+}
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_batch_logits_exact_m32(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[16];
+    __shared__ float smem[32 * N_PER_BLOCK * 2];
+    if (M <= 20u) {
+        w4a16_gemv_batch_logits_exact_body<20>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    } else if (M <= 25u) {
+        w4a16_gemv_batch_logits_exact_body<25>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    } else {
+        w4a16_gemv_batch_logits_exact_body<32>(
+            A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem);
+    }
+}
+
+#undef DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT
+
+// ============================================================
+// W4A16 exact M17 GEMV with CTA-cooperative activation staging.
+// ============================================================
+//
+// ABI-separated, default-unrouted twin of
+// `w4a16_gemv_batch_logits_exact_m17`.  The parent assigns four independent
+// 64-thread groups to four output rows.  Those groups request the same BF16 A
+// tile four times.  This twin publishes each 64-K16 (1024-column) A wave once
+// to shared memory, then lets all four groups consume the identical raw BF16
+// words.  Weight loads and every arithmetic boundary remain parent-exact:
+//
+//   * k16 = wave*64 + lane, preserving ordinary K1 ownership;
+//   * b=0..7 low then high FP32 updates;
+//   * the five-step warp shuffle tree and ordered two-warp add;
+//   * one final FP32-to-BF16 conversion per output element.
+//
+// Both barriers in the wave loop are block-unconditional.  Invalid N-tail
+// groups participate in publication and overwrite protection but form no
+// weight/output addresses.  Partial final waves publish/read only valid K16
+// chunks.  Shared footprint at MAX_M=17 is 34,816 B of raw A plus 64 B LUT and
+// 544 B reduction storage = 35,424 B.
+
+static constexpr unsigned int ASTAGE_K16_PER_WAVE = 64u;
+static constexpr unsigned int ASTAGE_U4_PER_K16 = 2u;
+static constexpr unsigned int ASTAGE_U4_PER_ROW =
+    ASTAGE_K16_PER_WAVE * ASTAGE_U4_PER_K16;
+
+__device__ __forceinline__ void w4a16_gemv_batch_logits_exact_m17_astage_body(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    float* s_lut,
+    float* smem,
+    uint4* s_a)
+{
+    constexpr unsigned int MAX_M = 17u;
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int warp_lane = lane % WARP_SIZE;
+    const unsigned int warp_idx = lane / WARP_SIZE;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool rows_valid = M > 0 && M <= MAX_M;
+    const bool valid = rows_valid && n < N;
+
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int row = 0; row < (int)MAX_M; ++row) acc[row] = 0.0f;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    for (unsigned int wave = 0; wave < K16; wave += ASTAGE_K16_PER_WAVE) {
+        const unsigned int wave_k16 =
+            min(ASTAGE_K16_PER_WAVE, K16 - wave);
+
+        // Prefetch weight + scale tile BEFORE the `s_a` staging barrier so
+        // DRAM weight latency overlaps with shared-memory activation staging.
+        unsigned long long pref_packed8 = 0ull;
+        unsigned char pref_scale_byte = 0u;
+        if (valid && lane < wave_k16) {
+            const unsigned int k16 = wave + lane;
+            const unsigned int base_k = k16 * 16;
+            const unsigned long long weight_row =
+                (unsigned long long)n * half_K;
+            const unsigned long long scale_row =
+                (unsigned long long)n * num_groups;
+            pref_packed8 =
+                *(const unsigned long long*)(B_packed + weight_row + k16 * 8);
+            const unsigned int scale_group = base_k / GROUP_SIZE;
+            pref_scale_byte = B_scale[scale_row + scale_group];
+        }
+
+        // Publish raw BF16 words only.  The fixed row stride makes every
+        // consumer's shared address independent of a partial final wave.
+        for (unsigned int slot = threadIdx.x;
+             slot < MAX_M * ASTAGE_U4_PER_ROW;
+             slot += BLOCK_SIZE) {
+            const unsigned int row = slot / ASTAGE_U4_PER_ROW;
+            const unsigned int row_slot = slot % ASTAGE_U4_PER_ROW;
+            const unsigned int local_k16 = row_slot / ASTAGE_U4_PER_K16;
+            const unsigned int half = row_slot % ASTAGE_U4_PER_K16;
+            if (rows_valid && row < M && local_k16 < wave_k16) {
+                const uint4* __restrict__ A_row =
+                    (const uint4*)(A + (unsigned long long)row * K);
+                s_a[slot] =
+                    A_row[(wave + local_k16) * ASTAGE_U4_PER_K16 + half];
+            }
+        }
+        __syncthreads();  // publication: unconditional for every CTA thread
+
+        if (valid && lane < wave_k16) {
+            const unsigned long long packed8 = pref_packed8;
+            const unsigned char scale_byte = pref_scale_byte;
+            __nv_fp8_e4m3 fp8;
+            *(unsigned char*)&fp8 = scale_byte;
+            const float scale = (float)fp8 * scale2;
+
+            float w_lo[8];
+            float w_hi[8];
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const unsigned char byte_val =
+                    (unsigned char)(packed8 >> (b * 8));
+                w_lo[b] = s_lut[byte_val & 0xF] * scale;
+                w_hi[b] = s_lut[byte_val >> 4] * scale;
+            }
+
+            #pragma unroll
+            for (int row = 0; row < (int)MAX_M; ++row) {
+                if ((unsigned int)row < M) {
+                    const unsigned int a_base =
+                        (unsigned int)row * ASTAGE_U4_PER_ROW
+                        + lane * ASTAGE_U4_PER_K16;
+                    const uint4 a_lo = s_a[a_base];
+                    const uint4 a_hi = s_a[a_base + 1];
+                    const unsigned int a_raw[8] = {
+                        a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                        a_hi.x, a_hi.y, a_hi.z, a_hi.w
+                    };
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        __nv_bfloat16 a_lo_bf, a_hi_bf;
+                        *(unsigned short*)&a_lo_bf =
+                            (unsigned short)(a_raw[b] & 0xFFFF);
+                        *(unsigned short*)&a_hi_bf =
+                            (unsigned short)(a_raw[b] >> 16);
+                        acc[row] += __bfloat162float(a_lo_bf) * w_lo[b];
+                        acc[row] += __bfloat162float(a_hi_bf) * w_hi[b];
+                    }
+                }
+            }
+        }
+
+        // No CTA may overwrite the shared A wave while another output group
+        // is still consuming it.  N-tail groups participate as well.
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int row = 0; row < (int)MAX_M; ++row) {
+        if ((unsigned int)row < M) {
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                acc[row] += __shfl_down_sync(0xFFFFFFFF, acc[row], offset);
+            }
+            if (warp_lane == 0) {
+                smem[(row * N_PER_BLOCK + local_out) * 2 + warp_idx] =
+                    acc[row];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        #pragma unroll
+        for (int row = 0; row < (int)MAX_M; ++row) {
+            if ((unsigned int)row < M) {
+                const unsigned int base =
+                    (row * N_PER_BLOCK + local_out) * 2;
+                C[(unsigned long long)row * N + n] =
+                    __float2bfloat16(smem[base] + smem[base + 1]);
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void w4a16_gemv_batch_logits_exact_m17_astage(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K)
+{
+    __shared__ float s_lut[16];
+    __shared__ float smem[17 * N_PER_BLOCK * 2];
+    __shared__ __align__(16) uint4 s_a[17 * ASTAGE_U4_PER_ROW];
+    w4a16_gemv_batch_logits_exact_m17_astage_body(
+        A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem, s_a);
+}
+
+// ============================================================
+// W4A16 GEMV — SINGLE-WARP-PER-OUTPUT variant (lossless; default ON,
+// disable with ATLAS_NO_GEMV_SW=1).
+//
+// Shares `w4a16_gemv_partial` with `w4a16_gemv` so accumulation order stays
+// bit-identical against the base kernel.
+//
+// 32 threads (1 warp) per output instead of 64 (2 warps). 8 outputs per
+// 256-thread block instead of 4. The cross-warp __syncthreads() + smem
+// round-trip is gone: the final combine is one FP32 add of two warp-shuffle
+// reductions.
+//
+// BIT-IDENTICALITY against `w4a16_gemv`: in the base kernel, the 64 threads
+// that own output `n` are hardware warp A (base lanes 0..31) and warp B (base
+// lanes 32..63), each shuffle-reduced independently into
+// smem[local_out*2 + 0] and smem[local_out*2 + 1], then added.
+// Here one warp holds both partials:
+//   acc_a[lane] == base acc[lane]        (k16 = lane,      stride 64)
+//   acc_b[lane] == base acc[lane + 32]   (k16 = lane + 32, stride 64)
+// Reducing each in the same 5-step shuffle tree gives reduced_a == smem[0]
+// and reduced_b == smem[1]; `reduced_a + reduced_b` is the base kernel's final
+// add, operand-for-operand.
+//
+// The early `n >= N` return is safe here because this kernel has no
+// __syncthreads() barrier at all (base `w4a16_gemv` predicates on `valid`
+// instead so all threads participate in its barriers).
+//
+// Grid: (ceil(N / 8), 1, 1)   Block: (256, 1, 1)
+// ============================================================
+
+#define N_PER_BLOCK_SW 8
+
+extern "C" __global__ void w4a16_gemv_sw(
+    const __nv_bfloat16* __restrict__ A,        // [1, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [1, N]
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int local_out = threadIdx.x / WARP_SIZE;  // 0..7
+    const unsigned int lane = threadIdx.x % WARP_SIZE;       // 0..31
+    const unsigned int n = blockIdx.x * N_PER_BLOCK_SW + local_out;
+    if (n >= N) return;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    // The early return above is warp-uniform but not block-uniform, so a
+    // block barrier would be invalid. Each warp publishes its own 64-byte row.
+    __shared__ float s_lut[N_PER_BLOCK_SW][16];
+    stage_e2m1_lut_warp(s_lut[local_out], lane);
+#if ATLAS_WARP_LUT_STAGED
+    const float* __restrict__ warp_lut = s_lut[local_out];
+#else
+    const float* __restrict__ warp_lut = E2M1_LUT;
+#endif
+
+    // acc_a reproduces base lane `lane` (warp A); acc_b reproduces base lane
+    // `lane + 32` (warp B). Same operands, same order as the 64-thread kernel.
+    float acc_a = w4a16_gemv_partial(A, B_packed, B_scale, scale2, warp_lut,
+                                     n, half_K, num_groups, K16, lane);
+    float acc_b = w4a16_gemv_partial(A, B_packed, B_scale, scale2, warp_lut,
+                                     n, half_K, num_groups, K16, lane + 32u);
+
+    // Reduce each accumulator within the warp in the SAME tree order as base.
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc_a += __shfl_down_sync(0xFFFFFFFF, acc_a, offset);
+        acc_b += __shfl_down_sync(0xFFFFFFFF, acc_b, offset);
+    }
+
+    // lane 0 holds reduced warp-A and warp-B. This add == smem[0] + smem[1].
+    if (lane == 0) {
+        C[n] = __float2bfloat16(acc_a + acc_b);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV with FP32 output (for LM head logits).
+// Identical to w4a16_gemv but writes float instead of BF16.
+// FP32 logits are critical for sampling quality — BF16 collapses
+// similar logit values, making stochastic sampling random.
+// ============================================================
+extern "C" __global__ void w4a16_gemv_logits(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    float* __restrict__ C,  // FP32 output
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (valid) {
+        for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
+            const unsigned int base_k = k16 * 16;
+            uint4 a_lo = ((const uint4*)A)[k16 * 2];
+            uint4 a_hi = ((const uint4*)A)[k16 * 2 + 1];
+            const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                            a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+            unsigned long long packed8 = *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + k16 * 8);
+            unsigned int scale_group = base_k / GROUP_SIZE;
+            unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+            __nv_fp8_e4m3 fp8;
+            *(unsigned char*)&fp8 = scale_byte;
+            float scale = (float)fp8 * scale2;
+            #pragma unroll
+            for (int b = 0; b < 8; b++) {
+                unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
+                float w_lo = s_lut[byte_val & 0xF] * scale;
+                float w_hi = s_lut[byte_val >> 4] * scale;
+                __nv_bfloat16 a_lo_bf, a_hi_bf;
+                *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFF);
+                *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+                acc += __bfloat162float(a_lo_bf) * w_lo;
+                acc += __bfloat162float(a_hi_bf) * w_hi;
+            }
+        }
+    }
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    if (warp_lane == 0) {
+        unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
+        smem[smem_idx] = acc;
+    }
+    __syncthreads();
+    if (valid && lane == 0) {
+        C[n] = smem[local_out * 2] + smem[local_out * 2 + 1]; // FP32 output!
+    }
+}
+
+// ============================================================
+// W4A16 double-GEMV (M=2): reads weights once, computes 2 outputs
+// ============================================================
+// For K=2 speculative verification: processes 2 input vectors through
+// the same weight matrix in a single pass. Eliminates the GEMM M=2
+// tile waste (64x64 tiles at 3% M-utilization).
+//
+// A: [2, K] BF16 contiguous (row 0 and row 1)
+// B: [N, K/2] NVFP4 packed weights
+// C: [2, N] BF16 contiguous (row 0 and row 1)
+//
+// Same memory bandwidth as M=1 GEMV (weights dominate, read once).
+// Extra cost: 2x activation reads (K*2 bytes per vector, fits in L1/L2).
+//
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_batch2(
+    const __nv_bfloat16* __restrict__ A,        // [2, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [2, N]
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    // Pointers to second input/output rows
+    const __nv_bfloat16* __restrict__ A1 = A + K;  // second input vector
+    __nv_bfloat16* __restrict__ C1 = C + N;         // second output vector
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 4];  // 2 warps × 2 accumulators per output
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f;  // accumulator for first input
+    float acc1 = 0.0f;  // accumulator for second input
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        // Load 8 BF16 activations from BOTH input vectors
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+
+        // Load 4 packed weight bytes (SHARED between both inputs)
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+
+        // Load single FP8 scale
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        // Unpack weights and FMA with BOTH activation vectors
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+
+            // First input vector
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo;
+            acc0 += __bfloat162float(a0_hi) * w_hi;
+
+            // Second input vector (same weights, different activations)
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo;
+            acc1 += __bfloat162float(a1_hi) * w_hi;
+        }
+    }
+    }
+
+    // Warp shuffle reduction for both accumulators
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+    }
+
+    // Cross-warp reduction via shared memory (2 warps per output × 2 accumulators)
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 4 + warp_idx * 2]     = acc0;
+        smem[local_out * 4 + warp_idx * 2 + 1] = acc1;
+    }
+    __syncthreads();
+
+    // First thread of each output group writes both results
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 4]     + smem[local_out * 4 + 2];
+        float result1 = smem[local_out * 4 + 1] + smem[local_out * 4 + 3];
+        C[n]  = __float2bfloat16(result0);
+        C1[n] = __float2bfloat16(result1);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV with inline Q/Gate deinterleave on output write
+// ============================================================
+// Same GEMV as w4a16_gemv but writes Q and Gate to separate halves.
+// Eliminates the separate deinterleave_qg kernel (saves 12 graph nodes).
+//
+// Input layout (interleaved per head): [Q_h0(hd), G_h0(hd), Q_h1(hd), G_h1(hd), ...]
+// Output layout (deinterleaved): [Q_h0..Q_nh | G_h0..G_nh]
+//
+// N = num_heads * head_dim * 2  (total Q+Gate elements)
+//
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_qg(
+    const __nv_bfloat16* __restrict__ A,        // [1, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [Q | G] deinterleaved
+    unsigned int N,
+    unsigned int K,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+        uint4 a_data = ((const uint4*)A)[k8];
+        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+            __nv_bfloat16 a_lo, a_hi;
+            *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
+            *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
+            acc += __bfloat162float(a_lo) * w_lo;
+            acc += __bfloat162float(a_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (warp_lane == 0) {
+        smem[local_out * 2 + (lane / WARP_SIZE)] = acc;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result = smem[local_out * 2] + smem[local_out * 2 + 1];
+
+        // Deinterleave: n indexes interleaved [Q_h0(hd), G_h0(hd), Q_h1(hd), ...]
+        // head = n / (2 * head_dim), is_gate = (n % (2 * head_dim)) >= head_dim
+        unsigned int group_dim = 2 * head_dim;
+        unsigned int h = n / group_dim;
+        unsigned int idx = n % group_dim;
+        unsigned int q_total = num_heads * head_dim;
+
+        unsigned int out_idx;
+        if (idx < head_dim) {
+            out_idx = h * head_dim + idx;             // Q region
+        } else {
+            out_idx = q_total + h * head_dim + (idx - head_dim);  // Gate region
+        }
+        C[out_idx] = __float2bfloat16(result);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV with inline QKVZ deinterleave on output write
+// ============================================================
+// Same GEMV as w4a16_gemv but writes to deinterleaved output locations.
+// Eliminates the separate deinterleave_qkvz kernel (saves 36 graph nodes).
+//
+// QKVZ interleaved layout (N=12288, 16 groups of 768):
+//   Group g: [Q_{g*128..128} | K_{g*128..128} | V_{g*256..256} | Z_{g*256..256}]
+//
+// Deinterleaved output: [Q_2048 | K_2048 | V_4096 | Z_4096]
+//
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_qkvz(
+    const __nv_bfloat16* __restrict__ A,        // [1, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [Q|K|V|Z] deinterleaved
+    unsigned int N,
+    unsigned int K,
+    // Deinterleave params:
+    unsigned int num_groups,        // 16
+    unsigned int head_k_dim,        // 128
+    unsigned int vheads_per_group,  // 2
+    unsigned int head_v_dim         // 128
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups_k = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+        uint4 a_data = ((const uint4*)A)[k8];
+        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups_k + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+            __nv_bfloat16 a_lo, a_hi;
+            *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
+            *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
+            acc += __bfloat162float(a_lo) * w_lo;
+            acc += __bfloat162float(a_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (warp_lane == 0) {
+        smem[local_out * 2 + (lane / WARP_SIZE)] = acc;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result = smem[local_out * 2] + smem[local_out * 2 + 1];
+
+        // Compute deinterleaved output index
+        unsigned int v_group_size = vheads_per_group * head_v_dim;
+        unsigned int group_dim = 2 * head_k_dim + 2 * v_group_size;
+        unsigned int g = n / group_dim;
+        unsigned int idx = n % group_dim;
+        unsigned int q_total = num_groups * head_k_dim;
+        unsigned int k_total = num_groups * head_k_dim;
+
+        unsigned int out_idx;
+        if (idx < head_k_dim) {
+            out_idx = g * head_k_dim + idx;
+        } else if (idx < 2 * head_k_dim) {
+            out_idx = q_total + g * head_k_dim + (idx - head_k_dim);
+        } else if (idx < 2 * head_k_dim + v_group_size) {
+            out_idx = q_total + k_total + g * v_group_size + (idx - 2 * head_k_dim);
+        } else {
+            out_idx = q_total + k_total + num_groups * v_group_size
+                    + g * v_group_size + (idx - 2 * head_k_dim - v_group_size);
+        }
+        C[out_idx] = __float2bfloat16(result);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV batch2 with inline Q/Gate deinterleave
+// ============================================================
+// Combines w4a16_gemv_batch2 (2-input) with w4a16_gemv_qg (deinterleave).
+// Reads Q+Gate weight matrix once for 2 input tokens, produces 2 deinterleaved
+// output vectors [Q_all | Gate_all] per token.
+//
+// Input:  A[2, K] BF16 (2 token hidden states)
+// Output: C[2, N] BF16 (deinterleaved: C[0] = [Q0|G0], C[1] = [Q1|G1])
+//
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_qg_batch2(
+    const __nv_bfloat16* __restrict__ A,        // [2, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [2, N] deinterleaved [Q|G] per token
+    unsigned int N,
+    unsigned int K,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    const __nv_bfloat16* __restrict__ A1 = A + K;
+    __nv_bfloat16* __restrict__ C1 = C + N;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 4];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 4 + warp_idx * 2]     = acc0;
+        smem[local_out * 4 + warp_idx * 2 + 1] = acc1;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 4]     + smem[local_out * 4 + 2];
+        float result1 = smem[local_out * 4 + 1] + smem[local_out * 4 + 3];
+
+        // Deinterleave: n indexes interleaved [Q_h0(hd), G_h0(hd), Q_h1(hd), ...]
+        unsigned int group_dim = 2 * head_dim;
+        unsigned int h = n / group_dim;
+        unsigned int idx = n % group_dim;
+        unsigned int q_total = num_heads * head_dim;
+
+        unsigned int out_idx;
+        if (idx < head_dim) {
+            out_idx = h * head_dim + idx;
+        } else {
+            out_idx = q_total + h * head_dim + (idx - head_dim);
+        }
+        C[out_idx]  = __float2bfloat16(result0);
+        C1[out_idx] = __float2bfloat16(result1);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV dual batch2: K+V for 2 input tokens in one launch
+// ============================================================
+// Processes 2 separate weight matrices (K and V) with 2 input vectors each.
+// blockIdx.z selects K (0) or V (1). Both projections compute 2 outputs.
+//
+// Input:  A[2, K_in] BF16 (2 token hidden states)
+// Output: C[2, N] where blockIdx.z=0 writes K, blockIdx.z=1 writes V
+//
+// Grid: (ceil(N / 4), 1, 2)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_dual_batch2(
+    const __nv_bfloat16* __restrict__ A,         // [2, K_in] BF16
+    const unsigned char* __restrict__ B0_packed,  // [N, K_in/2] first projection
+    const unsigned char* __restrict__ B0_scale,
+    float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,              // [2, N] first projection output
+    const unsigned char* __restrict__ B1_packed,  // [N, K_in/2] second projection
+    const unsigned char* __restrict__ B1_scale,
+    float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,              // [2, N] second projection output
+    unsigned int N,
+    unsigned int K_in
+) {
+    const unsigned int proj = blockIdx.z;
+    const unsigned char* B_packed = (proj == 0) ? B0_packed : B1_packed;
+    const unsigned char* B_scale = (proj == 0) ? B0_scale : B1_scale;
+    float s2 = (proj == 0) ? B0_scale2 : B1_scale2;
+    __nv_bfloat16* C_out = (proj == 0) ? C0 : C1;
+
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K_in / 2;
+    const unsigned int num_groups = K_in / GROUP_SIZE;
+    const unsigned int K8 = K_in / 8;
+
+    const __nv_bfloat16* A1 = A + K_in;
+    __nv_bfloat16* C_out1 = C_out + N;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 4];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int sg = base_k / GROUP_SIZE;
+        unsigned char sb = B_scale[(unsigned long long)n * num_groups + sg];
+        __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
+        float scale = (float)fp8 * s2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char bv = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[bv & 0xF] * scale;
+            float w_hi = s_lut[bv >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 4 + warp_idx * 2]     = acc0;
+        smem[local_out * 4 + warp_idx * 2 + 1] = acc1;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 4]     + smem[local_out * 4 + 2];
+        float result1 = smem[local_out * 4 + 1] + smem[local_out * 4 + 3];
+        C_out[n]  = __float2bfloat16(result0);
+        C_out1[n] = __float2bfloat16(result1);
+    }
+}
+
+// ============================================================
+// W4A16 triple-GEMV (M=3): reads weights once, computes 3 outputs
+// ============================================================
+// For K=3 speculative verification: processes 3 input vectors through
+// the same weight matrix in a single pass.
+//
+// A: [3, K] BF16 contiguous (row 0, 1, 2)
+// B: [N, K/2] NVFP4 packed weights
+// C: [3, N] BF16 contiguous (row 0, 1, 2)
+//
+// Same memory bandwidth as M=1 GEMV (weights dominate, read once).
+// Extra cost: 3x activation reads (K*2 bytes per vector, fits in L1/L2).
+//
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_batch3(
+    const __nv_bfloat16* __restrict__ A,        // [3, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [3, N]
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    const __nv_bfloat16* __restrict__ A1 = A + K;
+    const __nv_bfloat16* __restrict__ A2 = A + 2 * K;
+    __nv_bfloat16* __restrict__ C1 = C + N;
+    __nv_bfloat16* __restrict__ C2 = C + 2 * N;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 6];  // 2 warps × 3 accumulators per output
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        uint4 a2_data = ((const uint4*)A2)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+        const unsigned int a2_raw[4] = {a2_data.x, a2_data.y, a2_data.z, a2_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+
+            __nv_bfloat16 a2_lo, a2_hi;
+            *(unsigned short*)&a2_lo = (unsigned short)(a2_raw[b] & 0xFFFF);
+            *(unsigned short*)&a2_hi = (unsigned short)(a2_raw[b] >> 16);
+            acc2 += __bfloat162float(a2_lo) * w_lo + __bfloat162float(a2_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 6 + warp_idx * 3]     = acc0;
+        smem[local_out * 6 + warp_idx * 3 + 1] = acc1;
+        smem[local_out * 6 + warp_idx * 3 + 2] = acc2;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
+        float result1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
+        float result2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
+        C[n]  = __float2bfloat16(result0);
+        C1[n] = __float2bfloat16(result1);
+        C2[n] = __float2bfloat16(result2);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV batch3 with inline Q/Gate deinterleave
+// ============================================================
+// Combines w4a16_gemv_batch3 (3-input) with Q/Gate deinterleave.
+// Reads Q+Gate weight matrix once for 3 input tokens, produces 3 deinterleaved
+// output vectors [Q_all | Gate_all] per token.
+//
+// Input:  A[3, K] BF16 (3 token hidden states)
+// Output: C[3, N] BF16 (deinterleaved: C[i] = [Qi|Gi])
+//
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_qg_batch3(
+    const __nv_bfloat16* __restrict__ A,        // [3, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [3, N] deinterleaved [Q|G] per token
+    unsigned int N,
+    unsigned int K,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    const __nv_bfloat16* __restrict__ A1 = A + K;
+    const __nv_bfloat16* __restrict__ A2 = A + 2 * K;
+    __nv_bfloat16* __restrict__ C1 = C + N;
+    __nv_bfloat16* __restrict__ C2 = C + 2 * N;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 6];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        uint4 a2_data = ((const uint4*)A2)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+        const unsigned int a2_raw[4] = {a2_data.x, a2_data.y, a2_data.z, a2_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+
+            __nv_bfloat16 a2_lo, a2_hi;
+            *(unsigned short*)&a2_lo = (unsigned short)(a2_raw[b] & 0xFFFF);
+            *(unsigned short*)&a2_hi = (unsigned short)(a2_raw[b] >> 16);
+            acc2 += __bfloat162float(a2_lo) * w_lo + __bfloat162float(a2_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 6 + warp_idx * 3]     = acc0;
+        smem[local_out * 6 + warp_idx * 3 + 1] = acc1;
+        smem[local_out * 6 + warp_idx * 3 + 2] = acc2;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
+        float result1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
+        float result2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
+
+        unsigned int group_dim = 2 * head_dim;
+        unsigned int h = n / group_dim;
+        unsigned int idx = n % group_dim;
+        unsigned int q_total = num_heads * head_dim;
+
+        unsigned int out_idx;
+        if (idx < head_dim) {
+            out_idx = h * head_dim + idx;
+        } else {
+            out_idx = q_total + h * head_dim + (idx - head_dim);
+        }
+        C[out_idx]  = __float2bfloat16(result0);
+        C1[out_idx] = __float2bfloat16(result1);
+        C2[out_idx] = __float2bfloat16(result2);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV dual batch3: K+V for 3 input tokens in one launch
+// ============================================================
+// Processes 2 separate weight matrices (K and V) with 3 input vectors each.
+// blockIdx.z selects K (0) or V (1). Both projections compute 3 outputs.
+//
+// Input:  A[3, K_in] BF16 (3 token hidden states)
+// Output: C[3, N] where blockIdx.z=0 writes K, blockIdx.z=1 writes V
+//
+// Grid: (ceil(N / 4), 1, 2)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_dual_batch3(
+    const __nv_bfloat16* __restrict__ A,         // [3, K_in] BF16
+    const unsigned char* __restrict__ B0_packed,  // [N, K_in/2] first projection
+    const unsigned char* __restrict__ B0_scale,
+    float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,              // [3, N] first projection output
+    const unsigned char* __restrict__ B1_packed,  // [N, K_in/2] second projection
+    const unsigned char* __restrict__ B1_scale,
+    float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,              // [3, N] second projection output
+    unsigned int N,
+    unsigned int K_in
+) {
+    const unsigned int proj = blockIdx.z;
+    const unsigned char* B_packed = (proj == 0) ? B0_packed : B1_packed;
+    const unsigned char* B_scale = (proj == 0) ? B0_scale : B1_scale;
+    float s2 = (proj == 0) ? B0_scale2 : B1_scale2;
+    __nv_bfloat16* C_out = (proj == 0) ? C0 : C1;
+
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K_in / 2;
+    const unsigned int num_groups = K_in / GROUP_SIZE;
+    const unsigned int K8 = K_in / 8;
+
+    const __nv_bfloat16* A1 = A + K_in;
+    const __nv_bfloat16* A2 = A + 2 * K_in;
+    __nv_bfloat16* C_out1 = C_out + N;
+    __nv_bfloat16* C_out2 = C_out + 2 * N;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 6];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        uint4 a2_data = ((const uint4*)A2)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+        const unsigned int a2_raw[4] = {a2_data.x, a2_data.y, a2_data.z, a2_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int sg = base_k / GROUP_SIZE;
+        unsigned char sb = B_scale[(unsigned long long)n * num_groups + sg];
+        __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
+        float scale = (float)fp8 * s2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char bv = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[bv & 0xF] * scale;
+            float w_hi = s_lut[bv >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+
+            __nv_bfloat16 a2_lo, a2_hi;
+            *(unsigned short*)&a2_lo = (unsigned short)(a2_raw[b] & 0xFFFF);
+            *(unsigned short*)&a2_hi = (unsigned short)(a2_raw[b] >> 16);
+            acc2 += __bfloat162float(a2_lo) * w_lo + __bfloat162float(a2_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 6 + warp_idx * 3]     = acc0;
+        smem[local_out * 6 + warp_idx * 3 + 1] = acc1;
+        smem[local_out * 6 + warp_idx * 3 + 2] = acc2;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
+        float result1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
+        float result2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
+        C_out[n]  = __float2bfloat16(result0);
+        C_out1[n] = __float2bfloat16(result1);
+        C_out2[n] = __float2bfloat16(result2);
+    }
+}
+
+// ============================================================
+// M=1 GEMV tile-shape variants
+// ============================================================
+// Baseline w4a16_gemv (N_PER_BLOCK=4, threads_per_out=64) achieves
+// ~59-60% of GB10's 273 GB/s LPDDR5X bandwidth on M=1 small projections
+// (Qwen3.6-27B SSM qkvz_proj, attn Q/K/V/O), compared to ~85% for the
+// fused FFN kernels (w4a16_gemv_fused.cu), making single-output GEMV
+// the primary bandwidth bottleneck on the K=3 verify path.
+//
+// Four variants below try different (BLOCK_SIZE, N_PER_BLOCK, threads_per_out)
+// combinations:
+//   v1 (BS=256, N=2, t=128) — 2× more blocks, more threads per output, better K-dim coalescing
+//   v2 (BS=256, N=1, t=256) — 4× more blocks, single output per CTA
+//   v3 (BS=256, N=8, t=32)  — half the blocks but 1 warp/output (no cross-warp reduce)
+//   v4 (BS=128, N=2, t=64)  — 2× more blocks with half-size CTA (requires block = 128)
+//
+// All variants reuse the same vectorized inner loop: 16 BF16 acts as 2×uint4,
+// 8 packed weight bytes as uint64, 1 FP8 scale (since GROUP_SIZE=16).
+//
+// Generalized cross-warp reduction handles any warps_per_out in {1,2,4,8}.
+//
+// Each Rust launcher MUST set grid = ceil(N / N_PER_BLOCK_VARIANT) and
+// block = 256 for v1..v3, or block = 128 for v4.
+
+// Shared inner-loop FMA body (16 K-values per iteration, 1 scale, 1 packed8)
+#define W4A16_INNER_FMA(ACC, LANE, THREADS_PER_OUT)                                              \
+    for (unsigned int k16 = (LANE); k16 < K16; k16 += (THREADS_PER_OUT)) {                       \
+        const unsigned int base_k = k16 * 16;                                                    \
+        uint4 a_lo = ((const uint4*)A)[k16 * 2];                                                 \
+        uint4 a_hi = ((const uint4*)A)[k16 * 2 + 1];                                             \
+        const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,                           \
+                                        a_hi.x, a_hi.y, a_hi.z, a_hi.w};                         \
+        unsigned long long packed8 = *(const unsigned long long*)(                               \
+            B_packed + (unsigned long long)n * half_K + k16 * 8);                                \
+        unsigned int scale_group = base_k / GROUP_SIZE;                                          \
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];    \
+        __nv_fp8_e4m3 fp8;                                                                       \
+        *(unsigned char*)&fp8 = scale_byte;                                                      \
+        float scale = (float)fp8 * scale2;                                                       \
+        _Pragma("unroll")                                                                        \
+        for (int b = 0; b < 8; b++) {                                                            \
+            unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));                        \
+            float w_lo = s_lut[byte_val & 0xF] * scale;                                          \
+            float w_hi = s_lut[byte_val >> 4] * scale;                                           \
+            __nv_bfloat16 a_lo_bf, a_hi_bf;                                                      \
+            *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFF);                    \
+            *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);                       \
+            (ACC) += __bfloat162float(a_lo_bf) * w_lo;                                           \
+            (ACC) += __bfloat162float(a_hi_bf) * w_hi;                                           \
+        }                                                                                        \
+    }
+
+// ── Variant 1: (N_PER_BLOCK=2, threads_per_out=128) ──
+// 4 warps per output; cross-warp reduce via smem with 4 partials.
+extern "C" __global__ void w4a16_gemv_v1(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    constexpr unsigned int NB = 2;
+    constexpr unsigned int TPO = BLOCK_SIZE / NB;  // 128
+    constexpr unsigned int WARPS_PER_OUT = TPO / WARP_SIZE;  // 4
+
+    const unsigned int local_out = threadIdx.x / TPO;
+    const unsigned int lane = threadIdx.x % TPO;
+
+    const unsigned int n = blockIdx.x * NB + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[NB * WARPS_PER_OUT];  // 8 floats
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (valid) {
+    W4A16_INNER_FMA(acc, lane, TPO)
+    }
+
+    // Warp shuffle reduction (32 threads per warp)
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    // Cross-warp reduction via smem
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    const unsigned int warp_idx = lane / WARP_SIZE;  // 0..WARPS_PER_OUT-1
+    if (warp_lane == 0) {
+        smem[local_out * WARPS_PER_OUT + warp_idx] = acc;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result = 0.0f;
+        #pragma unroll
+        for (unsigned int w = 0; w < WARPS_PER_OUT; w++) {
+            result += smem[local_out * WARPS_PER_OUT + w];
+        }
+        C[n] = __float2bfloat16(result);
+    }
+}
+
+// ── Variant 2: (N_PER_BLOCK=1, threads_per_out=256) ──
+// 8 warps per output; one output per CTA. Max grid → max blocks resident.
+extern "C" __global__ void w4a16_gemv_v2(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    constexpr unsigned int NB = 1;
+    constexpr unsigned int TPO = BLOCK_SIZE / NB;  // 256
+    constexpr unsigned int WARPS_PER_OUT = TPO / WARP_SIZE;  // 8
+
+    const unsigned int local_out = 0;
+    const unsigned int lane = threadIdx.x;
+
+    const unsigned int n = blockIdx.x;
+    if (n >= N) return;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[WARPS_PER_OUT];  // 8 floats
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    W4A16_INNER_FMA(acc, lane, TPO)
+
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    const unsigned int warp_idx = threadIdx.x / WARP_SIZE;
+    if (warp_lane == 0) {
+        smem[warp_idx] = acc;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float result = 0.0f;
+        #pragma unroll
+        for (unsigned int w = 0; w < WARPS_PER_OUT; w++) {
+            result += smem[w];
+        }
+        C[n] = __float2bfloat16(result);
+        (void)local_out;
+    }
+}
+
+// ── Variant 3: (N_PER_BLOCK=8, threads_per_out=32) ──
+// 1 warp per output — pure warp shuffle, no cross-warp smem reduce.
+extern "C" __global__ void w4a16_gemv_v3(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    constexpr unsigned int NB = 8;
+    constexpr unsigned int TPO = BLOCK_SIZE / NB;  // 32
+
+    const unsigned int local_out = threadIdx.x / TPO;
+    const unsigned int lane = threadIdx.x % TPO;
+
+    const unsigned int n = blockIdx.x * NB + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (valid) {
+    W4A16_INNER_FMA(acc, lane, TPO)
+    }
+
+    // Pure warp shuffle (no cross-warp reduce since 1 warp == 1 output)
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (valid && lane == 0) {
+        C[n] = __float2bfloat16(acc);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV batch3 LOGITS: M=3 GEMV specialized for LM head.
+// ============================================================
+// Same M=3 algorithm as `w4a16_gemv_batch3` (reads each NVFP4 weight row
+// ONCE and FMAs against 3 input rows), but tuned for the large-N LM-head
+// case (vocab=248320 vs ~12k for SSM QKVZ):
+//
+//  * `N_PER_BLOCK = 8` → grid shrinks 2×  (62080 → 31040 CTAs)
+//  * `threads_per_out = 32`  → exactly 1 warp per output → NO smem
+//    cross-warp reduce. Only the 16-float LUT lives in smem.
+//  * Output is BF16 [3, N] contiguous (row-major, vocab is the inner dim),
+//    matching what the existing K=3 verify argmax expects.
+//
+// Bandwidth analysis (Qwen3.6-27B lm_head, hidden=5120 vocab=248320):
+//   Weight read   = 5120 × 248320 × 0.5625 B = 715 MB
+//   Activation rd = 3 × 5120 × 2 B           ≈  30 KB  (L1 / L2 cached)
+//   Output write  = 3 × 248320 × 2 B         ≈ 1.5 MB
+// Theoretical at 273 GB/s: ~2.6 ms. The 18.7 ms measured by the M=3
+// fallback through `w4a16_gemm` was 95% wasted M-tile (64×64 tile reads
+// the weight but only 3 of 64 M-rows are valid).
+//
+// Grid: (ceil(N / 8), 1, 1)   Block: (BLOCK_SIZE, 1, 1)   (NB = 8 outputs/CTA)
+//
+// Input layout:
+//   A           [3, K]      BF16 contiguous (3 token hidden states)
+//   B_packed    [N, K/2]    NVFP4 packed (2 weights per byte)
+//   B_scale     [N, K/16]   FP8-E4M3 (one scale per 16 K)
+//   C           [3, N]      BF16 contiguous (3 token logits)
+extern "C" __global__ void w4a16_gemv_batch3_logits(
+    const __nv_bfloat16* __restrict__ A,        // [3, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [3, N]
+    unsigned int N,
+    unsigned int K
+) {
+    constexpr unsigned int NB = 8;                  // 8 output cols per CTA
+    constexpr unsigned int TPO = BLOCK_SIZE / NB;   // 32 → 1 warp per output
+
+    const unsigned int local_out = threadIdx.x / TPO;
+    const unsigned int lane = threadIdx.x % TPO;
+
+    const unsigned int n = blockIdx.x * NB + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    const __nv_bfloat16* __restrict__ A1 = A + K;
+    const __nv_bfloat16* __restrict__ A2 = A + 2 * K;
+    __nv_bfloat16* __restrict__ C1 = C + N;
+    __nv_bfloat16* __restrict__ C2 = C + 2 * N;
+
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    // Process 8 K-values per iteration — matches the batch3 kernel layout
+    // (uint4 activation read = 8 BF16 values; uint32_t weight read = 4 bytes
+    // = 8 FP4 values; exactly half of GROUP_SIZE → 2 iters per scale).
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += TPO) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        uint4 a2_data = ((const uint4*)A2)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+        const unsigned int a2_raw[4] = {a2_data.x, a2_data.y, a2_data.z, a2_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+
+            __nv_bfloat16 a2_lo, a2_hi;
+            *(unsigned short*)&a2_lo = (unsigned short)(a2_raw[b] & 0xFFFF);
+            *(unsigned short*)&a2_hi = (unsigned short)(a2_raw[b] >> 16);
+            acc2 += __bfloat162float(a2_lo) * w_lo + __bfloat162float(a2_hi) * w_hi;
+        }
+    }
+    }
+
+    // 1 warp per output → pure shuffle reduce, no smem cross-warp step.
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+    }
+
+    if (valid && lane == 0) {
+        C[n]  = __float2bfloat16(acc0);
+        C1[n] = __float2bfloat16(acc1);
+        C2[n] = __float2bfloat16(acc2);
+    }
+}
+
+// ── Variant 4: BLOCK_SIZE=128, N_PER_BLOCK=2, threads_per_out=64 ──
+// Same threads-per-output as baseline (64, so 2 warps/output, identical
+// cross-warp reduce cost), but block is HALF the size — so grid count
+// is 2× baseline. More resident blocks at the same per-thread workload
+// can help saturate LPDDR5X by overlapping load latency across more CTAs.
+// Grid: (ceil(N / 2), 1, 1)   Block: (128, 1, 1)  (MUST launch with block = 128)
+extern "C" __global__ __launch_bounds__(128) void w4a16_gemv_v4(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    constexpr unsigned int BS = 128;
+    constexpr unsigned int NB = 2;
+    constexpr unsigned int TPO = BS / NB;  // 64
+    constexpr unsigned int WARPS_PER_OUT = TPO / WARP_SIZE;  // 2
+
+    const unsigned int local_out = threadIdx.x / TPO;
+    const unsigned int lane = threadIdx.x % TPO;
+
+    const unsigned int n = blockIdx.x * NB + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[NB * WARPS_PER_OUT];  // 4 floats
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (valid) {
+    W4A16_INNER_FMA(acc, lane, TPO)
+    }
+
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    const unsigned int warp_idx = lane / WARP_SIZE;
+    if (warp_lane == 0) {
+        smem[local_out * WARPS_PER_OUT + warp_idx] = acc;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result = 0.0f;
+        #pragma unroll
+        for (unsigned int w = 0; w < WARPS_PER_OUT; w++) {
+            result += smem[local_out * WARPS_PER_OUT + w];
+        }
+        C[n] = __float2bfloat16(result);
+    }
+}
+
+
+// ============================================================
+// Strided variants of w4a16_gemv_qg_batch3 and w4a16_gemv_dual_batch3
+// ============================================================
+// These accept an additional `out_stride` (in BF16 elements) so that the
+// per-token outputs land directly in an interleaved [Q|K|V] layout
+// (qkv_buf) without an intermediate scratch + d2d copy. When
+// out_stride == N the layout matches the non-strided kernel.
+//
+// Used by the attention Q/K/V projection path when
+// ATLAS_ATTN_QKV_FUSED=1.
+
+extern "C" __global__ void w4a16_gemv_qg_batch3_strided(
+    const __nv_bfloat16* __restrict__ A,        // [3, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // base pointer; token i at C + i*out_stride
+    unsigned int N,
+    unsigned int K,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int out_stride                       // BF16 elements between successive tokens
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    const __nv_bfloat16* __restrict__ A1 = A + K;
+    const __nv_bfloat16* __restrict__ A2 = A + 2 * K;
+    __nv_bfloat16* __restrict__ C1 = C + out_stride;
+    __nv_bfloat16* __restrict__ C2 = C + 2 * out_stride;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 6];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        uint4 a2_data = ((const uint4*)A2)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+        const unsigned int a2_raw[4] = {a2_data.x, a2_data.y, a2_data.z, a2_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        float scale = (float)fp8 * scale2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+
+            __nv_bfloat16 a2_lo, a2_hi;
+            *(unsigned short*)&a2_lo = (unsigned short)(a2_raw[b] & 0xFFFF);
+            *(unsigned short*)&a2_hi = (unsigned short)(a2_raw[b] >> 16);
+            acc2 += __bfloat162float(a2_lo) * w_lo + __bfloat162float(a2_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 6 + warp_idx * 3]     = acc0;
+        smem[local_out * 6 + warp_idx * 3 + 1] = acc1;
+        smem[local_out * 6 + warp_idx * 3 + 2] = acc2;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
+        float result1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
+        float result2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
+
+        unsigned int group_dim = 2 * head_dim;
+        unsigned int h = n / group_dim;
+        unsigned int idx = n % group_dim;
+        unsigned int q_total = num_heads * head_dim;
+
+        unsigned int out_idx;
+        if (idx < head_dim) {
+            out_idx = h * head_dim + idx;
+        } else {
+            out_idx = q_total + h * head_dim + (idx - head_dim);
+        }
+        C[out_idx]  = __float2bfloat16(result0);
+        C1[out_idx] = __float2bfloat16(result1);
+        C2[out_idx] = __float2bfloat16(result2);
+    }
+}
+
+extern "C" __global__ void w4a16_gemv_dual_batch3_strided(
+    const __nv_bfloat16* __restrict__ A,         // [3, K_in] BF16
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,              // base; token i at C0 + i*out_stride
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,              // base; token i at C1 + i*out_stride
+    unsigned int N,
+    unsigned int K_in,
+    unsigned int out_stride                       // BF16 elements between successive tokens
+) {
+    const unsigned int proj = blockIdx.z;
+    const unsigned char* B_packed = (proj == 0) ? B0_packed : B1_packed;
+    const unsigned char* B_scale = (proj == 0) ? B0_scale : B1_scale;
+    float s2 = (proj == 0) ? B0_scale2 : B1_scale2;
+    __nv_bfloat16* C_out = (proj == 0) ? C0 : C1;
+
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+
+    const unsigned int half_K = K_in / 2;
+    const unsigned int num_groups = K_in / GROUP_SIZE;
+    const unsigned int K8 = K_in / 8;
+
+    const __nv_bfloat16* A1 = A + K_in;
+    const __nv_bfloat16* A2 = A + 2 * K_in;
+    __nv_bfloat16* C_out1 = C_out + out_stride;
+    __nv_bfloat16* C_out2 = C_out + 2 * out_stride;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 6];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+
+    if (valid) {
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+
+        uint4 a0_data = ((const uint4*)A)[k8];
+        uint4 a1_data = ((const uint4*)A1)[k8];
+        uint4 a2_data = ((const uint4*)A2)[k8];
+        const unsigned int a0_raw[4] = {a0_data.x, a0_data.y, a0_data.z, a0_data.w};
+        const unsigned int a1_raw[4] = {a1_data.x, a1_data.y, a1_data.z, a1_data.w};
+        const unsigned int a2_raw[4] = {a2_data.x, a2_data.y, a2_data.z, a2_data.w};
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int sg = base_k / GROUP_SIZE;
+        unsigned char sb = B_scale[(unsigned long long)n * num_groups + sg];
+        __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
+        float scale = (float)fp8 * s2;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char bv = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[bv & 0xF] * scale;
+            float w_hi = s_lut[bv >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+
+            __nv_bfloat16 a2_lo, a2_hi;
+            *(unsigned short*)&a2_lo = (unsigned short)(a2_raw[b] & 0xFFFF);
+            *(unsigned short*)&a2_hi = (unsigned short)(a2_raw[b] >> 16);
+            acc2 += __bfloat162float(a2_lo) * w_lo + __bfloat162float(a2_hi) * w_hi;
+        }
+    }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 6 + warp_idx * 3]     = acc0;
+        smem[local_out * 6 + warp_idx * 3 + 1] = acc1;
+        smem[local_out * 6 + warp_idx * 3 + 2] = acc2;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float result0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
+        float result1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
+        float result2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
+        C_out[n]  = __float2bfloat16(result0);
+        C_out1[n] = __float2bfloat16(result1);
+        C_out2[n] = __float2bfloat16(result2);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV dual batch3 TUNED — fused gate+up, wider inner loop
+// ============================================================
+// Drop-in replacement for `w4a16_gemv_dual_batch3` gated behind
+// `ATLAS_FFN_DUAL_TUNED=1`. Two stacked optimisations vs the baseline:
+//
+//   1. Fused gate+up dispatch — both projections compute in the SAME CTA
+//      (8 outputs / CTA: 4 gate + 4 up, dispatched by warp id) instead of
+//      the baseline `blockIdx.z = 2` fan-out. Grid drops from
+//      (ceil(N/4), 1, 2) to (ceil(N/4), 1, 1) — exactly half as many CTAs
+//      across the kernel. The 3-token activation vector `A[3, K_in]` is
+//      L1-shared across all 8 outputs in the CTA instead of being read
+//      once per (CTA, projection), halving the L2 A-read traffic.
+//
+//   2. K=16 inner loop — each iteration consumes 16 K-values (8-byte
+//      weight load + 2× uint4 act loads per token) instead of 8. Halves
+//      the K-loop trip count, the integer index-math overhead, and the
+//      FP8-scale fetch frequency (one scale spans 16 K-vals exactly at
+//      GROUP_SIZE=16).
+//
+// Geometry:
+//   - 8 outputs per CTA, 64 threads per output (2 warps), 512 thr/block
+//   - Grid:  (ceil(N/4), 1, 1)   half the baseline CTA count
+//   - Block: (512, 1, 1)
+//   - `__launch_bounds__(512, 2)` requests at least 2 resident blocks/SM
+//
+// Mapping:
+//   local_out = threadIdx.x / 64   in [0..8)
+//   proj      = local_out & 1      0=gate, 1=up
+//   n_local   = local_out >> 1     in [0..4)
+//   n         = blockIdx.x * 4 + n_local
+//
+// Output buffer layout is identical to `w4a16_gemv_dual_batch3` (gate to
+// C0, up to C1) so the downstream silu_mul + down kernels need no changes
+// and the bytes are equivalent at FP arithmetic precision.
+//
+// Resources (ptxas --gpu-name sm_121 + cuobjdump --dump-resource-usage):
+//   64 registers / thread, 256 B static smem, 0 stack, 0 spills.
+//   2 blocks/SM resident (vs 6 for baseline at 40 reg × 256 thr),
+//   so 1024 threads/SM (vs 1536) — losing 33% thread-level occupancy in
+//   exchange for halving the CTA count and the activation traffic.
+//
+// Measured impact on Qwen3.6-27B (N=12288, K=5120) counting prompt:
+//   ffn_gate_up_dual_batch3 per-call: 477 us (baseline) -> 473-474 us
+//   (tuned), ~1% improvement. End-to-end server tok/s: 33.5 vs 33.4 — at
+//   the floor of LPDDR5X bandwidth + launch-overhead noise for this CTA
+//   geometry. The structural changes are correct; further headroom needs
+//   either pipelined activation prefetch (cp.async) or a fundamentally
+//   different weight-layout (eg interleaved gate/up rows for one bus burst
+//   per weight pair) which are out of scope for this drop-in replacement.
+extern "C" __global__ __launch_bounds__(512, 2)
+void w4a16_gemv_dual_batch3_tuned(
+    const __nv_bfloat16* __restrict__ A,         // [3, K_in] BF16 (shared)
+    const unsigned char* __restrict__ B0_packed,  // [N, K_in/2] gate
+    const unsigned char* __restrict__ B0_scale,
+    float B0_scale2,
+    __nv_bfloat16* __restrict__ C0,              // [3, N] gate output
+    const unsigned char* __restrict__ B1_packed,  // [N, K_in/2] up
+    const unsigned char* __restrict__ B1_scale,
+    float B1_scale2,
+    __nv_bfloat16* __restrict__ C1,              // [3, N] up output
+    unsigned int N,
+    unsigned int K_in
+) {
+    // 8 outputs per CTA (4 gate + 4 up), 64 threads per output (2 warps).
+    // 512 threads/block. The activation vector A[3, K_in] is read once per CTA
+    // (4 gate + 4 up outputs share it via L1) instead of once per CTA per
+    // projection like the baseline blockIdx.z=2 dispatch -> halves L2 A-read
+    // traffic across the kernel (6144 baseline CTAs -> 3072 tuned CTAs at N=12288).
+    constexpr unsigned int TPO = 64u;
+    const unsigned int local_out = threadIdx.x / TPO;        // 0..8
+    const unsigned int lane      = threadIdx.x % TPO;        // 0..64
+    const unsigned int proj      = local_out & 1u;
+    const unsigned int n_local   = local_out >> 1;           // 0..4
+
+    const unsigned char* B_packed = (proj == 0u) ? B0_packed : B1_packed;
+    const unsigned char* B_scale  = (proj == 0u) ? B0_scale  : B1_scale;
+    const float          s2       = (proj == 0u) ? B0_scale2 : B1_scale2;
+    __nv_bfloat16*       C_out    = (proj == 0u) ? C0        : C1;
+
+    const unsigned int n = blockIdx.x * 4u + n_local;
+    const bool valid = n < N;
+
+    const unsigned int half_K     = K_in / 2;
+    const unsigned int num_groups = K_in / GROUP_SIZE;
+    const unsigned int K16        = K_in / 16;  // 16 K-vals per iter
+
+    const __nv_bfloat16* A1 = A  + K_in;
+    const __nv_bfloat16* A2 = A1 + K_in;
+    __nv_bfloat16* C_out1 = C_out + N;
+    __nv_bfloat16* C_out2 = C_out + 2 * N;
+
+    // 8 outputs/CTA × 2 warps/out × 3 tokens = 48 floats for cross-warp reduce.
+    __shared__ float s_lut[16];
+    __shared__ float smem[8 * 6];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+
+    // 16 K-values per iteration: 2× uint4 acts (256-bit) + uint64 weight (8 bytes)
+    // + 1 scale byte (GROUP_SIZE=16 -> exactly one scale spans the whole iter).
+    if (valid) {
+    for (unsigned int k16 = lane; k16 < K16; k16 += TPO) {
+        const unsigned int base_k = k16 * 16;
+
+        // Two adjacent 128-bit loads -> 16 BF16 acts per token (8 uint per token).
+        uint4 a0_lo4 = ((const uint4*)A )[k16 * 2];
+        uint4 a0_hi4 = ((const uint4*)A )[k16 * 2 + 1];
+        uint4 a1_lo4 = ((const uint4*)A1)[k16 * 2];
+        uint4 a1_hi4 = ((const uint4*)A1)[k16 * 2 + 1];
+        uint4 a2_lo4 = ((const uint4*)A2)[k16 * 2];
+        uint4 a2_hi4 = ((const uint4*)A2)[k16 * 2 + 1];
+        const unsigned int a0_raw[8] = {a0_lo4.x, a0_lo4.y, a0_lo4.z, a0_lo4.w,
+                                         a0_hi4.x, a0_hi4.y, a0_hi4.z, a0_hi4.w};
+        const unsigned int a1_raw[8] = {a1_lo4.x, a1_lo4.y, a1_lo4.z, a1_lo4.w,
+                                         a1_hi4.x, a1_hi4.y, a1_hi4.z, a1_hi4.w};
+        const unsigned int a2_raw[8] = {a2_lo4.x, a2_lo4.y, a2_lo4.z, a2_lo4.w,
+                                         a2_hi4.x, a2_hi4.y, a2_hi4.z, a2_hi4.w};
+
+        // 8 packed bytes -> 16 weight values.
+        unsigned long long packed8 = *(const unsigned long long*)(
+            B_packed + (unsigned long long)n * half_K + k16 * 8);
+
+        unsigned int sg = base_k / GROUP_SIZE;
+        unsigned char sb = B_scale[(unsigned long long)n * num_groups + sg];
+        __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
+        float scale = (float)fp8 * s2;
+
+        #pragma unroll
+        for (int b = 0; b < 8; b++) {
+            unsigned char bv = (unsigned char)(packed8 >> (b * 8));
+            float w_lo = s_lut[bv & 0xF] * scale;
+            float w_hi = s_lut[bv >> 4] * scale;
+
+            __nv_bfloat16 a0_lo, a0_hi;
+            *(unsigned short*)&a0_lo = (unsigned short)(a0_raw[b] & 0xFFFF);
+            *(unsigned short*)&a0_hi = (unsigned short)(a0_raw[b] >> 16);
+            acc0 += __bfloat162float(a0_lo) * w_lo + __bfloat162float(a0_hi) * w_hi;
+
+            __nv_bfloat16 a1_lo, a1_hi;
+            *(unsigned short*)&a1_lo = (unsigned short)(a1_raw[b] & 0xFFFF);
+            *(unsigned short*)&a1_hi = (unsigned short)(a1_raw[b] >> 16);
+            acc1 += __bfloat162float(a1_lo) * w_lo + __bfloat162float(a1_hi) * w_hi;
+
+            __nv_bfloat16 a2_lo, a2_hi;
+            *(unsigned short*)&a2_lo = (unsigned short)(a2_raw[b] & 0xFFFF);
+            *(unsigned short*)&a2_hi = (unsigned short)(a2_raw[b] >> 16);
+            acc2 += __bfloat162float(a2_lo) * w_lo + __bfloat162float(a2_hi) * w_hi;
+        }
+    }
+    }
+
+    // 2 warps per output -> warp shuffle then smem cross-warp reduce (3 acc each).
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+        acc2 += __shfl_down_sync(0xFFFFFFFF, acc2, offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        smem[local_out * 6 + warp_idx * 3]     = acc0;
+        smem[local_out * 6 + warp_idx * 3 + 1] = acc1;
+        smem[local_out * 6 + warp_idx * 3 + 2] = acc2;
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        float r0 = smem[local_out * 6]     + smem[local_out * 6 + 3];
+        float r1 = smem[local_out * 6 + 1] + smem[local_out * 6 + 4];
+        float r2 = smem[local_out * 6 + 2] + smem[local_out * 6 + 5];
+        C_out [n] = __float2bfloat16(r0);
+        C_out1[n] = __float2bfloat16(r1);
+        C_out2[n] = __float2bfloat16(r2);
+    }
+}
+// w4a16_gemv_dual_batch3_tuned
+
+// ============================================================
+// Row-parallel exact GEMV (fn-mtp, ATLAS_W4A16_EXACT_ROWPAR=1).
+// ============================================================
+// `w4a16_gemv` with blockIdx.y selecting the activation row: M rows in one
+// launch, each row computed by exactly the K1 kernel's lanes (shared
+// `w4a16_gemv_partial`), shuffle tree and cross-warp add, so row r is
+// byte-identical to `w4a16_gemv` on row r and to every exact_m* tier.
+// For small-N matrices (Qwen4 hyper-connection mixers) the exact_m* tiers
+// serialize all M rows inside one block per 4 outputs and are latency bound;
+// here the rows run in parallel blocks.
+// Grid: (ceil(N / 4), M, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_rows(
+    const __nv_bfloat16* __restrict__ A,        // [M, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [M, N]
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+    const __nv_bfloat16* __restrict__ A_row = A + (unsigned long long)blockIdx.y * K;
+    __nv_bfloat16* __restrict__ C_row = C + (unsigned long long)blockIdx.y * N;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (valid) {
+        acc = w4a16_gemv_partial(A_row, B_packed, B_scale, scale2, s_lut,
+                                 n, half_K, num_groups, K16, lane);
+    }
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+    if (warp_lane == 0) {
+        smem[local_out * 2 + (lane / WARP_SIZE)] = acc;
+    }
+    __syncthreads();
+    if (valid && lane == 0) {
+        C_row[n] = __float2bfloat16(smem[local_out * 2] + smem[local_out * 2 + 1]);
+    }
+}
+
+// ============================================================
+// Exact multi-row GEMV, one warp per output (fn-mtp, ATLAS_W4A16_EXACT_SWK=1).
+// ============================================================
+// For small K (the Qwen4 hyper up projection, K=320 -> K16=20) the exact_m*
+// tiers keep 64 lanes per output of which only K16 do work. Here each lane l
+// reproduces base lanes l and l+32 of `w4a16_gemv` (as w4a16_gemv_sw does),
+// for OUT outputs and up to MAX_M rows; same per-lane operand sequence, same
+// five-step shuffle tree per half, final add half A + half B: byte-identical
+// to every exact_m* tier per row (fn-mtp microbench gemv_bench-2.out).
+// Grid: (ceil(N / (OUT * WARPS)), 1, 1)   Block: (32 * WARPS, 1, 1)
+template <int MAX_M, int OUT, int WARPS, int STAGE_ROWS = 0, bool EXACT_M = false>
+__device__ __forceinline__ void w4a16_gemv_batch_logits_exact_sw_body(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K,
+    float s_lut[WARPS][16], float* __restrict__ s_half0, uint4* __restrict__ s_a = nullptr)
+{
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    stage_e2m1_lut_warp(s_lut[warp], lane);
+#if ATLAS_WARP_LUT_STAGED
+    const float* lut = s_lut[warp];
+#else
+    const float* lut = E2M1_LUT;
+#endif
+    const unsigned int n0 = (blockIdx.x * WARPS + warp) * OUT;
+    if (M == 0 || M > (unsigned int)MAX_M) return;
+    if (STAGE_ROWS == 0 && n0 >= N) return;  // warp-uniform, no block barrier below when STAGE_ROWS == 0
+    const unsigned int half_K = K / 2, num_groups = K / GROUP_SIZE, K16 = K / 16;
+
+    #pragma unroll 1
+    for (int v = 0; v < 2; ++v) {
+        float acc[OUT][MAX_M];
+        #pragma unroll
+        for (int o = 0; o < OUT; ++o)
+            #pragma unroll
+            for (int r = 0; r < MAX_M; ++r)
+                acc[o][r] = 0.0f;
+
+        for (unsigned int kb_base = 0; kb_base < K16; kb_base += 64u) {
+            const unsigned int k16_base = kb_base + 32u * (unsigned int)v;
+            if (k16_base >= K16) break;
+            const unsigned int k16 = k16_base + lane;
+            unsigned long long pk[OUT];
+            unsigned char sb[OUT];
+            #pragma unroll
+            for (int o = 0; o < OUT; ++o) {
+                const unsigned int n = n0 + o;
+                const bool valid_w = (n < N) && (k16 < K16);
+                pk[o] = valid_w ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + k16 * 8) : 0ull;
+                sb[o] = valid_w ? B_scale[(unsigned long long)n * num_groups + (k16 * 16) / GROUP_SIZE] : 0;
+            }
+            if (STAGE_ROWS > 0) {
+                if (kb_base > 0u || v > 0) __syncthreads();
+                const unsigned int t_sub = threadIdx.x & 63u;
+                const unsigned int r_init = threadIdx.x >> 6;
+                const unsigned int s_idx = (t_sub & 1u) * 32u + (t_sub >> 1);
+                if (k16_base + (t_sub >> 1) < K16) {
+                    const unsigned int r_lim = (EXACT_M || M > (unsigned int)STAGE_ROWS)
+                        ? (unsigned int)STAGE_ROWS
+                        : M;
+                    for (unsigned int r = r_init; r < r_lim; r += ((32u * (unsigned int)WARPS) >> 6)) {
+                        const __nv_bfloat16* __restrict__ A_row = A + (unsigned long long)r * K;
+                        s_a[r * 64u + s_idx] = __ldg(&((const uint4*)A_row)[k16_base * 2u + t_sub]);
+                    }
+                }
+                __syncthreads();
+            } else {
+                if (k16 >= K16) continue;
+            }
+            float scale[OUT];
+            #pragma unroll
+            for (int o = 0; o < OUT; ++o) {
+                __nv_fp8_e4m3 fp8;
+                *(unsigned char*)&fp8 = sb[o];
+                scale[o] = (float)fp8 * scale2;
+            }
+            if constexpr (MAX_M >= 20) {
+                #pragma unroll 1
+                for (int bh = 0; bh < 2; ++bh) {
+                    float w_lo[OUT][4], w_hi[OUT][4];
+                    #pragma unroll
+                    for (int o = 0; o < OUT; ++o) {
+                        #pragma unroll
+                        for (int bi = 0; bi < 4; ++bi) {
+                            const int b = bh * 4 + bi;
+                            const unsigned char byte_val = (unsigned char)(pk[o] >> (b * 8));
+                            w_lo[o][bi] = lut[byte_val & 0xF] * scale[o];
+                            w_hi[o][bi] = lut[byte_val >> 4] * scale[o];
+                        }
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < MAX_M; ++r) {
+                        if (EXACT_M || (unsigned int)r < M) {
+                            const bool staged_r = (STAGE_ROWS > 0) && (r < STAGE_ROWS);
+                            if (k16 >= K16) continue;
+                            const uint4 a_vec = staged_r
+                                ? s_a[r * 64u + (unsigned int)bh * 32u + lane]
+                                : __ldg(&((const uint4*)(A + (unsigned long long)r * K))[k16 * 2 + bh]);
+                            const unsigned int a_raw[4] = {a_vec.x, a_vec.y, a_vec.z, a_vec.w};
+                            #pragma unroll
+                            for (int bi = 0; bi < 4; ++bi) {
+                                __nv_bfloat16 a_lo_bf, a_hi_bf;
+                                *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[bi] & 0xFFFF);
+                                *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[bi] >> 16);
+                                const float al = __bfloat162float(a_lo_bf), ah = __bfloat162float(a_hi_bf);
+                                #pragma unroll
+                                for (int o = 0; o < OUT; ++o) {
+                                    acc[o][r] += al * w_lo[o][bi];
+                                    acc[o][r] += ah * w_hi[o][bi];
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                float w_lo[OUT][8], w_hi[OUT][8];
+                #pragma unroll
+                for (int o = 0; o < OUT; ++o) {
+                    #pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        const unsigned char byte_val = (unsigned char)(pk[o] >> (b * 8));
+                        w_lo[o][b] = lut[byte_val & 0xF] * scale[o];
+                        w_hi[o][b] = lut[byte_val >> 4] * scale[o];
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < MAX_M; ++r) {
+                    if (EXACT_M || (unsigned int)r < M) {
+                        const bool staged_r = (STAGE_ROWS > 0) && (r < STAGE_ROWS);
+                        if (k16 >= K16) continue;
+                        const uint4 a_lo = staged_r
+                            ? s_a[r * 64u + 0u * 32u + lane]
+                            : __ldg(&((const uint4*)(A + (unsigned long long)r * K))[k16 * 2]);
+                        const uint4 a_hi = staged_r
+                            ? s_a[r * 64u + 1u * 32u + lane]
+                            : __ldg(&((const uint4*)(A + (unsigned long long)r * K))[k16 * 2 + 1]);
+                        const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                                       a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                        #pragma unroll
+                        for (int b = 0; b < 8; ++b) {
+                            __nv_bfloat16 a_lo_bf, a_hi_bf;
+                            *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFF);
+                            *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+                            const float al = __bfloat162float(a_lo_bf), ah = __bfloat162float(a_hi_bf);
+                            #pragma unroll
+                            for (int o = 0; o < OUT; ++o) {
+                                acc[o][r] += al * w_lo[o][b];
+                                acc[o][r] += ah * w_hi[o][b];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int o = 0; o < OUT; ++o) {
+            #pragma unroll
+            for (int r = 0; r < MAX_M; ++r) {
+                if (EXACT_M || (unsigned int)r < M) {
+                    float val = acc[o][r];
+                    #pragma unroll
+                    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+                    }
+                    const unsigned int idx = (warp * (unsigned int)OUT + (unsigned int)o) * (unsigned int)MAX_M + (unsigned int)r;
+                    if (v == 0) {
+                        if (lane == 0) s_half0[idx] = val;
+                    } else {
+                        const unsigned int n = n0 + o;
+                        if (lane == 0 && n < N) C[(unsigned long long)r * N + n] = __float2bfloat16(s_half0[idx] + val);
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int MAX_M, int OUT, int WARPS>
+__device__ __forceinline__ void w4a16_gemv_batch_logits_exact_swk32_body(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, float s_lut[WARPS][16])
+{
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    stage_e2m1_lut_warp(s_lut[warp], lane);
+#if ATLAS_WARP_LUT_STAGED
+    const float* lut = s_lut[warp];
+#else
+    const float* lut = E2M1_LUT;
+#endif
+    const unsigned int n0 = (blockIdx.x * WARPS + warp) * OUT;
+    if (n0 >= N || M == 0 || M > (unsigned int)MAX_M) return;
+    const unsigned int half_K = K / 2, num_groups = K / GROUP_SIZE, K16 = K / 16;
+
+    float acc0[OUT][MAX_M];
+    #pragma unroll
+    for (int o = 0; o < OUT; ++o)
+        #pragma unroll
+        for (int r = 0; r < MAX_M; ++r)
+            acc0[o][r] = 0.0f;
+
+    if (lane < K16) {
+        const unsigned int k16 = lane;
+        unsigned long long pk[OUT];
+        unsigned char sb[OUT];
+        #pragma unroll
+        for (int o = 0; o < OUT; ++o) {
+            const unsigned int n = n0 + o;
+            pk[o] = n < N ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + k16 * 8) : 0ull;
+            sb[o] = n < N ? B_scale[(unsigned long long)n * num_groups + (k16 * 16) / GROUP_SIZE] : 0;
+        }
+        float scale[OUT];
+        #pragma unroll
+        for (int o = 0; o < OUT; ++o) {
+            __nv_fp8_e4m3 fp8;
+            *(unsigned char*)&fp8 = sb[o];
+            scale[o] = (float)fp8 * scale2;
+        }
+        float w_lo[OUT][8], w_hi[OUT][8];
+        #pragma unroll
+        for (int o = 0; o < OUT; ++o) {
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const unsigned char byte_val = (unsigned char)(pk[o] >> (b * 8));
+                w_lo[o][b] = lut[byte_val & 0xF] * scale[o];
+                w_hi[o][b] = lut[byte_val >> 4] * scale[o];
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < MAX_M; ++r) {
+            if ((unsigned int)r < M) {
+                const __nv_bfloat16* __restrict__ A_row = A + (unsigned long long)r * K;
+                const uint4 a_lo = __ldg(&((const uint4*)A_row)[k16 * 2]);
+                const uint4 a_hi = __ldg(&((const uint4*)A_row)[k16 * 2 + 1]);
+                const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                               a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    __nv_bfloat16 a_lo_bf, a_hi_bf;
+                    *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFF);
+                    *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+                    const float al = __bfloat162float(a_lo_bf), ah = __bfloat162float(a_hi_bf);
+                    #pragma unroll
+                    for (int o = 0; o < OUT; ++o) {
+                        acc0[o][r] += al * w_lo[o][b];
+                        acc0[o][r] += ah * w_hi[o][b];
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int o = 0; o < OUT; ++o) {
+        #pragma unroll
+        for (int r = 0; r < MAX_M; ++r) {
+            if ((unsigned int)r < M) {
+                float a = acc0[o][r];
+                #pragma unroll
+                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                    a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+                }
+                const unsigned int n = n0 + o;
+                if (lane == 0 && n < N) C[(unsigned long long)r * N + n] = __float2bfloat16(a + 0.0f);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_batch_logits_exact_sw_m4_o2(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 2 * 5];
+    if (K <= 512u) {
+        if (M <= 4u) {
+            w4a16_gemv_batch_logits_exact_swk32_body<4, 2, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        } else {
+            w4a16_gemv_batch_logits_exact_swk32_body<5, 2, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        }
+    } else if (M <= 4u) {
+        w4a16_gemv_batch_logits_exact_sw_body<4, 2, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+    } else {
+        w4a16_gemv_batch_logits_exact_sw_body<5, 2, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+    }
+}
+extern "C" __global__ void __launch_bounds__(256, 4) w4a16_gemv_batch_logits_exact_sw_m8_o1(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 1 * 8];
+    if (K <= 512u) {
+        if (M <= 5u) {
+            w4a16_gemv_batch_logits_exact_swk32_body<5, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        } else {
+            w4a16_gemv_batch_logits_exact_swk32_body<8, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        }
+    } else {
+        w4a16_gemv_batch_logits_exact_sw_body<8, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+    }
+}
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemv_batch_logits_exact_sw_m10_o1(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 1 * 10];
+    if (K <= 512u) {
+        if (M <= 5u) {
+            w4a16_gemv_batch_logits_exact_swk32_body<5, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        } else if (M <= 8u) {
+            w4a16_gemv_batch_logits_exact_swk32_body<8, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        } else {
+            w4a16_gemv_batch_logits_exact_swk32_body<10, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        }
+    } else {
+        w4a16_gemv_batch_logits_exact_sw_body<10, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+    }
+}
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_batch_logits_exact_sw_m25_o1(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 1 * 25];
+    if (K <= 512u) {
+        if (M <= 15u) {
+            w4a16_gemv_batch_logits_exact_swk32_body<15, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        } else if (M <= 20u) {
+            w4a16_gemv_batch_logits_exact_swk32_body<20, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        } else {
+            w4a16_gemv_batch_logits_exact_swk32_body<25, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut);
+        }
+    } else {
+        w4a16_gemv_batch_logits_exact_sw_body<25, 1, 8>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+    }
+}
+// Wide-N twin (verify-cost, ATLAS_W4A16_EXACT_SW4=1): four outputs per warp, four warps per block,
+// so each lane's weight words of four outputs are in flight together. Same per-output arithmetic as
+// every exact tier (fn-mtp gemv_bench-2 swmo_m8_o4_w4, byte-identical; at 5..8 rows qkvz 16384x2560
+// 4.43-5.25 vs exact_m8 4.92-6.55 ms per 36 layers, lm_head 1.70-1.85 vs 1.82-2.34 ms).
+// Grid: (ceil(N / 16), 1, 1)   Block: (128, 1, 1)
+extern "C" __global__ void __launch_bounds__(128, 4) w4a16_gemv_batch_logits_exact_sw_m8_o4w4(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[4][16];
+    __shared__ float s_half0[4 * 4 * 8];
+    if (M <= 5u) {
+        w4a16_gemv_batch_logits_exact_sw_body<5, 4, 4>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+    } else {
+        w4a16_gemv_batch_logits_exact_sw_body<8, 4, 4>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+    }
+}
+extern "C" __global__ void __launch_bounds__(128, 3) w4a16_gemv_batch_logits_exact_sw_m10_o4w4(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[4][16];
+    __shared__ float s_half0[4 * 4 * 10];
+    w4a16_gemv_batch_logits_exact_sw_body<10, 4, 4>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0);
+}
+// Block: (256, 1, 1), Grid: (ceil(N / 16), 1, 1)  [WARPS=8, OUT=2, handles M <= 20]
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_batch_logits_exact_sw_m15_o2w4(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 2 * 20];
+    __shared__ uint4 s_a[20 * 64];
+    if (M == 15u) {
+        w4a16_gemv_batch_logits_exact_sw_body<15, 2, 8, 15, true>(A, B_packed, B_scale, scale2, C, 15u, N, K, s_lut, s_half0, s_a);
+    } else if (M <= 15u) {
+        w4a16_gemv_batch_logits_exact_sw_body<15, 2, 8, 15, false>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0, s_a);
+    } else if (M == 20u) {
+        w4a16_gemv_batch_logits_exact_sw_body<20, 2, 8, 20, true>(A, B_packed, B_scale, scale2, C, 20u, N, K, s_lut, s_half0, s_a);
+    } else {
+        w4a16_gemv_batch_logits_exact_sw_body<20, 2, 8, 20, false>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0, s_a);
+    }
+}
+// Block: (256, 1, 1), Grid: (ceil(N / 16), 1, 1)  [WARPS=8, OUT=2, handles M <= 25]
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_batch_logits_exact_sw_m25_o1w4(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 2 * 25];
+    __shared__ uint4 s_a[25 * 64];
+    if (M == 20u) {
+        w4a16_gemv_batch_logits_exact_sw_body<20, 2, 8, 20, true>(A, B_packed, B_scale, scale2, C, 20u, N, K, s_lut, s_half0, s_a);
+    } else if (M <= 20u) {
+        w4a16_gemv_batch_logits_exact_sw_body<20, 2, 8, 20, false>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0, s_a);
+    } else if (M == 25u) {
+        w4a16_gemv_batch_logits_exact_sw_body<25, 2, 8, 25, true>(A, B_packed, B_scale, scale2, C, 25u, N, K, s_lut, s_half0, s_a);
+    } else {
+        w4a16_gemv_batch_logits_exact_sw_body<25, 2, 8, 25, false>(A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0, s_a);
+    }
+}
+// ---------------------------------------------------------------------------
+// Exact latency variants of w4a16_gemv (fn-decode, ATLAS_QWEN4_HC_GEMV_V2=1).
+// Both produce C byte-identical to w4a16_gemv for the same (A, B, N, K).
+//
+// w4a16_gemv_pf: identical mapping (N_PER_BLOCK=4 outputs, 64 threads each,
+// thread lane walks k16 = lane, lane+64, ...), identical per-thread
+// accumulation order and reduction; up to 4 k16 iterations' loads are issued
+// before their FMAs (the incumbent issues one iteration's loads at a time).
+// Grid ceil(N/4), block 256.
+//
+// w4a16_gemv_w32: for K16 <= 32 (K <= 512) the incumbent's second warp per
+// output only adds +0.0f. One warp per output computes the identical lane
+// partials and shuffle tree, then adds +0.0f exactly as the incumbent's
+// smem[2j] + smem[2j+1]. 8 outputs per block. Grid ceil(N/8), block 256.
+// ---------------------------------------------------------------------------
+#define W4A16_PF_DEPTH 4
+
+__device__ __forceinline__ void w4a16_gemv_pf_out(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K,
+    unsigned int block_in_set,
+    const float* s_lut,
+    float* smem
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int n = block_in_set * N_PER_BLOCK + local_out;
+    const bool valid = n < N;
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    float acc = 0.0f;
+    if (valid) {
+        for (unsigned int k0 = lane; k0 < K16; k0 += 64u * W4A16_PF_DEPTH) {
+            uint4 alo[W4A16_PF_DEPTH], ahi[W4A16_PF_DEPTH];
+            unsigned long long pk[W4A16_PF_DEPTH];
+            unsigned char sb[W4A16_PF_DEPTH];
+#pragma unroll
+            for (int u = 0; u < W4A16_PF_DEPTH; ++u) {
+                const unsigned int k16 = k0 + 64u * u;
+                if (k16 < K16) {
+                    alo[u] = ((const uint4*)A)[k16 * 2];
+                    ahi[u] = ((const uint4*)A)[k16 * 2 + 1];
+                    pk[u] = *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + k16 * 8);
+                    sb[u] = B_scale[(unsigned long long)n * num_groups + (k16 * 16) / GROUP_SIZE];
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < W4A16_PF_DEPTH; ++u) {
+                const unsigned int k16 = k0 + 64u * u;
+                if (k16 >= K16) break;
+                const unsigned int a_raw[8] = {alo[u].x, alo[u].y, alo[u].z, alo[u].w,
+                                               ahi[u].x, ahi[u].y, ahi[u].z, ahi[u].w};
+                __nv_fp8_e4m3 fp8;
+                *(unsigned char*)&fp8 = sb[u];
+                const float scale = (float)fp8 * scale2;
+#pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    const unsigned char byte_val = (unsigned char)(pk[u] >> (b * 8));
+                    const float w_lo = s_lut[byte_val & 0xF] * scale;
+                    const float w_hi = s_lut[byte_val >> 4] * scale;
+                    __nv_bfloat16 a_lo_bf, a_hi_bf;
+                    *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFF);
+                    *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+                    acc += __bfloat162float(a_lo_bf) * w_lo;
+                    acc += __bfloat162float(a_hi_bf) * w_hi;
+                }
+            }
+        }
+    }
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+    if (warp_lane == 0) smem[local_out * 2 + (lane / WARP_SIZE)] = acc;
+    __syncthreads();
+    if (valid && lane == 0) {
+        const float result = smem[local_out * 2] + smem[local_out * 2 + 1];
+        C[n] = __float2bfloat16(result);
+    }
+}
+
+extern "C" __global__ void w4a16_gemv_pf(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    w4a16_gemv_pf_out(A, B_packed, B_scale, scale2, C, N, K, blockIdx.x, s_lut, smem);
+}
+
+// Two GEMVs over the same input A and K in one launch (hyper-connection
+// down N1=rank and inject N2=hc_count): blocks [0, ceil(N1/4)) compute set 1,
+// the rest set 2, each output exactly as w4a16_gemv_pf (= w4a16_gemv) would.
+// Grid: (ceil(N1/4) + ceil(N2/4), 1, 1), block 256.
+extern "C" __global__ void w4a16_gemv_pf_dual(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B2_packed,
+    const unsigned char* __restrict__ B2_scale,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int K
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    const unsigned int blocks1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    if (blockIdx.x < blocks1)
+        w4a16_gemv_pf_out(A, B1_packed, B1_scale, scale2_1, C1, N1, K, blockIdx.x, s_lut, smem);
+    else
+        w4a16_gemv_pf_out(A, B2_packed, B2_scale, scale2_2, C2, N2, K, blockIdx.x - blocks1, s_lut, smem);
+}
+
+// Multi-row twin of w4a16_gemv_pf_dual for the batched verify (verify-cost,
+// ATLAS_QWEN4_HC_DUAL_ROWS=1): the hyper down (N1 = rank) and inject (N2 =
+// hc_count) projections of the same M rows in one launch. Every output keeps
+// the exact tiers' arithmetic: 64 lanes, k16 = lane + 64i ascending, the
+// per-byte (low, high) MUL then ADD, the five-step tree per warp and
+// smem[A] + smem[B], independently per row; only the load schedule changes
+// (the packed words and scales of W4A16_PF_DEPTH k16 steps are issued before
+// their FMAs) and each decoded weight feeds every row. Byte-identical per row
+// to w4a16_gemv and to every exact_m* tier.
+// Grid: (ceil(N1/4) + ceil(N2/4), 1, 1), block 256 for single-tile variants;
+// 2D Grid: (ceil(N1/4) + ceil(N2/4), ceil(M/10), 1), block 256 for pf_dual_m10 / pf_dual_silu_m10.
+template <int MAX_M, bool EXACT_M = false>
+__device__ __forceinline__ void w4a16_exact_rows_pf_out(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int block_in_set,
+    const float* s_lut,
+    float* smem,
+    bool apply_silu_div = false,
+    float silu_divisor = 1.0f
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int warp_lane = lane % WARP_SIZE;
+    const unsigned int warp_idx = lane / WARP_SIZE;
+    const unsigned int n = block_in_set * N_PER_BLOCK + local_out;
+    const bool rows_valid = M > 0 && M <= (unsigned int)MAX_M;
+    const bool valid = rows_valid && n < N;
+
+    float acc[MAX_M];
+#pragma unroll
+    for (int row = 0; row < MAX_M; ++row) acc[row] = 0.0f;
+
+    if (valid) {
+        const unsigned int half_K = K / 2;
+        const unsigned int num_groups = K / GROUP_SIZE;
+        const unsigned int K16 = K / 16;
+        const unsigned long long weight_row = (unsigned long long)n * half_K;
+        const unsigned long long scale_row = (unsigned long long)n * num_groups;
+        constexpr int PF_DEPTH = (MAX_M > 10) ? 1 : W4A16_PF_DEPTH;
+        for (unsigned int k0 = lane; k0 < K16; k0 += 64u * PF_DEPTH) {
+            unsigned long long pk[PF_DEPTH];
+            unsigned char sb[PF_DEPTH];
+#pragma unroll
+            for (int u = 0; u < PF_DEPTH; ++u) {
+                const unsigned int k16 = k0 + 64u * u;
+                if (k16 < K16) {
+                    pk[u] = *(const unsigned long long*)(B_packed + weight_row + k16 * 8);
+                    sb[u] = B_scale[scale_row + (k16 * 16) / GROUP_SIZE];
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < PF_DEPTH; ++u) {
+                const unsigned int k16 = k0 + 64u * u;
+                if (k16 >= K16) break;
+                __nv_fp8_e4m3 fp8;
+                *(unsigned char*)&fp8 = sb[u];
+                const float scale = (float)fp8 * scale2;
+                if constexpr (MAX_M > 15) {
+                    #pragma unroll 1
+                    for (int bh = 0; bh < 2; ++bh) {
+                        float w_lo[4], w_hi[4];
+                        #pragma unroll
+                        for (int bi = 0; bi < 4; ++bi) {
+                            const int b = bh * 4 + bi;
+                            const unsigned char byte_val = (unsigned char)(pk[u] >> (b * 8));
+                            w_lo[bi] = s_lut[byte_val & 0xF] * scale;
+                            w_hi[bi] = s_lut[byte_val >> 4] * scale;
+                        }
+                        #pragma unroll
+                        for (int row = 0; row < MAX_M; ++row) {
+                            if (EXACT_M || (unsigned int)row < M) {
+                                const __nv_bfloat16* __restrict__ A_row = A + (unsigned long long)row * K;
+                                const uint4 a_vec = __ldg(&((const uint4*)A_row)[k16 * 2 + bh]);
+                                const unsigned int a_raw[4] = {a_vec.x, a_vec.y, a_vec.z, a_vec.w};
+                                #pragma unroll
+                                for (int bi = 0; bi < 4; ++bi) {
+                                    __nv_bfloat16 a_lo_bf, a_hi_bf;
+                                    *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[bi] & 0xFFFF);
+                                    *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[bi] >> 16);
+                                    acc[row] += __bfloat162float(a_lo_bf) * w_lo[bi];
+                                    acc[row] += __bfloat162float(a_hi_bf) * w_hi[bi];
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    float w_lo[8];
+                    float w_hi[8];
+#pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        const unsigned char byte_val = (unsigned char)(pk[u] >> (b * 8));
+                        w_lo[b] = s_lut[byte_val & 0xF] * scale;
+                        w_hi[b] = s_lut[byte_val >> 4] * scale;
+                    }
+#pragma unroll
+                    for (int row = 0; row < MAX_M; ++row) {
+                        if (EXACT_M || (unsigned int)row < M) {
+                            const __nv_bfloat16* __restrict__ A_row = A + (unsigned long long)row * K;
+                            const uint4 a_lo = __ldg(&((const uint4*)A_row)[k16 * 2]);
+                            const uint4 a_hi = __ldg(&((const uint4*)A_row)[k16 * 2 + 1]);
+                            const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                                           a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+#pragma unroll
+                            for (int b = 0; b < 8; ++b) {
+                                __nv_bfloat16 a_lo_bf, a_hi_bf;
+                                *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFF);
+                                *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+                                acc[row] += __bfloat162float(a_lo_bf) * w_lo[b];
+                                acc[row] += __bfloat162float(a_hi_bf) * w_hi[b];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int row = 0; row < MAX_M; ++row) {
+        if (EXACT_M || (unsigned int)row < M) {
+#pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                acc[row] += __shfl_down_sync(0xFFFFFFFF, acc[row], offset);
+            }
+            if (warp_lane == 0) smem[(row * N_PER_BLOCK + local_out) * 2 + warp_idx] = acc[row];
+        }
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+#pragma unroll
+        for (int row = 0; row < MAX_M; ++row) {
+            if (EXACT_M || (unsigned int)row < M) {
+                const unsigned int base = (row * N_PER_BLOCK + local_out) * 2;
+                const __nv_bfloat16 raw = __float2bfloat16(smem[base] + smem[base + 1]);
+                if (apply_silu_div) {
+                    const float x = __bfloat162float(raw) / silu_divisor;
+                    C[(unsigned long long)row * N + n] = __float2bfloat16(x / (1.0f + expf(-x)));
+                } else {
+                    C[(unsigned long long)row * N + n] = raw;
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemv_batch_logits_exact_pf_dual_m8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B2_packed,
+    const unsigned char* __restrict__ B2_scale,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int M,
+    unsigned int K
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[8 * N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    const unsigned int blocks1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    const bool is_b1 = blockIdx.x < blocks1;
+    w4a16_exact_rows_pf_out<8>(
+        A,
+        is_b1 ? B1_packed : B2_packed,
+        is_b1 ? B1_scale : B2_scale,
+        is_b1 ? scale2_1 : scale2_2,
+        is_b1 ? C1 : C2,
+        M,
+        is_b1 ? N1 : N2,
+        K,
+        is_b1 ? blockIdx.x : (blockIdx.x - blocks1),
+        s_lut,
+        smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemv_batch_logits_exact_pf_dual_silu_m8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B2_packed,
+    const unsigned char* __restrict__ B2_scale,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int M,
+    unsigned int K,
+    float silu_divisor
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[8 * N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    const unsigned int blocks1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    const bool is_b1 = blockIdx.x < blocks1;
+    w4a16_exact_rows_pf_out<8>(
+        A,
+        is_b1 ? B1_packed : B2_packed,
+        is_b1 ? B1_scale : B2_scale,
+        is_b1 ? scale2_1 : scale2_2,
+        is_b1 ? C1 : C2,
+        M,
+        is_b1 ? N1 : N2,
+        K,
+        is_b1 ? blockIdx.x : (blockIdx.x - blocks1),
+        s_lut,
+        smem,
+        is_b1,
+        silu_divisor);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemv_batch_logits_exact_pf_dual_m10(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B2_packed,
+    const unsigned char* __restrict__ B2_scale,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int M,
+    unsigned int K
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[10 * N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    const unsigned int row_off = blockIdx.y * 10u;
+    if (row_off >= M) return;
+    const unsigned int chunk_m = (M - row_off > 10u) ? 10u : (M - row_off);
+    A += (unsigned long long)row_off * K;
+    C1 += (unsigned long long)row_off * N1;
+    C2 += (unsigned long long)row_off * N2;
+    const unsigned int blocks1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    const bool is_b1 = blockIdx.x < blocks1;
+    w4a16_exact_rows_pf_out<10>(
+        A,
+        is_b1 ? B1_packed : B2_packed,
+        is_b1 ? B1_scale : B2_scale,
+        is_b1 ? scale2_1 : scale2_2,
+        is_b1 ? C1 : C2,
+        chunk_m,
+        is_b1 ? N1 : N2,
+        K,
+        is_b1 ? blockIdx.x : (blockIdx.x - blocks1),
+        s_lut,
+        smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemv_batch_logits_exact_pf_dual_silu_m10(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B2_packed,
+    const unsigned char* __restrict__ B2_scale,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int M,
+    unsigned int K,
+    float silu_divisor
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[10 * N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    const unsigned int row_off = blockIdx.y * 10u;
+    if (row_off >= M) return;
+    const unsigned int chunk_m = (M - row_off > 10u) ? 10u : (M - row_off);
+    A += (unsigned long long)row_off * K;
+    C1 += (unsigned long long)row_off * N1;
+    C2 += (unsigned long long)row_off * N2;
+    const unsigned int blocks1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    const bool is_b1 = blockIdx.x < blocks1;
+    w4a16_exact_rows_pf_out<10>(
+        A,
+        is_b1 ? B1_packed : B2_packed,
+        is_b1 ? B1_scale : B2_scale,
+        is_b1 ? scale2_1 : scale2_2,
+        is_b1 ? C1 : C2,
+        chunk_m,
+        is_b1 ? N1 : N2,
+        K,
+        is_b1 ? blockIdx.x : (blockIdx.x - blocks1),
+        s_lut,
+        smem,
+        is_b1,
+        silu_divisor);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemv_batch_logits_exact_pf_dual_m25(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B2_packed,
+    const unsigned char* __restrict__ B2_scale,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int M,
+    unsigned int K
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[25 * N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    const unsigned int blocks1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    const bool is_b1 = blockIdx.x < blocks1;
+    const unsigned char* B_packed = is_b1 ? B1_packed : B2_packed;
+    const unsigned char* B_scale = is_b1 ? B1_scale : B2_scale;
+    const float scale2 = is_b1 ? scale2_1 : scale2_2;
+    __nv_bfloat16* C = is_b1 ? C1 : C2;
+    const unsigned int N = is_b1 ? N1 : N2;
+    const unsigned int block_in_set = is_b1 ? blockIdx.x : (blockIdx.x - blocks1);
+    if (M == 15u) {
+        w4a16_exact_rows_pf_out<15, true>(A, B_packed, B_scale, scale2, C, 15u, N, K, block_in_set, s_lut, smem);
+    } else if (M <= 15u) {
+        w4a16_exact_rows_pf_out<15, false>(A, B_packed, B_scale, scale2, C, M, N, K, block_in_set, s_lut, smem);
+    } else if (M == 20u) {
+        w4a16_exact_rows_pf_out<20, true>(A, B_packed, B_scale, scale2, C, 20u, N, K, block_in_set, s_lut, smem);
+    } else if (M <= 20u) {
+        w4a16_exact_rows_pf_out<20, false>(A, B_packed, B_scale, scale2, C, M, N, K, block_in_set, s_lut, smem);
+    } else if (M == 25u) {
+        w4a16_exact_rows_pf_out<25, true>(A, B_packed, B_scale, scale2, C, 25u, N, K, block_in_set, s_lut, smem);
+    } else {
+        w4a16_exact_rows_pf_out<25, false>(A, B_packed, B_scale, scale2, C, M, N, K, block_in_set, s_lut, smem);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 3) w4a16_gemv_batch_logits_exact_pf_dual_silu_m25(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B2_packed,
+    const unsigned char* __restrict__ B2_scale,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int M,
+    unsigned int K,
+    float silu_divisor
+) {
+    __shared__ float s_lut[16];
+    __shared__ float smem[25 * N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+    const unsigned int blocks1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    const bool is_b1 = blockIdx.x < blocks1;
+    const unsigned char* B_packed = is_b1 ? B1_packed : B2_packed;
+    const unsigned char* B_scale = is_b1 ? B1_scale : B2_scale;
+    const float scale2 = is_b1 ? scale2_1 : scale2_2;
+    __nv_bfloat16* C = is_b1 ? C1 : C2;
+    const unsigned int N = is_b1 ? N1 : N2;
+    const unsigned int block_in_set = is_b1 ? blockIdx.x : (blockIdx.x - blocks1);
+    if (M == 15u) {
+        w4a16_exact_rows_pf_out<15, true>(A, B_packed, B_scale, scale2, C, 15u, N, K, block_in_set, s_lut, smem, is_b1, silu_divisor);
+    } else if (M <= 15u) {
+        w4a16_exact_rows_pf_out<15, false>(A, B_packed, B_scale, scale2, C, M, N, K, block_in_set, s_lut, smem, is_b1, silu_divisor);
+    } else if (M == 20u) {
+        w4a16_exact_rows_pf_out<20, true>(A, B_packed, B_scale, scale2, C, 20u, N, K, block_in_set, s_lut, smem, is_b1, silu_divisor);
+    } else if (M <= 20u) {
+        w4a16_exact_rows_pf_out<20, false>(A, B_packed, B_scale, scale2, C, M, N, K, block_in_set, s_lut, smem, is_b1, silu_divisor);
+    } else if (M == 25u) {
+        w4a16_exact_rows_pf_out<25, true>(A, B_packed, B_scale, scale2, C, 25u, N, K, block_in_set, s_lut, smem, is_b1, silu_divisor);
+    } else {
+        w4a16_exact_rows_pf_out<25, false>(A, B_packed, B_scale, scale2, C, M, N, K, block_in_set, s_lut, smem, is_b1, silu_divisor);
+    }
+}
+
+extern "C" __global__ void w4a16_gemv_w32(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    const unsigned int n = blockIdx.x * (BLOCK_SIZE / WARP_SIZE) + warp;
+    const bool valid = n < N;
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (valid) {
+        // K16 <= 32: lane walks k16 = lane only (the incumbent's lanes 32..63 see nothing).
+        acc = w4a16_gemv_partial(A, B_packed, B_scale, scale2, s_lut, n, half_K, num_groups, K16, lane);
+    }
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+    if (valid && lane == 0) {
+        const float second_warp = 0.0f;  // the incumbent's idle warp: sum of +0.0f
+        C[n] = __float2bfloat16(acc + second_warp);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// qwen4_hc_up_mix_fused (fn-decode, ATLAS_QWEN4_HC_GEMV_V2=1): one launch for
+// the hyper-connection decode read-out tail qwen4_hc_silu_div -> w4a16_gemv
+// (up, N = hc*hidden, K = rank <= 512) -> qwen4_hc_mix, byte-identical:
+//   * silu_div is applied on the fly to the BF16 down outputs and rounded to
+//     BF16 exactly as the incumbent stores them (x/div, x/(1+expf(-x)));
+//   * each up output = the incumbent's lane partials (k16 = lane), 32-lane
+//     shuffle tree, + the idle second warp's +0.0f, rounded to BF16;
+//   * mix: sum over streams s = 0..hc-1 in order of sigmoid(g)*normed, / hc;
+//     inject logits transformed as qwen4_hc_mix does (block 0).
+// Block 256 = 8 warps = 8 up outputs = (8/hc) hidden indices (hc in {1,2,4,8}).
+// Grid ceil(hidden / (8/hc)).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void qwen4_hc_up_mix_fused(
+    const __nv_bfloat16* __restrict__ down_out,      // [rank] pre-silu
+    const unsigned char* __restrict__ up_packed,     // [hc*hidden, rank/2]
+    const unsigned char* __restrict__ up_scale,      // [hc*hidden, rank/16]
+    const float up_scale2,
+    const __nv_bfloat16* __restrict__ normed,        // [hc*hidden]
+    __nv_bfloat16* __restrict__ inject_logits,       // [hc] raw -> transformed
+    __nv_bfloat16* __restrict__ mixed,               // [hidden]
+    unsigned int hidden_size,
+    unsigned int hc_count,
+    unsigned int rank,
+    float silu_divisor) {
+    __shared__ float s_lut[16];
+    __shared__ float s_g[8];
+    __shared__ float s_act[512];  // silu_div outputs as stored (BF16-rounded), rank <= 512
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    for (unsigned int i = threadIdx.x; i < rank; i += blockDim.x) {
+        const float x = __bfloat162float(down_out[i]) / silu_divisor;
+        s_act[i] = __bfloat162float(__float2bfloat16(x / (1.0f + expf(-x))));
+    }
+    __syncthreads();
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    const unsigned int per_block = (BLOCK_SIZE / WARP_SIZE) / hc_count;   // hidden indices per block
+    const unsigned int local_h = warp / hc_count;
+    const unsigned int s = warp % hc_count;
+    const unsigned int h = blockIdx.x * per_block + local_h;
+    const bool valid = h < hidden_size;
+    const unsigned int n = s * hidden_size + h;
+    const unsigned int half_K = rank / 2;
+    const unsigned int num_groups = rank / GROUP_SIZE;
+    const unsigned int K16 = rank / 16;
+
+    float acc = 0.0f;
+    if (valid && lane < K16) {
+        const unsigned int k16 = lane;
+        float a[16];
+#pragma unroll
+        for (int e = 0; e < 16; ++e) a[e] = s_act[k16 * 16 + e];
+        const unsigned long long packed8 = *(const unsigned long long*)(up_packed + (unsigned long long)n * half_K + k16 * 8);
+        const unsigned char scale_byte = up_scale[(unsigned long long)n * num_groups + k16];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+        const float scale = (float)fp8 * up_scale2;
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
+            const float w_lo = s_lut[byte_val & 0xF] * scale;
+            const float w_hi = s_lut[byte_val >> 4] * scale;
+            acc += a[2 * b] * w_lo;
+            acc += a[2 * b + 1] * w_hi;
+        }
+    }
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+    if (lane == 0) {
+        const float second_warp = 0.0f;
+        s_g[warp] = __bfloat162float(__float2bfloat16(acc + second_warp));  // mix_logits[n] as stored
+    }
+    __syncthreads();
+    if (lane == 0 && s == 0 && valid) {
+        float m = 0.0f;
+        for (unsigned int ss = 0; ss < hc_count; ++ss) {
+            const float g0 = s_g[local_h * hc_count + ss];
+            const float g = 1.0f / (1.0f + expf(-g0));
+            m += g * __bfloat162float(normed[ss * hidden_size + h]);
+        }
+        mixed[h] = __float2bfloat16(m / hc_count);
+    }
+    if (blockIdx.x == 0 && threadIdx.x < hc_count) {
+        const float x = __bfloat162float(inject_logits[threadIdx.x]) / hc_count;
+        inject_logits[threadIdx.x] = __float2bfloat16(2.0f / (1.0f + expf(-x)));
+    }
+}
+
+// qwen4_hc_up_mix_fused2: same contract and bytes as qwen4_hc_up_mix_fused, one
+// THREAD per up output. For K16 <= 32 the incumbent's per-output value is the
+// 32-lane shuffle tree over lane partials p[l] (p[l] = 0 for l >= K16), plus
+// the idle warp's +0.0f; a thread reproduces that tree add for add
+// (offsets 16, 8, 4, 2, 1, zero lanes included), so the result is identical
+// while each output's contiguous weight row streams with all loads in flight.
+// Block 64 = 16 hidden indices x 4 streams (hc_count must be 4); grid hidden/16.
+extern "C" __global__ void __launch_bounds__(64) qwen4_hc_up_mix_fused2(
+    const __nv_bfloat16* __restrict__ down_out,
+    const unsigned char* __restrict__ up_packed,
+    const unsigned char* __restrict__ up_scale,
+    const float up_scale2,
+    const __nv_bfloat16* __restrict__ normed,
+    __nv_bfloat16* __restrict__ inject_logits,
+    __nv_bfloat16* __restrict__ mixed,
+    unsigned int hidden_size,
+    unsigned int hc_count,
+    unsigned int rank,
+    float silu_divisor) {
+    __shared__ float s_lut[16];
+    __shared__ float s_act[512];
+    __shared__ float s_g[64];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    for (unsigned int i = threadIdx.x; i < rank; i += blockDim.x) {
+        const float x = __bfloat162float(down_out[i]) / silu_divisor;
+        s_act[i] = __bfloat162float(__float2bfloat16(x / (1.0f + expf(-x))));
+    }
+    __syncthreads();
+    const unsigned int local_h = threadIdx.x / 4u;
+    const unsigned int s = threadIdx.x % 4u;
+    const unsigned int h = blockIdx.x * 16u + local_h;
+    const bool valid = h < hidden_size && hc_count == 4u;
+    const unsigned int K16 = rank / 16;
+    float p[32];
+#pragma unroll
+    for (int l = 0; l < 32; ++l) p[l] = 0.0f;
+    if (valid) {
+        const unsigned int n = s * hidden_size + h;
+        const unsigned char* wrow = up_packed + (unsigned long long)n * (rank / 2);
+        const unsigned char* srow = up_scale + (unsigned long long)n * (rank / GROUP_SIZE);
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            if ((unsigned int)l < K16) {
+                const unsigned long long packed8 = *(const unsigned long long*)(wrow + l * 8);
+                __nv_fp8_e4m3 fp8;
+                *(unsigned char*)&fp8 = srow[l];
+                const float scale = (float)fp8 * up_scale2;
+                float acc = 0.0f;
+#pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    const unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
+                    const float w_lo = s_lut[byte_val & 0xF] * scale;
+                    const float w_hi = s_lut[byte_val >> 4] * scale;
+                    acc += s_act[l * 16 + 2 * b] * w_lo;
+                    acc += s_act[l * 16 + 2 * b + 1] * w_hi;
+                }
+                p[l] = acc;
+            }
+        }
+    }
+    // The incumbent's __shfl_down tree as seen by lane 0.
+#pragma unroll
+    for (int l = 0; l < 16; ++l) p[l] = p[l] + p[l + 16];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) p[l] = p[l] + p[l + 8];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) p[l] = p[l] + p[l + 4];
+#pragma unroll
+    for (int l = 0; l < 2; ++l) p[l] = p[l] + p[l + 2];
+    p[0] = p[0] + p[1];
+    const float second_warp = 0.0f;
+    s_g[threadIdx.x] = __bfloat162float(__float2bfloat16(p[0] + second_warp));
+    __syncthreads();
+    if (s == 0 && valid) {
+        float m = 0.0f;
+        for (unsigned int ss = 0; ss < 4u; ++ss) {
+            const float g0 = s_g[local_h * 4u + ss];
+            const float g = 1.0f / (1.0f + expf(-g0));
+            m += g * __bfloat162float(normed[ss * hidden_size + h]);
+        }
+        mixed[h] = __float2bfloat16(m / hc_count);
+    }
+    if (blockIdx.x == 0 && threadIdx.x < hc_count) {
+        const float x = __bfloat162float(inject_logits[threadIdx.x]) / hc_count;
+        inject_logits[threadIdx.x] = __float2bfloat16(2.0f / (1.0f + expf(-x)));
+    }
+}
+
+// qwen4_hc_up_mix_tail_rows (verify-cost, ATLAS_QWEN4_HC_TAIL_ROWS=1): the
+// batched hyper-connection read-out tail for up to HC_TAIL_MAX_ROWS verify
+// rows in one launch, byte-identical to qwen4_hc_silu_div -> the exact up
+// GEMV (w4a16_gemv arithmetic per row) -> qwen4_hc_mix -> qwen4_hc_save_inject
+// as prepare_batched runs them, with the up weights streamed once:
+//   * silu rows are staged as qwen4_hc_silu_div stores them (BF16-rounded);
+//   * 16 lane-threads own one up output: thread j (0..15) keeps incumbent
+//     lanes k16 = 16*mh + j (mh = 0..1), each the identical sequential two-add
+//     per-byte sum over its k16; lanes k16 >= K16 hold a runtime +0.0f as the
+//     incumbent's idle lanes do (K16 stays a runtime value, as in
+//     qwen4_hc_up_mix_fused2). The 32-lane tree's offset 16 runs as a register
+//     add (mh=0 + mh=1), followed by width-16 shuffles of offsets 8, 4, 2, 1;
+//     the idle second warp adds +0.0f; BF16 rounding;
+//   * mix sums streams 0..hc-1 in order exactly as qwen4_hc_mix;
+//   * the block owning the last hidden indices reads its normalized tail
+//     before it transforms the raw inject logits (qwen4_hc_mix's expression)
+//     and stores them both in place and in each row's residual tail
+//     (qwen4_hc_save_inject), so no other block can read an overwritten tail.
+// Block 256 = 4 hidden x 4 streams x 16 lane-threads (hc_count must be 4,
+// rank <= 320 and a multiple of 16, hidden a multiple of 4). Grid = hidden / 4.
+#define HC_TAIL_MAX_ROWS 25
+#define HC_TAIL_MAX_RANK 320
+#define HC_TAIL_HIDDEN_PER_BLOCK 4
+
+extern "C" __global__ void __launch_bounds__(256, 4) qwen4_hc_up_mix_tail_rows(
+    const __nv_bfloat16* __restrict__ down_out,  // [rows][rank] pre-silu or post-silu (BF16)
+    const unsigned char* __restrict__ up_packed,  // [hc*hidden, rank/2]
+    const unsigned char* __restrict__ up_scale,   // [hc*hidden, rank/16]
+    const float up_scale2,
+    __nv_bfloat16* __restrict__ residual,         // [rows][hc*hidden] normed; tail <- inject scales
+    __nv_bfloat16* __restrict__ inject_logits,    // [rows][hc] raw -> transformed (nullable)
+    __nv_bfloat16* __restrict__ mixed,            // [rows][hidden]
+    unsigned int hidden_size,
+    unsigned int hc_count,
+    unsigned int rank,
+    float silu_divisor,
+    unsigned int rows) {
+    __shared__ float s_lut[16];
+    __shared__ __align__(16) __nv_bfloat16 s_act[HC_TAIL_MAX_ROWS * HC_TAIL_MAX_RANK];  // silu rows as stored, BF16-rounded
+    __shared__ float s_g[HC_TAIL_MAX_ROWS][HC_TAIL_HIDDEN_PER_BLOCK * 4];               // mix logits as stored, [row][local_h*4 + s]
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    const bool shape_ok = hc_count == 4u && rows >= 1u && rows <= HC_TAIL_MAX_ROWS && rank <= HC_TAIL_MAX_RANK
+        && rank % 16u == 0u && hidden_size % HC_TAIL_HIDDEN_PER_BLOCK == 0u;
+    if (!shape_ok) return;  // the launcher admits only this shape
+    if (silu_divisor == 0.0f) {
+        const unsigned int vec_cnt = (rows * rank) >> 3;
+        for (unsigned int i = threadIdx.x; i < vec_cnt; i += blockDim.x) {
+            ((uint4*)s_act)[i] = __ldg(&((const uint4*)down_out)[i]);
+        }
+    } else {
+        for (unsigned int i = threadIdx.x; i < rows * rank; i += blockDim.x) {
+            const float x = __bfloat162float(down_out[i]) / silu_divisor;
+            s_act[i] = __float2bfloat16(x / (1.0f + expf(-x)));
+        }
+    }
+    const unsigned int j = threadIdx.x & 15u;
+    const unsigned int s = (threadIdx.x >> 4) & 3u;
+    const unsigned int local_h = threadIdx.x >> 6;
+    const unsigned int h = blockIdx.x * HC_TAIL_HIDDEN_PER_BLOCK + local_h;
+    const unsigned int n = s * hidden_size + h;
+    const unsigned int K16 = rank / 16u;
+    unsigned long long pk_m[2];
+    float sc_m[2];
+    #pragma unroll
+    for (int mh = 0; mh < 2; ++mh) {
+        const unsigned int k16 = 16u * (unsigned int)mh + j;
+        const bool ok = k16 < K16;
+        pk_m[mh] = ok
+            ? __ldg((const unsigned long long*)(up_packed + (unsigned long long)n * (rank / 2u) + k16 * 8u))
+            : 0ull;
+        __nv_fp8_e4m3 fp8_s;
+        *(unsigned char*)&fp8_s = ok ? __ldg(&up_scale[(unsigned long long)n * (rank / GROUP_SIZE) + k16]) : (unsigned char)0;
+        sc_m[mh] = (float)fp8_s * up_scale2;
+    }
+    __syncthreads();
+
+    float w_lo[2][8], w_hi[2][8];
+    #pragma unroll
+    for (int mh = 0; mh < 2; ++mh) {
+        #pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const unsigned char byte_val = (unsigned char)(pk_m[mh] >> (b * 8));
+            w_lo[mh][b] = s_lut[byte_val & 0xF] * sc_m[mh];
+            w_hi[mh][b] = s_lut[byte_val >> 4] * sc_m[mh];
+        }
+    }
+
+    #pragma unroll 1
+    for (unsigned int r = 0; r < rows; ++r) {
+        float v = 0.0f;
+        #pragma unroll
+        for (int mh = 0; mh < 2; ++mh) {
+            const unsigned int k16 = 16u * (unsigned int)mh + j;
+            float acc = 0.0f;
+            if (k16 < K16) {
+                const uint4* a_vec = (const uint4*)(s_act + r * rank + k16 * 16u);
+                const uint4 a_lo = a_vec[0];
+                const uint4 a_hi = a_vec[1];
+                const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                               a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    __nv_bfloat16 a0, a1;
+                    *(unsigned short*)&a0 = (unsigned short)(a_raw[b] & 0xFFFFu);
+                    *(unsigned short*)&a1 = (unsigned short)(a_raw[b] >> 16);
+                    acc += __bfloat162float(a0) * w_lo[mh][b];
+                    acc += __bfloat162float(a1) * w_hi[mh][b];
+                }
+            }
+            v = (mh == 0) ? acc : (v + acc);
+        }
+        v = v + __shfl_down_sync(0xFFFFFFFFu, v, 8, 16);
+        v = v + __shfl_down_sync(0xFFFFFFFFu, v, 4, 16);
+        v = v + __shfl_down_sync(0xFFFFFFFFu, v, 2, 16);
+        v = v + __shfl_down_sync(0xFFFFFFFFu, v, 1, 16);
+        if (j == 0u) {
+            const float second_warp = 0.0f;
+            s_g[r][local_h * 4u + s] = __bfloat162float(__float2bfloat16(v + second_warp));
+        }
+    }
+    __syncthreads();
+
+    // Mix: one thread per (row, hidden index) of this block, streams in order.
+    const unsigned int r_width = hidden_size * 4u;
+    for (unsigned int t = threadIdx.x; t < rows * HC_TAIL_HIDDEN_PER_BLOCK; t += blockDim.x) {
+        const unsigned int row = t / HC_TAIL_HIDDEN_PER_BLOCK;
+        const unsigned int lh = t % HC_TAIL_HIDDEN_PER_BLOCK;
+        const unsigned int hh = blockIdx.x * HC_TAIL_HIDDEN_PER_BLOCK + lh;
+        float acc = 0.0f;
+        for (unsigned int ss = 0; ss < hc_count; ++ss) {
+            const float g0 = s_g[row][lh * 4u + ss];
+            const float g = 1.0f / (1.0f + expf(-g0));
+            acc += g * __bfloat162float(residual[row * r_width + ss * hidden_size + hh]);
+        }
+        mixed[row * hidden_size + hh] = __float2bfloat16(acc / hc_count);
+    }
+    // Inject transform + save into the residual tail: the last block, after its
+    // own mix reads of that tail.
+    if (inject_logits != nullptr && blockIdx.x == gridDim.x - 1u) {
+        __syncthreads();
+        for (unsigned int t = threadIdx.x; t < rows * hc_count; t += blockDim.x) {
+            const unsigned int row = t / hc_count;
+            const unsigned int ss = t % hc_count;
+            const float x = __bfloat162float(inject_logits[t]) / hc_count;
+            const __nv_bfloat16 scale = __float2bfloat16(2.0f / (1.0f + expf(-x)));
+            inject_logits[t] = scale;
+            residual[row * r_width + (r_width - hc_count) + ss] = scale;
+        }
+    }
+}
+
+// Warp-per-2-outputs fused `up` GEMV + `qwen4_hc_mix_save_inject` for `rows in 1..=5`
+// (`grid = [hidden_size / 4, 1, 1] = [640, 1, 1], block = [256, 1, 1]`).
+// Each of the 8 warps in a CTA owns stream `s = warp >> 1` (0..3) and two hidden
+// indices `h = blockIdx.x * 4 + (warp & 1) * 2 + o` (`o = 0, 1`), computing the
+// exact `swk32_body` inner loop (`lane < K16`, no K loop for `rank <= 512`) and
+// 5-step warp-shuffle reduction, then mixing all 4 streams in-block and saving
+// transformed `inject_logits` (when non-null) into the residual tail.
+#define HC_SW_MAX_ROWS 5
+extern "C" __global__ void __launch_bounds__(256, 4) qwen4_hc_up_mix_sw_m5_o2(
+    const __nv_bfloat16* __restrict__ down_out,   // [rows][rank] post-silu (BF16)
+    const unsigned char* __restrict__ up_packed,   // [hc*hidden, rank/2]
+    const unsigned char* __restrict__ up_scale,    // [hc*hidden, rank/16]
+    const float up_scale2,
+    __nv_bfloat16* __restrict__ residual,          // [rows][hc*hidden] normed; tail <- inject scales
+    __nv_bfloat16* __restrict__ inject_logits,     // [rows][hc] raw -> transformed (or nullptr)
+    __nv_bfloat16* __restrict__ mixed,             // [rows][hidden]
+    unsigned int hidden_size,
+    unsigned int hc_count,
+    unsigned int rank,
+    unsigned int rows
+) {
+    __shared__ float s_lut[8][16];
+    __shared__ float s_g[HC_SW_MAX_ROWS][16];
+
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    stage_e2m1_lut_warp(s_lut[warp], lane);
+#if ATLAS_WARP_LUT_STAGED
+    const float* lut = s_lut[warp];
+#else
+    const float* lut = E2M1_LUT;
+#endif
+
+    if (hc_count != 4u || (hidden_size & 3u) != 0u || rank > 512u || (rank & 15u) != 0u || rows == 0u || rows > (unsigned int)HC_SW_MAX_ROWS) {
+        return;
+    }
+
+    const unsigned int s = warp >> 1;
+    const unsigned int local_h0 = (warp & 1u) * 2u;
+    const unsigned int h0 = blockIdx.x * 4u + local_h0;
+    const unsigned int half_K = rank / 2u;
+    const unsigned int num_groups = rank / GROUP_SIZE;
+    const unsigned int K16 = rank / 16u;
+    const unsigned int r_width = hidden_size * hc_count;
+
+    float acc0[2][HC_SW_MAX_ROWS];
+    #pragma unroll
+    for (int o = 0; o < 2; ++o) {
+        #pragma unroll
+        for (int r = 0; r < HC_SW_MAX_ROWS; ++r) {
+            acc0[o][r] = 0.0f;
+        }
+    }
+
+    if (lane < K16) {
+        const unsigned int k16 = lane;
+        unsigned long long pk[2];
+        unsigned char sb[2];
+        #pragma unroll
+        for (int o = 0; o < 2; ++o) {
+            const unsigned int h = h0 + (unsigned int)o;
+            const unsigned int n = s * hidden_size + h;
+            pk[o] = h < hidden_size
+                ? *(const unsigned long long*)(up_packed + (unsigned long long)n * half_K + k16 * 8u)
+                : 0ull;
+            sb[o] = h < hidden_size
+                ? up_scale[(unsigned long long)n * num_groups + k16]
+                : (unsigned char)0;
+        }
+        float scale[2];
+        #pragma unroll
+        for (int o = 0; o < 2; ++o) {
+            __nv_fp8_e4m3 fp8;
+            *(unsigned char*)&fp8 = sb[o];
+            scale[o] = (float)fp8 * up_scale2;
+        }
+        float w_lo[2][8], w_hi[2][8];
+        #pragma unroll
+        for (int o = 0; o < 2; ++o) {
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const unsigned char byte_val = (unsigned char)(pk[o] >> (b * 8));
+                w_lo[o][b] = lut[byte_val & 0xF] * scale[o];
+                w_hi[o][b] = lut[byte_val >> 4] * scale[o];
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < HC_SW_MAX_ROWS; ++r) {
+            if ((unsigned int)r < rows) {
+                const __nv_bfloat16* __restrict__ A_row = down_out + (unsigned long long)r * rank;
+                const uint4 a_lo = __ldg(&((const uint4*)A_row)[k16 * 2u]);
+                const uint4 a_hi = __ldg(&((const uint4*)A_row)[k16 * 2u + 1u]);
+                const unsigned int a_raw[8] = {
+                    a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                    a_hi.x, a_hi.y, a_hi.z, a_hi.w
+                };
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    __nv_bfloat16 a_lo_bf, a_hi_bf;
+                    *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFFu);
+                    *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+                    const float al = __bfloat162float(a_lo_bf);
+                    const float ah = __bfloat162float(a_hi_bf);
+                    #pragma unroll
+                    for (int o = 0; o < 2; ++o) {
+                        acc0[o][r] += al * w_lo[o][b];
+                        acc0[o][r] += ah * w_hi[o][b];
+                    }
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < 2; ++o) {
+        const unsigned int lh = local_h0 + (unsigned int)o;
+        const unsigned int h = blockIdx.x * 4u + lh;
+        #pragma unroll
+        for (int r = 0; r < HC_SW_MAX_ROWS; ++r) {
+            if ((unsigned int)r < rows) {
+                float a = acc0[o][r];
+                #pragma unroll
+                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                    a += __shfl_down_sync(0xFFFFFFFFu, a, offset);
+                }
+                if (lane == 0u && h < hidden_size) {
+                    s_g[r][lh * 4u + s] = __bfloat162float(__float2bfloat16(a + 0.0f));
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int t = threadIdx.x; t < rows * 4u; t += blockDim.x) {
+        const unsigned int row = t >> 2;
+        const unsigned int lh = t & 3u;
+        const unsigned int hh = blockIdx.x * 4u + lh;
+        if (hh < hidden_size) {
+            float acc = 0.0f;
+            for (unsigned int ss = 0; ss < hc_count; ++ss) {
+                const float g0 = s_g[row][lh * 4u + ss];
+                const float g = 1.0f / (1.0f + expf(-g0));
+                acc += g * __bfloat162float(residual[row * r_width + ss * hidden_size + hh]);
+            }
+            mixed[row * hidden_size + hh] = __float2bfloat16(acc / hc_count);
+        }
+    }
+
+    if (inject_logits != nullptr && blockIdx.x == gridDim.x - 1u) {
+        __syncthreads();
+        for (unsigned int t = threadIdx.x; t < rows * hc_count; t += blockDim.x) {
+            const unsigned int row = t / hc_count;
+            const unsigned int ss = t % hc_count;
+            const float x = __bfloat162float(inject_logits[t]) / hc_count;
+            const __nv_bfloat16 scale = __float2bfloat16(2.0f / (1.0f + expf(-x)));
+            inject_logits[t] = scale;
+            residual[row * r_width + (r_width - hc_count) + ss] = scale;
+        }
+    }
+}
+
+// ============================================================
+// Single-sweep wide-row exact NVFP4 GEMV (M <= 64 / 80 / 128).
+// ============================================================
+// Block = 256 (WARPS = 8, OUT = 1 -> 8 outputs/CTA), Grid = (ceil(N / 8), 1, 1).
+// Exact 0-ULP match to `w4a16_gemv` (K=1) and `w4a16_gemv_batch_logits_exact_sw_m25_o1w4`:
+//   - v=0 owns K1 lanes 0..31 (k16 = lane + 64*i), v=1 owns K1 lanes 32..63
+//     (k16 = 32 + lane + 64*i).
+//   - Per k16_base, B_packed and B_scale are loaded once (1.0x weight sweep)
+//     and reused across 16-row slabs staged cooperatively into s_a[16 * 64].
+//   - Ordered low/high FP32 accumulation (--fmad=false), 5-step warp shuffle
+//     reduction per half, and final __float2bfloat16(s_half0[idx] + val).
+template <int MAX_M, bool SPLIT_BH = false>
+__device__ __forceinline__ void w4a16_gemv_batch_logits_exact_sw_slab_body(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    float s_lut[8][16],
+    float* __restrict__ s_half0,
+    uint4* __restrict__ s_a)
+{
+    static_assert(MAX_M % 16 == 0, "MAX_M must be a multiple of 16");
+    constexpr int NUM_SLABS = MAX_M / 16;
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    stage_e2m1_lut_warp(s_lut[warp], lane);
+#if ATLAS_WARP_LUT_STAGED
+    const float* lut = s_lut[warp];
+#else
+    const float* lut = E2M1_LUT;
+#endif
+    if (M == 0u || M > (unsigned int)MAX_M) return;
+
+    const unsigned int n = blockIdx.x * 8u + warp;
+    const unsigned int half_K = K / 2u;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16u;
+    const unsigned int t_sub = threadIdx.x & 63u;
+    const unsigned int r_init = threadIdx.x >> 6;
+    const unsigned int s_idx = (t_sub & 1u) * 32u + (t_sub >> 1);
+    const unsigned long long weight_row = (unsigned long long)n * half_K;
+    const unsigned long long scale_row = (unsigned long long)n * num_groups;
+
+    #pragma unroll 1
+    for (int v = 0; v < 2; ++v) {
+        float acc[MAX_M];
+        #pragma unroll
+        for (int r = 0; r < MAX_M; ++r) {
+            acc[r] = 0.0f;
+        }
+
+        for (unsigned int kb_base = 0u; kb_base < K16; kb_base += 64u) {
+            const unsigned int k16_base = kb_base + 32u * (unsigned int)v;
+            if (k16_base >= K16) break;
+            const unsigned int k16 = k16_base + lane;
+            const bool valid_w = (n < N) && (k16 < K16);
+            const unsigned long long pk = valid_w
+                ? *(const unsigned long long*)(B_packed + weight_row + (unsigned long long)k16 * 8u)
+                : 0ull;
+            const unsigned char sb = valid_w
+                ? B_scale[scale_row + (k16 * 16u) / GROUP_SIZE]
+                : (unsigned char)0;
+            __nv_fp8_e4m3 fp8;
+            *(unsigned char*)&fp8 = sb;
+            const float scale = (float)fp8 * scale2;
+
+            float w_lo[8], w_hi[8];
+            if constexpr (!SPLIT_BH) {
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    const unsigned char byte_val = (unsigned char)(pk >> (b * 8));
+                    w_lo[b] = lut[byte_val & 0xF] * scale;
+                    w_hi[b] = lut[byte_val >> 4] * scale;
+                }
+            }
+
+            const bool stage_k_valid = (k16_base + (t_sub >> 1)) < K16;
+            const unsigned int stage_u4_idx = k16_base * 2u + t_sub;
+
+            #pragma unroll
+            for (int slab = 0; slab < NUM_SLABS; ++slab) {
+                const unsigned int row_base = (unsigned int)(slab * 16);
+                if (row_base < M) {
+                    if (v > 0 || kb_base > 0u || slab > 0) __syncthreads();
+                    const unsigned int rem = M - row_base;
+                    const unsigned int slab_rows = rem > 16u ? 16u : rem;
+                    if (stage_k_valid) {
+                        for (unsigned int rl = r_init; rl < slab_rows; rl += 4u) {
+                            const __nv_bfloat16* __restrict__ A_row =
+                                A + (unsigned long long)(row_base + rl) * K;
+                            s_a[rl * 64u + s_idx] = __ldg(&((const uint4*)A_row)[stage_u4_idx]);
+                        }
+                    }
+                    __syncthreads();
+
+                    if (valid_w) {
+                        if constexpr (SPLIT_BH) {
+                            #pragma unroll 1
+                            for (int bh = 0; bh < 2; ++bh) {
+                                float w_lo4[4], w_hi4[4];
+                                #pragma unroll
+                                for (int bi = 0; bi < 4; ++bi) {
+                                    const int b = bh * 4 + bi;
+                                    const unsigned char byte_val = (unsigned char)(pk >> (b * 8));
+                                    w_lo4[bi] = lut[byte_val & 0xF] * scale;
+                                    w_hi4[bi] = lut[byte_val >> 4] * scale;
+                                }
+                                #pragma unroll
+                                for (int rl = 0; rl < 16; ++rl) {
+                                    if ((unsigned int)rl < slab_rows) {
+                                        const uint4 a_vec = s_a[rl * 64u + (unsigned int)bh * 32u + lane];
+                                        const unsigned int a_raw[4] = {
+                                            a_vec.x, a_vec.y, a_vec.z, a_vec.w
+                                        };
+                                        #pragma unroll
+                                        for (int bi = 0; bi < 4; ++bi) {
+                                            __nv_bfloat16 a_lo_bf, a_hi_bf;
+                                            *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[bi] & 0xFFFFu);
+                                            *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[bi] >> 16);
+                                            acc[slab * 16 + rl] += __bfloat162float(a_lo_bf) * w_lo4[bi];
+                                            acc[slab * 16 + rl] += __bfloat162float(a_hi_bf) * w_hi4[bi];
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int rl = 0; rl < 16; ++rl) {
+                                if ((unsigned int)rl < slab_rows) {
+                                    const uint4 a_lo = s_a[rl * 64u + lane];
+                                    const uint4 a_hi = s_a[rl * 64u + 32u + lane];
+                                    const unsigned int a_raw[8] = {
+                                        a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                        a_hi.x, a_hi.y, a_hi.z, a_hi.w
+                                    };
+                                    #pragma unroll
+                                    for (int b = 0; b < 8; ++b) {
+                                        __nv_bfloat16 a_lo_bf, a_hi_bf;
+                                        *(unsigned short*)&a_lo_bf = (unsigned short)(a_raw[b] & 0xFFFFu);
+                                        *(unsigned short*)&a_hi_bf = (unsigned short)(a_raw[b] >> 16);
+                                        acc[slab * 16 + rl] += __bfloat162float(a_lo_bf) * w_lo[b];
+                                        acc[slab * 16 + rl] += __bfloat162float(a_hi_bf) * w_hi[b];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < MAX_M; ++r) {
+            if ((unsigned int)r < M) {
+                float val = acc[r];
+                #pragma unroll
+                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                    val += __shfl_down_sync(0xFFFFFFFFu, val, offset);
+                }
+                const unsigned int idx = warp * (unsigned int)MAX_M + (unsigned int)r;
+                if (v == 0) {
+                    if (lane == 0u) s_half0[idx] = val;
+                } else {
+                    if (lane == 0u && n < N) {
+                        C[(unsigned long long)r * N + n] = __float2bfloat16(s_half0[idx] + val);
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_batch_logits_exact_sw_m64_o1w8(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 64];
+    __shared__ __align__(16) uint4 s_a[16 * 64];
+    w4a16_gemv_batch_logits_exact_sw_slab_body<64, false>(
+        A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0, s_a);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) w4a16_gemv_batch_logits_exact_sw_m80_o1w8(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 80];
+    __shared__ __align__(16) uint4 s_a[16 * 64];
+    w4a16_gemv_batch_logits_exact_sw_slab_body<80, true>(
+        A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0, s_a);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1) w4a16_gemv_batch_logits_exact_sw_m128_o1w8(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    __shared__ float s_lut[8][16];
+    __shared__ float s_half0[8 * 128];
+    __shared__ __align__(16) uint4 s_a[16 * 64];
+    w4a16_gemv_batch_logits_exact_sw_slab_body<128, false>(
+        A, B_packed, B_scale, scale2, C, M, N, K, s_lut, s_half0, s_a);
+}

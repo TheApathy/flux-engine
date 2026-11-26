@@ -1,0 +1,52 @@
+{
+  "milestone": "Milestone 2 \u2014 Native 262K Context Qualification (R2)",
+  "verdict": "PASS",
+  "timestamp_utc": "2026-10-24T14:33:17Z",
+  "needle_retrieval": {
+    "prompt_tokens": 262080,
+    "passkeys": {
+      "ALPHA": "alpha-0731826",
+      "BETA": "beta-0492175",
+      "GAMMA": "gamma-0863204",
+      "DELTA": "delta-0184932",
+      "EPSILON": "epsilon-0952174"
+    },
+    "depths": [
+      0.01,
+      0.25,
+      0.5,
+      0.75,
+      0.99
+    ],
+    "all_retrieved": true,
+    "repeat_identical": true,
+    "forced_endpoint_fill_passkeys_retrieved": true
+  },
+  "forced_fill": {
+    "prompt_tokens": 262080,
+    "output_tokens": 64,
+    "total_tokens": 262144,
+    "succeeded": true
+  },
+  "boundary_and_overflow": {
+    "control_token_id": 15,
+    "boundary_tokens": 262143,
+    "boundary_output_tokens": 1,
+    "boundary_total_tokens": 262144,
+    "boundary_token_id": 15,
+    "boundary_matches_control": true,
+    "overflow_tokens": 262144,
+    "overflow_output_tokens": 1,
+    "overflow_http_status": 400,
+    "overflow_error_type": "invalid_request_error",
+    "overflow_scheduler_dispatch": 0
+  },
+  "canary_recovery": {
+    "canary_tokens": 262080,
+    "canary_token_id": 15,
+    "canary_matches_control": true,
+    "delta_tokens": 262080,
+    "delta_chunks": 64,
+    "recovered": true
+  }
+}

@@ -1,0 +1,1130 @@
+{
+  "schema": 2,
+  "entries": {
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1024x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        0,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.344992
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1024x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        0,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.462768
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1024x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        30,
+        1,
+        0,
+        0,
+        22,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.182272
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|14080x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 4.726128
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|14080x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        467,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 6.35128
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|14080x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        467,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 2.352032
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15104x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        144,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.3013
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15360x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 5.1508
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15360x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 6.8429
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15616x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 2.476896
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 5.3556
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 7.1552
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        144,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.3976
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.291728
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2048x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.685056
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2048x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        1,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 0.862064
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2048x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        0,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 0.31736
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2048x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        32,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.037808
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2048x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        32,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.03576
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|512x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        412,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.228272
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|512x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        17,
+        1,
+        0,
+        1,
+        0,
+        16,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 0.305088
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|512x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        26,
+        1,
+        0,
+        0,
+        29,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 0.014192
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.8402
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 3.7238
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        144,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 1.3127
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        406,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.1376
+    },
+    "v2|lt=130100|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        406,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.141824
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1052x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        33,
+        1,
+        0,
+        0,
+        23,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.021376
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1052x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        20,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.043696
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1280x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        0,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.404816
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1280x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 3.933696
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|1280x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        31,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.31216
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|13528x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        406,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.244112
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|13528x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        416,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.234416
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|13568x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        467,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 4.376048
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|13568x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.066304
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15028x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        465,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 0.266656
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15028x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.259968
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15104x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        467,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 4.835264
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15104x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        416,
+        1,
+        0,
+        0,
+        20,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 8.888752
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15104x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        144,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.2383
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15360x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 5.0128
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15360x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 6.5729
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15828x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.284992
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|15872x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 4.519568
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 5.2371
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 7.0072
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        144,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.357
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.298448
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|16384x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        465,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 0.299072
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2076x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        32,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.076384
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2076x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        17,
+        1,
+        0,
+        1,
+        0,
+        16,
+        0,
+        0
+      ],
+      "heur_index": 4,
+      "measured_ms": 0.079888
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2304x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        1,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 2,
+      "measured_ms": 1.328128
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2304x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.131344
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|2304x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        1,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.43712
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|4124x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        32,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.170048
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|4124x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        32,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.11336
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|4352x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        467,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 3.049152
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|540x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        26,
+        1,
+        0,
+        0,
+        19,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.014176
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|5628x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        29,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.191584
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|5628x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        414,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 4,
+      "measured_ms": 0.103344
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|5632x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 3.21936
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|768x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        0,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.277936
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|768x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        20,
+        1,
+        0,
+        0,
+        0,
+        15,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 4.783616
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|768x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        35,
+        17,
+        1,
+        0,
+        1,
+        0,
+        16,
+        0,
+        0
+      ],
+      "heur_index": 5,
+      "measured_ms": 0.294176
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 2.7559
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 3.6367
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8192x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        24,
+        1,
+        0,
+        0,
+        144,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 1.2801
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8220x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        406,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.131952
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8220x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        406,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.140288
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8428x512x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        406,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 0.141696
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8428x512x2560|at=28|ldc=512|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        416,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 0.17552
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8448x12288x2560|at=28|ldc=13312|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        23,
+        1,
+        0,
+        0,
+        31,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 2.874752
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8448x16384x2560|at=28|ldc=16384|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        467,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 0,
+      "measured_ms": 15.554448
+    },
+    "v2|lt=130101|sm=12.1:48:NVIDIA_GB10|ws=67108864|fp8_scaled|8448x2560x6144|at=28|ldc=2560|outer=0|eps=0x00000000": {
+      "config": [
+        67,
+        467,
+        1,
+        0,
+        0,
+        30,
+        36,
+        0,
+        0
+      ],
+      "heur_index": 1,
+      "measured_ms": 1.456592
+    }
+  }
+}

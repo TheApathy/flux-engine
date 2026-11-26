@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Real paired Lil accuracy gate. See R16_ACCURACY_GATE_DRIVERS.md."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+from contextlib import contextmanager
+import hashlib
+import http.client
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+import types
+import urllib.parse
+
+GATE = "mmlu-pro"
+LIL_SHA256 = "11f36dcf276b0d3ef7da3144d16b50c4bf6737fee211ded4f13b348962545fc2"
+CONTRACTS = {
+    "mmlu-pro": (
+        "mmlu_pro_1000",
+        "mmlu_pro_1000.jsonl",
+        "a229ed37f28bea012bf08e81d8ae3358dda17ef7370dca360f632952e3bdcaca",
+        1000,
+        0.65,
+    ),
+    "gsm8k": (
+        "gsm8k_test",
+        "gsm8k_test.jsonl",
+        "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+        1319,
+        0.95,
+    ),
+}
+MAX_RESPONSE = 32 * 1024 * 1024
+REQUEST_TIMEOUT = 14400
+# Leave time for a terminal timeout response before the HTTP client gives up.
+SERVER_REQUEST_TIMEOUT = REQUEST_TIMEOUT - 60
+READY_TIMEOUT = 1800
+LABEL_PREFIX = "com.theapathy.flux."
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_parent_suite(expected):
+    """Bind the helper pin to the actual sealed suite that launched this gate."""
+    parent = os.getppid()
+    argv = Path(f"/proc/{parent}/cmdline").read_bytes().split(b"\0")
+    candidates = [item for item in argv if re.fullmatch(rb"/proc/self/fd/[0-9]+", item)]
+    require(len(candidates) == 1, "gate must be launched by the sealed release suite")
+    number = int(candidates[0].rsplit(b"/", 1)[1])
+    descriptor = os.open(f"/proc/{parent}/fd/{number}", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        require(
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals == seals,
+            "launching suite bytes are not sealed",
+        )
+        size = os.fstat(descriptor).st_size
+        require(0 < size <= 16 * 1024 * 1024, "launching suite size differs")
+        require(
+            digest(os.pread(descriptor, size + 1, 0)) == expected
+            and os.getppid() == parent,
+            "helper differs from the launching suite",
+        )
+    finally:
+        os.close(descriptor)
+
+
+def load_module(path, expected, name):
+    """Execute checked bytes, never reopen the pathname after hashing."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * 1024 * 1024,
+            "module size is invalid",
+        )
+        payload = os.pread(descriptor, before.st_size + 1, 0)
+        after = os.fstat(descriptor)
+        require(
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            == (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ),
+            "module changed while reading",
+        )
+        require(digest(payload) == expected, "source dependency hash differs")
+    finally:
+        os.close(descriptor)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    sys.modules[name] = module
+    try:
+        exec(compile(payload, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def docker(arguments):
+    result = subprocess.run(
+        ["docker", *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
+    )
+    require(result.returncode == 0, "Docker identity or process query failed")
+    require(len(result.stdout) <= 16 * 1024 * 1024, "Docker response is oversized")
+    return result.stdout
+
+
+def inspect_container(args, suite):
+    document = suite.strict_json_loads(
+        docker(["container", "inspect", "--format", "{{json .}}", args.container_id]),
+        "accuracy container",
+    )
+    require(
+        type(document) is dict
+        and document.get("Id") == args.container_id
+        and document.get("Image") == args.image_id,
+        "container identity differs",
+    )
+    require(
+        document.get("State", {}).get("Running") is True
+        and document.get("HostConfig", {}).get("ReadonlyRootfs") is True,
+        "container is not running with read-only root",
+    )
+    labels = document.get("Config", {}).get("Labels", {})
+    plan = {
+        "in_container_binary_path": labels.get(LABEL_PREFIX + "binary-path"),
+        "in_container_recipe_path": labels.get(LABEL_PREFIX + "recipe-path"),
+        "in_container_binary_sha256": labels.get(LABEL_PREFIX + "binary-sha256"),
+        "recipe_sha256": labels.get(LABEL_PREFIX + "recipe-sha256"),
+    }
+    for key, prefix in (
+        ("in_container_binary_path", "/opt/flux/bin/"),
+        ("in_container_recipe_path", "/opt/flux/repro-kit/recipes/"),
+    ):
+        value = plan[key]
+        require(
+            type(value) is str and value.startswith(prefix),
+            "image artifact path differs",
+        )
+        suite.normalized_absolute(value, "image artifact")
+    for key in ("in_container_binary_sha256", "recipe_sha256"):
+        suite.exact_hex(plan[key], 64, "image artifact digest")
+    init_pid = suite.exact_int(
+        document.get("State", {}).get("Pid"), "container init PID", 1, 1 << 31
+    )
+    root = os.open(
+        f"/proc/{init_pid}/root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        descriptor = suite._open_process_file(root, plan["in_container_recipe_path"])
+        try:
+            observed, payload = suite._hash_regular_fd(
+                descriptor, "accuracy recipe", suite.MAX_PROGRAM_BYTES
+            )
+            require(observed == plan["recipe_sha256"], "image recipe hash differs")
+            environment = {
+                key.decode(): value.decode()
+                for key, value in suite._recipe_environment(payload).items()
+            }
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root)
+    return plan, environment
+
+
+def request(args, method, route, body=None, *, timeout=REQUEST_TIMEOUT):
+    parsed = urllib.parse.urlsplit(args.base_url)
+    connection = http.client.HTTPConnection(
+        parsed.hostname, parsed.port, timeout=timeout
+    )
+    try:
+        payload = None if body is None else args.suite.canonical_bytes(body)
+        connection.request(
+            method,
+            route,
+            body=payload,
+            headers={"Content-Type": "application/json", "Connection": "close"},
+        )
+        response = connection.getresponse()
+        raw = response.read(MAX_RESPONSE + 1)
+        if route == "/health" and response.status != 200:
+            raise ConnectionError("server is not ready")
+        require(
+            len(raw) <= MAX_RESPONSE and response.status == 200,
+            "endpoint status or response bound differs",
+        )
+        return raw
+    finally:
+        connection.close()
+
+
+def find_pid(args, model):
+    raw = docker(["container", "top", args.container_id, "-eo", "pid,args"]).decode(
+        "utf-8", "strict"
+    )
+    rows = []
+    for line in raw.splitlines()[1:]:
+        columns = line.strip().split(None, 1)
+        if len(columns) == 2 and model in columns[1].split():
+            rows.append(int(columns[0]))
+    require(len(rows) <= 1, "server process identity is ambiguous")
+    return None if not rows else rows[0]
+
+
+def claim_pid(args, pid, plan):
+    """Bind cleanup to our exact container/executable before taking ownership."""
+    descriptor = os.pidfd_open(pid)
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_bytes()
+        require(
+            re.search(
+                rb"(?<![0-9a-f])" + args.container_id.encode() + rb"(?![0-9a-f])",
+                cgroup,
+            )
+            is not None,
+            "server is outside the launch container",
+        )
+        executable = os.open(f"/proc/{pid}/exe", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            observed, _ = args.suite._hash_regular_fd(
+                executable, "accuracy executable", 2 * 1024 * 1024 * 1024
+            )
+            require(
+                observed == plan["in_container_binary_sha256"],
+                "server executable hash differs",
+            )
+        finally:
+            os.close(executable)
+        require(
+            not select.select([descriptor], [], [], 0)[0],
+            "server exited before ownership",
+        )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def server(args, mode, plan, recipe):
+    model = "flux-accuracy-" + GATE + "-" + secrets.token_hex(16)
+    environment = dict(recipe)
+    environment["ATLAS_DISABLE_SPECULATION"] = "1" if mode == "none" else "0"
+    argv = [
+        plan["in_container_binary_path"],
+        "serve",
+        "--no-tui",
+        "--model-from-path",
+        "/models",
+        "--model-name",
+        model,
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        str(args.container_port),
+        "--request-timeout",
+        str(SERVER_REQUEST_TIMEOUT),
+        "--max-batch-size",
+        "1",
+        "--max-num-seqs",
+        "1",
+        "--max-seq-len",
+        "262144",
+        "--qwen4-qsa",
+        "--kv-cache-dtype",
+        "bf16",
+    ]
+    if mode == "native-mtp-k5":
+        argv += ["--speculative", "--num-drafts", "4"]
+    command = [
+        "docker",
+        "exec",
+        args.container_id,
+        "/usr/bin/env",
+        *[key + "=" + value for key, value in sorted(environment.items())],
+        *argv,
+    ]
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+    pid = pidfd = None
+    proof = None
+    try:
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "server launcher exited before readiness")
+            if pid is None:
+                pid = find_pid(args, model)
+                if pid is not None:
+                    pidfd = claim_pid(args, pid, plan)
+            if pid is not None:
+                try:
+                    request(args, "GET", "/health", timeout=2)
+                    request(args, "GET", "/health", timeout=2)
+                    proof = args.suite.verify_live_server(
+                        {
+                            "schema": "flux-r15-live-process-request/1",
+                            "mode": mode,
+                            "host_pid": pid,
+                        },
+                        plan,
+                        args.identities,
+                    )
+                    break
+                except (
+                    ConnectionError,
+                    TimeoutError,
+                    OSError,
+                    http.client.HTTPException,
+                ):
+                    pass
+            time.sleep(0.1)
+        require(proof is not None, "fresh server readiness deadline expired")
+        yield model, proof, pidfd
+        final = args.suite.verify_live_server(
+            {
+                "schema": "flux-r15-live-process-request/1",
+                "mode": mode,
+                "host_pid": pid,
+            },
+            plan,
+            args.identities,
+        )
+        require(final == proof, "server identity changed during the accuracy arm")
+    finally:
+        try:
+            if pidfd is None:
+                candidate = find_pid(args, model)
+                if candidate is not None:
+                    pidfd = claim_pid(args, candidate, plan)
+            if pidfd is not None:
+                if not select.select([pidfd], [], [], 0)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                if not select.select([pidfd], [], [], 10)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    require(
+                        bool(select.select([pidfd], [], [], 5)[0]),
+                        "server survived forced cleanup",
+                    )
+                    raise ValueError("server required forced cleanup")
+            process.wait(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if pidfd is not None:
+                os.close(pidfd)
+
+
+def response_measurement(args, bench, profile, item, model, response, nonce):
+    require(
+        type(response) is dict and response.get("model") == model,
+        "response model identity differs",
+    )
+    choices = response.get("choices")
+    require(
+        type(choices) is list and len(choices) == 1, "response choice census differs"
+    )
+    choice = choices[0]
+    require(
+        type(choice) is dict and choice.get("finish_reason") == "stop",
+        "request is incomplete or has a non-stop finish",
+    )
+    message = choice.get("message")
+    require(
+        type(message) is dict and not message.get("tool_calls"),
+        "accuracy response contains tool calls",
+    )
+    content = message.get("content")
+    reasoning = message.get("reasoning_content") or ""
+    require(
+        type(content) is str and content.strip() and type(reasoning) is str,
+        "response answer is empty or malformed",
+    )
+    ledger = response.get("interventions")
+    require(
+        ledger
+        == {"schema": "atlas.interventions.v1", "policy": "report_only", "events": []},
+        "missing or nonempty intervention ledger",
+    )
+    usage = response.get("usage")
+    require(type(usage) is dict, "exact token usage is missing")
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    require(
+        type(prompt) is int
+        and prompt > 0
+        and type(completion) is int
+        and 0 < completion < 131072,
+        "exact usage is invalid or hits the token budget",
+    )
+    require(
+        type(usage.get("total_tokens")) is int
+        and usage["total_tokens"] == prompt + completion,
+        "exact token usage total differs",
+    )
+    cache = usage.get("prompt_tokens_details")
+    require(
+        type(cache) is dict
+        and type(cache.get("cached_tokens")) is int
+        and cache["cached_tokens"] == 0,
+        "prefix cache reuse is unsupported for accuracy qualification",
+    )
+    rendered = response.get("rendered_prompt_evidence")
+    require(
+        type(rendered) is dict
+        and set(rendered) == {"schema", "nonce", "response_id", "prompt_sha256"}
+        and rendered["schema"] == "atlas.rendered_prompt.v1"
+        and rendered["nonce"] == nonce
+        and rendered["response_id"] == response.get("id")
+        and type(rendered["prompt_sha256"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", rendered["prompt_sha256"]) is not None
+        and set(rendered["prompt_sha256"]) != {"0"},
+        "server rendered-prompt challenge differs",
+    )
+    tokens = choice.get("token_ids")
+    require(
+        type(tokens) is list
+        and len(tokens) == completion
+        and all(type(token) is int and 0 <= token < 1 << 32 for token in tokens),
+        "exact scheduler token IDs are missing or incomplete",
+    )
+    answer = bench.extract_final_answer(content)
+    score = bench.score_completion_profile(
+        profile=profile,
+        final_answer=answer,
+        content_text=content,
+        output_text=reasoning + content,
+        regex="",
+        source="final_answer",
+        item=item,
+        finish_reason="stop",
+    )
+    require(
+        type(score.get("correct")) is bool
+        and score.get("score_label") in ("exact", "fail")
+        and type(score.get("parsed_answer")) is str
+        and bool(score["parsed_answer"]),
+        "Lil scorer returned an unparseable or nonfinal answer",
+    )
+    return {
+        "item_id": item["item_id"],
+        "expected_answer": item["expected_answer"],
+        "correct": score["correct"],
+        "parsed_answer": score["parsed_answer"],
+        "answer_sha256": digest(content.encode()),
+        "reasoning_sha256": digest(reasoning.encode()),
+        "token_ids_sha256": digest(args.suite.canonical_bytes(tokens)),
+        "completion_tokens": completion,
+        "prompt_tokens": prompt,
+        "rendered_prompt_sha256": rendered["prompt_sha256"],
+        "finish_reason": "stop",
+    }
+
+
+def compare_pairs(plain, native, count, floor):
+    require(
+        len(plain) == count and set(plain) == set(native),
+        "paired dataset item coverage differs",
+    )
+    rows, observations = [], []
+    for key, left in plain.items():
+        right = native[key]
+        answer_equal = all(
+            left[field] == right[field]
+            for field in (
+                "parsed_answer",
+                "answer_sha256",
+                "reasoning_sha256",
+                "rendered_prompt_sha256",
+                "finish_reason",
+            )
+        )
+        token_equal = all(
+            left[field] == right[field]
+            for field in ("token_ids_sha256", "completion_tokens", "prompt_tokens")
+        )
+        correctness_equal = left["correct"] is right["correct"]
+        require(
+            answer_equal and token_equal and correctness_equal,
+            "per-item plain/native K5 identity differs",
+        )
+        rows.append(
+            {
+                "plain_correct": left["correct"],
+                "k5_correct": right["correct"],
+                "answer_identity": answer_equal,
+                "correctness_identity": correctness_equal,
+                "token_identity": token_equal,
+            }
+        )
+        observations.append({"plain": left, "native_k5": right})
+    correct = sum(row["plain_correct"] for row in rows)
+    require(correct / count >= floor, "provisional accuracy sanity floor failed")
+    return rows, observations, correct
+
+
+def make_directory(suite, runtime, parts):
+    parent = suite.open_directory_chain(runtime, "accuracy runtime")
+    try:
+        for name in parts:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+            os.close(parent)
+            parent = child
+    finally:
+        os.close(parent)
+
+
+def run(args):
+    suite = args.suite
+    dataset_name, filename, dataset_sha, count, floor = CONTRACTS[GATE]
+    bench = load_module(
+        args.lil_program, LIL_SHA256, "_r16_lil_" + GATE.replace("-", "_")
+    )
+    require(
+        bench.VERSION == "0.7.9" and bench.SCORER_VERSION == 2,
+        "unsupported Lil scorer version",
+    )
+    data_path = Path(args.lil_program).parent / "data" / filename
+    descriptor = suite.open_absolute_file(data_path, "pinned accuracy dataset")
+    dataset_fd = None
+    try:
+        payload = suite.read_fd(
+            descriptor, "pinned accuracy dataset", 16 * 1024 * 1024, nlink=None
+        )
+        require(digest(payload) == dataset_sha, "pinned accuracy dataset hash differs")
+        dataset_fd = suite.anonymous_writable_file("accuracy-dataset")
+        suite.write_all(dataset_fd, payload)
+        suite.seal_written_file(dataset_fd, "pinned accuracy dataset", 16 * 1024 * 1024)
+
+        # This replaces Lil's resolver before use: no cache lookup or download.
+        def local_dataset(name, console=None):
+            require(name == dataset_name, "unexpected Lil dataset request")
+            return f"/proc/self/fd/{dataset_fd}", dataset_sha
+
+        bench.resolve_benchmark_dataset = local_dataset
+        profile = bench.BUILTIN_TEST_PROFILES[GATE]
+        items, _metadata = bench.load_benchmark_dataset_items(GATE, profile)
+    finally:
+        os.close(descriptor)
+        if dataset_fd is not None:
+            os.close(dataset_fd)
+    require(
+        len(items) == count and len({item["item_id"] for item in items}) == count,
+        "pinned dataset item coverage differs",
+    )
+    plan, recipe = inspect_container(args, suite)
+    runtime = suite.normalized_absolute(args.runtime_dir, "accuracy runtime")
+    runtime_identity = suite.directory_identity_sha256(runtime, "accuracy runtime")
+    parts = ["accuracy", GATE]
+    make_directory(suite, runtime, parts)
+    base = "/".join(parts)
+    journal_path = base + "/responses.jsonl"
+    journal = suite.create_beneath(
+        runtime, journal_path, "accuracy response journal", 0o400
+    )
+    journal_hash = hashlib.sha256()
+    normalized, proofs, request_ids, verification_metrics = {}, [], set(), {}
+    try:
+        for mode in ("none", "native-mtp-k5"):
+            arm = {}
+            with server(args, mode, plan, recipe) as (model, proof, pidfd):
+                proofs.append(proof)
+                for index, item in enumerate(items):
+                    require(
+                        not select.select([pidfd], [], [], 0)[0],
+                        "accuracy server exited",
+                    )
+                    body = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": item["prompt"]}],
+                        "max_tokens": 131072,
+                        "temperature": 0.0,
+                        "stream": False,
+                        "return_token_ids": True,
+                        "report_interventions": True,
+                        "rendered_prompt_evidence_nonce": secrets.token_hex(16),
+                    }
+                    raw = request(args, "POST", "/v1/chat/completions", body)
+                    response = suite.strict_json_loads(raw, "accuracy response")
+                    entry = (
+                        suite.canonical_bytes(
+                            {
+                                "mode": mode,
+                                "index": index,
+                                "item_id": item["item_id"],
+                                "request": body,
+                                "response": response,
+                            }
+                        )
+                        + b"\n"
+                    )
+                    require(
+                        os.fstat(journal).st_size + len(entry)
+                        <= suite.MAX_RAW_LOG_BYTES,
+                        "accuracy response journal exceeds the release bound",
+                    )
+                    suite.write_all(journal, entry)
+                    journal_hash.update(entry)
+                    require(
+                        not select.select([pidfd], [], [], 0)[0],
+                        "accuracy server exited during request",
+                    )
+                    response_id = response.get("id") if type(response) is dict else None
+                    require(
+                        type(response_id) is str
+                        and bool(response_id)
+                        and response_id not in request_ids,
+                        "response identity is missing or reused",
+                    )
+                    request_ids.add(response_id)
+                    arm[item["item_id"]] = response_measurement(
+                        args,
+                        bench,
+                        profile,
+                        item,
+                        model,
+                        response,
+                        body["rendered_prompt_evidence_nonce"],
+                    )
+                metrics = request(args, "GET", "/metrics").decode("utf-8", "strict")
+                k5_events = sum(
+                    float(value)
+                    for value in re.findall(
+                        r'^atlas_spec_decode_verify_total\{[^\n}]*\bk="5"[^\n}]*\}\s+([0-9.eE+-]+)\s*$',
+                        metrics,
+                        re.MULTILINE,
+                    )
+                )
+                require(
+                    math.isfinite(k5_events)
+                    and 0 <= k5_events <= 1_000_000_000_000
+                    and float(k5_events).is_integer(),
+                    "native K5 verification counter is malformed",
+                )
+                require(
+                    k5_events > 0 if mode == "native-mtp-k5" else k5_events == 0,
+                    "native K5 verifier engagement differs",
+                )
+                verification_metrics[mode] = {
+                    "k5_events": int(k5_events),
+                    "metrics_sha256": digest(metrics.encode()),
+                    "metrics": metrics,
+                }
+            normalized[mode] = arm
+        os.fsync(journal)
+        suite.assert_path_identity(
+            runtime, journal_path, journal, "accuracy response journal"
+        )
+        observed_journal, _ = suite._hash_regular_fd(
+            journal, "accuracy response journal", suite.MAX_RAW_LOG_BYTES
+        )
+        require(
+            observed_journal == journal_hash.hexdigest(),
+            "accuracy response journal changed",
+        )
+        require(
+            suite.directory_identity_sha256(runtime, "accuracy runtime")
+            == runtime_identity,
+            "accuracy runtime identity changed",
+        )
+        rows, observations, correct = compare_pairs(
+            normalized["none"], normalized["native-mtp-k5"], count, floor
+        )
+        validator = {
+            "schema": "flux-r15-gate-validator/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "raw": {
+                "dataset_sha256": dataset_sha,
+                "items": rows,
+                "observations": observations,
+                "response_journal": {
+                    "artifact": journal_path,
+                    "sha256": journal_hash.hexdigest(),
+                    "requests": count * 2,
+                },
+                "process_bindings": proofs,
+                "evaluator_sha256": LIL_SHA256,
+                "verification_metrics": verification_metrics,
+            },
+        }
+        validator_raw = suite.canonical_bytes(validator)
+        require(
+            len(validator_raw) <= suite.MAX_GATE_RECEIPT_BYTES,
+            "validator artifact exceeds the release bound",
+        )
+        validator_path = base + "/validator.json"
+        target = suite.create_beneath(
+            runtime, validator_path, "accuracy validator", 0o400
+        )
+        try:
+            suite.write_all(target, validator_raw)
+            os.fsync(target)
+        finally:
+            os.close(target)
+        evidence = {
+            "dataset_sha256": dataset_sha,
+            "items": count,
+            "no_spec_correct": correct,
+            "k5_correct": correct,
+            "score": correct / count,
+            "provisional_floor": floor,
+            "per_item_answer_identity": True,
+            "per_item_correctness_identity": True,
+            "per_item_token_identity": True,
+            "validator_artifact": validator_path,
+            "validator_receipt_sha256": digest(validator_raw),
+        }
+        receipt = {
+            "schema": "flux-r15-container-gate-receipt/1",
+            "gate": GATE,
+            "status": "PASS",
+            "release_qualified": True,
+            "execution_scope": "immutable-container",
+            "image_id": args.image_id,
+            "image_digest": args.image_digest,
+            "container_id": args.container_id,
+            "run_id": args.run_id,
+            "evidence": evidence,
+        }
+        suite.write_all(args.receipt_fd, suite.canonical_bytes(receipt))
+        os.fsync(args.receipt_fd)
+        return receipt
+    finally:
+        os.close(journal)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    for name in (
+        "container-id",
+        "image-id",
+        "image-digest",
+        "base-url",
+        "run-id",
+        "receipt-fd",
+        "raw-log-fd",
+        "runtime-dir",
+        "suite-program",
+        "suite-sha256",
+        "lil-program",
+    ):
+        parser.add_argument(
+            "--" + name, required=True, type=int if name.endswith("-fd") else str
+        )
+    parser.add_argument("--container-port", type=int, default=8888)
+    args = parser.parse_args(argv)
+    parsed = urllib.parse.urlsplit(args.base_url)
+    require(
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.port is not None
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None,
+        "base URL must be explicit HTTP IPv4 loopback",
+    )
+    require(1 <= args.container_port <= 65535, "container port is invalid")
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.container_id) is not None,
+        "container ID differs",
+    )
+    for value in (args.image_id, args.image_digest):
+        require(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None,
+            "immutable image identity differs",
+        )
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.run_id) is not None,
+        "run ID is invalid",
+    )
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", args.suite_sha256) is not None
+        and set(args.suite_sha256) != {"0"},
+        "suite dependency hash is invalid",
+    )
+    verify_parent_suite(args.suite_sha256)
+    args.suite = load_module(
+        args.suite_program, args.suite_sha256, "_r16_suite_" + GATE.replace("-", "_")
+    )
+    require(
+        callable(getattr(args.suite, "_live_listener_identity", None))
+        and callable(getattr(args.suite, "_verify_live_mode", None)),
+        "source-pinned live broker upgrade is required",
+    )
+    args.identities = {
+        name: getattr(args, name)
+        for name in ("container_id", "image_id", "image_digest", "run_id", "base_url")
+    }
+    require(
+        hasattr(signal, "pidfd_send_signal") and hasattr(os, "pidfd_open"),
+        "local Linux pidfd support is required",
+    )
+    return args
+
+
+def main():
+    try:
+        run(parse_args())
+    except Exception as error:
+        # Paths, host identifiers, and response text stay in private artifacts.
+        print(
+            GATE + ": qualification failed (" + type(error).__name__ + ")",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

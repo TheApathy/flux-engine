@@ -1,0 +1,1382 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Post-transform weight artifact cache (fast engine recovery, Phase 1).
+//!
+//! Restarting the server re-runs every per-layer weight transform even though
+//! the raw checkpoint is unchanged and already warm in the page cache. The
+//! expensive ones are host round-trips: [`crate::weight_map::QuantizedWeight::transpose_for_gemm`]
+//! does a D2H of the packed weight, a scalar byte-wise transpose on the CPU,
+//! and an H2D of the result — ~9 times per layer on qwen3.8-27b.
+//!
+//! This module stores the *output* buffers of those transforms in a
+//! content-keyed directory. On a later start the buffers are mmap'd and
+//! pushed straight H2D, skipping the transform entirely.
+//!
+//! Everything here is off unless `ATLAS_WEIGHT_CACHE=1`. With the flag unset
+//! [`get`] returns `None` and every call site falls through to the original
+//! code path, so the default build is byte-for-byte unchanged.
+//!
+//! Env:
+//!   - `ATLAS_WEIGHT_CACHE=1`        — enable (default off)
+//!   - `ATLAS_WEIGHT_CACHE_DIR=<p>`  — cache root (default `~/.cache/atlas-weight-cache`)
+//!   - `ATLAS_WEIGHT_CACHE_VERIFY=1` — on every hit, ALSO run the real
+//!     transform and byte-compare a sample; mismatches log an error and the
+//!     freshly computed buffer is served instead of the cached one.
+//!
+//! On-disk layout, one directory per fingerprint:
+//!   `<root>/<fingerprint>/blob.bin`   — all parts concatenated, 64B aligned
+//!   `<root>/<fingerprint>/index.json` — slot → [(offset, len)]
+//!
+//! One blob plus one index rather than a file per layer: the read side wants a
+//! single mmap and one sequential fault-in pass instead of ~600 opens, and the
+//! index doubles as the commit marker. Both `blob.bin` and `index.json` are
+//! written to unique temp files and published by atomic `rename` (blob first,
+//! index last), so an existing `blob.bin` is never truncated in-place and a
+//! build torn by a crash or a failed load has no index and is ignored on the
+//! next start.
+
+use anyhow::{Context, Result, ensure};
+use parking_lot::Mutex;
+use ring::digest::{SHA256, digest};
+use serde::{Deserialize, Serialize};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::weights::{WeightStore, WeightTensor};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+mod evict;
+
+/// Bump on ANY change to the on-disk layout, to the set of fingerprint
+/// inputs, or to the meaning of a slot key. Existing caches then fail the
+/// key check and are rewritten rather than silently reused.
+pub const CACHE_FORMAT_VERSION: u32 = 4;
+
+/// Parts are padded to this boundary inside the blob so each mmap slice
+/// handed to `copy_h2d` starts aligned.
+const PART_ALIGN: u64 = 64;
+
+const BLOB_FILE: &str = "blob.bin";
+const INDEX_FILE: &str = "index.json";
+const INDEX_TMP_FILE: &str = "index.json.tmp";
+
+static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp_path(dir: &Path, stem: &str) -> PathBuf {
+    let seq = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{stem}.tmp.{}.{seq}", std::process::id()))
+}
+
+fn remove_tmp_file(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            "weight cache: failed to remove temp file {} ({error})",
+            path.display()
+        ),
+    }
+}
+
+/// Runtime env vars that change what a transform produces. Any of these
+/// flipping must produce a different cache key — otherwise a run with
+/// `ATLAS_FFN_M16_TRANSPOSED=1` would serve buffers built without it.
+/// Adding a transform-affecting env var means adding it here.
+const TRANSFORM_ENV_KEYS: &[&str] = &[
+    "ATLAS_ATTN_QKV_SPLITK",
+    "ATLAS_ATTN_SLIDING_WINDOW",
+    "ATLAS_FAKE_NVFP4",
+    "ATLAS_FFN_GATEUP_SPLITK",
+    "ATLAS_FFN_M16_TRANSPOSED",
+    "ATLAS_FFN_PREDEQUANT_FP8",
+    "ATLAS_FFN_W3_LAYERS",
+    "ATLAS_FFN_W3_SIDECAR",
+    "ATLAS_FORCE_NVFP4_MOE",
+    "ATLAS_MODEL_PATH",
+    "ATLAS_SSM_GDN_LAZY",
+    "ATLAS_TARGET_MODEL",
+    "ATLAS_TARGET_QUANT",
+    "TQ_PLUS_WEIGHT_ROTATION",
+];
+
+/// Generic transforms retain the legacy bounded store sample. Official packed
+/// MTP slots additionally bind the exact SHA256 receipt of every byte in both
+/// source banks before a hit is possible; this sample is not their provenance.
+const CONTENT_SAMPLE_TENSORS: usize = 24;
+const CONTENT_SAMPLE_BYTES: usize = 2048;
+
+/// Bound peak host memory while establishing exact packed-MTP provenance.
+const CONTENT_DIGEST_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes compared per part under `ATLAS_WEIGHT_CACHE_VERIFY=1`.
+const VERIFY_WINDOW: usize = 4096;
+
+// ─────────────────────────── fingerprint ───────────────────────────
+
+/// Non-cryptographic 128-bit fingerprint accumulator (two FNV-1a-64 lanes
+/// with different offset bases). Used only to decide whether a cache
+/// directory belongs to this exact model + build + env, never for security.
+/// Every write is length-prefixed so `"ab" + "c"` and `"a" + "bc"` differ.
+#[derive(Debug, Clone)]
+pub struct Fingerprint {
+    lane_a: u64,
+    lane_b: u64,
+}
+
+impl Default for Fingerprint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fingerprint {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    const BASIS_A: u64 = 0xcbf2_9ce4_8422_2325;
+    const BASIS_B: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    pub fn new() -> Self {
+        Self {
+            lane_a: Self::BASIS_A,
+            lane_b: Self::BASIS_B,
+        }
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> &mut Self {
+        for b in (bytes.len() as u64).to_le_bytes() {
+            self.mix(b);
+        }
+        for &b in bytes {
+            self.mix(b);
+        }
+        self
+    }
+
+    pub fn write_str(&mut self, s: &str) -> &mut Self {
+        self.write(s.as_bytes())
+    }
+
+    pub fn write_usize(&mut self, v: usize) -> &mut Self {
+        self.write(&(v as u64).to_le_bytes())
+    }
+
+    pub fn write_u32(&mut self, v: u32) -> &mut Self {
+        self.write(&v.to_le_bytes())
+    }
+
+    fn mix(&mut self, b: u8) {
+        self.lane_a = (self.lane_a ^ b as u64).wrapping_mul(Self::PRIME);
+        self.lane_b = (self.lane_b ^ b as u64).wrapping_mul(Self::PRIME);
+    }
+
+    /// Stable lowercase hex, 32 chars. This is the cache directory name.
+    pub fn finish_hex(&self) -> String {
+        format!("{:016x}{:016x}", self.lane_a, self.lane_b)
+    }
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Cryptographic digest over every source byte.
+#[cfg(test)]
+pub(crate) fn exact_content_digest(bytes: &[u8]) -> Result<String> {
+    Ok(hex_digest(digest(&SHA256, bytes).as_ref()))
+}
+
+/// Compute the exact SHA-256 receipt of a device allocation directly from live
+/// device bytes without process-global address memoization. Copy failure is
+/// fatal: an incomplete identity must never be allowed to hit a cache slot.
+fn compute_device_content_digest(
+    gpu: &dyn GpuBackend,
+    ptr: DevicePtr,
+    byte_len: usize,
+) -> Result<String> {
+    ensure!(
+        !ptr.is_null(),
+        "exact content digest source pointer is null"
+    );
+    ensure!(byte_len > 0, "exact content digest source is empty");
+    ensure!(
+        ptr.0.checked_add(byte_len as u64).is_some(),
+        "exact content digest source address overflows"
+    );
+    let mut host = vec![0u8; CONTENT_DIGEST_CHUNK_BYTES.min(byte_len)];
+    let mut receipt = Vec::with_capacity(
+        32 + byte_len
+            .div_ceil(CONTENT_DIGEST_CHUNK_BYTES)
+            .saturating_mul(32),
+    );
+    receipt.extend_from_slice(b"exact-device-content.v1");
+    receipt.extend_from_slice(&(byte_len as u64).to_le_bytes());
+    let mut offset = 0usize;
+    while offset < byte_len {
+        let take = host.len().min(byte_len - offset);
+        gpu.copy_d2h(ptr.offset(offset), &mut host[..take])
+            .with_context(|| format!("hash exact device bytes {offset}..{}", offset + take))?;
+        receipt.extend_from_slice(digest(&SHA256, &host[..take]).as_ref());
+        offset += take;
+    }
+    Ok(hex_digest(digest(&SHA256, &receipt).as_ref()))
+}
+
+/// Exact transform implementation plus output-relevant backend/device class.
+/// The backend receipt covers the exact PTX bytes loaded into its registry;
+/// SM topology and memory class prevent cross-device reuse.
+pub(crate) fn packed_mtp_transform_identity(gpu: &dyn GpuBackend) -> Result<String> {
+    let implementation = gpu
+        .transform_cache_identity()
+        .context("GPU backend has no exact transform-cache implementation identity")?;
+    let sm_count = gpu
+        .sm_count()
+        .context("packed MTP cache requires an exact device SM count")?;
+    let total_memory = gpu
+        .total_memory()
+        .context("packed MTP cache requires exact device memory identity")?;
+    Ok(format!(
+        "target_os={};target_arch={};device_sms={sm_count};device_memory={total_memory};{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        implementation,
+    ))
+}
+
+pub(crate) fn bind_packed_mtp_slot_provenance(
+    slot: String,
+    source: &WeightTensor,
+    gpu: &dyn GpuBackend,
+) -> Result<String> {
+    // The packed schema's 1,536 slices partition these two immutable source
+    // tensors. Bind the whole tensor so every source byte is covered once,
+    // memoized only within the active `TransformCache` session, while the
+    // geometric slot still selects one exact slice and role.
+    let source_digest = match get() {
+        Some(cache) => cache.exact_device_content_digest(gpu, source.ptr, source.byte_size())?,
+        None => compute_device_content_digest(gpu, source.ptr, source.byte_size())?,
+    };
+    Ok(format!(
+        "{slot};source_content_digest={source_digest};{}",
+        packed_mtp_transform_identity(gpu)?,
+    ))
+}
+
+/// Hash the fields of [`atlas_core::config::ModelConfig`] that any weight
+/// transform depends on. Listed explicitly rather than derived from `Serialize`
+/// (the struct has no `Serialize` impl) — adding a config field that changes a
+/// transform means adding it here AND bumping [`CACHE_FORMAT_VERSION`].
+pub fn hash_model_config(fp: &mut Fingerprint, config: &atlas_core::config::ModelConfig) {
+    fp.write_str("model_config.v1");
+    fp.write_usize(config.hidden_size);
+    fp.write_usize(config.num_hidden_layers);
+    fp.write_usize(config.intermediate_size);
+    fp.write_usize(config.vocab_size);
+    fp.write_usize(config.num_attention_heads);
+    fp.write_usize(config.num_key_value_heads);
+    fp.write_usize(config.head_dim);
+    fp.write_usize(config.linear_num_key_heads);
+    fp.write_usize(config.linear_key_head_dim);
+    fp.write_usize(config.linear_num_value_heads);
+    fp.write_usize(config.linear_value_head_dim);
+    fp.write_usize(config.num_experts);
+    fp.write_usize(config.moe_intermediate_size);
+    fp.write_usize(config.tp_rank);
+    fp.write_usize(config.tp_world_size);
+    fp.write_str(&config.weight_prefix);
+    fp.write(&[config.attn_gated as u8]);
+    fp.write_usize(config.layer_types.len());
+    for lt in &config.layer_types {
+        fp.write_str(&format!("{lt:?}"));
+    }
+}
+
+/// Hash the build identity and every transform-affecting env var.
+pub fn hash_build_and_env(fp: &mut Fingerprint) {
+    hash_build_and_env_with(fp, |key| std::env::var(key).ok());
+}
+
+fn hash_build_and_env_with(fp: &mut Fingerprint, lookup: impl Fn(&str) -> Option<String>) {
+    fp.write_str("build.v1");
+    fp.write_u32(CACHE_FORMAT_VERSION);
+    fp.write_str(env!("CARGO_PKG_VERSION"));
+    // Kernel target selected at compile time. A binary built for a different
+    // ATLAS_TARGET_MODEL can produce different transform outputs, so the
+    // build-time value belongs in the key alongside the runtime one.
+    fp.write_str(option_env!("ATLAS_TARGET_MODEL").unwrap_or(""));
+    fp.write_str(option_env!("ATLAS_TARGET_QUANT").unwrap_or(""));
+    for key in TRANSFORM_ENV_KEYS {
+        fp.write_str(key);
+        fp.write_str(&lookup(key).unwrap_or_default());
+    }
+}
+
+fn hash_construction_mode(fp: &mut Fingerprint, use_native_mtp: bool) {
+    fp.write_str("construction-mode.v1")
+        .write(&[use_native_mtp as u8]);
+}
+
+/// Hash tensor names, dtypes and shapes, plus a bounded content sample so
+/// two checkpoints with the same geometry but different weights cannot
+/// share a cache directory.
+fn hash_weight_store(fp: &mut Fingerprint, store: &WeightStore, gpu: &dyn GpuBackend) {
+    fp.write_str("store.v1");
+    let mut names: Vec<&str> = store.names().collect();
+    names.sort_unstable();
+    fp.write_usize(names.len());
+    for name in &names {
+        let Ok(t) = store.get(name) else { continue };
+        fp.write_str(name);
+        fp.write_str(&format!("{:?}", t.dtype));
+        fp.write_usize(t.shape.len());
+        for d in &t.shape {
+            fp.write_usize(*d);
+        }
+    }
+
+    // Content sample: leading bytes of evenly spread tensors.
+    if names.is_empty() {
+        return;
+    }
+    let stride = names.len().div_ceil(CONTENT_SAMPLE_TENSORS).max(1);
+    let mut buf = vec![0u8; CONTENT_SAMPLE_BYTES];
+    for name in names.iter().step_by(stride) {
+        let Ok(t) = store.get(name) else { continue };
+        let size = t.byte_size();
+        if size == 0 || t.ptr == DevicePtr::NULL {
+            continue;
+        }
+        let take = CONTENT_SAMPLE_BYTES.min(size);
+        if gpu.copy_d2h(t.ptr, &mut buf[..take]).is_ok() {
+            fp.write_str(name);
+            fp.write_usize(size);
+            fp.write(&buf[..take]);
+        }
+    }
+}
+
+/// Full cache key for this process: model content + config + build + env.
+pub fn compute_fingerprint(
+    store: &WeightStore,
+    config: &atlas_core::config::ModelConfig,
+    gpu: &dyn GpuBackend,
+    variant_tag: &str,
+) -> String {
+    let mut fp = Fingerprint::new();
+    hash_build_and_env(&mut fp);
+    hash_construction_mode(&mut fp, construction_mode());
+    fp.write_str("variant");
+    fp.write_str(variant_tag);
+    hash_model_config(&mut fp, config);
+    hash_weight_store(&mut fp, store, gpu);
+    fp.finish_hex()
+}
+
+// ─────────────────────────── slot geometry ───────────────────────────
+
+/// Byte lengths of the two buffers `QuantizedWeight::transpose_for_gemm`
+/// allocates for an [N, K] weight: (packed, scale).
+///
+/// This MIRRORS the arithmetic in that method — `n_pad` rounds N up to 64,
+/// packed is `[K/2, n_pad]`, scale is `[K/16, n_pad]`. `transpose_for_gemm_cached`
+/// cross-checks the result against the lengths recorded in the cache index and
+/// recomputes on any disagreement, so a drift between the two surfaces as a
+/// slow load, never as wrong numerics. Changing the transposed layout means
+/// changing both and bumping [`CACHE_FORMAT_VERSION`].
+pub fn transposed_lens(n: usize, k: usize) -> (usize, usize) {
+    const GROUP_SIZE: usize = 16;
+    let n_pad = n.div_ceil(64) * 64;
+    ((k / 2) * n_pad, (k / GROUP_SIZE) * n_pad)
+}
+
+// ─────────────────────────── index ───────────────────────────
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Part {
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub slot: String,
+    pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheIndex {
+    pub format_version: u32,
+    pub fingerprint: String,
+    pub blob_len: u64,
+    pub entries: Vec<IndexEntry>,
+}
+
+impl CacheIndex {
+    /// Reject an index that was written by a different layout or for a
+    /// different model. Callers treat `false` as "no cache".
+    pub fn matches(&self, fingerprint: &str) -> bool {
+        self.format_version == CACHE_FORMAT_VERSION && self.fingerprint == fingerprint
+    }
+
+    pub fn to_map(&self) -> HashMap<String, Vec<Part>> {
+        self.entries
+            .iter()
+            .map(|e| (e.slot.clone(), e.parts.clone()))
+            .collect()
+    }
+}
+
+// ─────────────────────────── cache ───────────────────────────
+
+struct Reader {
+    mmap: memmap2::Mmap,
+    slots: HashMap<String, Vec<Part>>,
+}
+
+struct Writer {
+    tmp_blob_path: PathBuf,
+    file: BufWriter<File>,
+    offset: u64,
+    entries: Vec<IndexEntry>,
+}
+
+#[derive(Default)]
+struct Stats {
+    hits: usize,
+    misses: usize,
+    verified: usize,
+    verify_failures: usize,
+}
+
+pub struct TransformCache {
+    /// Cache root holding every fingerprint directory. Retained so the
+    /// eviction pass can see sibling variants.
+    root: PathBuf,
+    dir: PathBuf,
+    fingerprint: String,
+    reader: Option<Reader>,
+    writer: Mutex<Option<Writer>>,
+    verify: bool,
+    stats: Mutex<Stats>,
+    /// Per-session SHA-256 memoization for immutable `WeightStore` source
+    /// buffers, scoped to this `TransformCache` instance and cleared on
+    /// `finish()` so address reuse across model loads or tests cannot return a
+    /// stale digest.
+    device_digests: Mutex<HashMap<(u64, usize), String>>,
+}
+
+impl TransformCache {
+    pub fn verify_enabled(&self) -> bool {
+        self.verify
+    }
+
+    /// Exact digest of an immutable device allocation, memoized for the
+    /// lifetime of this [`TransformCache`] load session.
+    pub(crate) fn exact_device_content_digest(
+        &self,
+        gpu: &dyn GpuBackend,
+        ptr: DevicePtr,
+        byte_len: usize,
+    ) -> Result<String> {
+        ensure!(
+            !ptr.is_null(),
+            "exact content digest source pointer is null"
+        );
+        ensure!(byte_len > 0, "exact content digest source is empty");
+        ensure!(
+            ptr.0.checked_add(byte_len as u64).is_some(),
+            "exact content digest source address overflows"
+        );
+        if let Some(digest) = self.device_digests.lock().get(&(ptr.0, byte_len)).cloned() {
+            return Ok(digest);
+        }
+        let digest = compute_device_content_digest(gpu, ptr, byte_len)?;
+        self.device_digests
+            .lock()
+            .insert((ptr.0, byte_len), digest.clone());
+        Ok(digest)
+    }
+
+    /// Fetch a slot's parts and push them H2D into fresh allocations.
+    ///
+    /// `expected` is the byte length the caller derived from the model
+    /// geometry. Any disagreement with the index is treated as a miss rather
+    /// than trusted — that is the backstop against a transform whose output
+    /// layout drifted without [`CACHE_FORMAT_VERSION`] being bumped.
+    pub fn load_parts(
+        &self,
+        slot: &str,
+        gpu: &dyn GpuBackend,
+        expected: &[usize],
+    ) -> Option<Vec<DevicePtr>> {
+        let reader = self.reader.as_ref()?;
+        let parts = reader.slots.get(slot)?;
+        if parts.len() != expected.len() {
+            tracing::warn!(
+                "weight cache: slot {slot} has {} parts, expected {}; recomputing",
+                parts.len(),
+                expected.len()
+            );
+            return None;
+        }
+        let mut out = Vec::with_capacity(parts.len());
+        for (part, &want) in parts.iter().zip(expected) {
+            if u64::try_from(want).ok() != Some(part.len) {
+                tracing::warn!(
+                    "weight cache: slot {slot} part len {} != expected {want}; recomputing",
+                    part.len
+                );
+                self.free_all(gpu, &out);
+                return None;
+            }
+            let Some((start, end)) = usize::try_from(part.offset)
+                .ok()
+                .and_then(|s| s.checked_add(want).map(|e| (s, e)))
+            else {
+                tracing::warn!(
+                    "weight cache: slot {slot} part offset {} + len {want} overflows; recomputing",
+                    part.offset
+                );
+                self.free_all(gpu, &out);
+                return None;
+            };
+            let Some(src) = reader.mmap.get(start..end) else {
+                tracing::warn!("weight cache: slot {slot} runs past blob end; recomputing");
+                self.free_all(gpu, &out);
+                return None;
+            };
+            match gpu
+                .alloc(want)
+                .and_then(|p| gpu.copy_h2d(src, p).map(|()| p))
+            {
+                Ok(p) => out.push(p),
+                Err(e) => {
+                    tracing::warn!("weight cache: H2D for slot {slot} failed ({e:#}); recomputing");
+                    self.free_all(gpu, &out);
+                    return None;
+                }
+            }
+        }
+        self.stats.lock().hits += 1;
+        Some(out)
+    }
+
+    /// Append freshly transformed buffers to the blob. Errors are logged and
+    /// swallowed: a cache we failed to write is a slow next start, never a
+    /// wrong answer, so it must not fail the load.
+    pub fn store_parts(&self, slot: &str, gpu: &dyn GpuBackend, bufs: &[(DevicePtr, usize)]) {
+        let mut guard = self.writer.lock();
+        let Some(writer) = guard.as_mut() else {
+            return;
+        };
+        self.stats.lock().misses += 1;
+        let mut parts = Vec::with_capacity(bufs.len());
+        for &(ptr, len) in bufs {
+            let pad = (PART_ALIGN - writer.offset % PART_ALIGN) % PART_ALIGN;
+            if pad > 0 {
+                if let Err(e) = writer.file.write_all(&vec![0u8; pad as usize]) {
+                    tracing::warn!("weight cache: pad write failed ({e}); disabling writer");
+                    abort_writer(&mut guard, &self.dir);
+                    return;
+                }
+                writer.offset += pad;
+            }
+            let mut host = vec![0u8; len];
+            if let Err(e) = gpu.copy_d2h(ptr, &mut host) {
+                tracing::warn!(
+                    "weight cache: D2H for slot {slot} failed ({e:#}); disabling writer"
+                );
+                abort_writer(&mut guard, &self.dir);
+                return;
+            }
+            if let Err(e) = writer.file.write_all(&host) {
+                tracing::warn!("weight cache: blob write failed ({e}); disabling writer");
+                abort_writer(&mut guard, &self.dir);
+                return;
+            }
+            parts.push(Part {
+                offset: writer.offset,
+                len: len as u64,
+            });
+            writer.offset += len as u64;
+        }
+        writer.entries.push(IndexEntry {
+            slot: slot.to_string(),
+            parts,
+        });
+    }
+
+    /// Byte-compare a sample of each part: head window, tail window, and a
+    /// deterministic middle window. Returns `false` on any mismatch.
+    pub fn verify_pair(
+        &self,
+        slot: &str,
+        gpu: &dyn GpuBackend,
+        cached: &[(DevicePtr, usize)],
+        fresh: &[(DevicePtr, usize)],
+    ) -> bool {
+        let mut ok = true;
+        for (idx, (&(c_ptr, c_len), &(f_ptr, f_len))) in cached.iter().zip(fresh).enumerate() {
+            if c_len != f_len {
+                tracing::error!("weight cache VERIFY: {slot}[{idx}] length {c_len} != {f_len}");
+                ok = false;
+                continue;
+            }
+            let mut a = vec![0u8; c_len];
+            let mut b = vec![0u8; f_len];
+            if gpu.copy_d2h(c_ptr, &mut a).is_err() || gpu.copy_d2h(f_ptr, &mut b).is_err() {
+                tracing::error!("weight cache VERIFY: {slot}[{idx}] D2H failed");
+                ok = false;
+                continue;
+            }
+            for (label, range) in sample_windows(c_len) {
+                if a[range.clone()] != b[range.clone()] {
+                    tracing::error!(
+                        "weight cache VERIFY FAIL: {slot}[{idx}] {label} window {range:?} differs"
+                    );
+                    ok = false;
+                }
+            }
+        }
+        let mut stats = self.stats.lock();
+        stats.verified += 1;
+        if !ok {
+            stats.verify_failures += 1;
+        } else {
+            tracing::debug!("weight cache VERIFY PASS: {slot}");
+        }
+        ok
+    }
+
+    fn free_all(&self, gpu: &dyn GpuBackend, ptrs: &[DevicePtr]) {
+        for &p in ptrs {
+            let _ = gpu.free(p);
+        }
+    }
+
+    /// Stamp this cache as used, then prune siblings back under budget unless
+    /// `ATLAS_WEIGHT_CACHE_EVICT=0` opts out.
+    ///
+    /// The `last_used` stamp is written unconditionally, including under the
+    /// opt-out. It costs one small file write and it means recency data is
+    /// already accurate whenever pruning is switched back on, instead of every
+    /// directory looking equally cold on the first pass afterwards.
+    ///
+    /// Called only once the active directory is known-good (a hit, or a build
+    /// whose index has just been published), so a variant we are about to
+    /// serve from can never be chosen as a victim. Best-effort throughout:
+    /// a cache we could not prune is a disk-space problem, never a
+    /// correctness one, and must not fail a load that already succeeded.
+    fn touch_and_evict(&self) {
+        let now = evict::unix_now();
+        evict::touch_last_used(&self.dir, now);
+        if let Err(e) = evict::run(
+            &self.root,
+            &self.fingerprint,
+            evict::budget_bytes(),
+            evict::keep_limit(),
+            now,
+            evict::eviction_enabled(),
+        ) {
+            tracing::warn!("weight cache: eviction pass failed ({e:#})");
+        }
+    }
+
+    /// Flush the blob and publish the index. Called once after all layers
+    /// are built; skipping it (because the load failed) leaves the blob
+    /// without an index, which the next start ignores.
+    pub fn finish(&self) {
+        self.device_digests.lock().clear();
+        let stats = self.stats.lock();
+        if self.verify {
+            tracing::info!(
+                "weight cache VERIFY summary: {} slots checked, {} failures",
+                stats.verified,
+                stats.verify_failures,
+            );
+        }
+        let hits = stats.hits;
+        let misses = stats.misses;
+        drop(stats);
+
+        // Never hold the stats mutex while waiting for the writer mutex:
+        // store_parts takes these in writer -> stats order.  Model loading is
+        // normally serial, but keeping a single lock order makes an early
+        // shutdown/finalisation race bounded instead of deadlocking.
+        let mut guard = self.writer.lock();
+        let Some(writer) = guard.take() else {
+            tracing::info!(
+                "weight cache: {} hits, {} misses (read-only, {})",
+                hits,
+                misses,
+                self.dir.display(),
+            );
+            return;
+        };
+        let Writer {
+            tmp_blob_path,
+            mut file,
+            offset: blob_len,
+            entries,
+        } = writer;
+        if let Err(e) = file.flush().and_then(|()| file.get_ref().sync_all()) {
+            tracing::warn!("weight cache: blob sync failed ({e}); not publishing index");
+            drop(file);
+            remove_tmp_file(&tmp_blob_path);
+            cleanup_unpublished(&self.dir);
+            return;
+        }
+        // The temp blob handle must be closed before atomically publishing
+        // `blob.bin` or unlinking a failed build.
+        drop(file);
+        let blob_path = self.dir.join(BLOB_FILE);
+        if let Err(e) = fs::rename(&tmp_blob_path, &blob_path) {
+            tracing::warn!(
+                "weight cache: blob publish {} -> {} failed ({e}); cache not published",
+                tmp_blob_path.display(),
+                blob_path.display(),
+            );
+            remove_tmp_file(&tmp_blob_path);
+            cleanup_unpublished(&self.dir);
+            return;
+        }
+        let index = CacheIndex {
+            format_version: CACHE_FORMAT_VERSION,
+            fingerprint: self.fingerprint.clone(),
+            blob_len,
+            entries,
+        };
+        if let Err(e) = write_index(&self.dir, &index) {
+            tracing::warn!("weight cache: index write failed ({e:#}); cache not published");
+            cleanup_unpublished(&self.dir);
+            return;
+        }
+        tracing::info!(
+            "weight cache WRITTEN: {} slots, {:.2} GiB at {}",
+            index.entries.len(),
+            blob_len as f64 / (1024.0 * 1024.0 * 1024.0),
+            self.dir.display(),
+        );
+        // Only now is this directory a committed cache, so only now is it
+        // safe to count it against the budget and prune the older variants.
+        self.touch_and_evict();
+    }
+}
+
+fn abort_writer(slot: &mut Option<Writer>, dir: &Path) {
+    if let Some(Writer {
+        tmp_blob_path,
+        file,
+        ..
+    }) = slot.take()
+    {
+        drop(file);
+        remove_tmp_file(&tmp_blob_path);
+    }
+    cleanup_unpublished(dir);
+}
+
+/// Remove only this fingerprint's unpublished artifacts after a writer
+/// failure. The commit marker is never removed; if it exists, fail closed and
+/// preserve the directory because another process may have published it.
+/// Callers must drop the active blob handle before entering this function.
+fn cleanup_unpublished(dir: &Path) {
+    let index = dir.join(INDEX_FILE);
+    match index.try_exists() {
+        Ok(true) => {
+            tracing::warn!(
+                "weight cache: refusing unpublished cleanup because commit marker exists at {}",
+                index.display()
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                "weight cache: refusing unpublished cleanup; cannot inspect {} ({error})",
+                index.display()
+            );
+            return;
+        }
+    }
+
+    for name in [INDEX_TMP_FILE, BLOB_FILE] {
+        let path = dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => tracing::info!("weight cache: removed unpublished {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                "weight cache: failed to remove unpublished {} ({error})",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Head / middle / tail windows used by verify mode.
+fn sample_windows(len: usize) -> Vec<(&'static str, std::ops::Range<usize>)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let w = VERIFY_WINDOW.min(len);
+    let mid_start = (len / 2).saturating_sub(w / 2).min(len - w);
+    vec![
+        ("head", 0..w),
+        ("mid", mid_start..mid_start + w),
+        ("tail", len - w..len),
+    ]
+}
+
+fn write_index(dir: &Path, index: &CacheIndex) -> Result<()> {
+    let tmp = unique_tmp_path(dir, INDEX_FILE);
+    let final_path = dir.join(INDEX_FILE);
+    let bytes = serde_json::to_vec(index).context("serialize cache index")?;
+    if let Err(error) = fs::write(&tmp, &bytes) {
+        remove_tmp_file(&tmp);
+        return Err(error).with_context(|| format!("write {}", tmp.display()));
+    }
+    if let Err(error) = fs::rename(&tmp, &final_path) {
+        remove_tmp_file(&tmp);
+        return Err(error).with_context(|| format!("publish {}", final_path.display()));
+    }
+    Ok(())
+}
+
+// ─────────────────────────── process-wide handle ───────────────────────────
+
+static CACHE: OnceLock<Option<TransformCache>> = OnceLock::new();
+static CONSTRUCTION_MODE: OnceLock<bool> = OnceLock::new();
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).ok().as_deref() == Some("1")
+}
+
+fn construction_mode() -> bool {
+    CONSTRUCTION_MODE.get().copied().unwrap_or(false)
+}
+
+/// Bind cache publication to native-MTP construction mode before the loader
+/// calls [`init`]. A target-only/DFlash-only Qwen4 generation and a native-MTP
+/// generation therefore never open the same read-only index. No state is
+/// installed while the cache feature is disabled.
+pub fn configure_construction_mode(use_native_mtp: bool) -> Result<()> {
+    if !env_flag("ATLAS_WEIGHT_CACHE") {
+        return Ok(());
+    }
+    if let Some(&configured) = CONSTRUCTION_MODE.get() {
+        ensure!(
+            configured == use_native_mtp,
+            "weight cache construction mode changed within one process"
+        );
+        return Ok(());
+    }
+    CONSTRUCTION_MODE
+        .set(use_native_mtp)
+        .map_err(|_| anyhow::anyhow!("weight cache construction mode raced initialization"))
+}
+
+fn cache_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("ATLAS_WEIGHT_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".cache")
+        .join("atlas-weight-cache")
+}
+
+/// Open (or create) the cache for this model. Idempotent — the first call
+/// wins, later calls are no-ops. Returns without doing anything when
+/// `ATLAS_WEIGHT_CACHE` is not `1`.
+pub fn init(
+    store: &WeightStore,
+    config: &atlas_core::config::ModelConfig,
+    gpu: &dyn GpuBackend,
+    variant_tag: &str,
+) {
+    if CACHE.get().is_some() {
+        return;
+    }
+    if !env_flag("ATLAS_WEIGHT_CACHE") {
+        let _ = CACHE.set(None);
+        return;
+    }
+    let verify = env_flag("ATLAS_WEIGHT_CACHE_VERIFY");
+    let fingerprint = compute_fingerprint(store, config, gpu, variant_tag);
+    let cache = match open(cache_root(), fingerprint, verify) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("weight cache: disabled — {e:#}");
+            None
+        }
+    };
+    let _ = CACHE.set(cache);
+    // On a hit the cache is usable the moment `open` returns, so mark it used
+    // and prune siblings now. On a miss the active directory is not yet
+    // committed — `finish` runs the pass once the index is published, so an
+    // interrupted build never counts as a live cache worth keeping.
+    if let Some(cache) = get()
+        && cache.reader.is_some()
+    {
+        cache.touch_and_evict();
+    }
+}
+
+fn open(root: PathBuf, fingerprint: String, verify: bool) -> Result<TransformCache> {
+    let dir = root.join(&fingerprint);
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let blob_path = dir.join(BLOB_FILE);
+    let index_path = dir.join(INDEX_FILE);
+
+    // Read path: an index is only present when a previous run completed.
+    if let Ok(bytes) = fs::read(&index_path)
+        && let Ok(index) = serde_json::from_slice::<CacheIndex>(&bytes)
+        && index.matches(&fingerprint)
+        && let Ok(file) = File::open(&blob_path)
+    {
+        // SAFETY: `blob.bin` is only ever published by atomic `fs::rename`
+        // from a unique temp file after flushing and syncing, and writers
+        // never open or truncate an existing `blob.bin` inode in place.
+        // Replacing `blob.bin` via rename unlinks only the directory entry
+        // while keeping any already-mapped inode intact and immutable for the
+        // lifetime of this `Mmap`, provided no external process modifies or
+        // truncates `blob.bin` in place.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("mmap {}", blob_path.display()))?;
+        if mmap.len() as u64 >= index.blob_len {
+            tracing::info!(
+                "weight cache HIT: {} slots, {:.2} GiB at {}{}",
+                index.entries.len(),
+                index.blob_len as f64 / (1024.0 * 1024.0 * 1024.0),
+                dir.display(),
+                if verify { " (VERIFY on)" } else { "" },
+            );
+            return Ok(TransformCache {
+                root,
+                dir,
+                fingerprint,
+                reader: Some(Reader {
+                    slots: index.to_map(),
+                    mmap,
+                }),
+                writer: Mutex::new(None),
+                verify,
+                stats: Mutex::new(Stats::default()),
+                device_digests: Mutex::new(HashMap::new()),
+            });
+        }
+        tracing::warn!("weight cache: blob shorter than index claims; rebuilding");
+    }
+
+    // Write path: drop any stale/corrupt index and write to a brand-new unique
+    // temp blob file so an existing `blob.bin` inode is never truncated in
+    // place while another reader may hold an mmap on it. `finish()` atomically
+    // renames the temp blob to `blob.bin` before publishing `index.json`.
+    let _ = fs::remove_file(&index_path);
+    let tmp_blob_path = unique_tmp_path(&dir, BLOB_FILE);
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_blob_path)
+        .with_context(|| format!("create {}", tmp_blob_path.display()))?;
+    tracing::info!("weight cache MISS: building at {}", dir.display());
+    Ok(TransformCache {
+        root,
+        dir,
+        fingerprint,
+        reader: None,
+        writer: Mutex::new(Some(Writer {
+            tmp_blob_path,
+            file: BufWriter::with_capacity(8 * 1024 * 1024, file),
+            offset: 0,
+            entries: Vec::new(),
+        })),
+        verify,
+        stats: Mutex::new(Stats::default()),
+        device_digests: Mutex::new(HashMap::new()),
+    })
+}
+
+/// The process-wide cache, or `None` when the feature is off.
+pub fn get() -> Option<&'static TransformCache> {
+    CACHE.get().and_then(|c| c.as_ref())
+}
+
+/// Publish the cache. Call only after every layer has loaded successfully.
+pub fn finish() {
+    if let Some(cache) = get() {
+        cache.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    fn tempdir(tag: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "atlas-transform-cache-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_length_prefixed() {
+        let mut a = Fingerprint::new();
+        a.write_str("ab").write_str("c");
+        let mut b = Fingerprint::new();
+        b.write_str("a").write_str("bc");
+        assert_ne!(
+            a.finish_hex(),
+            b.finish_hex(),
+            "length prefixing must stop concatenation collisions"
+        );
+
+        let mut c = Fingerprint::new();
+        c.write_str("ab").write_str("c");
+        assert_eq!(a.finish_hex(), c.finish_hex(), "same input, same digest");
+        assert_eq!(a.finish_hex().len(), 32);
+        assert!(a.finish_hex().chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_scalar_kinds() {
+        let mut a = Fingerprint::new();
+        a.write_usize(1);
+        let mut b = Fingerprint::new();
+        b.write_u32(1);
+        assert_ne!(
+            a.finish_hex(),
+            b.finish_hex(),
+            "u32 and usize widths differ"
+        );
+    }
+
+    #[test]
+    fn exact_content_digest_observes_first_byte_after_legacy_sample() {
+        let original = vec![0x5au8; CONTENT_SAMPLE_BYTES + 1];
+        let mut hostile = original.clone();
+        hostile[CONTENT_SAMPLE_BYTES] ^= 1;
+        assert_eq!(
+            &original[..CONTENT_SAMPLE_BYTES],
+            &hostile[..CONTENT_SAMPLE_BYTES],
+            "the legacy 2 KiB prefix cannot distinguish this mutation"
+        );
+        assert_ne!(
+            exact_content_digest(&original).unwrap(),
+            exact_content_digest(&hostile).unwrap(),
+            "exact source identity must cover byte offset 2048"
+        );
+    }
+
+    #[test]
+    fn exact_content_digest_matches_sha256_standard_vectors() {
+        assert_eq!(
+            exact_content_digest(b"").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            exact_content_digest(b"abc").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn construction_mode_separates_no_mtp_then_native_mtp_generations() {
+        let digest = |use_native_mtp| {
+            let mut fp = Fingerprint::new();
+            hash_construction_mode(&mut fp, use_native_mtp);
+            fp.finish_hex()
+        };
+        let target_only = digest(false);
+        let speculative = digest(true);
+        assert_ne!(target_only, speculative);
+        assert_eq!(target_only, digest(false));
+        assert_eq!(speculative, digest(true));
+    }
+
+    #[test]
+    fn build_env_change_changes_fingerprint() {
+        let mut a = Fingerprint::new();
+        hash_build_and_env_with(&mut a, |key| {
+            (key == "ATLAS_FFN_M16_TRANSPOSED").then(|| "0".to_string())
+        });
+        let mut b = Fingerprint::new();
+        hash_build_and_env_with(&mut b, |key| {
+            (key == "ATLAS_FFN_M16_TRANSPOSED").then(|| "1".to_string())
+        });
+        assert_ne!(
+            a.finish_hex(),
+            b.finish_hex(),
+            "a transform-affecting env var must change the key"
+        );
+    }
+
+    #[test]
+    fn device_digest_memoization_is_scoped_per_cache_instance() {
+        let root_a = tempdir("digest-scope-a");
+        let root_b = tempdir("digest-scope-b");
+        let cache_a = open(root_a.clone(), "fp-a".into(), false).unwrap();
+        let cache_b = open(root_b.clone(), "fp-b".into(), false).unwrap();
+
+        // Two independent MockGpuBackend instances start from the same base
+        // address; per-instance memoization must never leak digests across them.
+        let gpu_a = MockGpuBackend::new();
+        let ptr_a = gpu_a.alloc(64).unwrap();
+        gpu_a.copy_h2d(&[0x11u8; 64], ptr_a).unwrap();
+
+        let gpu_b = MockGpuBackend::new();
+        let ptr_b = gpu_b.alloc(64).unwrap();
+        gpu_b.copy_h2d(&[0x22u8; 64], ptr_b).unwrap();
+        assert_eq!(ptr_a, ptr_b);
+
+        let digest_a = cache_a
+            .exact_device_content_digest(&gpu_a, ptr_a, 64)
+            .unwrap();
+        let digest_b = cache_b
+            .exact_device_content_digest(&gpu_b, ptr_b, 64)
+            .unwrap();
+        assert_ne!(
+            digest_a, digest_b,
+            "separate cache sessions must hash live bytes instead of reusing stale address digests"
+        );
+
+        gpu_a.free(ptr_a).unwrap();
+        gpu_b.free(ptr_b).unwrap();
+        fs::remove_dir_all(root_a).unwrap();
+        fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
+    fn blob_publish_uses_atomic_rename_without_truncating_existing_blob() {
+        let root = tempdir("atomic-blob");
+        let fp = "deadbeef00000000deadbeef00000001";
+        let dir = root.join(fp);
+        fs::create_dir_all(&dir).unwrap();
+        let blob_path = dir.join(BLOB_FILE);
+        let original = vec![0xAAu8; 128];
+        fs::write(&blob_path, &original).unwrap();
+
+        // Simulate a live reader holding an open handle to the old blob inode.
+        let old_file = File::open(&blob_path).unwrap();
+        // SAFETY: test owns this temp file exclusively; `open()` below must
+        // never truncate or mutate this inode in place.
+        let old_mmap = unsafe { memmap2::Mmap::map(&old_file) }.unwrap();
+        assert_eq!(&old_mmap[..], original.as_slice());
+
+        // Missing index triggers the write path, which must write to a unique
+        // temp file without disturbing the existing `blob.bin` inode.
+        let cache = open(root.clone(), fp.to_string(), false).unwrap();
+        let gpu = MockGpuBackend::new();
+        let src = gpu.alloc(64).unwrap();
+        let updated = vec![0xBBu8; 64];
+        gpu.copy_h2d(&updated, src).unwrap();
+        cache.store_parts("slot.0", &gpu, &[(src, 64)]);
+        assert_eq!(
+            &old_mmap[..],
+            original.as_slice(),
+            "in-progress write must not truncate or mutate existing blob.bin"
+        );
+
+        cache.finish();
+        // Old mmap still sees the original unlinked inode intact, while the
+        // directory entry now serves the newly published blob.
+        assert_eq!(&old_mmap[..], original.as_slice());
+        let reopened = open(root.clone(), fp.to_string(), false).unwrap();
+        let loaded = reopened.load_parts("slot.0", &gpu, &[64]).unwrap();
+        let mut readback = vec![0u8; 64];
+        gpu.copy_d2h(loaded[0], &mut readback).unwrap();
+        assert_eq!(readback, updated);
+
+        gpu.free(loaded[0]).unwrap();
+        gpu.free(src).unwrap();
+        drop(old_mmap);
+        drop(old_file);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_parts_rejects_overflowing_part_offset_without_panicking() {
+        let root = tempdir("overflow-part");
+        let fp = "deadbeef00000000deadbeef00000002";
+        let dir = root.join(fp);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(BLOB_FILE), vec![0u8; 64]).unwrap();
+        let index = CacheIndex {
+            format_version: CACHE_FORMAT_VERSION,
+            fingerprint: fp.to_string(),
+            blob_len: 64,
+            entries: vec![IndexEntry {
+                slot: "corrupt.slot".to_string(),
+                parts: vec![Part {
+                    offset: u64::MAX,
+                    len: 16,
+                }],
+            }],
+        };
+        write_index(&dir, &index).unwrap();
+
+        let cache = open(root.clone(), fp.to_string(), false).unwrap();
+        let gpu = MockGpuBackend::new();
+        assert!(cache.load_parts("corrupt.slot", &gpu, &[16]).is_none());
+        assert_eq!(gpu.alloc_count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn sample_index() -> CacheIndex {
+        CacheIndex {
+            format_version: CACHE_FORMAT_VERSION,
+            fingerprint: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            blob_len: 320,
+            entries: vec![
+                IndexEntry {
+                    slot: "L0.self_attn.q_proj.t".to_string(),
+                    parts: vec![
+                        Part {
+                            offset: 0,
+                            len: 128,
+                        },
+                        Part {
+                            offset: 128,
+                            len: 64,
+                        },
+                    ],
+                },
+                IndexEntry {
+                    slot: "L0.self_attn.k_proj.t".to_string(),
+                    parts: vec![Part {
+                        offset: 192,
+                        len: 128,
+                    }],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn index_round_trips_through_json() {
+        let index = sample_index();
+        let bytes = serde_json::to_vec(&index).unwrap();
+        let back: CacheIndex = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(index, back);
+    }
+
+    #[test]
+    fn index_rejects_wrong_key_and_version() {
+        let index = sample_index();
+        assert!(index.matches(&index.fingerprint));
+        assert!(!index.matches("0000000000000000000000000000abcd"));
+
+        let stale = CacheIndex {
+            format_version: CACHE_FORMAT_VERSION + 1,
+            ..index.clone()
+        };
+        assert!(!stale.matches(&index.fingerprint));
+    }
+
+    #[test]
+    fn index_map_preserves_part_order() {
+        let map = sample_index().to_map();
+        let q = map.get("L0.self_attn.q_proj.t").unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(
+            q[0],
+            Part {
+                offset: 0,
+                len: 128
+            }
+        );
+        assert_eq!(
+            q[1],
+            Part {
+                offset: 128,
+                len: 64
+            }
+        );
+        assert!(map.contains_key("L0.self_attn.k_proj.t"));
+        assert!(!map.contains_key("L1.self_attn.q_proj.t"));
+    }
+
+    #[test]
+    fn verify_windows_cover_head_mid_tail_without_overflow() {
+        for len in [1usize, 100, VERIFY_WINDOW, VERIFY_WINDOW * 3 + 7] {
+            for (label, range) in sample_windows(len) {
+                assert!(
+                    range.end <= len,
+                    "{label} window {range:?} escapes len {len}"
+                );
+                assert!(range.start < range.end, "{label} window is empty");
+            }
+        }
+        assert!(sample_windows(0).is_empty());
+    }
+
+    #[test]
+    fn transposed_lens_matches_transpose_for_gemm_layout() {
+        // N already 64-aligned: n_pad == n, so packed is n*k/2 and scale n*k/16.
+        assert_eq!(transposed_lens(128, 5120), (128 * 2560, 128 * 320));
+        // qwen3.8-27b attention O proj: N = hidden = 5120, K = heads*head_dim.
+        assert_eq!(transposed_lens(5120, 4096), (5120 * 2048, 5120 * 256));
+        // Odd N (248077-vocab lm_head class) pads up to the next multiple of 64.
+        let (w, s) = transposed_lens(100, 64);
+        assert_eq!(w, 32 * 128, "n_pad must be 128, not 100");
+        assert_eq!(s, 4 * 128);
+    }
+
+    #[test]
+    fn transposed_lens_padding_never_shrinks_the_buffer() {
+        for n in [1usize, 63, 64, 65, 4096, 5120, 248077] {
+            let (w, s) = transposed_lens(n, 1024);
+            assert!(w >= n * 512, "packed buffer must cover all {n} rows");
+            assert!(s >= n * 64, "scale buffer must cover all {n} rows");
+        }
+    }
+
+    #[test]
+    fn part_alignment_padding_is_computed_correctly() {
+        // Mirrors the arithmetic in store_parts.
+        for offset in [0u64, 1, 63, 64, 65, 4096, 4097] {
+            let pad = (PART_ALIGN - offset % PART_ALIGN) % PART_ALIGN;
+            assert_eq!((offset + pad) % PART_ALIGN, 0);
+            assert!(pad < PART_ALIGN);
+        }
+    }
+
+    #[test]
+    fn failed_writer_cleanup_is_fingerprint_local_and_preserves_commits() {
+        let root = tempdir("failed-writer-cleanup");
+        let active = root.join("active");
+        let sibling = root.join("sibling");
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(active.join(BLOB_FILE), b"partial").unwrap();
+        fs::write(active.join(INDEX_TMP_FILE), b"partial-index").unwrap();
+        fs::write(active.join("unrelated"), b"keep").unwrap();
+        fs::write(sibling.join(BLOB_FILE), b"committed").unwrap();
+        fs::write(sibling.join(INDEX_FILE), b"commit-marker").unwrap();
+
+        cleanup_unpublished(&active);
+        assert!(!active.join(BLOB_FILE).exists());
+        assert!(!active.join(INDEX_TMP_FILE).exists());
+        assert!(active.join("unrelated").exists());
+        assert!(sibling.join(BLOB_FILE).exists());
+        assert!(sibling.join(INDEX_FILE).exists());
+
+        // A commit marker makes cleanup fail closed, even in the active dir.
+        fs::write(active.join(BLOB_FILE), b"committed").unwrap();
+        fs::write(active.join(INDEX_TMP_FILE), b"unrelated-temp").unwrap();
+        fs::write(active.join(INDEX_FILE), b"commit-marker").unwrap();
+        cleanup_unpublished(&active);
+        assert!(active.join(BLOB_FILE).exists());
+        assert!(active.join(INDEX_TMP_FILE).exists());
+        assert!(active.join(INDEX_FILE).exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -1,0 +1,49 @@
+{
+  "artifact_policy": "hashes-and-metrics-only",
+  "benchmark": "repro/qwen38-flash-next/run.py",
+  "binaries": {
+    "estonia_cert1_and_lil_v9_sha256": "c60fc35ced1ddfa1217c6dce8ed0968caa00417236e0d27573378200301a4e4f",
+    "estonia_cert2_sha256": "732911414fd9cbc15126c03e096ee309ddcd047e84bca4b192e21f7b9b9ddfaa",
+    "lil_v9_w4096_sha256": "84d629bda7c9aa291b806bb55b914df31e58fe793170e9574e43804a1ba387b4",
+    "lossless_10p_gate_sha256": "6017d6b21795dbcbedd023c663eec134bd6296d642de85ad50c4b01ec8b4fd2f",
+    "wave09_63618f661_sha256": "71252d2e13316dfbf02b5bcbd95fb01bc90dbeffcde5f0b7e944dd4b75c7943a",
+    "wave10_076086763_sha256": "187811ccc713df82385a8ca37a56fd97a9707b40a00bb3745a1b06686de01b5d",
+    "wave11_ae58bc27e_sha256": "29e959d401137bb4da2248319cbddced0fefb66b5a3c91f55cdc2141bd98dab5"
+  },
+  "checkpoint": {
+    "draft_model_repository": "Inferact/Qwen3.8-Flash-Next-MTP-Sidecar",
+    "draft_model_revision": "129972269565f7f4f664fdf8dd42268d3bbda9fd",
+    "official_fp8_revision": "bcd9f01ddc9cff2316eb84281bebcd5b058bddce",
+    "radixark_nvfp4_revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+    "target_manifest_sha256": "ed8aa879996dc322e3720eb9848a4193c4cfc1d7c05e0421d85108429bd15869",
+    "target_model_files": 548,
+    "target_model_repository": "Hotshot2000/Qwen3.8-Flash-Next-NVFP4",
+    "target_model_revision": "ed8aa879996dc322e3720eb9848a4193c4cfc1d7c05e0421d85108429bd15869"
+  },
+  "evidence": {
+    "estonia_v9": "repro/qwen38-flash-next/evidence/estonia-v9.json",
+    "lil_decode_v9": "repro/qwen38-flash-next/evidence/lil-decode-v9.json",
+    "lil_decode_v9_w4096": "repro/qwen38-flash-next/evidence/lil-decode-v9-w4096.json"
+  },
+  "hardware": {
+    "architecture": "aarch64",
+    "cuda": "13.x",
+    "gpu": "NVIDIA GB10",
+    "sm": "12.1a",
+    "uma_gib": 119.7
+  },
+  "launchers": {
+    "fast_prefill": "bench/qwen38-flash-next-gb10/serve-fast-prefill.sh",
+    "k5_decode": "bench/qwen38-flash-next-gb10/serve-k5-decode.sh",
+    "v9_max_prefill": "bench/qwen38-flash-next-gb10/serve.sh",
+    "v9_w4096_interactive": "bench/qwen38-flash-next-gb10/serve-w4096.sh"
+  },
+  "release_status": "certified-gb10-unified13-v9-and-v9-w4096",
+  "schema": "theapathy-qwen38-flash-next-release-manifest-v1",
+  "source": {
+    "branch": "unified13",
+    "repository": "https://github.com/TheApathy/apathy-atlas",
+    "revision": "ae58bc27efd8b35aa4272da15dd5f4c549ec332a",
+    "tag": "unified13/20261016"
+  }
+}

@@ -1,0 +1,40 @@
+# Flux Engine CODEOWNERS
+#
+# Lines starting with `#` are comments. The LAST matching pattern wins
+# (per GitHub's CODEOWNERS spec — be careful adding broader patterns
+# at the bottom of this file, they will override more specific ones
+# above).
+#
+# SECURITY: every path under .github/ — workflows, dependabot config,
+# CODEOWNERS itself, issue/PR templates — is owner-only and must stay
+# that way. Branch protection on `main` enforces this by requiring
+# CODEOWNER review on every PR.
+#
+# Reference: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default fallback — every PR pings the maintainer.
+*                                            @TheApathy
+
+# Compute path: kernel registration, model loaders, hot-path Rust.
+kernels/                                     @TheApathy
+crates/atlas-kernels/                        @TheApathy
+crates/spark-model/                          @TheApathy
+crates/spark-runtime/                        @TheApathy
+
+# Server / HTTP API surface.
+crates/spark-server/                         @TheApathy
+
+# Multi-rank communication (NCCL / RDMA).
+crates/spark-comm/                           @TheApathy
+
+# Storage / NVMe-backed swap.
+crates/spark-storage/                        @TheApathy
+
+# Build, CI, governance.
+.github/                                     @TheApathy
+.github/workflows/                           @TheApathy
+.github/CODEOWNERS                           @TheApathy
+.github/dependabot.yml                       @TheApathy
+docs/adr/                                    @TheApathy
+Cargo.toml                                   @TheApathy
+LICENSE                                      @TheApathy

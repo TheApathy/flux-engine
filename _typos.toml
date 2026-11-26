@@ -1,0 +1,105 @@
+# typos (https://github.com/crate-ci/typos) config for Flux Engine.
+#
+# Ignore directories that mirror third-party upstream content, benchmark
+# datasets, test vector dumps, or generated build outputs.
+
+[default]
+extend-ignore-re = [
+    # Mixed hex commit SHAs / hashes containing both digits and a-f letters (e.g. `81afe8261`).
+    '\b(?:[0-9]+[a-f]+[0-9a-f]*|[a-f]+[0-9]+[0-9a-f]*)\b',
+    # OCP MXFP4/NVFP4 unsigned-exponent scale formats (`UE4M3`, `UE8M0`, `VEC16_UE4M3`, `ue8m0_to_f32`)
+    # and MoE up-projection accumulator vars (`ue0`, `ue1`).
+    '(?:UE|ue)[0-9][Mm][0-9]',
+    '\bue[0-9]+\b',
+    # Historical milestone tag `fnd4` in CUDA stream sync documentation.
+    '\bfnd[0-9]+\b',
+    # Standard hyphenated/underscored form `pre-empted` / `pre_empted`.
+    '[Pp]re[-_]empted\b',
+    # Creative Commons license identifier `CC BY-NC-ND`.
+    'CC BY-NC-ND',
+    # Regex fragments in log-scanner patterns (`allocat(?:or|ion)`, `fail(?:ed|ure)`).
+    'allocat\(\?:or\|ion\)',
+    'fail\(\?:ed\|ure\)',
+    # Whitespace-stripped source-contract test assertions in Rust/Python tests.
+    '\bifself\b',
+    '\binself\b',
+    'DFlashBRANCHinvalidtop-2row',
+    'QWEN4_SERIAL_BATCH_FRAMErows',
+    'ApplyPLEto',
+    # Intentional negative-test literals verifying rejection of malformed keys/JSON/magic.
+    'thinking\.defualt',
+    'GGUF-not-reallY',
+    'taget_layer_ids',
+    '\{"a":tru\}',
+    'convers\\\\u0061tion',
+]
+extend-ignore-identifiers-re = [
+    # `in_proj_ba` is the bias projection in NVFP4 Mamba/SSM checkpoints.
+    "in_proj_ba",
+    # `iy_base`, `iy` etc. — CUDA kernel variable name for "index Y".
+    "iy.*",
+    # `BA_GEMM` — A+B linear-attention GEMM.
+    "BA_GEMM",
+]
+
+[default.extend-words]
+# CUDA / GPU / ML domain identifiers and abbreviations
+OPTIN = "OPTIN"
+thw = "thw"
+TOOKS = "TOOKS"
+WHT = "WHT"
+wht = "wht"
+iwht = "iwht"
+BA = "BA"
+ba = "ba"
+ot = "ot"
+stps = "stps"
+mis = "mis"
+abd = "abd"
+Ratatui = "Ratatui"
+ratatui = "ratatui"
+subtile = "subtile"
+subtiles = "subtiles"
+unparseable = "unparseable"
+Unparseable = "Unparseable"
+nothink = "nothink"
+arange = "arange"
+thr = "thr"
+thi = "thi"
+suh = "suh"
+anc = "anc"
+ABL = "ABL"
+abl = "abl"
+EIN = "EIN"
+ein = "ein"
+alo = "alo"
+clen = "clen"
+restat = "restat"
+alog = "alog"
+thn = "thn"
+godd = "godd"
+cpy = "cpy"
+nd = "nd"
+Nd = "Nd"
+# SLSA / in-toto attestation bundle filename extension (`.intoto.jsonl`).
+intoto = "intoto"
+
+[default.extend-identifiers]
+wht_bf16 = "wht_bf16"
+wht_dim = "wht_dim"
+wht_stride = "wht_stride"
+
+[files]
+extend-exclude = [
+    "test_data/",
+    "target/",
+    "target-*/",
+    "tests/all_models_results*/",
+    "repro-kit/llm-inference-bench/",
+    "repro-kit/source-closure/",
+    "repro-kit/fid_gate12/fid_gate12_manifest.jsonl",
+    "kernels/gb10/qwen3.6-27b/nvfp4/q4k_vendor/",
+    "kernels/gb10/deepseek-v4.1/cb3/cb3_decode_vectors.txt",
+    "bench/llm-inference-bench/results/",
+    "qualification/accuracy/reports/",
+]
