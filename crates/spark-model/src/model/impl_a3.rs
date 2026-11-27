@@ -315,6 +315,8 @@ static W4A16_GEMM_COALESCED_V2_N64_M16_FALLBACK_KERNEL: BackendKernelCache =
 static W4A16_GEMM_COALESCED_M32_KERNEL: BackendKernelCache = BackendKernelCache::new();
 static W4A16_GEMM_COALESCED_M64_KERNEL: BackendKernelCache = BackendKernelCache::new();
 static W4A16_GEMM_COALESCED_M128_KERNEL: BackendKernelCache = BackendKernelCache::new();
+static LM_HEAD_NVFP4_ARGMAX_PARTIAL_KERNEL: BackendKernelCache = BackendKernelCache::new();
+static LM_HEAD_ARGMAX_REDUCE_KERNEL: BackendKernelCache = BackendKernelCache::new();
 
 /// SM count threshold above which NVFP4 `lm_head` dispatches v2 coalesced
 /// 2-stage K-prefetch kernels (`v2_n64_m80`/`v2_n64_m128` for `M > 64` verify,
@@ -1246,6 +1248,112 @@ impl TransformerModel {
             self.apply_logit_softcap(logits, total, cap, stream)?;
         }
         Ok(logits)
+    }
+
+    /// Opt-in fused two-stage NVFP4 LM-head + online warp/block argmax
+    /// (`ATLAS_LM_HEAD_FUSED_ARGMAX=1`, default OFF).
+    ///
+    /// Computes `[rows]` greedy argmax token IDs directly into `out_tokens`
+    /// using `self.buffers.logits()` purely as compact partial-reduction
+    /// scratch (`<= 124 KiB` for `rows <= 16`, `V = 248,077`), eliminating the
+    /// full `[rows, V]` BF16 logit write+read slab. Returns `Ok(false)` (failing
+    /// closed to standard `lm_head_batched` + `argmax_bf16*`) whenever disabled
+    /// or any admission guard is unmet.
+    pub(super) fn try_lm_head_fused_argmax(
+        &self,
+        hidden: DevicePtr,
+        out_tokens: DevicePtr,
+        rows: u32,
+        vocab: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        let policy = ops::FusedLmHeadArgmaxPolicy::from_env()?;
+        if policy == ops::FusedLmHeadArgmaxPolicy::Disabled {
+            return Ok(false);
+        }
+        if self.use_fp32_logits {
+            return Ok(false);
+        }
+        let weight_format = if self.use_target_fp8_lm_head() {
+            ops::LmHeadWeightFormat::Fp8
+        } else if self.use_target_bf16_lm_head() {
+            ops::LmHeadWeightFormat::Bf16
+        } else if self.lm_head_nvfp4.is_some() {
+            ops::LmHeadWeightFormat::Nvfp4
+        } else {
+            ops::LmHeadWeightFormat::Bf16
+        };
+        let Some(ref nvfp4) = self.lm_head_nvfp4 else {
+            return Ok(false);
+        };
+        let partial_k = LM_HEAD_NVFP4_ARGMAX_PARTIAL_KERNEL.get_or_try_load(
+            self.gpu.as_ref(),
+            "lm_head_nvfp4_argmax_sm120",
+            "lm_head_nvfp4_argmax_partial_sm120",
+        );
+        let reduce_k = LM_HEAD_ARGMAX_REDUCE_KERNEL.get_or_try_load(
+            self.gpu.as_ref(),
+            "lm_head_nvfp4_argmax_sm120",
+            "lm_head_argmax_reduce_sm120",
+        );
+        let kernels = if partial_k.0 != 0 && reduce_k.0 != 0 {
+            ops::LmHeadKernelAvailability::Ready
+        } else {
+            ops::LmHeadKernelAvailability::Unavailable
+        };
+        let softcap = if self.logit_softcap_kernel.0 != 0
+            || self.config.final_logit_softcapping != 0.0
+            || !self.config.final_logit_softcapping.is_finite()
+        {
+            ops::LmHeadSoftcapMode::Enabled
+        } else {
+            ops::LmHeadSoftcapMode::Disabled
+        };
+        let req = ops::LmHeadArgmaxAdmissionRequest {
+            sampling: ops::LmHeadSamplingMode::GreedyArgmax,
+            penalties: ops::LmHeadPenaltyMode::Inactive,
+            grammar: ops::LmHeadGrammarMode::Inactive,
+            logprobs: ops::LmHeadLogprobsMode::Omitted,
+            softcap,
+            weight_format,
+            kernels,
+            rows,
+            vocab,
+            hidden: self.config.hidden_size as u32,
+        };
+        let Ok(plan) = ops::admit_fused_lm_head_argmax(policy, &req) else {
+            return Ok(false);
+        };
+        let scratch = self.buffers.logits();
+        let scratch_bytes = self.buffers.sizes().logits;
+        if scratch == DevicePtr::NULL || scratch_bytes < plan.total_scratch_bytes {
+            return Ok(false);
+        }
+        ops::lm_head_nvfp4_fused_argmax(
+            self.gpu.as_ref(),
+            partial_k,
+            reduce_k,
+            &plan,
+            hidden,
+            nvfp4,
+            scratch,
+            scratch_bytes,
+            out_tokens,
+            stream,
+        )?;
+        static FUSED_LOGGED: std::sync::Once = std::sync::Once::new();
+        FUSED_LOGGED.call_once(|| {
+            tracing::info!(
+                target: "atlas::lm_head",
+                rows = plan.rows,
+                vocab = plan.vocab,
+                hidden = plan.hidden,
+                num_v_tiles = plan.num_v_tiles,
+                scratch_bytes = plan.total_scratch_bytes,
+                "ENGAGED ATLAS_LM_HEAD_FUSED_ARGMAX: two-stage NVFP4 LM-head + online argmax"
+            );
+        });
+        Ok(true)
     }
 
     pub(super) fn lm_head_batched(

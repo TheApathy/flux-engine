@@ -23,10 +23,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import re
 import struct
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -325,6 +327,240 @@ def load_weight_from_checkpoint(checkpoint_dir: Path, tensor_prefix: str) -> np.
     raise ValueError(f"Unsupported source dtype {dtype} for {weight_key}")
 
 
+def format_layers_spec(layers: List[int]) -> str:
+    """Format sorted unique layer indices into canonical comma/range spec (e.g. '1,3-5')."""
+    if not layers:
+        return ""
+    ordered = sorted(set(layers))
+    ranges: List[str] = []
+    start = ordered[0]
+    prev = ordered[0]
+    for idx in ordered[1:]:
+        if idx == prev + 1:
+            prev = idx
+        else:
+            ranges.append(f"{start}" if start == prev else f"{start}-{prev}")
+            start = prev = idx
+    ranges.append(f"{start}" if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def discover_checkpoint_ffn_layers(
+    checkpoint_dir: Path,
+    layer_prefix: Optional[str] = None,
+) -> Tuple[str, List[int]]:
+    """Discover complete FFN layers ({gate,up,down}_proj) in a HuggingFace checkpoint."""
+    index_path = checkpoint_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        all_keys = list(json.loads(index_path.read_text(encoding="utf-8"))["weight_map"].keys())
+    else:
+        all_keys = []
+        for shard in sorted(checkpoint_dir.glob("*.safetensors")):
+            _, hdr = read_safetensors_header(shard)
+            all_keys.extend(k for k in hdr.keys() if k != "__metadata__")
+
+    pattern = re.compile(r"^(.+)\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.weight$")
+    by_prefix: Dict[str, Dict[int, set]] = {}
+    for key in all_keys:
+        match = pattern.match(key)
+        if not match:
+            continue
+        pref, idx_s, proj = match.group(1), match.group(2), match.group(3)
+        if layer_prefix is not None and pref != layer_prefix:
+            continue
+        by_prefix.setdefault(pref, {}).setdefault(int(idx_s), set()).add(proj)
+
+    if not by_prefix:
+        raise FileNotFoundError(
+            f"No FFN projections (*.*.mlp.{{gate,up,down}}_proj.weight) found under {checkpoint_dir}"
+        )
+
+    best_prefix = max(
+        sorted(by_prefix.keys()),
+        key=lambda p: sum(1 for projs in by_prefix[p].values() if len(projs) == 3),
+    )
+    complete_layers = sorted(
+        idx for idx, projs in by_prefix[best_prefix].items() if len(projs) == 3
+    )
+    if not complete_layers:
+        raise ValueError(f"No layer under {checkpoint_dir} has all 3 FFN projections")
+    return best_prefix, complete_layers
+
+
+def score_weight_sensitivity(
+    weight_f32: np.ndarray,
+    rho: float = 0.20,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
+    """Compute kurtosis, block-16 outlier ratio, NVFP4 NMSE, and AutoFP6 sidecar tensors."""
+    w = weight_f32.astype(np.float32, copy=False)
+    flat = w.reshape(-1).astype(np.float64)
+    mean = float(np.mean(flat))
+    centered = flat - mean
+    var = float(np.mean(centered * centered))
+    if var > 1e-24:
+        fourth = float(np.mean((centered * centered) ** 2))
+        excess_kurtosis = max(0.0, fourth / (var * var) - 3.0)
+    else:
+        excess_kurtosis = 0.0
+
+    n, k = w.shape
+    blocks = w.reshape(n, k // GROUP_SIZE, GROUP_SIZE).astype(np.float64)
+    bmax = np.max(np.abs(blocks), axis=2)
+    brms = np.sqrt(np.mean(blocks * blocks, axis=2))
+    outlier_ratios = np.where(brms > 1e-12, bmax / np.maximum(brms, 1e-12), 1.0)
+    block16_outlier_mean = float(np.mean(outlier_ratios))
+    block16_outlier_p95 = float(np.percentile(outlier_ratios, 95))
+
+    codes, mask, prefix, meta, stats = build_projection_sidecar(w, rho=rho)
+    nmse_gain = max(0.0, stats["base_nmse"] - stats["refined_nmse"])
+    sensitivity_score = (
+        100.0
+        * stats["base_nmse"]
+        * (1.0 + 0.25 * math.log1p(excess_kurtosis))
+        * (block16_outlier_p95 / 2.0)
+    )
+    metrics = {
+        "excess_kurtosis": excess_kurtosis,
+        "block16_outlier_mean": block16_outlier_mean,
+        "block16_outlier_p95": block16_outlier_p95,
+        "base_nmse": stats["base_nmse"],
+        "refined_nmse": stats["refined_nmse"],
+        "nmse_gain": nmse_gain,
+        "added_bpw": stats["added_bpw"],
+        "sensitivity_score": sensitivity_score,
+    }
+    return codes, mask, prefix, meta, metrics
+
+
+def scan_checkpoint(
+    checkpoint_dir: Path,
+    rho: float = 0.20,
+    top_k_layers: Optional[int] = None,
+    budget_fraction: float = 0.25,
+    layer_prefix: Optional[str] = None,
+    output_path: Optional[Path] = None,
+    manifest_path: Optional[Path] = None,
+) -> Dict[str, object]:
+    """Scan a checkpoint's FFN layers, rank sensitivity, and optionally emit sidecar+manifest."""
+    if not (0.0 < budget_fraction <= 1.0):
+        raise ValueError(f"budget_fraction must lie in (0, 1], got {budget_fraction}")
+
+    detected_prefix, discovered_layers = discover_checkpoint_ffn_layers(
+        checkpoint_dir, layer_prefix=layer_prefix
+    )
+    if top_k_layers is None:
+        k_select = max(1, min(len(discovered_layers), int(round(len(discovered_layers) * budget_fraction))))
+    else:
+        if top_k_layers < 1 or top_k_layers > len(discovered_layers):
+            raise ValueError(
+                f"top_k_layers={top_k_layers} must lie in 1..={len(discovered_layers)}"
+            )
+        k_select = top_k_layers
+
+    layer_scores: List[Dict[str, object]] = []
+    cached_tensors: Dict[int, Dict[str, np.ndarray]] = {}
+
+    for layer in discovered_layers:
+        lp = f"{detected_prefix}.{layer}"
+        proj_metrics: Dict[str, Dict[str, float]] = {}
+        layer_tensors: Dict[str, np.ndarray] = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            full_prefix = f"{lp}.mlp.{proj}"
+            weight = load_weight_from_checkpoint(checkpoint_dir, full_prefix)
+            codes, mask, prefix, meta, metrics = score_weight_sensitivity(weight, rho=rho)
+            proj_metrics[proj] = metrics
+            if output_path is not None:
+                layer_tensors[f"{full_prefix}.ae_refine_codes"] = codes
+                layer_tensors[f"{full_prefix}.ae_refine_mask"] = mask
+                layer_tensors[f"{full_prefix}.ae_group_prefix"] = prefix
+                layer_tensors[f"{full_prefix}.ae_meta"] = meta
+        if output_path is not None:
+            cached_tensors[layer] = layer_tensors
+
+        mean_kurtosis = float(np.mean([m["excess_kurtosis"] for m in proj_metrics.values()]))
+        mean_outlier_p95 = float(np.mean([m["block16_outlier_p95"] for m in proj_metrics.values()]))
+        mean_base_nmse = float(np.mean([m["base_nmse"] for m in proj_metrics.values()]))
+        mean_ref_nmse = float(np.mean([m["refined_nmse"] for m in proj_metrics.values()]))
+        layer_sensitivity = float(np.mean([m["sensitivity_score"] for m in proj_metrics.values()]))
+        layer_scores.append(
+            {
+                "layer": layer,
+                "sensitivity_score": round(layer_sensitivity, 6),
+                "excess_kurtosis": round(mean_kurtosis, 4),
+                "block16_outlier_p95": round(mean_outlier_p95, 4),
+                "base_nmse": round(mean_base_nmse, 6),
+                "refined_nmse": round(mean_ref_nmse, 6),
+            }
+        )
+
+    ranked = sorted(
+        layer_scores,
+        key=lambda row: (float(row["sensitivity_score"]), -int(row["layer"])),
+        reverse=True,
+    )
+    recommended_layers = sorted(int(row["layer"]) for row in ranked[:k_select])
+    layers_spec = format_layers_spec(recommended_layers)
+
+    report: Dict[str, object] = {
+        "checkpoint_dir": str(checkpoint_dir.resolve()),
+        "layer_prefix": detected_prefix,
+        "discovered_layers": discovered_layers,
+        "recommended_layers": recommended_layers,
+        "recommended_layers_spec": layers_spec,
+        "rho": rho,
+        "ranked_layers": ranked,
+    }
+
+    if output_path is not None:
+        selected_tensors: Dict[str, np.ndarray] = {}
+        for layer in recommended_layers:
+            selected_tensors.update(cached_tensors[layer])
+        size_bytes, digest = write_safetensors(output_path, selected_tensors)
+        resolved_out = str(output_path.resolve())
+        report["sidecar"] = {
+            "path": resolved_out,
+            "size_bytes": size_bytes,
+            "sha256": digest,
+            "env": {
+                "ATLAS_AUTOEMATIC_LAYERS": layers_spec,
+                "ATLAS_AUTOEMATIC_SIDECAR": resolved_out,
+                "ATLAS_AUTOEMATIC_SIDECAR_SHA256": digest,
+                "ATLAS_AUTOEMATIC_SIDECAR_SIZE": str(size_bytes),
+            },
+        }
+        mpath = manifest_path if manifest_path is not None else output_path.with_suffix(".manifest.json")
+        mpath.parent.mkdir(parents=True, exist_ok=True)
+        mpath.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        report["manifest_path"] = str(mpath.resolve())
+
+    return report
+
+
+def _encode_bf16_array(arr_f32: np.ndarray) -> np.ndarray:
+    u32 = np.ascontiguousarray(arr_f32, dtype=np.float32).view(np.uint32)
+    return (u32 >> 16).astype(np.uint16)
+
+
+def _write_test_safetensors_raw(path: Path, entries: Dict[str, Tuple[str, Tuple[int, ...], bytes]]) -> None:
+    header: Dict[str, dict] = {}
+    payloads: List[bytes] = []
+    offset = 0
+    for name in sorted(entries.keys()):
+        dtype, shape, raw = entries[name]
+        end = offset + len(raw)
+        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, end]}
+        payloads.append(raw)
+        offset = end
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    pad = (8 - (len(header_bytes) % 8)) % 8
+    header_bytes += b" " * pad
+    with path.open("wb") as fh:
+        fh.write(struct.pack("<Q", len(header_bytes)))
+        fh.write(header_bytes)
+        for chunk in payloads:
+            fh.write(chunk)
+
+
 def run_self_test() -> int:
     rng = np.random.default_rng(2026)
     # 1. Isotropic Gaussian: refining 20% subgroups reduces NMSE by ~14-18%.
@@ -355,7 +591,8 @@ def run_self_test() -> int:
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="ae-sidecar-test-") as tmp:
-        out_path = Path(tmp) / "test.safetensors"
+        tmp_path = Path(tmp)
+        out_path = tmp_path / "test.safetensors"
         size_b, digest = write_safetensors(
             out_path,
             {
@@ -368,6 +605,69 @@ def run_self_test() -> int:
         assert size_b == out_path.stat().st_size
         assert digest == hashlib.sha256(out_path.read_bytes()).hexdigest()
 
+        # 4. Verify --scan-checkpoint end-to-end on a 4-layer sharded BF16+FP8 fixture:
+        #    layers 1 and 3 carry heavy-tailed block-16 outlier spikes; layers 0 and 2 are smooth.
+        ckpt_dir = tmp_path / "synthetic_ckpt"
+        ckpt_dir.mkdir()
+        shard0: Dict[str, Tuple[str, Tuple[int, ...], bytes]] = {}
+        shard1: Dict[str, Tuple[str, Tuple[int, ...], bytes]] = {}
+        weight_map: Dict[str, str] = {}
+        shapes = {"gate_proj": (64, 128), "up_proj": (64, 128), "down_proj": (128, 64)}
+
+        for layer in range(4):
+            is_outlier = layer in (1, 3)
+            for proj, (n_dim, k_dim) in shapes.items():
+                mat = rng.standard_normal((n_dim, k_dim)).astype(np.float32) * 0.5
+                if is_outlier:
+                    # Inject heavy-tailed single-element block-16 spikes (10x magnitude)
+                    mat[:, 0::16] *= 10.0
+                key = f"model.layers.{layer}.mlp.{proj}.weight"
+                if layer < 2:
+                    # Shard 0: BF16
+                    shard0[key] = ("BF16", (n_dim, k_dim), _encode_bf16_array(mat).tobytes())
+                    weight_map[key] = "model-00001-of-00002.safetensors"
+                else:
+                    # Shard 1: block-128 FP8 E4M3 + BF16 weight_scale_inv
+                    amax = float(np.max(np.abs(mat)))
+                    bscale = np.array([[amax / 448.0 if amax > 0.0 else 1.0]], dtype=np.float32)
+                    scaled = mat / bscale[0, 0]
+                    fp8_mag = float_to_ue4m3_array(scaled)
+                    fp8_bytes = np.where((scaled < 0.0) & (fp8_mag != 0), fp8_mag | 0x80, fp8_mag).astype(np.uint8)
+                    scale_key = f"model.layers.{layer}.mlp.{proj}.weight_scale_inv"
+                    shard1[key] = ("F8_E4M3", (n_dim, k_dim), fp8_bytes.tobytes())
+                    shard1[scale_key] = ("BF16", (1, 1), _encode_bf16_array(bscale).tobytes())
+                    weight_map[key] = "model-00002-of-00002.safetensors"
+                    weight_map[scale_key] = "model-00002-of-00002.safetensors"
+
+        _write_test_safetensors_raw(ckpt_dir / "model-00001-of-00002.safetensors", shard0)
+        _write_test_safetensors_raw(ckpt_dir / "model-00002-of-00002.safetensors", shard1)
+        (ckpt_dir / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {}, "weight_map": weight_map}), encoding="utf-8"
+        )
+
+        scan_out = tmp_path / "scanned_sidecar.safetensors"
+        scan_manifest = tmp_path / "scanned_manifest.json"
+        scan_report = scan_checkpoint(
+            ckpt_dir,
+            rho=0.20,
+            top_k_layers=2,
+            output_path=scan_out,
+            manifest_path=scan_manifest,
+        )
+        assert scan_report["discovered_layers"] == [0, 1, 2, 3], scan_report
+        assert scan_report["recommended_layers"] == [1, 3], (
+            f"expected outlier layers [1, 3], got {scan_report['recommended_layers']}"
+        )
+        assert scan_report["recommended_layers_spec"] == "1,3"
+        sidecar_info = scan_report["sidecar"]
+        assert isinstance(sidecar_info, dict)
+        assert scan_out.stat().st_size == sidecar_info["size_bytes"]
+        assert hashlib.sha256(scan_out.read_bytes()).hexdigest() == sidecar_info["sha256"]
+        assert scan_manifest.is_file()
+        # Verify emitted sidecar header contains exact 4 tensors x 3 projs x 2 layers = 24 tensors.
+        _, emitted_hdr = read_safetensors_header(scan_out)
+        assert len(emitted_hdr) == 24, f"expected 24 tensors, got {len(emitted_hdr)}"
+
     print(
         json.dumps(
             {
@@ -378,6 +678,8 @@ def run_self_test() -> int:
                 "het_refined_nmse": round(stats_het["refined_nmse"], 6),
                 "added_bpw": round(stats_iso["added_bpw"], 4),
                 "num_refined_sg": int(stats_iso["num_refined_sg"]),
+                "scan_recommended_layers": scan_report["recommended_layers"],
+                "scan_emitted_tensors": len(emitted_hdr),
             }
         )
     )
@@ -387,25 +689,46 @@ def run_self_test() -> int:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build zero-calibration AutoEMatic (+0.4 bpw) AutoFP6 sidecar.")
     parser.add_argument("--checkpoint", type=Path, help="Upstream BF16/FP8 checkpoint directory")
+    parser.add_argument(
+        "--scan-checkpoint",
+        type=Path,
+        help="Scan HF safetensors checkpoint, rank per-layer quantization sensitivity, recommend top-K layers, and optionally emit authenticated sidecar + manifest",
+    )
     parser.add_argument("--output", type=Path, help="Destination .safetensors sidecar path")
+    parser.add_argument("--manifest", type=Path, help="Destination JSON manifest path for --scan-checkpoint")
     parser.add_argument("--layers", type=str, default="0", help="Layer indices/ranges (e.g. '0-63' or '4,8,12')")
-    parser.add_argument("--layer-prefix", type=str, default="model.layers", help="HF layer prefix before .<idx>")
+    parser.add_argument("--layer-prefix", type=str, default=None, help="HF layer prefix before .<idx> (auto-detected under --scan-checkpoint; defaults to 'model.layers' otherwise)")
+    parser.add_argument("--top-k-layers", type=int, default=None, help="Number of top-sensitivity layers to select under --scan-checkpoint")
+    parser.add_argument("--budget-fraction", type=float, default=0.25, help="Fraction of layers to select when --top-k-layers is unset (default 0.25)")
     parser.add_argument("--rho", type=float, default=0.20, help="Subgroup refinement budget (default 0.20 -> +0.4 bpw)")
-    parser.add_argument("--self-test", action="store_true", help="Run built-in numerical verification and exit")
+    parser.add_argument("--self-test", action="store_true", help="Run built-in numerical and --scan-checkpoint verification and exit")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.self_test:
         return run_self_test()
+    if args.scan_checkpoint is not None:
+        report = scan_checkpoint(
+            args.scan_checkpoint,
+            rho=args.rho,
+            top_k_layers=args.top_k_layers,
+            budget_fraction=args.budget_fraction,
+            layer_prefix=args.layer_prefix,
+            output_path=args.output,
+            manifest_path=args.manifest,
+        )
+        print(json.dumps(report, indent=2))
+        return 0
     if args.checkpoint is None or args.output is None:
-        parser.error("--checkpoint and --output are required unless --self-test is given")
+        parser.error("--checkpoint and --output are required unless --self-test or --scan-checkpoint is given")
 
+    layer_prefix = args.layer_prefix if args.layer_prefix is not None else "model.layers"
     layers = parse_layers_spec(args.layers)
     tensors: Dict[str, np.ndarray] = {}
     nmse_ratios: List[float] = []
     bpw_list: List[float] = []
 
     for layer in layers:
-        lp = f"{args.layer_prefix}.{layer}"
+        lp = f"{layer_prefix}.{layer}"
         for proj in ("gate_proj", "up_proj", "down_proj"):
             full_prefix = f"{lp}.mlp.{proj}"
             weight = load_weight_from_checkpoint(args.checkpoint, full_prefix)

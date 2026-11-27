@@ -202,27 +202,33 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         self.final_norm_rows(hidden, normed, k as u32, stream)?;
 
-        // ── LM head for K tokens → logits[K, vocab] ──
-        self.lm_head_batched(normed, k as u32, stream)?;
-
-        // ── Argmax per token ──
+        // ── LM head + Argmax for K tokens ──
         // Verify-side (possibly truncated) vocab must match the stride/range
         // `lm_head_batched` wrote — full vocab when truncation is off.
         let vocab = self.verify_lmhead_vocab() as usize;
-        let mut results = Vec::with_capacity(k);
-        for t in 0..k {
-            let logits_t = self.buffers.logits().offset(t * vocab * bf16);
-            let out_ptr = self.buffers.scratch().offset(t * 4);
-            ops::argmax_bf16(
-                self.gpu.as_ref(),
-                self.argmax_kernel,
-                logits_t,
-                out_ptr,
-                vocab as u32,
-                stream,
-            )?;
+        if !self.try_lm_head_fused_argmax(
+            normed,
+            self.buffers.scratch(),
+            k as u32,
+            vocab as u32,
+            stream,
+        )? {
+            self.lm_head_batched(normed, k as u32, stream)?;
+            for t in 0..k {
+                let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                let out_ptr = self.buffers.scratch().offset(t * 4);
+                ops::argmax_bf16(
+                    self.gpu.as_ref(),
+                    self.argmax_kernel,
+                    logits_t,
+                    out_ptr,
+                    vocab as u32,
+                    stream,
+                )?;
+            }
         }
         // D2H: copy all K argmax results at once on the active stream.
+        let mut results = Vec::with_capacity(k);
         let mut buf = vec![0u8; k * 4];
         self.gpu
             .copy_d2h_on_stream(self.buffers.scratch(), &mut buf, stream)?;

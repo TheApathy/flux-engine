@@ -213,6 +213,15 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         let vocab = self.verify_lmhead_vocab() as usize;
         self.final_norm_rows(hidden, normed, total_rows as u32, stream)?;
+        if self.try_lm_head_fused_argmax(
+            normed,
+            self.buffers.scratch(),
+            total_rows as u32,
+            vocab as u32,
+            stream,
+        )? {
+            return Ok(());
+        }
         self.lm_head_batched(normed, total_rows as u32, stream)?;
         self.dflash_argmax_logits_rows(self.buffers.scratch(), total_rows, vocab, stream)
     }

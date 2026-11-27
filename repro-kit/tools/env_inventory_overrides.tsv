@@ -123,3 +123,4 @@ ATLAS_AUTOEMATIC_SIDECAR_SIZE	RESOURCE	expected exact byte size authenticating A
 ATLAS_DUAL_PLANE_NVFP4	NUMERICS	repacks BF16/FP8 weights into 8.5 bpw shared-scale DualPlaneNvfp4 (weight_map/dual_plane.rs)
 ATLAS_DUAL_PLANE_SELF_SPEC	ROUTE	opt-in W_hi DualPlaneNvfp4 self-speculation; target verify preserves DualPlaneNvfp4 output (speculative_self.rs)
 ATLAS_FUSED_RMSNORM_NVFP4	NUMERICS	opt-in single-pass Blackwell RMSNorm/SwiGLU -> E2M1 NVFP4 activation fusion (layers/ops/rmsnorm_nvfp4.rs)
+ATLAS_LM_HEAD_FUSED_ARGMAX	ROUTE	opt-in fused two-stage NVFP4 LM-head + online warp/block argmax for greedy verify (ops/lm_head_argmax.rs)
