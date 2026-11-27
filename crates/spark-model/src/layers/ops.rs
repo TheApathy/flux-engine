@@ -21,6 +21,8 @@ mod dcoco_selector;
 mod dflash2_conv;
 #[path = "ops/embeddings.rs"]
 mod embeddings;
+#[path = "ops/exact_spec_accept.rs"]
+pub mod exact_spec_accept;
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[path = "ops/flashinfer_sm121.rs"]
 pub mod flashinfer_sm121;
@@ -161,6 +163,7 @@ pub use bitfp4_kv::*;
 pub use dcoco_selector::*;
 pub use dflash2_conv::*;
 pub use embeddings::*;
+pub use exact_spec_accept::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;

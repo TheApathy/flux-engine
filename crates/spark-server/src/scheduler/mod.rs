@@ -27,6 +27,7 @@ mod deferred_prefill_tail;
 mod device_topk_route;
 mod device_topk_spec;
 mod emit_step;
+mod exact_gpu_accept;
 mod exact_greedy_admission;
 mod glm53_policy_driver;
 mod helpers;
