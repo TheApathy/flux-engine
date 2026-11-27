@@ -132,3 +132,4 @@ ATLAS_GB10_FAST_PREFILL	NUMERICS	opt-in GB10 fast prefill umbrella enabling SM12
 ATLAS_TENSOR_FP8_PREFILL	NUMERICS	opt-in scalar Tensor-FP8 E4M3 prefill projections with [0.125, 8.0] bounded epilogue deferral via cuBLASLt (ops/tensor_fp8.rs)
 ATLAS_GDN_L2_WINDOW_MIB	RESOURCE	opt-in L2-resident token window budget in MiB for GDN prefill recurrence; carries exact FP32 h_state and conv_state across windows (qwen3_ssm/gdn_l2_window.rs)
 ATLAS_SPEC_EXACT_GPU_ACCEPT	ROUTE	opt-in hardened on-GPU exact speculative acceptance with Philox4_32_10 and two-pass sparse residual sampling (ops/exact_spec_accept.rs)
+ATLAS_W4A4_DECODE_SK3	NUMERICS	opt-in 48-SM roofline W4A4 decode GEMM (split_k=3 deterministic reduction, ops/w4a4_decode_sk3.rs)

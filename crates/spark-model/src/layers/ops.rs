@@ -161,6 +161,8 @@ mod ssm_mamba;
 mod ssm_preproc;
 #[path = "ops/tensor_fp8.rs"]
 mod tensor_fp8;
+#[path = "ops/w4a4_decode_sk3.rs"]
+pub mod w4a4_decode_sk3;
 
 pub use activations::*;
 pub use bitfp4_kv::*;
@@ -248,6 +250,7 @@ pub use ssm_gdn_batched::*;
 pub use ssm_mamba::*;
 pub use ssm_preproc::*;
 pub use tensor_fp8::*;
+pub use w4a4_decode_sk3::*;
 
 #[cfg(test)]
 #[path = "ops/kernel_call_site_tests.rs"]

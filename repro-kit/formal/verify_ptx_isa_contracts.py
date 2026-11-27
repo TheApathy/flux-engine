@@ -349,6 +349,17 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "exact_spec_prefix_reduce_sm120",
         ),
     ),
+    (
+        "kernels/gb10/common/w4a4_decode_roofline_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "w4a4_gemm_m16_sk3_sm120",
+            "reduce_w4a4_sk3_bf16_sm120",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(
