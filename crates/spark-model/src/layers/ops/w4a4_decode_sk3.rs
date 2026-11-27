@@ -379,8 +379,11 @@ pub fn ensure_w4a4_decode_sk3_workspace(
     if policy == W4a4WorkspaceAllocPolicy::CaptureNoAlloc {
         return Ok(None);
     }
-    if let Some(prev) = guard.remove(&key) {
+    if let Some(prev) = guard.get(&key).copied() {
         gpu.synchronize(stream)?;
+        // Remove and free only after synchronization succeeds so a sync error
+        // keeps `prev` tracked in `CACHE` instead of leaking device memory.
+        guard.remove(&key);
         let _ = gpu.free(prev.ptr);
     }
     let ptr = gpu.alloc(req_bytes)?;
@@ -392,6 +395,55 @@ pub fn ensure_w4a4_decode_sk3_workspace(
         },
     );
     Ok(Some((ptr, req_bytes)))
+}
+
+/// Pre-launch operand, handle, and alignment preflight for a 3-projection
+/// NVFP4 FFN (`gate_proj`, `up_proj`, `down_proj`).
+///
+/// Called before allocating scratch/workspace or issuing the first GPU kernel
+/// so any missing handle, null scale pointer, or misaligned buffer falls back
+/// cleanly with zero GPU side effects.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn w4a4_decode_sk3_ffn_preflight_ok(
+    gate_proj: &QuantizedWeight,
+    up_proj: &QuantizedWeight,
+    down_proj: &QuantizedWeight,
+    act_mul: KernelHandle,
+    nvfp4_quantize_k: KernelHandle,
+    input: DevicePtr,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    output: DevicePtr,
+) -> bool {
+    let weight_ok = |w: &QuantizedWeight| {
+        !w.is_null()
+            && !w.weight_scale.is_null()
+            && w.weight.0.is_multiple_of(16)
+            && w.weight_scale.0.is_multiple_of(4)
+            && w.weight_scale_2.is_finite()
+            && w.weight_scale_2 > 0.0
+    };
+    let bf16_buf_ok = |p: DevicePtr| !p.is_null() && p.0.is_multiple_of(2);
+    nvfp4_quantize_k.0 != 0
+        && act_mul.0 != 0
+        && weight_ok(gate_proj)
+        && weight_ok(up_proj)
+        && weight_ok(down_proj)
+        && bf16_buf_ok(input)
+        && bf16_buf_ok(gate_out)
+        && bf16_buf_ok(up_out)
+        && bf16_buf_ok(output)
+}
+
+/// Pre-launch pointer and alignment check for NVFP4 activation scratch
+/// (`a_packed` 16B-aligned, `a_scale` 4B-aligned).
+#[must_use]
+pub fn w4a4_decode_sk3_activation_scratch_ok(a_packed: DevicePtr, a_scale: DevicePtr) -> bool {
+    !a_packed.is_null()
+        && a_packed.0.is_multiple_of(16)
+        && !a_scale.is_null()
+        && a_scale.0.is_multiple_of(4)
 }
 
 fn validate_gemm_operands(
@@ -1320,6 +1372,239 @@ mod tests {
             Some((ws_ptr, 4096))
         );
         assert_eq!(gpu_ws.alloc_count(), 1);
+    }
+
+    #[test]
+    fn workspace_growth_frees_previous_and_preserves_cache_on_sync_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SyncFailGpu {
+            inner: MockGpuBackend,
+            fail_sync: AtomicBool,
+        }
+
+        impl GpuBackend for SyncFailGpu {
+            fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
+                self.inner.alloc(bytes)
+            }
+            fn alloc_managed(&self, bytes: usize) -> Result<DevicePtr> {
+                self.inner.alloc_managed(bytes)
+            }
+            fn free(&self, ptr: DevicePtr) -> Result<()> {
+                self.inner.free(ptr)
+            }
+            fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
+                self.inner.copy_h2d(src, dst)
+            }
+            fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
+                self.inner.copy_d2h(src, dst)
+            }
+            fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()> {
+                self.inner.copy_d2d(src, dst, bytes)
+            }
+            fn launch(
+                &self,
+                func: KernelHandle,
+                grid: [u32; 3],
+                block: [u32; 3],
+                shared_mem: u32,
+                stream: u64,
+                params: &mut [*mut std::ffi::c_void],
+            ) -> Result<()> {
+                self.inner
+                    .launch(func, grid, block, shared_mem, stream, params)
+            }
+            fn synchronize(&self, stream: u64) -> Result<()> {
+                if self.fail_sync.load(Ordering::Relaxed) {
+                    anyhow::bail!("injected stream synchronize failure");
+                }
+                self.inner.synchronize(stream)
+            }
+            fn default_stream(&self) -> u64 {
+                self.inner.default_stream()
+            }
+            fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle> {
+                self.inner.kernel(module, func_name)
+            }
+            fn memset(&self, ptr: DevicePtr, value: u8, bytes: usize) -> Result<()> {
+                self.inner.memset(ptr, value, bytes)
+            }
+            fn memset_async(
+                &self,
+                ptr: DevicePtr,
+                value: u8,
+                bytes: usize,
+                stream: u64,
+            ) -> Result<()> {
+                self.inner.memset_async(ptr, value, bytes, stream)
+            }
+            fn total_memory(&self) -> Result<usize> {
+                self.inner.total_memory()
+            }
+            fn free_memory(&self) -> Result<usize> {
+                self.inner.free_memory()
+            }
+        }
+
+        let gpu = Box::new(SyncFailGpu {
+            inner: MockGpuBackend::new(),
+            fail_sync: AtomicBool::new(false),
+        });
+        let stream = 0xCAFE_BABE_u64;
+
+        // Initial eager allocation (4096 B).
+        let (p1, sz1) = ensure_w4a4_decode_sk3_workspace(
+            gpu.as_ref(),
+            stream,
+            4096,
+            W4a4WorkspaceAllocPolicy::AllowAlloc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sz1, 4096);
+        assert_eq!(gpu.inner.alloc_count(), 1);
+
+        // Growth fails on stream synchronize: previous buffer MUST remain cached (0 leak).
+        gpu.fail_sync.store(true, Ordering::Relaxed);
+        assert!(
+            ensure_w4a4_decode_sk3_workspace(
+                gpu.as_ref(),
+                stream,
+                8192,
+                W4a4WorkspaceAllocPolicy::AllowAlloc,
+            )
+            .is_err()
+        );
+        assert_eq!(gpu.inner.alloc_count(), 1);
+        assert_eq!(gpu.inner.invalid_free_count(), 0);
+        // Cached `p1` is still tracked and reusable without allocation.
+        assert_eq!(
+            ensure_w4a4_decode_sk3_workspace(
+                gpu.as_ref(),
+                stream,
+                4096,
+                W4a4WorkspaceAllocPolicy::CaptureNoAlloc,
+            )
+            .unwrap(),
+            Some((p1, 4096))
+        );
+
+        // Once synchronize succeeds, growth frees `p1` and installs `p2` (8192 B).
+        gpu.fail_sync.store(false, Ordering::Relaxed);
+        let (p2, sz2) = ensure_w4a4_decode_sk3_workspace(
+            gpu.as_ref(),
+            stream,
+            8192,
+            W4a4WorkspaceAllocPolicy::AllowAlloc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sz2, 8192);
+        assert_ne!(p2, p1);
+        assert_eq!(gpu.inner.alloc_count(), 1);
+        assert_eq!(gpu.inner.invalid_free_count(), 0);
+    }
+
+    #[test]
+    fn ffn_preflight_rejects_null_or_misaligned_weights_scales_buffers_and_handles() {
+        let ok_w = make_valid_weight();
+        let ok_act = KernelHandle(1);
+        let ok_q = KernelHandle(2);
+        let ok_in = DevicePtr(0x1000);
+        let ok_g = DevicePtr(0x2000);
+        let ok_u = DevicePtr(0x3000);
+        let ok_out = DevicePtr(0x4000);
+
+        assert!(w4a4_decode_sk3_ffn_preflight_ok(
+            &ok_w, &ok_w, &ok_w, ok_act, ok_q, ok_in, ok_g, ok_u, ok_out
+        ));
+        // Missing kernel handles fail closed.
+        assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+            &ok_w,
+            &ok_w,
+            &ok_w,
+            KernelHandle(0),
+            ok_q,
+            ok_in,
+            ok_g,
+            ok_u,
+            ok_out
+        ));
+        assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+            &ok_w,
+            &ok_w,
+            &ok_w,
+            ok_act,
+            KernelHandle(0),
+            ok_in,
+            ok_g,
+            ok_u,
+            ok_out
+        ));
+        // Null/misaligned weight_scale or weight on down_proj (or gate/up) fails BEFORE any launch.
+        let bad_null_scale = QuantizedWeight {
+            weight_scale: DevicePtr::NULL,
+            ..ok_w
+        };
+        let bad_align_w = QuantizedWeight {
+            weight: DevicePtr(0x2008),
+            ..ok_w
+        };
+        let bad_align_s = QuantizedWeight {
+            weight_scale: DevicePtr(0x4002),
+            ..ok_w
+        };
+        let bad_scale2 = QuantizedWeight {
+            weight_scale_2: f32::NAN,
+            ..ok_w
+        };
+        for bad_w in [bad_null_scale, bad_align_w, bad_align_s, bad_scale2] {
+            assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+                &bad_w, &ok_w, &ok_w, ok_act, ok_q, ok_in, ok_g, ok_u, ok_out
+            ));
+            assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+                &ok_w, &bad_w, &ok_w, ok_act, ok_q, ok_in, ok_g, ok_u, ok_out
+            ));
+            assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+                &ok_w, &ok_w, &bad_w, ok_act, ok_q, ok_in, ok_g, ok_u, ok_out
+            ));
+        }
+        // Null or odd-aligned BF16 I/O buffers fail closed.
+        for bad_ptr in [DevicePtr::NULL, DevicePtr(0x4001)] {
+            assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+                &ok_w, &ok_w, &ok_w, ok_act, ok_q, bad_ptr, ok_g, ok_u, ok_out
+            ));
+            assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+                &ok_w, &ok_w, &ok_w, ok_act, ok_q, ok_in, bad_ptr, ok_u, ok_out
+            ));
+            assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+                &ok_w, &ok_w, &ok_w, ok_act, ok_q, ok_in, ok_g, bad_ptr, ok_out
+            ));
+            assert!(!w4a4_decode_sk3_ffn_preflight_ok(
+                &ok_w, &ok_w, &ok_w, ok_act, ok_q, ok_in, ok_g, ok_u, bad_ptr
+            ));
+        }
+        // Activation scratch alignment checks.
+        assert!(w4a4_decode_sk3_activation_scratch_ok(
+            DevicePtr(0x1000),
+            DevicePtr(0x2000)
+        ));
+        assert!(!w4a4_decode_sk3_activation_scratch_ok(
+            DevicePtr::NULL,
+            DevicePtr(0x2000)
+        ));
+        assert!(!w4a4_decode_sk3_activation_scratch_ok(
+            DevicePtr(0x1008),
+            DevicePtr(0x2000)
+        ));
+        assert!(!w4a4_decode_sk3_activation_scratch_ok(
+            DevicePtr(0x1000),
+            DevicePtr::NULL
+        ));
+        assert!(!w4a4_decode_sk3_activation_scratch_ok(
+            DevicePtr(0x1000),
+            DevicePtr(0x2002)
+        ));
     }
 
     #[test]
