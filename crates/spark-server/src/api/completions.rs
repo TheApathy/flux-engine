@@ -290,6 +290,76 @@ fn validate_completion_input(req: &CompletionRequest) -> Result<(), Response> {
 /// leakage (the model expects it in raw completions mode), and for
 /// deepseek_v41 it is tokenized as given with BOS prepended, as the Python
 /// server does.
+/// Environment variable disabling the default `<think></think>\n\n` auto-prepend
+/// on raw `/v1/completions` text prompts for thinking-capable models.
+///
+/// Accepts `"0"` (default: auto-prepend) or `"1"` (raw verbatim tokenization).
+/// Any other value (including non-UTF-8) fails closed with an error.
+const COMPLETIONS_RAW_NO_THINK_PREFIX_ENV: &str = "ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX";
+
+/// Policy governing whether raw `/v1/completions` text prompts auto-prepend
+/// `<think></think>\n\n` on thinking-capable models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionsThinkPrefixPolicy {
+    /// Default behavior: prepend `<think></think>\n\n` when the tokenizer
+    /// supports thinking and the raw text does not already contain `</think>`.
+    AutoPrepend,
+    /// Opt-in exact-token parity mode (`ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1`):
+    /// tokenize raw `/v1/completions` text verbatim without prepending
+    /// `<think></think>\n\n` or recording `completion_thinking_prefix`.
+    RawNoThinkPrefix,
+}
+
+/// Parses `ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX` strictly (`"0"` or `"1"` only).
+///
+/// Unset and `"0"` select [`CompletionsThinkPrefixPolicy::AutoPrepend`]; `"1"` selects
+/// [`CompletionsThinkPrefixPolicy::RawNoThinkPrefix`]; any other value or non-UTF-8
+/// bytes fail closed with an error.
+pub(crate) fn parse_completions_raw_no_think_prefix_env(
+    raw: Result<String, std::env::VarError>,
+) -> Result<CompletionsThinkPrefixPolicy, String> {
+    match raw {
+        Err(std::env::VarError::NotPresent) => Ok(CompletionsThinkPrefixPolicy::AutoPrepend),
+        Ok(value) if value == "0" => Ok(CompletionsThinkPrefixPolicy::AutoPrepend),
+        Ok(value) if value == "1" => Ok(CompletionsThinkPrefixPolicy::RawNoThinkPrefix),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                env = COMPLETIONS_RAW_NO_THINK_PREFIX_ENV,
+                "non-UTF-8 value; failing closed"
+            );
+            Err(format!(
+                "Invalid {COMPLETIONS_RAW_NO_THINK_PREFIX_ENV}: value is not valid UTF-8 (expected \"0\" or \"1\")"
+            ))
+        }
+        Ok(other) => {
+            tracing::warn!(
+                env = COMPLETIONS_RAW_NO_THINK_PREFIX_ENV,
+                value = %other,
+                "invalid value; failing closed"
+            );
+            Err(format!(
+                "Invalid {COMPLETIONS_RAW_NO_THINK_PREFIX_ENV}={other:?}: expected \"0\" or \"1\""
+            ))
+        }
+    }
+}
+
+fn completions_think_prefix_policy() -> Result<CompletionsThinkPrefixPolicy, String> {
+    let policy = parse_completions_raw_no_think_prefix_env(std::env::var(
+        COMPLETIONS_RAW_NO_THINK_PREFIX_ENV,
+    ))?;
+    if policy == CompletionsThinkPrefixPolicy::RawNoThinkPrefix {
+        static RAW_NO_THINK_RECEIPT: std::sync::Once = std::sync::Once::new();
+        RAW_NO_THINK_RECEIPT.call_once(|| {
+            tracing::info!(
+                env = COMPLETIONS_RAW_NO_THINK_PREFIX_ENV,
+                "ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1 engaged (receipt): raw /v1/completions text prompts skip <think></think> auto-prepend"
+            );
+        });
+    }
+    Ok(policy)
+}
+
 fn resolve_prompt_tokens(
     req: &CompletionRequest,
     tokenizer: &crate::tokenizer::ChatTokenizer,
@@ -303,6 +373,17 @@ fn resolve_prompt_tokens_with_audit(
     tokenizer: &crate::tokenizer::ChatTokenizer,
     dsv41: bool,
     ledger: Option<&crate::openai::SharedInterventionLedger>,
+) -> Result<Vec<u32>, String> {
+    let policy = completions_think_prefix_policy()?;
+    resolve_prompt_tokens_with_audit_and_policy(req, tokenizer, dsv41, ledger, policy)
+}
+
+pub(crate) fn resolve_prompt_tokens_with_audit_and_policy(
+    req: &CompletionRequest,
+    tokenizer: &crate::tokenizer::ChatTokenizer,
+    dsv41: bool,
+    ledger: Option<&crate::openai::SharedInterventionLedger>,
+    think_prefix_policy: CompletionsThinkPrefixPolicy,
 ) -> Result<Vec<u32>, String> {
     use crate::openai::CompletionPrompt;
     let exact = match (&req.prompt_token_ids, &req.prompt) {
@@ -341,7 +422,9 @@ fn resolve_prompt_tokens_with_audit(
             })
             .map_err(|e| format!("Tokenization error: {e}"));
     }
-    let inject_thinking = tokenizer.supports_thinking() && !text.contains("</think>");
+    let inject_thinking = think_prefix_policy == CompletionsThinkPrefixPolicy::AutoPrepend
+        && tokenizer.supports_thinking()
+        && !text.contains("</think>");
     let raw_prompt = if inject_thinking {
         format!("<think></think>\n\n{text}")
     } else {
@@ -507,6 +590,14 @@ pub async fn completions(
     CurrentModel(state): CurrentModel,
     req: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
+    completions_with_policy(state, req, completions_think_prefix_policy()).await
+}
+
+pub(crate) async fn completions_with_policy(
+    state: Arc<AppState>,
+    req: Result<Json<CompletionRequest>, JsonRejection>,
+    think_prefix_policy: Result<CompletionsThinkPrefixPolicy, String>,
+) -> Response {
     let mut ingress_guard = crate::metrics::IngressGuard::new();
     let Json(req) = match req {
         Ok(r) => r,
@@ -520,16 +611,23 @@ pub async fn completions(
     if let Err(response) = validate_completion_input(&req) {
         return response;
     }
+    let think_prefix_policy = match think_prefix_policy {
+        Ok(policy) => policy,
+        Err(message) => {
+            return openai_error_response(StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
+    };
     let intervention_ledger = req.report_interventions.then(|| {
         Arc::new(std::sync::Mutex::new(
             crate::openai::InterventionLedger::default(),
         ))
     });
-    let prompt_tokens = match resolve_prompt_tokens_with_audit(
+    let prompt_tokens = match resolve_prompt_tokens_with_audit_and_policy(
         &req,
         &state.tokenizer,
         state.dsv41,
         intervention_ledger.as_ref(),
+        think_prefix_policy,
     ) {
         Ok(ids) => ids,
         Err(message) => {
@@ -557,8 +655,11 @@ pub async fn completions(
         );
     }
 
-    let temperature = req.temperature.unwrap_or(state.default_temperature);
     let top_k = req.top_k.unwrap_or(state.default_top_k);
+    let temperature = super::canonical_greedy_temperature(
+        req.temperature.unwrap_or(state.default_temperature),
+        top_k,
+    );
     let top_p = req.top_p.unwrap_or(state.default_top_p);
     let top_n_sigma = req.top_n_sigma.unwrap_or(state.default_top_n_sigma);
     let min_p = req.min_p.unwrap_or(state.default_min_p);
@@ -1123,7 +1224,10 @@ mod completion_cancel_tests {
 
 #[cfg(test)]
 mod completion_prompt_intervention_tests {
-    use super::resolve_prompt_tokens_with_audit;
+    use super::{
+        CompletionsThinkPrefixPolicy, parse_completions_raw_no_think_prefix_env,
+        resolve_prompt_tokens_with_audit, resolve_prompt_tokens_with_audit_and_policy,
+    };
     use crate::openai::{CompletionRequest, InterventionLedger, snapshot_shared_interventions};
     use crate::tokenizer::ChatTokenizer;
     use std::sync::{Arc, Mutex};
@@ -1242,6 +1346,145 @@ mod completion_prompt_intervention_tests {
                 assert_eq!(snapshot.events[0].code, "completion_bos_prefix");
             }
         }
+    }
+
+    #[test]
+    fn parse_completions_raw_no_think_prefix_env_is_strict_zero_or_one_and_fail_closed() {
+        assert_eq!(
+            parse_completions_raw_no_think_prefix_env(Err(std::env::VarError::NotPresent)),
+            Ok(CompletionsThinkPrefixPolicy::AutoPrepend)
+        );
+        assert_eq!(
+            parse_completions_raw_no_think_prefix_env(Ok("0".into())),
+            Ok(CompletionsThinkPrefixPolicy::AutoPrepend)
+        );
+        assert_eq!(
+            parse_completions_raw_no_think_prefix_env(Ok("1".into())),
+            Ok(CompletionsThinkPrefixPolicy::RawNoThinkPrefix)
+        );
+        for invalid in ["", "true", "false", "yes", "2", "-1", " 1 ", "1\n", "00"] {
+            let err = parse_completions_raw_no_think_prefix_env(Ok(invalid.into()))
+                .expect_err("invalid env value must fail closed");
+            assert!(
+                err.contains("ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX"),
+                "invalid={invalid:?} err={err}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            let raw = Err(std::env::VarError::NotUnicode(OsString::from_vec(vec![
+                0xff, 0xfe,
+            ])));
+            let err = parse_completions_raw_no_think_prefix_env(raw)
+                .expect_err("non-UTF-8 env value must fail closed");
+            assert!(
+                err.contains("ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX") && err.contains("UTF-8"),
+                "err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_no_think_prefix_policy_skips_auto_prepend_and_intervention_record() {
+        let thinking_tok = tokenizer(true);
+        let auto_ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+        let auto_ids = resolve_prompt_tokens_with_audit_and_policy(
+            &request(serde_json::json!({"prompt": "hello"})),
+            &thinking_tok,
+            false,
+            Some(&auto_ledger),
+            CompletionsThinkPrefixPolicy::AutoPrepend,
+        )
+        .unwrap();
+        assert_eq!(
+            auto_ids,
+            thinking_tok.encode("<think></think>\n\nhello").unwrap()
+        );
+        let auto_events = snapshot_shared_interventions(Some(&auto_ledger))
+            .unwrap()
+            .events;
+        assert_eq!(auto_events.len(), 1);
+        assert_eq!(auto_events[0].code, "completion_thinking_prefix");
+
+        let raw_ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+        let raw_ids = resolve_prompt_tokens_with_audit_and_policy(
+            &request(serde_json::json!({"prompt": "hello"})),
+            &thinking_tok,
+            false,
+            Some(&raw_ledger),
+            CompletionsThinkPrefixPolicy::RawNoThinkPrefix,
+        )
+        .unwrap();
+        assert_eq!(raw_ids, thinking_tok.encode("hello").unwrap());
+        assert_ne!(
+            raw_ids, auto_ids,
+            "raw mode must omit the <think></think> prefix tokens"
+        );
+        assert!(
+            snapshot_shared_interventions(Some(&raw_ledger))
+                .unwrap()
+                .events
+                .is_empty(),
+            "raw mode must not record completion_thinking_prefix"
+        );
+
+        // Prompt already containing </think> is unchanged under both policies.
+        for policy in [
+            CompletionsThinkPrefixPolicy::AutoPrepend,
+            CompletionsThinkPrefixPolicy::RawNoThinkPrefix,
+        ] {
+            let ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+            let ids = resolve_prompt_tokens_with_audit_and_policy(
+                &request(serde_json::json!({"prompt": "</think>hello"})),
+                &thinking_tok,
+                false,
+                Some(&ledger),
+                policy,
+            )
+            .unwrap();
+            assert_eq!(ids, thinking_tok.encode("</think>hello").unwrap());
+            assert!(
+                snapshot_shared_interventions(Some(&ledger))
+                    .unwrap()
+                    .events
+                    .is_empty()
+            );
+        }
+
+        // Exact token-id and dsv41 paths remain unaffected by RawNoThinkPrefix.
+        let exact_ids = resolve_prompt_tokens_with_audit_and_policy(
+            &request(serde_json::json!({"prompt_token_ids": [1, 0]})),
+            &thinking_tok,
+            false,
+            None,
+            CompletionsThinkPrefixPolicy::RawNoThinkPrefix,
+        )
+        .unwrap();
+        assert_eq!(exact_ids, vec![1, 0]);
+
+        let bos = thinking_tok
+            .inner()
+            .token_to_id(crate::dsv41::encoding::BOS)
+            .unwrap();
+        let dsv_ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+        let dsv_ids = resolve_prompt_tokens_with_audit_and_policy(
+            &request(serde_json::json!({"prompt": "hello"})),
+            &thinking_tok,
+            true,
+            Some(&dsv_ledger),
+            CompletionsThinkPrefixPolicy::RawNoThinkPrefix,
+        )
+        .unwrap();
+        assert_eq!(dsv_ids.first(), Some(&bos));
+        assert_eq!(
+            snapshot_shared_interventions(Some(&dsv_ledger))
+                .unwrap()
+                .events[0]
+                .code,
+            "completion_bos_prefix"
+        );
     }
 }
 

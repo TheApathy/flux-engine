@@ -511,7 +511,7 @@ fn build_blocking_request(
         max_tokens,
         min_tokens: 0,
         ignore_eos: false,
-        temperature,
+        temperature: super::canonical_greedy_temperature(temperature, top_k),
         top_k,
         top_p,
         top_n_sigma,
@@ -1089,5 +1089,54 @@ mod tests {
             .next()
             .expect("production source precedes tests");
         assert!(!prod.contains("request_tx.send("));
+    }
+
+    #[test]
+    fn build_blocking_request_collapses_top_k_one_to_canonical_greedy_temperature() {
+        let (tx_greedy, _rx_greedy) = oneshot::channel();
+        let greedy = build_blocking_request(
+            vec![1, 2],
+            42,
+            16,
+            0.7,
+            1,
+            0.8,
+            0.0,
+            0.0,
+            Some(7),
+            None,
+            tx_greedy,
+        );
+        let InferenceRequest::Blocking {
+            temperature, top_k, ..
+        } = greedy
+        else {
+            panic!("expected blocking request");
+        };
+        assert_eq!(temperature, 0.0);
+        assert_eq!(top_k, 1);
+
+        let (tx_sampled, _rx_sampled) = oneshot::channel();
+        let sampled = build_blocking_request(
+            vec![1, 2],
+            42,
+            16,
+            0.7,
+            20,
+            0.8,
+            0.0,
+            0.0,
+            Some(7),
+            None,
+            tx_sampled,
+        );
+        let InferenceRequest::Blocking {
+            temperature, top_k, ..
+        } = sampled
+        else {
+            panic!("expected blocking request");
+        };
+        assert_eq!(temperature, 0.7);
+        assert_eq!(top_k, 20);
     }
 }
