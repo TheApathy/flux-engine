@@ -347,18 +347,24 @@ def compare_two_traces(ref: dict[str, Any], cand: dict[str, Any]) -> dict[str, A
     if first_div is None and len(seq_ref) != len(seq_cand):
         first_div = min_len
 
-    exact_match = (ref_ids == cand_ids) if (ref_ids and cand_ids) else (ref_text == cand_text)
-    if ref_ids and cand_ids:
-        exact_match = exact_match and (ref_text == cand_text)
+    token_ids_asymmetric = bool(ref_ids) != bool(cand_ids)
+    exact_match = (
+        False
+        if token_ids_asymmetric
+        else ((ref_ids == cand_ids and ref_text == cand_text) if ref_ids else (ref_text == cand_text))
+    )
+    if token_ids_asymmetric and first_div is None:
+        first_div = 0
 
-    # Logprob & top-1 flip analysis over overlapping steps.
+    # Logprob & top-1 flip analysis across full length (penalizing truncated logprobs).
     ref_lps = ref.get("logprobs") or []
     cand_lps = cand.get("logprobs") or []
-    lp_steps = min(len(ref_lps), len(cand_lps))
-    top1_flips = 0
+    min_lp_steps = min(len(ref_lps), len(cand_lps))
+    max_lp_steps = max(len(ref_lps), len(cand_lps))
+    top1_flips = abs(len(ref_lps) - len(cand_lps))
     max_abs_lp_diff = 0.0
     step_kls: list[float] = []
-    for t in range(lp_steps):
+    for t in range(min_lp_steps):
         r_entry = ref_lps[t]
         c_entry = cand_lps[t]
         r_top = r_entry.get("top_logprobs") or {}
@@ -375,8 +381,8 @@ def compare_two_traces(ref: dict[str, Any], cand: dict[str, Any]) -> dict[str, A
         step_kls.append(kl)
         max_abs_lp_diff = max(max_abs_lp_diff, step_diff)
 
-    if lp_steps > 0:
-        top1_flip_rate = top1_flips / float(lp_steps)
+    if max_lp_steps > 0:
+        top1_flip_rate = top1_flips / float(max_lp_steps)
     elif max_len > 0:
         top1_flip_rate = mismatches / float(max_len)
     else:
@@ -388,9 +394,10 @@ def compare_two_traces(ref: dict[str, Any], cand: dict[str, Any]) -> dict[str, A
     return {
         "case_id": ref.get("case_id", "unknown"),
         "unit": unit,
+        "token_ids_asymmetric": token_ids_asymmetric,
         "trajectory_exact_match": exact_match,
         "first_divergence_index": first_div,
-        "compared_steps": lp_steps if lp_steps > 0 else max_len,
+        "compared_steps": max_lp_steps if max_lp_steps > 0 else max_len,
         "top1_flip_rate": round(top1_flip_rate, 8),
         "max_abs_logprob_diff": round(max_abs_lp_diff, 8),
         "mean_kl_divergence": mean_kl,
@@ -631,7 +638,7 @@ def run_certification_suite(
     replay_prompt = build_cold_needle_prompt(
         target_tokens=replay_len,
         passkey=replay_passkey,
-        salt=f"{salt}-replay-unique-{int(time.time() * 1000) % 100000}",
+        salt=f"{salt}-replay-unique",
         depth_fraction=0.45,
     )
     cold_res = query_model(
@@ -846,13 +853,14 @@ def run_verify_width_invariance(
     model: str,
     seed: int = DEFAULT_SEED,
     top_logprobs: int = DEFAULT_TOP_LOGPROBS,
+    run_salt: str | None = None,
     max_kl: float = DEFAULT_MAX_KL,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
     """Run canonical prompts across ``W=1`` vs ``W=8`` vs ``W=16`` servers and certify exactness."""
     if len(width_urls) < 2:
         raise ValueError("width invariance requires at least two labeled URLs (e.g. w1=...,w8=...,w16=...)")
-    salt = hashlib.sha256(f"flux-v14-width-{seed}".encode("utf-8")).hexdigest()[:12]
+    salt = run_salt or hashlib.sha256(f"flux-v14-width-{seed}".encode("utf-8")).hexdigest()[:12]
     reports: dict[str, dict[str, Any]] = {}
     for label, url in width_urls.items():
         reports[label] = run_certification_suite(
@@ -906,6 +914,7 @@ class _MockExactnessState:
         self.prefix_cache: set[str] = set()
         self.inject_canary_leak = inject_canary_leak
         self.last_canary_seen: str | None = None
+        self.received_prompts: list[str] = []
 
     @staticmethod
     def _answer_prompt(prompt: str) -> str:
@@ -932,6 +941,7 @@ class _MockExactnessState:
         prompt_hash = sha256_text(prompt)
         prompt_tokens = max(8, len(prompt.split()))
         with self.lock:
+            self.received_prompts.append(prompt)
             was_cached = prompt_hash in self.prefix_cache
             self.prefix_cache.add(prompt_hash)
             cached_tokens = (prompt_tokens // 16) * 16 if was_cached else 0
@@ -1082,15 +1092,34 @@ def run_self_test() -> int:
         warm_case = next(c for c in report_a["cases"] if c["case_id"] == "cold_vs_warm_warm")
         assert warm_case["cached_tokens"] > 0, "expected warm replay prefix cache hit"
 
-        # 2. Verify W=1 == W=8 == W=16 multi-width invariance.
-        width_res = run_verify_width_invariance(
-            width_urls={"w1": base_url, "w8": base_url, "w16": base_url},
-            endpoint="/v1/chat/completions",
-            model="mock-flux-v14",
-            seed=42,
-            top_logprobs=5,
+        # 2. Verify W=1 == W=8 == W=16 multi-width invariance across 3 independent servers
+        # and confirm byte-identical deterministic prompts (including Suite 3 cold-vs-warm salt).
+        w1_state, w8_state, w16_state = (
+            _MockExactnessState(),
+            _MockExactnessState(),
+            _MockExactnessState(),
         )
-        assert width_res["passed"], f"width invariance failed: {width_res['failures']}"
+        w1_srv, w1_thr, w1_url = _start_mock_openai_server(w1_state)
+        w8_srv, w8_thr, w8_url = _start_mock_openai_server(w8_state)
+        w16_srv, w16_thr, w16_url = _start_mock_openai_server(w16_state)
+        try:
+            width_res = run_verify_width_invariance(
+                width_urls={"w1": w1_url, "w8": w8_url, "w16": w16_url},
+                endpoint="/v1/chat/completions",
+                model="mock-flux-v14",
+                seed=42,
+                top_logprobs=5,
+            )
+            assert width_res["passed"], f"width invariance failed: {width_res['failures']}"
+            assert len(w1_state.received_prompts) >= 8
+            assert w1_state.received_prompts == w8_state.received_prompts == w16_state.received_prompts, (
+                "W=1, W=8, and W=16 must receive byte-identical prompts across all suites"
+            )
+        finally:
+            for srv, thr in ((w1_srv, w1_thr), (w8_srv, w8_thr), (w16_srv, w16_thr)):
+                srv.shutdown()
+                srv.server_close()
+                thr.join(timeout=2.0)
 
         # 3. Verify --compare round-trip via JSON files + negative fail-closed tests.
         with tempfile.TemporaryDirectory(prefix="atlas_exactness_selftest_") as tmpdir:
@@ -1130,6 +1159,23 @@ def run_self_test() -> int:
             assert not cmp_kl_fail["passed"]
             assert cmp_kl_fail["summary"]["max_kl_divergence"] > 1.0e-4
 
+            # Negative test C: asymmetric missing token_ids -> must fail exactness closed.
+            bad_asym = json.loads(json.dumps(report_a))
+            bad_asym["cases"][0]["token_ids"] = []
+            cmp_asym_fail = compare_reports(report_a, bad_asym)
+            assert not cmp_asym_fail["passed"], "asymmetric token_ids must fail closed"
+            assert any(c["token_ids_asymmetric"] for c in cmp_asym_fail["cases"])
+
+            # Negative test D: truncated logprobs on matching prefix -> must fail flip gate even with --allow-non-exact.
+            bad_trunc = json.loads(json.dumps(report_a))
+            multi_idx = next(i for i, c in enumerate(bad_trunc["cases"]) if len(c["logprobs"]) >= 2)
+            bad_trunc["cases"][multi_idx]["logprobs"] = bad_trunc["cases"][multi_idx]["logprobs"][:1]
+            cmp_trunc_fail = compare_reports(
+                report_a, bad_trunc, require_exact=False, max_top1_flip_rate=0.0
+            )
+            assert not cmp_trunc_fail["passed"], "truncated logprobs must fail top-1 flip gate"
+            assert cmp_trunc_fail["summary"]["max_top1_flip_rate"] > 0.0
+
         # 4. Negative test C: canary leakage in mixed batch MUST fail closed.
         # Seed a canary on leaky_srv then run B=4 batch invariance.
         leaky_report = run_certification_suite(
@@ -1167,8 +1213,11 @@ def run_self_test() -> int:
                     "negative_gates_verified": [
                         "token_divergence_detected",
                         "kl_gate_1e_4_enforced",
+                        "asymmetric_token_ids_rejected",
+                        "truncated_logprobs_rejected",
                         "canary_leak_rejected",
                     ],
+                    "deterministic_width_prompts_verified": True,
                 },
                 indent=2,
             )
@@ -1217,6 +1266,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Comma-separated mixed-batch concurrency sizes tested against B=1",
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Deterministic sampling seed")
+    parser.add_argument(
+        "--run-salt",
+        help="Optional explicit shared cold-prompt salt (defaults deterministically from --seed)",
+    )
     parser.add_argument(
         "--top-logprobs",
         type=int,
@@ -1298,6 +1351,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             seed=args.seed,
             top_logprobs=args.top_logprobs,
+            run_salt=args.run_salt,
             max_kl=args.max_kl,
         )
         if args.json_out is not None:
@@ -1320,6 +1374,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_sizes=batch_sizes,
         seed=args.seed,
         top_logprobs=args.top_logprobs,
+        run_salt=args.run_salt,
         max_kl=args.max_kl,
     )
     if args.json_out is not None:

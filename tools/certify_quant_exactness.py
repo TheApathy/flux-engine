@@ -238,6 +238,22 @@ def verify_lowest_index_tie_break() -> dict[str, Any]:
     return {"passed": len(failed) == 0, "cases": len(cases), "failures": failed}
 
 
+def _validate_lm_head_gates(
+    min_dual_plane_sqnr_db: float,
+    strict_bf16_sqnr_db: float,
+    max_top1_flip_rate: float,
+    max_kl_t1: float,
+) -> None:
+    if not math.isfinite(min_dual_plane_sqnr_db) or min_dual_plane_sqnr_db < 0.0:
+        raise ValueError(f"min_dual_plane_sqnr_db must be finite and >= 0, got {min_dual_plane_sqnr_db}")
+    if not math.isfinite(strict_bf16_sqnr_db) or strict_bf16_sqnr_db < 0.0:
+        raise ValueError(f"strict_bf16_sqnr_db must be finite and >= 0, got {strict_bf16_sqnr_db}")
+    if not math.isfinite(max_top1_flip_rate) or not (0.0 <= max_top1_flip_rate <= 1.0):
+        raise ValueError(f"max_top1_flip_rate must be finite and in [0, 1], got {max_top1_flip_rate}")
+    if not math.isfinite(max_kl_t1) or max_kl_t1 < 0.0:
+        raise ValueError(f"max_kl_t1 must be finite and >= 0, got {max_kl_t1}")
+
+
 def certify_lm_head_dual_plane(
     weights_fp32: np.ndarray | None = None,
     vocab_size: int = 4096,
@@ -250,6 +266,12 @@ def certify_lm_head_dual_plane(
     max_kl_t1: float = 1.0e-4,
 ) -> dict[str, Any]:
     """Certify ``DualPlaneNvfp4`` (`8.5 bpw`) and BF16 ``lm_head`` numerical exactness."""
+    _validate_lm_head_gates(
+        min_dual_plane_sqnr_db=min_dual_plane_sqnr_db,
+        strict_bf16_sqnr_db=strict_bf16_sqnr_db,
+        max_top1_flip_rate=max_top1_flip_rate,
+        max_kl_t1=max_kl_t1,
+    )
     rng = np.random.default_rng(seed)
     if weights_fp32 is None:
         if vocab_size < 2 or hidden_size <= 0 or hidden_size % DUAL_PLANE_GROUP_SIZE != 0:
@@ -317,14 +339,24 @@ def certify_lm_head_dual_plane(
     # Hardware-exact 8.5 bpw DualPlaneNvfp4 gate (matches dual_plane.rs:604 ~38.5 dB ceiling)
     # + strict >=45 dB BF16-equivalence check (satisfied by BF16 ~55.6 dB; reported honestly for 8.5 bpw).
     failures: list[str] = []
+    for metric_name, metric_val in (
+        ("dp_weight_sqnr", dp_weight_sqnr),
+        ("dp_logit_sqnr", dp_logit_sqnr),
+        ("gain_over_fp8", gain_over_fp8),
+        ("top1_flip_rate", top1_flip_rate),
+        ("mean_kl_dp", mean_kl_dp),
+        ("bf16_logit_sqnr", bf16_logit_sqnr),
+    ):
+        if not math.isfinite(metric_val):
+            failures.append(f"non-finite metric `{metric_name}`={metric_val}")
     if dp_weight_sqnr < min_dual_plane_sqnr_db:
         failures.append(f"DualPlaneNvfp4 weight SQNR {dp_weight_sqnr:.2f} dB < {min_dual_plane_sqnr_db:.2f} dB")
     if gain_over_fp8 < 6.0:
         failures.append(f"DualPlaneNvfp4 gain over block-128 FP8 {gain_over_fp8:.2f} dB < 6.00 dB")
-    if top1_flip_rate >= max_top1_flip_rate:
-        failures.append(f"DualPlaneNvfp4 top-1 flip rate {top1_flip_rate:.6f} >= {max_top1_flip_rate:.6f}")
-    if mean_kl_dp >= max_kl_t1:
-        failures.append(f"DualPlaneNvfp4 mean D_KL@T=1.0 {mean_kl_dp:.3e} >= {max_kl_t1:.3e}")
+    if top1_flip_rate > max_top1_flip_rate:
+        failures.append(f"DualPlaneNvfp4 top-1 flip rate {top1_flip_rate:.6f} > {max_top1_flip_rate:.6f}")
+    if mean_kl_dp > max_kl_t1:
+        failures.append(f"DualPlaneNvfp4 mean D_KL@T=1.0 {mean_kl_dp:.3e} > {max_kl_t1:.3e}")
     if bf16_logit_sqnr < strict_bf16_sqnr_db:
         failures.append(f"BF16 reference logit SQNR {bf16_logit_sqnr:.2f} dB < {strict_bf16_sqnr_db:.2f} dB")
     if not tie_break["passed"]:
@@ -663,14 +695,22 @@ def _load_weight_matrix(path: Path, key: str | None) -> np.ndarray:
 
 def run_self_test() -> int:
     """Run full offline quantization exactness certification + negative fail-closed checks."""
-    lm_res = certify_lm_head_dual_plane(vocab_size=2048, hidden_size=256, num_queries=256, seed=77)
+    # Exact zero-flip gate (`max_top1_flip_rate=0.0`) must pass when measured flip rate is 0.0.
+    lm_res = certify_lm_head_dual_plane(
+        vocab_size=2048,
+        hidden_size=256,
+        num_queries=256,
+        seed=77,
+        max_top1_flip_rate=0.0,
+    )
     assert lm_res["passed"], f"LM-head DualPlaneNvfp4 cert failed: {lm_res['failures']}"
+    assert lm_res["metrics"]["dual_plane_top1_flip_rate"] == 0.0
     assert lm_res["metrics"]["bf16_meets_strict_45db_gate"], "BF16 reference must pass >=45 dB"
     assert not lm_res["metrics"]["dual_plane_meets_strict_45db_gate"], (
         "8.5 bpw DualPlaneNvfp4 has ~38.5 dB ceiling and must honestly report <45 dB"
     )
 
-    # Negative check: demanding 45 dB from 8.5 bpw DualPlaneNvfp4 MUST fail closed!
+    # Negative check A: demanding 45 dB from 8.5 bpw DualPlaneNvfp4 MUST fail closed!
     strict_fail = certify_lm_head_dual_plane(
         vocab_size=512,
         hidden_size=128,
@@ -679,6 +719,20 @@ def run_self_test() -> int:
         min_dual_plane_sqnr_db=45.0,
     )
     assert not strict_fail["passed"], "min_dual_plane_sqnr_db=45.0 must fail closed on 8.5 bpw DualPlane"
+
+    # Negative check B: NaN / out-of-range gate parameters MUST fail closed via ValueError!
+    for bad_kwargs in (
+        {"min_dual_plane_sqnr_db": float("nan")},
+        {"max_top1_flip_rate": float("nan")},
+        {"max_kl_t1": float("nan")},
+        {"max_kl_t1": -1.0e-5},
+        {"max_top1_flip_rate": 1.5},
+    ):
+        try:
+            certify_lm_head_dual_plane(vocab_size=64, hidden_size=32, num_queries=8, seed=77, **bad_kwargs)
+            raise AssertionError(f"invalid gate kwargs {bad_kwargs} must raise ValueError")
+        except ValueError:
+            pass
 
     kv_res = certify_bitfp4_razer_kv(num_tokens=64, num_queries=16, seed=77)
     assert kv_res["passed"], f"BitFP4+RaZeR KV cert failed: {kv_res['failures']}"
@@ -689,7 +743,11 @@ def run_self_test() -> int:
                 "self_test": "PASS",
                 "lm_head_dual_plane": lm_res,
                 "bitfp4_razer_kv": kv_res,
-                "negative_gates_verified": ["dual_plane_45db_strict_fails_closed"],
+                "negative_gates_verified": [
+                    "dual_plane_45db_strict_fails_closed",
+                    "nan_and_oob_gates_rejected",
+                    "zero_flip_rate_exact_gate_passes",
+                ],
             },
             indent=2,
         )
@@ -725,6 +783,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.self_test:
         return run_self_test()
+
+    try:
+        _validate_lm_head_gates(
+            min_dual_plane_sqnr_db=args.min_sqnr_db,
+            strict_bf16_sqnr_db=45.0,
+            max_top1_flip_rate=args.max_top1_flip_rate,
+            max_kl_t1=args.max_kl,
+        )
+    except ValueError as err:
+        raise SystemExit(f"error: {err}") from err
 
     w = _load_weight_matrix(args.weights, args.weight_key) if args.weights else None
     lm_res = certify_lm_head_dual_plane(
