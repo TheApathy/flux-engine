@@ -124,3 +124,6 @@ ATLAS_DUAL_PLANE_NVFP4	NUMERICS	repacks BF16/FP8 weights into 8.5 bpw shared-sca
 ATLAS_DUAL_PLANE_SELF_SPEC	ROUTE	opt-in W_hi DualPlaneNvfp4 self-speculation; target verify preserves DualPlaneNvfp4 output (speculative_self.rs)
 ATLAS_FUSED_RMSNORM_NVFP4	NUMERICS	opt-in single-pass Blackwell RMSNorm/SwiGLU -> E2M1 NVFP4 activation fusion (layers/ops/rmsnorm_nvfp4.rs)
 ATLAS_LM_HEAD_FUSED_ARGMAX	ROUTE	opt-in fused two-stage NVFP4 LM-head + online warp/block argmax for greedy verify (ops/lm_head_argmax.rs)
+ATLAS_DCOCO_SIDECAR	RESOURCE	canonical filesystem path to authenticated ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
+ATLAS_DCOCO_SIDECAR_SHA256	RESOURCE	expected SHA-256 digest authenticating ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
+ATLAS_DCOCO_SIDECAR_SIZE	RESOURCE	expected exact byte size authenticating ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
