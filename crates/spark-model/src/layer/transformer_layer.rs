@@ -1224,6 +1224,26 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// Snapshot this SSM layer's staged 1D GDN correction-record commit descriptor
+    /// (`ATLAS_GDN_1D_REPLAY=1`), returning `Ok(None)` for non-SSM layers or when
+    /// no 1D verify window is currently staged.
+    fn gdn_1d_replay_commit_desc(&self) -> Result<Option<crate::layers::ops::GdnCommitSlotDesc>> {
+        Ok(None)
+    }
+
+    /// Advance this SSM layer's 1D GDN slot generation (`ATLAS_GDN_1D_REPLAY=1`)
+    /// after commit, rollback, checkpoint reset, or verify abort so stale records
+    /// fail closed if re-submitted. Default no-op.
+    fn gdn_1d_replay_invalidate_generation(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Optional SM120/SM121 cross-layer 1D GDN commit replay kernel handle
+    /// (`gdn_commit_replay_1d_sm120`). Null for non-SSM layers or older bundles.
+    fn gdn_1d_replay_commit_kernel(&self) -> spark_runtime::gpu::KernelHandle {
+        spark_runtime::gpu::KernelHandle(0)
+    }
+
     /// Whether this layer can participate in zero-replay `KEEP_LATE` DeltaNet
     /// commits (fused multi-seq lazyfinal kernel loaded with group-done counter).
     /// Default `false` — non-SSM layers.

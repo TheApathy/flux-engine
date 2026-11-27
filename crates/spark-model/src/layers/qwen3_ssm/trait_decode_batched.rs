@@ -483,9 +483,15 @@ impl Qwen3SsmLayer {
         // Layout per token: [gate(nv), beta(nv)] → stride = 2*nv FP32 elements.
         // Must match gdn_decode_chunk2's gb_stride parameter.
         let max_k = crate::layers::qwen3_ssm::GDN_LAZY_MAX_K;
-        let gdn_nosnap = std::env::var("ATLAS_SSM_GDN_NOSNAP").ok().as_deref() == Some("1")
+        let gdn_1d_replay_policy = ops::gdn_1d_replay_policy()?;
+        let gdn_1d_replay_on_exact_seq = gdn_1d_replay_policy == ops::Gdn1dReplayPolicy::Enabled
+            && !force_serial_recurrent
+            && exact_flat_route == ExactFlatSsmRoute::ExactSequence;
+        let gdn_nosnap = !gdn_1d_replay_on_exact_seq
+            && std::env::var("ATLAS_SSM_GDN_NOSNAP").ok().as_deref() == Some("1")
             && self.gdn_f32_sequence_nosnap_k.0 != 0;
-        let gdn_seq_lazy = !gdn_nosnap
+        let gdn_seq_lazy = !gdn_1d_replay_on_exact_seq
+            && !gdn_nosnap
             && self.gdn_seq_lazy_engaged_inner(num_tokens)
             && ctx.ddtree_parent_ids_dev.is_none();
         // Write BA gates and FP32 conv1d outputs directly into this layer's
@@ -719,10 +725,6 @@ impl Qwen3SsmLayer {
         // out-of-bounds panic instead of an actionable error. Common cause: an
         // EP=2 worker started without `--speculative --mtp-quantization` to
         // mirror the head node.
-        let gdn_1d_replay_policy = ops::gdn_1d_replay_policy()?;
-        let gdn_1d_replay_on_exact_seq = gdn_1d_replay_policy == ops::Gdn1dReplayPolicy::Enabled
-            && !force_serial_recurrent
-            && exact_flat_route == ExactFlatSsmRoute::ExactSequence;
         if (!gdn_1d_replay_on_exact_seq && ssm_state.h_state_intermediates.len() < num_tokens)
             || ssm_state.conv_state_intermediates.len() < num_tokens
         {
@@ -835,28 +837,55 @@ impl Qwen3SsmLayer {
                     "H",
                 )?
             };
-            let gdn_1d_verify_args = gdn_1d_replay::ExactSequenceGdn1dVerifyArgs {
-                h_state: ssm_state.h_state,
-                h_is_f16: ssm_state.h_is_f16,
-                conv_f32,
-                gdn_f32,
-                gates_buf,
-                live_tokens: num_tokens as u32,
-                max_tokens: max_k.max(num_tokens) as u32,
-                nk: nk as u32,
-                nv: nv as u32,
-                kd: kd as u32,
-                vd: vd as u32,
-                key_dim,
-                qkvz_size: qkvz_size as u32,
-                graph_capture: ctx.graph_capture,
-                has_tree_parent_ids: ctx.ddtree_parent_ids_dev.is_some(),
-            };
-            if gdn_1d_replay_on_exact_seq {
+            let gdn_1d_verify_args = if gdn_1d_replay_on_exact_seq {
+                let backing_conv_bytes = if direct_retain.is_some() {
+                    max_k
+                        .checked_mul(qkvz_size)
+                        .and_then(|v| v.checked_mul(fp32))
+                        .ok_or_else(|| anyhow::anyhow!("GDN 1D direct_retain byte size overflow"))?
+                } else {
+                    ctx.buffers.sizes().ssm_conv_out_f32
+                };
+                let output_capacity_bytes =
+                    backing_conv_bytes.checked_sub(conv_dim * fp32).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ATLAS_GDN_1D_REPLAY=1 ssm_conv_out_f32 ({backing_conv_bytes} B) smaller than conv_dim offset ({} B)",
+                            conv_dim * fp32
+                        )
+                    })?;
+                let bounded_max_tokens = gdn_1d_replay::bounded_verify_max_tokens(
+                    num_tokens as u32,
+                    max_k.max(num_tokens) as u32,
+                    qkvz_size as u32,
+                    nv as u32,
+                    output_capacity_bytes,
+                )?;
+                let verify_args = gdn_1d_replay::ExactSequenceGdn1dVerifyArgs {
+                    h_state: ssm_state.h_state,
+                    h_is_f16: ssm_state.h_is_f16,
+                    conv_f32,
+                    gdn_f32,
+                    gates_buf,
+                    output_capacity_bytes,
+                    live_tokens: num_tokens as u32,
+                    max_tokens: bounded_max_tokens,
+                    nk: nk as u32,
+                    nv: nv as u32,
+                    kd: kd as u32,
+                    vd: vd as u32,
+                    key_dim,
+                    qkvz_size: qkvz_size as u32,
+                    graph_capture: ctx.graph_capture,
+                    has_tree_parent_ids: ctx.ddtree_parent_ids_dev.is_some(),
+                };
                 // Fail closed BEFORE mutating conv_state on GPU if kernels,
-                // geometry, state format, or graph-capture preconditions fail.
-                self.preflight_gdn_1d_replay_exact_sequence(ctx.gpu, &gdn_1d_verify_args, stream)?;
-            }
+                // geometry, output capacity, sharing, alignment, state format,
+                // or graph-capture preconditions fail.
+                self.preflight_gdn_1d_replay_exact_sequence(ctx.gpu, &verify_args, stream)?;
+                Some(verify_args)
+            } else {
+                None
+            };
             crate::kprof!(ctx.gpu, stream, "ssm_conv_fp32_seq", {
                 ops::conv1d_update_l2norm_f32_sequence(
                     ctx.gpu,
@@ -879,8 +908,8 @@ impl Qwen3SsmLayer {
                 )?;
                 anyhow::Result::<()>::Ok(())
             })?;
-            let gdn_1d_verify_outcome = if gdn_1d_replay_on_exact_seq {
-                self.try_gdn_1d_replay_verify_exact_sequence(ctx.gpu, &gdn_1d_verify_args, stream)?
+            let gdn_1d_verify_outcome = if let Some(ref verify_args) = gdn_1d_verify_args {
+                self.try_gdn_1d_replay_verify_exact_sequence(ctx.gpu, verify_args, stream)?
             } else {
                 gdn_1d_replay::Gdn1dReplayVerifyOutcome::Disabled
             };

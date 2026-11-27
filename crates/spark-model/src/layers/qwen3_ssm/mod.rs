@@ -1264,6 +1264,18 @@ impl TransformerLayer for Qwen3SsmLayer {
         (lane < pool.lanes).then(|| pool.retain_active_ptr(lane))
     }
 
+    fn gdn_1d_replay_commit_desc(&self) -> Result<Option<ops::GdnCommitSlotDesc>> {
+        self.try_current_gdn_1d_commit_desc()
+    }
+
+    fn gdn_1d_replay_invalidate_generation(&self) -> Result<()> {
+        self.invalidate_gdn_1d_replay_generation()
+    }
+
+    fn gdn_1d_replay_commit_kernel(&self) -> KernelHandle {
+        self.gdn_1d_replay_k.commit_replay_1d
+    }
+
     fn gdn_keep_late_supported(&self) -> bool {
         self.gdn_keep_late_supported_inner()
     }

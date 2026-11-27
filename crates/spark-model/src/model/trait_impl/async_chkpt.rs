@@ -38,6 +38,9 @@ impl TransformerModel {
         let mut allocated_ckpt = false;
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == LayerType::LinearAttention {
+                // Advance any staged 1D GDN slot generation when establishing a
+                // fresh checkpoint so pre-checkpoint 1D records fail closed.
+                self.layers[i].gdn_1d_replay_invalidate_generation()?;
                 let ssm = layer_state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
@@ -104,6 +107,16 @@ impl TransformerModel {
             seq.slot_idx,
         );
 
+        let gdn_1d_replay_active = ops::gdn_1d_replay_policy()? == ops::Gdn1dReplayPolicy::Enabled;
+        if gdn_1d_replay_active {
+            anyhow::ensure!(
+                num_accepted == 0,
+                "start_rollback_and_checkpoint_async_dispatch(num_accepted={num_accepted}) is \
+                 unsupported under ATLAS_GDN_1D_REPLAY=1 because 2D h_state_intermediates are not \
+                 written; commit partial/full accepts via commit_verify_state_async_dispatch"
+            );
+        }
+
         if num_accepted == 0 {
             anyhow::ensure!(
                 !self.is_h_ckpt_stale(seq.slot_idx),
@@ -118,6 +131,9 @@ impl TransformerModel {
 
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == LayerType::LinearAttention {
+                // Advance any staged 1D GDN slot generation when establishing a
+                // fresh checkpoint so pre-checkpoint 1D records fail closed.
+                self.layers[i].gdn_1d_replay_invalidate_generation()?;
                 let ssm = layer_state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
@@ -192,7 +208,15 @@ impl TransformerModel {
         use crate::layer::SsmLayerState;
 
         let stream = self.gpu.default_stream();
+        let gdn_1d_replay_active = ops::gdn_1d_replay_policy()? == ops::Gdn1dReplayPolicy::Enabled;
         if in_verify_abort() {
+            if gdn_1d_replay_active {
+                for (i, layer) in self.layers.iter().enumerate() {
+                    if self.config.layer_type(i) == LayerType::LinearAttention {
+                        layer.gdn_1d_replay_invalidate_generation()?;
+                    }
+                }
+            }
             // Error-only abort rollback: determine whether the GPU already
             // executed a staged KEEP_LATE verify before flushing any remaining
             // pending rows, then leave live + checkpoint conv state consistent.
@@ -241,6 +265,7 @@ impl TransformerModel {
                 self.prewarm_gdn_lazy_retain_pools(prewarm_k)?;
             }
             if let Some((k, is_batch)) = active_frame
+                && !gdn_1d_replay_active
                 && self.can_stage_keep_late_for_frame(k, is_batch)
             {
                 let live_clean = self.take_live_state_clean(seq.slot_idx);
@@ -303,10 +328,15 @@ impl TransformerModel {
     }
 
     fn restore_pre_verify_ssm_and_ple(&self, seq: &mut SequenceState, stream: u64) -> Result<()> {
+        let gdn_1d_replay_active = ops::gdn_1d_replay_policy()? == ops::Gdn1dReplayPolicy::Enabled;
         let skip_h_ckpt_restore =
             self.ssm_pool.compact_lazy_h || self.is_h_ckpt_stale(seq.slot_idx);
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == LayerType::LinearAttention {
+                // Restoring pre-verify checkpoints invalidates any stale staged 1D record.
+                if gdn_1d_replay_active {
+                    self.layers[i].gdn_1d_replay_invalidate_generation()?;
+                }
                 let ssm = layer_state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
@@ -662,10 +692,12 @@ impl TransformerModel {
             flat_tree_injected,
         );
 
+        let gdn_1d_replay_active = ops::gdn_1d_replay_policy()? == ops::Gdn1dReplayPolicy::Enabled;
         let flags = self.commit_runtime_flags;
         let h_bytes = self.ssm_pool.h_bytes;
         let conv_bytes = self.ssm_pool.conv_bytes;
-        let can_batch = self.supports_verify_batch_cached()
+        let can_batch = !gdn_1d_replay_active
+            && self.supports_verify_batch_cached()
             && !was_tree_mode
             && h_bytes.is_multiple_of(4)
             && conv_bytes.is_multiple_of(4);
@@ -1013,10 +1045,15 @@ impl TransformerModel {
         // Refuse before any recurrent/PLE effect, so the owner can still abort.
         self.check_qsa_journal_commit(seq)?;
 
+        let gdn_1d_replay_active = ops::gdn_1d_replay_policy()? == ops::Gdn1dReplayPolicy::Enabled;
+
         if num_accepted == 0 {
             for (i, layer) in self.layers.iter().enumerate() {
                 if self.config.layer_type(i) == LayerType::LinearAttention {
                     layer.gdn_keep_late_clear_pending(seq.slot_idx);
+                    if gdn_1d_replay_active {
+                        layer.gdn_1d_replay_invalidate_generation()?;
+                    }
                 }
             }
             self.clear_live_state_clean(seq.slot_idx);
@@ -1118,8 +1155,84 @@ impl TransformerModel {
         let mut all_h_ckpt_written = true;
 
         let stream = self.secondary_stream;
-        let keep_late_ready = self.can_commit_keep_late_slot(seq, num_accepted, k, was_tree_mode);
-        if !keep_late_ready {
+        let keep_late_ready = !gdn_1d_replay_active
+            && self.can_commit_keep_late_slot(seq, num_accepted, k, was_tree_mode);
+        if gdn_1d_replay_active {
+            anyhow::ensure!(
+                !skip_restore,
+                "ATLAS_GDN_1D_REPLAY=1 commit is incompatible with skip_restore diagnostic"
+            );
+            let mut ssm_live_states: Vec<(usize, DevicePtr, bool)> =
+                Vec::with_capacity(self.ssm_pool.num_ssm_layers);
+            for (i, layer_state) in seq.layer_states.iter().enumerate() {
+                if self.config.layer_type(i) != LayerType::LinearAttention {
+                    continue;
+                }
+                let ssm = layer_state
+                    .as_any()
+                    .downcast_ref::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                ssm_live_states.push((i, ssm.h_state, ssm.h_is_f16));
+            }
+            execute_gdn_1d_cross_layer_commit_on_layers(
+                self.gpu.as_ref(),
+                &self.layers,
+                &ssm_live_states,
+                num_accepted,
+                nk,
+                nv,
+                kd,
+                vd,
+                was_tree_mode,
+                stream,
+            )?;
+
+            // Mirror updated FP32 `h_state` (unless no_mirror) and commit exact
+            // `conv_state` + `conv_ckpt` for every SSM layer.
+            let mut ssm_layer_idx = 0usize;
+            for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
+                if self.config.layer_type(i) != LayerType::LinearAttention {
+                    continue;
+                }
+                let ssm = layer_state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                if let Some(conv_ckpt) = ssm.conv_state_checkpoint {
+                    let conv_src = if num_accepted < k {
+                        let conv_inter = self.ssm_pool.conv_intermediate(
+                            ssm_layer_idx,
+                            seq.slot_idx,
+                            last_inter_slot,
+                        );
+                        self.gpu
+                            .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
+                        conv_inter
+                    } else {
+                        ssm.conv_state
+                    };
+                    self.gpu
+                        .copy_d2d_async(conv_src, conv_ckpt, conv_bytes, stream)?;
+                }
+                if no_mirror_req || ssm.h_state_checkpoint.is_none() {
+                    any_h_ckpt_skipped = true;
+                    all_h_ckpt_written = false;
+                } else if let Some(h_ckpt) = ssm.h_state_checkpoint {
+                    self.gpu
+                        .copy_d2d_async(ssm.h_state, h_ckpt, h_bytes, stream)?;
+                }
+                ssm_layer_idx += 1;
+            }
+            if any_h_ckpt_skipped {
+                self.mark_h_ckpt_stale(seq.slot_idx);
+                log_qwen4_gdn_commit_no_mirror_engaged();
+            } else if all_h_ckpt_written {
+                self.clear_h_ckpt_stale(seq.slot_idx);
+            }
+            self.clear_conv_ckpt_stale(seq.slot_idx);
+            self.mark_live_state_clean(seq.slot_idx);
+            super::verify_qwen4_batched::reset_dedup_slot(seq.slot_idx);
+        } else if !keep_late_ready {
             let mut ssm_layer_idx = 0usize;
 
             for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
@@ -1571,6 +1684,199 @@ impl GdnLazyfinalSplitv4Cache {
 fn gdn_lazyfinal_splitv4_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
     static CACHE: GdnLazyfinalSplitv4Cache = GdnLazyfinalSplitv4Cache::new();
     CACHE.get_or_load(gpu)
+}
+
+#[derive(Clone, Copy)]
+struct Gdn1dCommitStaging {
+    descs_dev: DevicePtr,
+    cap_descs: usize,
+    accepted_dev: DevicePtr,
+    status_dev: DevicePtr,
+}
+
+fn ensure_gdn_1d_commit_staging(
+    gpu: &dyn GpuBackend,
+    num_descs: usize,
+    stream: u64,
+) -> Result<(DevicePtr, DevicePtr, DevicePtr)> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<(usize, u64), Gdn1dCommitStaging>>> =
+        std::sync::OnceLock::new();
+    anyhow::ensure!(
+        num_descs > 0,
+        "GDN 1D commit staging requires num_descs > 0"
+    );
+    let key = (std::ptr::from_ref(gpu) as *const () as usize, stream);
+    let mut map = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock();
+    if let Some(entry) = map.get(&key).copied()
+        && entry.cap_descs >= num_descs
+    {
+        return Ok((entry.descs_dev, entry.accepted_dev, entry.status_dev));
+    }
+
+    let capturing = spark_runtime::gpu_capture_region::active_capture_region().is_some()
+        || gpu.stream_is_capturing(stream)
+        || gpu.stream_is_capturing(gpu.default_stream());
+    anyhow::ensure!(
+        !capturing,
+        "ATLAS_GDN_1D_REPLAY=1 cannot allocate/grow cross-layer commit staging during CUDA graph capture"
+    );
+
+    let desc_bytes = num_descs
+        .checked_mul(ops::GdnCommitSlotDesc::ABI_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("GDN 1D commit descriptor staging size overflow"))?;
+    let new_descs = gpu.alloc(desc_bytes)?;
+    if let Some(prev) = map.get(&key).copied() {
+        if let Err(err) = gpu.synchronize(stream) {
+            let _ = gpu.free(new_descs);
+            return Err(err);
+        }
+        let _ = gpu.free(prev.descs_dev);
+        let updated = Gdn1dCommitStaging {
+            descs_dev: new_descs,
+            cap_descs: num_descs,
+            accepted_dev: prev.accepted_dev,
+            status_dev: prev.status_dev,
+        };
+        map.insert(key, updated);
+        return Ok((updated.descs_dev, updated.accepted_dev, updated.status_dev));
+    }
+
+    let accepted_dev = match gpu.alloc(4) {
+        Ok(ptr) => ptr,
+        Err(err) => {
+            let _ = gpu.free(new_descs);
+            return Err(err);
+        }
+    };
+    let status_dev = match gpu.alloc(4) {
+        Ok(ptr) => ptr,
+        Err(err) => {
+            let _ = gpu.free(accepted_dev);
+            let _ = gpu.free(new_descs);
+            return Err(err);
+        }
+    };
+    let entry = Gdn1dCommitStaging {
+        descs_dev: new_descs,
+        cap_descs: num_descs,
+        accepted_dev,
+        status_dev,
+    };
+    map.insert(key, entry);
+    Ok((entry.descs_dev, entry.accepted_dev, entry.status_dev))
+}
+
+/// Execute ONE device-driven cross-layer `gdn_commit_replay_1d_sm120` commit
+/// across all SSM layers for a single sequence verify window, then advance
+/// every SSM layer's slot generation so the consumed 1D record cannot be
+/// replayed twice.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper matching TransformerModel SSM commit geometry"
+)]
+fn execute_gdn_1d_cross_layer_commit_on_layers(
+    gpu: &dyn GpuBackend,
+    layers: &[Box<dyn TransformerLayer>],
+    ssm_live_states: &[(usize, DevicePtr, bool)],
+    num_accepted: usize,
+    nk: usize,
+    nv: usize,
+    kd: usize,
+    vd: usize,
+    was_tree_mode: bool,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        !was_tree_mode,
+        "ATLAS_GDN_1D_REPLAY=1 commit does not support tree-mode verify (fail closed)"
+    );
+    anyhow::ensure!(
+        kd == ops::GDN_1D_HEAD_DIM as usize && vd == ops::GDN_1D_HEAD_DIM as usize,
+        "ATLAS_GDN_1D_REPLAY=1 commit requires kd==128 and vd==128; got kd={kd}, vd={vd}"
+    );
+    anyhow::ensure!(
+        nk > 0 && nv > 0 && nv.is_multiple_of(nk),
+        "ATLAS_GDN_1D_REPLAY=1 commit invalid head geometry nk={nk}, nv={nv}"
+    );
+    anyhow::ensure!(
+        !ssm_live_states.is_empty(),
+        "ATLAS_GDN_1D_REPLAY=1 commit requires at least one SSM layer"
+    );
+    let num_accepted_u32 = u32::try_from(num_accepted)
+        .map_err(|_| anyhow::anyhow!("ATLAS_GDN_1D_REPLAY=1 num_accepted exceeds u32"))?;
+
+    let mut descs = Vec::with_capacity(ssm_live_states.len());
+    let mut commit_kernel = KernelHandle(0);
+    for &(layer_idx, live_h_state, h_is_f16) in ssm_live_states {
+        anyhow::ensure!(
+            !h_is_f16,
+            "ATLAS_GDN_1D_REPLAY=1 commit requires canonical FP32 h_state at layer {layer_idx}"
+        );
+        let layer = layers
+            .get(layer_idx)
+            .ok_or_else(|| anyhow::anyhow!("SSM layer index {layer_idx} out of bounds"))?;
+        let k_handle = layer.gdn_1d_replay_commit_kernel();
+        anyhow::ensure!(
+            k_handle.0 != 0,
+            "ATLAS_GDN_1D_REPLAY=1 commit kernel missing on SSM layer {layer_idx}"
+        );
+        if commit_kernel.0 == 0 {
+            commit_kernel = k_handle;
+        }
+        let desc = layer.gdn_1d_replay_commit_desc()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "ATLAS_GDN_1D_REPLAY=1 commit missing staged 1D correction record on layer {layer_idx}"
+            )
+        })?;
+        anyhow::ensure!(
+            desc.h_state_ptr == live_h_state.0,
+            "ATLAS_GDN_1D_REPLAY=1 commit live h_state ({:#x}) differs from staged record ({:#x}) on layer {layer_idx}",
+            live_h_state.0,
+            desc.h_state_ptr
+        );
+        anyhow::ensure!(
+            num_accepted_u32 <= desc.max_tokens,
+            "ATLAS_GDN_1D_REPLAY=1 commit num_accepted ({num_accepted_u32}) > staged max_tokens ({}) on layer {layer_idx}",
+            desc.max_tokens
+        );
+        descs.push(desc);
+    }
+
+    let num_ssm_layers_u32 = u32::try_from(descs.len())
+        .map_err(|_| anyhow::anyhow!("ATLAS_GDN_1D_REPLAY=1 layer count exceeds u32"))?;
+    let commit = crate::layers::qwen3_ssm::gdn_1d_replay::Gdn1dReplayCrossLayerCommit::try_new(
+        num_ssm_layers_u32,
+        1,
+        nk as u32,
+        nv as u32,
+        descs,
+    )?;
+
+    let (descs_dev, accepted_dev, status_dev) =
+        ensure_gdn_1d_commit_staging(gpu, ssm_live_states.len(), stream)?;
+    gpu.copy_h2d_async(&num_accepted_u32.to_le_bytes(), accepted_dev, stream)?;
+    gpu.memset_async(status_dev, 0, 4, stream)?;
+
+    let kernels = ops::GdnCorrectionReplayKernels {
+        verify_record_1d: KernelHandle(0),
+        commit_replay_1d: commit_kernel,
+        zero_tail_rows: KernelHandle(0),
+    };
+    commit.launch(
+        gpu,
+        &kernels,
+        descs_dev,
+        accepted_dev,
+        Some(status_dev),
+        stream,
+    )?;
+
+    // Advance every SSM layer's slot generation so the consumed 1D record
+    // fails closed if accidentally re-committed.
+    for &(layer_idx, _, _) in ssm_live_states {
+        layers[layer_idx].gdn_1d_replay_invalidate_generation()?;
+    }
+    Ok(())
 }
 
 fn log_qwen4_gdn_commit_no_mirror_engaged() {
@@ -2578,5 +2884,181 @@ mod keep_late_batch_h2d_tests {
                 (DevicePtr(0x4000_1000), 128, 64),
             ]
         );
+    }
+
+    #[test]
+    fn gdn_1d_cross_layer_commit_lifecycle_commits_once_invalidates_and_fails_closed() {
+        use super::execute_gdn_1d_cross_layer_commit_on_layers;
+        use crate::layer::{ForwardContext, LayerState, TransformerLayer};
+        use crate::layers::ops::{Gdn1dRecordGeometry, GdnCommitSlotDesc};
+        use crate::layers::qwen3_ssm::gdn_1d_replay::{Gdn1dAllocContext, Gdn1dReplayArena};
+        use anyhow::Result;
+        use spark_runtime::gpu::mock::MockGpuBackend;
+        use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+        use spark_runtime::kv_cache::PagedKvCache;
+
+        struct Fake1dSsmLayer {
+            arena: std::sync::Mutex<Gdn1dReplayArena>,
+            commit_k: KernelHandle,
+        }
+
+        impl TransformerLayer for Fake1dSsmLayer {
+            fn decode(
+                &self,
+                _: DevicePtr,
+                _: DevicePtr,
+                _: &mut dyn LayerState,
+                _: &mut PagedKvCache,
+                _: usize,
+                _: &mut Vec<u32>,
+                _: &mut Vec<u32>,
+                _: &mut Vec<u32>,
+                _: &ForwardContext,
+                _: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn prefill(
+                &self,
+                _: DevicePtr,
+                _: DevicePtr,
+                _: usize,
+                _: &mut dyn LayerState,
+                _: &mut PagedKvCache,
+                _: usize,
+                _: &mut Vec<u32>,
+                _: &mut Vec<u32>,
+                _: &mut Vec<u32>,
+                _: usize,
+                _: &ForwardContext,
+                _: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
+                anyhow::bail!("unused in mock 1D commit lifecycle test")
+            }
+            fn gdn_1d_replay_commit_desc(&self) -> Result<Option<GdnCommitSlotDesc>> {
+                let g = self.arena.lock().unwrap();
+                if !g.slot_state().recorded {
+                    return Ok(None);
+                }
+                Ok(Some(g.slot_state().to_commit_desc()?))
+            }
+            fn gdn_1d_replay_invalidate_generation(&self) -> Result<()> {
+                self.arena
+                    .lock()
+                    .unwrap()
+                    .slot_state_mut()
+                    .advance_generation();
+                Ok(())
+            }
+            fn gdn_1d_replay_commit_kernel(&self) -> KernelHandle {
+                self.commit_k
+            }
+        }
+
+        let gpu = MockGpuBackend::new();
+        let geom = Gdn1dRecordGeometry::try_new(1, 8, 16, 48).unwrap();
+        let h_bytes = geom.h_state_bytes().unwrap();
+
+        let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::new();
+        let mut live_states = Vec::new();
+        for layer_idx in 0..3usize {
+            let mut arena =
+                Gdn1dReplayArena::allocate(&gpu, geom, Gdn1dAllocContext::OutsideGraphCapture, 1)
+                    .unwrap();
+            let h_ptr = gpu.alloc(h_bytes).unwrap();
+            arena.slot_state_mut().record_verify(h_ptr, 6, 8).unwrap();
+            layers.push(Box::new(Fake1dSsmLayer {
+                arena: std::sync::Mutex::new(arena),
+                commit_k: KernelHandle(77),
+            }));
+            live_states.push((layer_idx, h_ptr, false));
+        }
+
+        // Tree mode, FP16 h_state, and OOB accepted MUST fail closed with 0 launches.
+        assert!(
+            execute_gdn_1d_cross_layer_commit_on_layers(
+                &gpu,
+                &layers,
+                &live_states,
+                4,
+                16,
+                48,
+                128,
+                128,
+                true,
+                1,
+            )
+            .is_err()
+        );
+        let mut fp16_states = live_states.clone();
+        fp16_states[1].2 = true;
+        assert!(
+            execute_gdn_1d_cross_layer_commit_on_layers(
+                &gpu,
+                &layers,
+                &fp16_states,
+                4,
+                16,
+                48,
+                128,
+                128,
+                false,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            execute_gdn_1d_cross_layer_commit_on_layers(
+                &gpu,
+                &layers,
+                &live_states,
+                9,
+                16,
+                48,
+                128,
+                128,
+                false,
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(gpu.launch_count(), 0);
+
+        // Valid partial accept dispatches EXACTLY ONE cross-layer commit across all 3 SSM layers!
+        execute_gdn_1d_cross_layer_commit_on_layers(
+            &gpu,
+            &layers,
+            &live_states,
+            4,
+            16,
+            48,
+            128,
+            128,
+            false,
+            1,
+        )
+        .unwrap();
+        assert_eq!(gpu.launch_count(), 1);
+
+        // Immediate duplicate commit MUST fail closed because generation was invalidated!
+        assert!(
+            execute_gdn_1d_cross_layer_commit_on_layers(
+                &gpu,
+                &layers,
+                &live_states,
+                4,
+                16,
+                48,
+                128,
+                128,
+                false,
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(gpu.launch_count(), 1);
     }
 }

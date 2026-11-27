@@ -172,6 +172,22 @@ impl Gdn1dReplayArena {
         alloc_context: Gdn1dAllocContext,
         stream: u64,
     ) -> Result<Self> {
+        Self::allocate_carrying(gpu, geometry, alloc_context, stream, None)
+    }
+
+    /// Allocate a replacement arena while carrying forward `generation + 1` and
+    /// `sharing_count` from `prior_slot` so arena resizing never resets generation
+    /// back to `1` or clears an active `sharing_count > 1` guard.
+    ///
+    /// # Errors
+    /// Returns an error if allocation fails or if invoked during CUDA graph capture.
+    pub fn allocate_carrying(
+        gpu: &dyn GpuBackend,
+        geometry: Gdn1dRecordGeometry,
+        alloc_context: Gdn1dAllocContext,
+        stream: u64,
+        prior_slot: Option<&Gdn1dReplaySlotState>,
+    ) -> Result<Self> {
         let capturing = matches!(alloc_context, Gdn1dAllocContext::DuringGraphCapture)
             || spark_runtime::gpu_capture_region::active_capture_region().is_some()
             || gpu.stream_is_capturing(stream)
@@ -189,10 +205,15 @@ impl Gdn1dReplayArena {
         let delta_ptr = base;
         let k_ptr = base.offset(geometry.k_offset_bytes);
         let decay_ptr = base.offset(geometry.decay_offset_bytes);
+        let mut slot_state = Gdn1dReplaySlotState::new_exclusive(delta_ptr, k_ptr, decay_ptr);
+        if let Some(prev) = prior_slot {
+            slot_state.generation = prev.generation.wrapping_add(1).max(1);
+            slot_state.sharing_count = prev.sharing_count;
+        }
         Ok(Self {
             base,
             geometry,
-            slot_state: Gdn1dReplaySlotState::new_exclusive(delta_ptr, k_ptr, decay_ptr),
+            slot_state,
         })
     }
 
@@ -337,6 +358,10 @@ pub(super) struct ExactSequenceGdn1dVerifyArgs {
     pub conv_f32: DevicePtr,
     pub gdn_f32: DevicePtr,
     pub gates_buf: DevicePtr,
+    /// Verified available byte capacity starting at `gdn_f32` inside its
+    /// backing allocation so tail-row zeroing `[live_tokens, max_tokens)` can
+    /// never write past the end of `ssm_conv_out_f32`.
+    pub output_capacity_bytes: usize,
     pub live_tokens: u32,
     pub max_tokens: u32,
     pub nk: u32,
@@ -347,6 +372,73 @@ pub(super) struct ExactSequenceGdn1dVerifyArgs {
     pub qkvz_size: u32,
     pub graph_capture: bool,
     pub has_tree_parent_ids: bool,
+}
+
+/// Compute the exact required byte span written from `output` (`gdn_f32`) for
+/// `max_tokens` rows at FP32 stride `out_stride` and `nv * 128` active columns.
+///
+/// # Errors
+/// Returns an error if `max_tokens == 0`, `out_stride < nv * 128`, or byte
+/// calculation overflows `usize`.
+pub fn required_verify_output_bytes(
+    max_tokens: u32,
+    out_stride: u32,
+    num_v_heads: u32,
+) -> Result<usize> {
+    ensure!(
+        max_tokens > 0,
+        "required_verify_output_bytes needs max_tokens > 0"
+    );
+    let value_dim = (num_v_heads as usize)
+        .checked_mul(GDN_1D_HEAD_DIM as usize)
+        .context("verify output value_dim overflow")?;
+    ensure!(
+        (out_stride as usize) >= value_dim,
+        "verify output stride ({out_stride}) < value_dim ({value_dim})"
+    );
+    let last_row_elem_offset = ((max_tokens - 1) as usize)
+        .checked_mul(out_stride as usize)
+        .context("verify output last-row offset overflow")?;
+    let total_elems = last_row_elem_offset
+        .checked_add(value_dim)
+        .context("verify output total elements overflow")?;
+    total_elems
+        .checked_mul(4)
+        .context("verify output byte span overflow")
+}
+
+/// Compute the maximum `max_tokens` (`>= live_tokens` and `<= desired_max_tokens`)
+/// whose FP32 output + tail-zero span fits strictly inside `output_capacity_bytes`.
+///
+/// # Errors
+/// Fails closed if `output_capacity_bytes` cannot even fit `live_tokens` rows.
+pub fn bounded_verify_max_tokens(
+    live_tokens: u32,
+    desired_max_tokens: u32,
+    out_stride: u32,
+    num_v_heads: u32,
+    output_capacity_bytes: usize,
+) -> Result<u32> {
+    ensure!(
+        live_tokens > 0,
+        "bounded_verify_max_tokens requires live_tokens > 0"
+    );
+    let live_req = required_verify_output_bytes(live_tokens, out_stride, num_v_heads)?;
+    ensure!(
+        live_req <= output_capacity_bytes,
+        "ATLAS_GDN_1D_REPLAY=1 output buffer capacity ({output_capacity_bytes} B) cannot hold live_tokens={live_tokens} (needs {live_req} B)"
+    );
+    let value_dim_bytes = (num_v_heads as usize)
+        .checked_mul(GDN_1D_HEAD_DIM as usize)
+        .and_then(|v| v.checked_mul(4))
+        .context("verify output value_dim bytes overflow")?;
+    let row_stride_bytes = (out_stride as usize)
+        .checked_mul(4)
+        .context("verify output row stride bytes overflow")?;
+    let extra_rows = (output_capacity_bytes - value_dim_bytes) / row_stride_bytes;
+    let max_fit = u32::try_from(extra_rows.saturating_add(1)).unwrap_or(u32::MAX);
+    let target = desired_max_tokens.max(live_tokens);
+    Ok(target.min(max_fit).max(live_tokens))
 }
 
 impl Qwen3SsmLayer {
@@ -375,19 +467,19 @@ impl Qwen3SsmLayer {
         };
         if needs_alloc {
             let default_stream = gpu.default_stream();
-            let new_arena = Gdn1dReplayArena::allocate(
+            let new_arena = Gdn1dReplayArena::allocate_carrying(
                 gpu,
                 geom,
                 Gdn1dAllocContext::OutsideGraphCapture,
                 default_stream,
+                guard.as_ref().map(Gdn1dReplayArena::slot_state),
             )?;
-            if let Some(old) = guard.as_ref() {
-                if let Err(err) = gpu.synchronize(default_stream) {
-                    let _ = gpu.free(new_arena.base());
-                    return Err(err)
-                        .context("synchronize before replacing GDN 1D correction-record arena");
-                }
-                let _ = old;
+            if guard.is_some()
+                && let Err(err) = gpu.synchronize(default_stream)
+            {
+                let _ = gpu.free(new_arena.base());
+                return Err(err)
+                    .context("synchronize before replacing GDN 1D correction-record arena");
             }
             if let Some(old) = guard.replace(new_arena) {
                 let _ = gpu.free(old.base());
@@ -401,14 +493,27 @@ impl Qwen3SsmLayer {
     /// # Errors
     /// Returns an error if no 1D correction record is currently staged.
     pub fn current_gdn_1d_commit_desc(&self) -> Result<GdnCommitSlotDesc> {
+        self.try_current_gdn_1d_commit_desc()?
+            .context("GDN 1D replay arena has no recorded correction window on this layer")
+    }
+
+    /// Snapshot this layer's current [`GdnCommitSlotDesc`] if a verify window is
+    /// staged, returning `Ok(None)` when no 1D record has been recorded yet.
+    ///
+    /// # Errors
+    /// Returns an error if the arena lock is poisoned.
+    pub fn try_current_gdn_1d_commit_desc(&self) -> Result<Option<GdnCommitSlotDesc>> {
         let guard = self
             .gdn_1d_replay_arena
             .lock()
             .map_err(|_| anyhow::anyhow!("gdn_1d_replay_arena lock poisoned"))?;
-        let arena = guard
-            .as_ref()
-            .context("GDN 1D replay arena has not been initialized on this layer")?;
-        arena.slot_state().to_commit_desc()
+        let Some(arena) = guard.as_ref() else {
+            return Ok(None);
+        };
+        if !arena.slot_state().recorded {
+            return Ok(None);
+        }
+        Ok(Some(arena.slot_state().to_commit_desc()?))
     }
 
     /// Advance this layer's slot generation on rollback/reset/eviction, invalidating
@@ -520,8 +625,38 @@ impl Qwen3SsmLayer {
         if args.live_tokens == 0 {
             bail!("ATLAS_GDN_1D_REPLAY=1 requires live_tokens > 0");
         }
-        let max_tokens = args.max_tokens.max(args.live_tokens);
-        let geom = Gdn1dRecordGeometry::try_new(1, max_tokens, args.nk, args.nv)?;
+        ensure!(
+            args.max_tokens >= args.live_tokens,
+            "ATLAS_GDN_1D_REPLAY=1 requires max_tokens ({}) >= live_tokens ({})",
+            args.max_tokens,
+            args.live_tokens
+        );
+        ensure!(
+            !args.h_state.is_null() && args.h_state.0.is_multiple_of(16),
+            "ATLAS_GDN_1D_REPLAY=1 h_state ({:#x}) must be non-null and 16-byte aligned",
+            args.h_state.0
+        );
+        for (ptr, label) in [
+            (args.conv_f32, "conv_f32"),
+            (args.gdn_f32, "gdn_f32"),
+            (args.gates_buf, "gates_buf"),
+        ] {
+            ensure!(
+                !ptr.is_null() && ptr.0.is_multiple_of(4),
+                "ATLAS_GDN_1D_REPLAY=1 {label} ({:#x}) must be non-null and 4-byte aligned",
+                ptr.0
+            );
+        }
+        let required_out_bytes =
+            required_verify_output_bytes(args.max_tokens, args.qkvz_size, args.nv)?;
+        ensure!(
+            required_out_bytes <= args.output_capacity_bytes,
+            "ATLAS_GDN_1D_REPLAY=1 output span ({required_out_bytes} B for max_tokens={}) exceeds backing buffer capacity ({} B)",
+            args.max_tokens,
+            args.output_capacity_bytes
+        );
+
+        let geom = Gdn1dRecordGeometry::try_new(1, args.max_tokens, args.nk, args.nv)?;
         let capturing = args.graph_capture
             || spark_runtime::gpu_capture_region::active_capture_region().is_some()
             || gpu.stream_is_capturing(stream)
@@ -530,6 +665,13 @@ impl Qwen3SsmLayer {
             .gdn_1d_replay_arena
             .lock()
             .map_err(|_| anyhow::anyhow!("gdn_1d_replay_arena lock poisoned"))?;
+        if let Some(existing) = guard.as_ref() {
+            ensure!(
+                existing.slot_state().sharing_count <= 1,
+                "ATLAS_GDN_1D_REPLAY=1 refuses verify on shared slot (sharing_count={})",
+                existing.slot_state().sharing_count
+            );
+        }
         let needs_alloc = match guard.as_ref() {
             Some(existing) => existing.geometry() != geom,
             None => true,
@@ -560,8 +702,7 @@ impl Qwen3SsmLayer {
         }
         self.preflight_gdn_1d_replay_exact_sequence(gpu, args, stream)?;
 
-        let max_tokens = args.max_tokens.max(args.live_tokens);
-        let geom = Gdn1dRecordGeometry::try_new(1, max_tokens, args.nk, args.nv)?;
+        let geom = Gdn1dRecordGeometry::try_new(1, args.max_tokens, args.nk, args.nv)?;
 
         let mut guard = self
             .gdn_1d_replay_arena
@@ -577,7 +718,13 @@ impl Qwen3SsmLayer {
             } else {
                 Gdn1dAllocContext::OutsideGraphCapture
             };
-            let new_arena = Gdn1dReplayArena::allocate(gpu, geom, alloc_ctx, stream)?;
+            let new_arena = Gdn1dReplayArena::allocate_carrying(
+                gpu,
+                geom,
+                alloc_ctx,
+                stream,
+                guard.as_ref().map(Gdn1dReplayArena::slot_state),
+            )?;
             if guard.is_some()
                 && let Err(err) = gpu.synchronize(stream)
             {
@@ -592,6 +739,12 @@ impl Qwen3SsmLayer {
         let arena = guard
             .as_mut()
             .context("GDN 1D replay arena unavailable after allocation")?;
+        // Re-check sharing_count under the held lock BEFORE launching on GPU.
+        ensure!(
+            arena.slot_state().sharing_count <= 1,
+            "ATLAS_GDN_1D_REPLAY=1 refuses verify on shared slot (sharing_count={})",
+            arena.slot_state().sharing_count
+        );
 
         let fp32 = 4usize;
         ops::launch_gdn_verify_record_1d_sm120(
@@ -620,7 +773,7 @@ impl Qwen3SsmLayer {
         )?;
         arena
             .slot_state_mut()
-            .record_verify(args.h_state, args.live_tokens, max_tokens)?;
+            .record_verify(args.h_state, args.live_tokens, args.max_tokens)?;
         Ok(Gdn1dReplayVerifyOutcome::Executed)
     }
 }
@@ -1125,5 +1278,44 @@ mod tests {
             Gdn1dReplayArena::allocate(&gpu, geom, Gdn1dAllocContext::DuringGraphCapture, 1)
                 .is_err()
         );
+
+        // Arena resize carries forward monotonic generation (gen -> gen + 1) and sharing_count.
+        let resized = Gdn1dReplayArena::allocate_carrying(
+            &gpu,
+            Gdn1dRecordGeometry::try_new(1, 32, 16, 48).unwrap(),
+            Gdn1dAllocContext::OutsideGraphCapture,
+            1,
+            Some(arena_l1.slot_state()),
+        )
+        .unwrap();
+        assert_eq!(
+            resized.slot_state().generation,
+            arena_l1.slot_state().generation + 1
+        );
+        assert_eq!(
+            resized.slot_state().sharing_count,
+            arena_l1.slot_state().sharing_count
+        );
+        assert!(!resized.slot_state().recorded);
+    }
+
+    #[test]
+    fn bounded_verify_max_tokens_prevents_oob_tail_zero_writes_and_fails_closed() {
+        // Qwen3.8-Flash-Next geometry: nv=48, value_dim=6144, conv_dim=10240, qkvz_size=16384.
+        let out_stride = 16_384u32;
+        let nv = 48u32;
+        let conv_dim_bytes = 10_240usize * 4;
+        // Suppose ssm_conv_out_f32 is sized for exactly 8 rows (8 * 16384 * 4 = 524,288 B).
+        let buf_8_rows = 8usize * (out_stride as usize) * 4;
+        let cap_from_gdn = buf_8_rows - conv_dim_bytes;
+
+        // Desired max_tokens=16 is bounded down to 8 so tail zeroing NEVER writes past buf_8_rows!
+        let bounded = bounded_verify_max_tokens(5, 16, out_stride, nv, cap_from_gdn).unwrap();
+        assert_eq!(bounded, 8);
+        assert!(required_verify_output_bytes(bounded, out_stride, nv).unwrap() <= cap_from_gdn);
+        assert!(required_verify_output_bytes(bounded + 1, out_stride, nv).unwrap() > cap_from_gdn);
+
+        // If buffer capacity cannot even hold live_tokens=9, fail closed!
+        assert!(bounded_verify_max_tokens(9, 16, out_stride, nv, cap_from_gdn).is_err());
     }
 }

@@ -340,8 +340,8 @@ extern "C" __global__ __launch_bounds__(128, 2) void gdn_verify_record_1d_sm120(
         static_cast<unsigned long long>(seq) * static_cast<unsigned long long>(max_tokens);
 
     __shared__ float4 smem_h_tile[4][32];
-    __shared__ float smem_k[GDN_1D_DIM];
-    __shared__ float smem_q[GDN_1D_DIM];
+    __shared__ alignas(16) float smem_k[GDN_1D_DIM];
+    __shared__ alignas(16) float smem_q[GDN_1D_DIM];
 
     if (active_tokens > 0u) {
         float H_reg[GDN_1D_DIM];
@@ -457,7 +457,7 @@ extern "C" __global__ __launch_bounds__(128, 2) void gdn_commit_replay_1d_sm120(
     __shared__ unsigned int smem_accepted;
     __shared__ unsigned int smem_err_bits;
     __shared__ float4 smem_h_tile[4][32];
-    __shared__ float smem_k[GDN_1D_DIM];
+    __shared__ alignas(16) float smem_k[GDN_1D_DIM];
 
     if (tid == 0u) {
         const unsigned long long desc_idx =

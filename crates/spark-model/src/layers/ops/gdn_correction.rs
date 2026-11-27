@@ -227,11 +227,13 @@ impl GdnCommitStatus {
 ///
 /// - Unset (`NotPresent`) or `"0"` -> `Ok(Disabled)`.
 /// - `"1"` -> `Ok(Enabled)`.
-/// - `NotUnicode` -> emits `tracing::warn!` and fails closed to `Ok(Disabled)`.
+/// - `NotUnicode` -> emits `tracing::warn!` and returns `Err(...)` (fail closed,
+///   matching `recipe_contract` non-UTF-8 refusal).
 /// - Any other UTF-8 value -> returns `Err(...)` (fail closed).
 ///
 /// # Errors
-/// Returns an error if a valid UTF-8 value other than `"0"` or `"1"` is set.
+/// Returns an error if the variable is non-UTF-8 or set to any UTF-8 value
+/// other than `"0"` or `"1"`.
 pub fn parse_gdn_1d_replay_env(
     value: std::result::Result<String, std::env::VarError>,
 ) -> Result<Gdn1dReplayPolicy> {
@@ -240,9 +242,9 @@ pub fn parse_gdn_1d_replay_env(
         Err(std::env::VarError::NotUnicode(_)) => {
             tracing::warn!(
                 env = GDN_1D_REPLAY_ENV_VAR,
-                "ATLAS_GDN_1D_REPLAY is not valid UTF-8; failing closed to Disabled (0)"
+                "ATLAS_GDN_1D_REPLAY is not valid UTF-8; refusing fail-closed"
             );
-            Ok(Gdn1dReplayPolicy::Disabled)
+            bail!("{GDN_1D_REPLAY_ENV_VAR} must be valid UTF-8 and exactly \"0\" or \"1\"")
         }
         Ok(raw) => match raw.as_str() {
             "0" => Ok(Gdn1dReplayPolicy::Disabled),
@@ -1670,9 +1672,9 @@ mod tests {
         let bad_os = OsString::from_vec(vec![0xff, 0xfe]);
         #[cfg(not(unix))]
         let bad_os = OsString::from("bad");
-        assert_eq!(
-            parse_gdn_1d_replay_env(Err(VarError::NotUnicode(bad_os))).unwrap(),
-            Gdn1dReplayPolicy::Disabled
+        assert!(
+            parse_gdn_1d_replay_env(Err(VarError::NotUnicode(bad_os))).is_err(),
+            "NotUnicode must fail closed with Err"
         );
     }
 
@@ -1978,6 +1980,8 @@ mod tests {
         assert!(cuda.contains("cvt.rn.bf16.f32"));
         assert!(cuda.contains("L2::evict_first"));
         assert!(cuda.contains("__CUDA_ARCH__ >= 1200"));
+        assert!(cuda.contains("__shared__ alignas(16) float smem_k[GDN_1D_DIM]"));
+        assert!(cuda.contains("__shared__ alignas(16) float smem_q[GDN_1D_DIM]"));
         assert!(cuda.contains("static_assert(sizeof(GdnCommitSlotDesc) == 64"));
     }
 }
