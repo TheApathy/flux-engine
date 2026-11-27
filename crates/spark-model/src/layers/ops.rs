@@ -13,6 +13,8 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/dcoco_selector.rs"]
+mod dcoco_selector;
 #[path = "ops/dflash2_conv.rs"]
 mod dflash2_conv;
 #[path = "ops/embeddings.rs"]
@@ -147,6 +149,7 @@ mod ssm_mamba;
 mod ssm_preproc;
 
 pub use activations::*;
+pub use dcoco_selector::*;
 pub use dflash2_conv::*;
 pub use embeddings::*;
 pub use fp8_moe::*;

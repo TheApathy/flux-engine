@@ -54,6 +54,7 @@ pub(super) struct ProposalPolicy {
     pub ddtree_nonflat: bool,
     pub ddtree_chain_only: bool,
     pub prefill_pipe: bool,
+    pub ngram_bonus: bool,
 }
 
 impl ProposalPolicy {
@@ -120,6 +121,7 @@ impl ProposalPolicy {
         let ddtree_nonflat = is_one(get("ATLAS_DDTREE_NONFLAT"));
         let ddtree_chain_only = is_one(get("ATLAS_DDTREE_CHAIN_ONLY"));
         let prefill_pipe = is_one(get("ATLAS_DFLASH_PREFILL_PIPE"));
+        let ngram_bonus = is_one(get("ATLAS_DFLASH_NGRAM_BONUS"));
         Self {
             force_no_ctx,
             force_ctx_used,
@@ -171,6 +173,7 @@ impl ProposalPolicy {
             ddtree_nonflat,
             ddtree_chain_only,
             prefill_pipe,
+            ngram_bonus,
         }
     }
 }
@@ -246,6 +249,7 @@ mod tests {
         assert_eq!(policy.branch_margin, 2.0);
         assert_eq!(policy.free_slots_tail, 4);
         assert!(!policy.prefill_pipe);
+        assert!(!policy.ngram_bonus);
     }
 
     #[test]
@@ -258,6 +262,7 @@ mod tests {
             ("ATLAS_DFLASH_TPS_ROUTER_WIDTHS", "4,8,15"),
             ("ATLAS_DFLASH_MASK_OVERRIDE", "248319"),
             ("ATLAS_DFLASH_PREFILL_PIPE", "1"),
+            ("ATLAS_DFLASH_NGRAM_BONUS", "1"),
             ("ATLAS_PLD_NGRAM", "0"),
         ]);
         let policy = ProposalPolicy::from_lookup(|name| values.get(name).map(ToString::to_string));
@@ -268,6 +273,7 @@ mod tests {
         assert_eq!(policy.router_widths.as_deref(), Some("4,8,15"));
         assert_eq!(policy.mask_override, Some(248319));
         assert!(policy.prefill_pipe);
+        assert!(policy.ngram_bonus);
         assert_eq!(policy.pld_ngram, 1);
     }
 

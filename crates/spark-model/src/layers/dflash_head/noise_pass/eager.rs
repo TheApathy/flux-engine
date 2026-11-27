@@ -33,6 +33,17 @@ pub(in super::super) struct NoisePassArgs {
 }
 
 impl BlockDiffusionDraftHead {
+    /// True when the opt-in 4-gate in-context n-gram selector kernel and its
+    /// device staging buffers are all initialized and ready to dispatch.
+    #[inline]
+    #[must_use]
+    pub(in super::super) fn ngram_selector_ready(&self) -> bool {
+        self.kernels.dflash2_selector_walk_ngram_batched.0 != 0
+            && !self.scratch.ngram_tables_dev.is_null()
+            && !self.scratch.ngram_prev3_dev.is_null()
+            && !self.scratch.batch_anchor_ids.is_null()
+    }
+
     /// Run one γ-block noise pass. `committed[i]` (length `gamma_eff`),
     /// when `Some(tok)`, embeds `tok` at noise row i+1 instead of the
     /// mask token (multi-step denoise feedback).
@@ -478,8 +489,17 @@ impl BlockDiffusionDraftHead {
                 && !self.scratch.batch_anchor_ids.is_null()
                 && rejection_slot_valid.is_some();
             let effective_gumbel_spec = if rejection_env { None } else { gumbel_spec };
+            let use_ngram_selector = !is_probabilistic_sampled
+                && !use_rejection_selector
+                && effective_gumbel_spec.is_none()
+                && self.markov.is_none()
+                && self.draft_sample_method
+                    != crate::dflash_sampling::DflashDraftSampleMethod::Probabilistic
+                && super::super::ngram_bonus::ngram_bonus_enabled()
+                && self.ngram_selector_ready();
             let can_use_k32 = !is_probabilistic_sampled
                 && !use_rejection_selector
+                && !use_ngram_selector
                 && self.markov.is_none()
                 && self.draft_sample_method
                     != crate::dflash_sampling::DflashDraftSampleMethod::Probabilistic
@@ -697,6 +717,51 @@ impl BlockDiffusionDraftHead {
                 if loop_pass == 0 {
                     dstate.pending_draft_probs_gamma = gamma_eff;
                     dstate.set_last_rejection_q(valid_q_record);
+                }
+            } else if use_ngram_selector {
+                let head_state_arc = noise_graph_head_state(self as *const Self as usize);
+                {
+                    let mut state = head_state_arc
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.upload_ngram_meta_c1(
+                        gpu,
+                        &dstate.pld_tokens,
+                        last_token,
+                        self.scratch.ngram_tables_dev,
+                        self.scratch.ngram_prev3_dev,
+                        Some(self.scratch.batch_anchor_ids),
+                        stream,
+                    )?;
+                }
+                let cfg = super::super::ngram_bonus::NgramBonusConfig::default();
+                ops::dflash2_selector_walk_ngram_batched(
+                    gpu,
+                    self.kernels.dflash2_selector_walk_ngram_batched,
+                    &ops::Dflash2NgramWalkArgs {
+                        unary: self.scratch.topk_logits_dev,
+                        candidates: self.scratch.topk_tokens_dev,
+                        hidden: self.scratch.selector_hidden,
+                        pred: sel.predecessor_codebook.weight,
+                        succ: sel.successor_codebook.weight,
+                        out_tokens: self.scratch.draft_tokens_dev,
+                        out_probs: (!self.scratch.batch_out_probs.is_null())
+                            .then_some(self.scratch.batch_out_probs),
+                        anchor_ids: self.scratch.batch_anchor_ids,
+                        prev3_tokens: Some(self.scratch.ngram_prev3_dev),
+                        ngram_tables: Some(self.scratch.ngram_tables_dev),
+                        temperatures: None,
+                        margin_thresh: cfg.margin_thresh,
+                        max_bonus: cfg.effective_max_bonus(),
+                        top_k_shortlist: shortlist_k,
+                        gamma: gamma_eff,
+                        rank: sel.rank,
+                        batch_size: 1,
+                    },
+                    stream,
+                )?;
+                if loop_pass == 0 && !self.scratch.batch_out_probs.is_null() {
+                    dstate.pending_draft_probs_gamma = gamma_eff;
                 }
             } else if use_k32_selector {
                 let head_state_arc = noise_graph_head_state(self as *const Self as usize);

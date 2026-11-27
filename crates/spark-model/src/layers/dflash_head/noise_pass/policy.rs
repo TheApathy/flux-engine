@@ -535,6 +535,7 @@ pub(in super::super) struct NoiseGraphRuntimeKey {
     pub(in super::super) lm_head_path_tag: u8,
     pub(in super::super) prefer_tc_lm_head: bool,
     pub(in super::super) rejection_mode: bool,
+    pub(in super::super) ngram_mode: bool,
     pub(in super::super) shortlist_k: u8,
     pub(in super::super) mask_id: u32,
     pub(in super::super) stream: u64,

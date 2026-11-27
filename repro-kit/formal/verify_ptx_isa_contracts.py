@@ -58,7 +58,26 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
     ),
     ("kernels/gb10/common/w3a16_gemm.cu", True, True, True, False, ()),
     ("kernels/gb10/common/sampler_topk_candidates.cu", False, False, True, False, ()),
-    ("kernels/gb10/common/dflash2_selector.cu", False, False, True, False, ()),
+    (
+        "kernels/gb10/common/dflash2_selector.cu",
+        False,
+        False,
+        True,
+        False,
+        ("dflash2_selector_walk_ngram_batched",),
+    ),
+    (
+        "kernels/gb10/common/dcoco_selector.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "dcoco_proj_fuse_bf16",
+            "dcoco_pair_mlp_bf16",
+            "dcoco_walk_and_export_q",
+        ),
+    ),
     ("kernels/gb10/common/dspine_bridge.cu", False, False, True, False, ()),
     (
         "kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4_moe_compact_t_k32_v28.cu",

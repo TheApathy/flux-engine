@@ -384,6 +384,7 @@ fn conv_geometry_compatible(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BatchedSelectorMode {
     ProbabilisticRejection { use_radix_topk: bool },
+    GreedyNgramBatched { use_radix_topk: bool },
     GumbelK32 { use_radix_topk: bool },
     GumbelK16 { use_radix_topk: bool },
     GreedyBatched { use_radix_topk: bool },
@@ -398,6 +399,7 @@ struct BatchedSelectorPlanInput {
     any_coupled_gumbel: bool,
     sel_top_k: Option<usize>,
     rejection_selector_ready: bool,
+    ngram_bonus_ready: bool,
     shared_q_stride: usize,
     shared_q_row_cap: usize,
     gamma_eff: usize,
@@ -436,9 +438,16 @@ fn resolve_batched_selector_plan(input: &BatchedSelectorPlanInput) -> BatchedSel
         && input.shared_q_stride == crate::model::trait_impl::device_topk::REJECTION_Q_STRIDE
         && input.gamma_eff <= slot_stride
         && total_q_slots >= input.batch_size;
-    let has_k32 = !rejection_mode && input.sel_top_k.is_some() && input.gumbel_k32_ready;
-    let use_gumbel_selector =
-        !rejection_mode && input.sel_top_k.is_some() && (has_k32 || input.gumbel_k16_ready);
+    let ngram_mode = !rejection_mode
+        && !input.any_coupled_gumbel
+        && input.ngram_bonus_ready
+        && input.sel_top_k.is_some();
+    let has_k32 =
+        !rejection_mode && !ngram_mode && input.sel_top_k.is_some() && input.gumbel_k32_ready;
+    let use_gumbel_selector = !rejection_mode
+        && !ngram_mode
+        && input.sel_top_k.is_some()
+        && (has_k32 || input.gumbel_k16_ready);
     let (shortlist_k, selector_mode) = if rejection_mode {
         let (k, use_radix_topk) = super::noise_pass::resolve_rejection_shortlist_k(
             input.lm_stride,
@@ -448,6 +457,14 @@ fn resolve_batched_selector_plan(input: &BatchedSelectorPlanInput) -> BatchedSel
         (
             k,
             BatchedSelectorMode::ProbabilisticRejection { use_radix_topk },
+        )
+    } else if ngram_mode && let Some(sel_top_k) = input.sel_top_k {
+        let k = sel_top_k.min(input.lm_stride);
+        (
+            k,
+            BatchedSelectorMode::GreedyNgramBatched {
+                use_radix_topk: input.has_topk_radix,
+            },
         )
     } else if let Some(sel_top_k) = input.sel_top_k {
         let (k, use_radix_topk, use_k32) = resolve_dflash2_selector_topk(
@@ -947,6 +964,8 @@ pub(super) struct BatchedNoiseGraphCache {
     split_ctx_splitkv_reduce_kernel: Option<KernelHandle>,
     split_kv_ws_dev: DevicePtr,
     split_kv_ws_cap: usize,
+    ngram_upload_pinned: Option<PinnedHostBuffer>,
+    ngram_upload_slot: usize,
     graphs: HashMap<BatchedNoiseGraphKey, GraphHandle>,
     graph_order: Vec<BatchedNoiseGraphKey>,
 }
@@ -969,6 +988,8 @@ impl BatchedNoiseGraphCache {
             split_ctx_splitkv_reduce_kernel: None,
             split_kv_ws_dev: DevicePtr::NULL,
             split_kv_ws_cap: 0,
+            ngram_upload_pinned: None,
+            ngram_upload_slot: 0,
             graphs: HashMap::new(),
             graph_order: Vec::new(),
         }
@@ -1144,6 +1165,88 @@ impl BatchedNoiseGraphCache {
             self.split_kv_ws_dev = DevicePtr::NULL;
             self.split_kv_ws_cap = 0;
         }
+        self.ngram_upload_pinned = None;
+        self.ngram_upload_slot = 0;
+    }
+
+    /// Build per-sequence Gate-4 anti-loop n-gram tables for `actual_b` active
+    /// sequences (zero-padding trailing bucketed lanes `actual_b..padded_b`)
+    /// and upload them asynchronously on `stream` via rotating pinned slots.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors batched Stage-2 pinned upload helper signature"
+    )]
+    fn upload_ngram_tables_batched(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        dstates: &[&mut DflashProposerState],
+        last_tokens: &[u32],
+        padded_b: usize,
+        tables_dev: DevicePtr,
+        prev3_dev: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        use super::ngram_bonus::{
+            NGRAM_EMPTY_TOK, NGRAM_PREV3_BYTES, NGRAM_TABLE_BYTES, NgramBonusConfig,
+            build_sequence_ngram_table,
+        };
+        const MAX_TABLES_BYTES: usize = DFLASH_BATCH_MAX_SEQS * NGRAM_TABLE_BYTES;
+        const MAX_PREV3_BYTES: usize = DFLASH_BATCH_MAX_SEQS * NGRAM_PREV3_BYTES;
+        const SLOT_BYTES: usize = MAX_TABLES_BYTES + MAX_PREV3_BYTES;
+
+        let actual_b = last_tokens.len();
+        anyhow::ensure!(
+            actual_b > 0
+                && actual_b == dstates.len()
+                && (actual_b..=DFLASH_BATCH_MAX_SEQS).contains(&padded_b),
+            "batched n-gram upload batch bounds invalid: actual_b={actual_b} padded_b={padded_b}"
+        );
+        if self.ngram_upload_pinned.is_none() {
+            self.ngram_upload_pinned =
+                Some(gpu.alloc_host_pinned(SLOT_BYTES * BATCHED_META_PINNED_SLOTS)?);
+        }
+        let slot = self.ngram_upload_slot;
+        self.ngram_upload_slot = (self.ngram_upload_slot + 1) % BATCHED_META_PINNED_SLOTS;
+        let base = slot * SLOT_BYTES;
+        let active_tables_bytes = padded_b * NGRAM_TABLE_BYTES;
+        let active_prev3_bytes = padded_b * NGRAM_PREV3_BYTES;
+        let cfg = NgramBonusConfig::default();
+
+        let pinned = self
+            .ngram_upload_pinned
+            .as_mut()
+            .context("batched n-gram pinned staging missing")?;
+        let dst = &mut pinned.as_mut_slice()[base..base + SLOT_BYTES];
+        for s in 0..actual_b {
+            let (table, prev3) =
+                build_sequence_ngram_table(&dstates[s].pld_tokens, last_tokens[s], cfg);
+            let tbl_off = s * NGRAM_TABLE_BYTES;
+            table.write_le_bytes_into(&mut dst[tbl_off..tbl_off + NGRAM_TABLE_BYTES])?;
+            let p3_off = MAX_TABLES_BYTES + s * NGRAM_PREV3_BYTES;
+            for (i, &tok) in prev3.iter().enumerate() {
+                dst[p3_off + i * 4..p3_off + i * 4 + 4].copy_from_slice(&tok.to_le_bytes());
+            }
+        }
+        for s in actual_b..padded_b {
+            let tbl_off = s * NGRAM_TABLE_BYTES;
+            dst[tbl_off..tbl_off + NGRAM_TABLE_BYTES].fill(0);
+            let p3_off = MAX_TABLES_BYTES + s * NGRAM_PREV3_BYTES;
+            for i in 0..3 {
+                dst[p3_off + i * 4..p3_off + i * 4 + 4]
+                    .copy_from_slice(&NGRAM_EMPTY_TOK.to_le_bytes());
+            }
+        }
+
+        let tbl_slice = pinned.pinned_slice_range(base, active_tables_bytes)?;
+        let prev3_slice = pinned.pinned_slice_range(base + MAX_TABLES_BYTES, active_prev3_bytes)?;
+        // SAFETY: `ngram_upload_pinned` is page-locked and owned by
+        // `BatchedNoiseGraphCache`; rotating across `BATCHED_META_PINNED_SLOTS`
+        // disjoint slots ensures no in-flight async H2D transfer is overwritten.
+        unsafe {
+            gpu.copy_h2d_pinned_async(tbl_slice, tables_dev, stream)?;
+            gpu.copy_h2d_pinned_async(prev3_slice, prev3_dev, stream)?;
+        }
+        Ok(())
     }
 
     /// Pack all Stage-2 per-step dynamic metadata into one rotating page-locked
@@ -1854,6 +1957,9 @@ impl BlockDiffusionDraftHead {
             any_coupled_gumbel,
             sel_top_k: self.selector.as_ref().map(|sel| sel.top_k),
             rejection_selector_ready: self.rejection_selector_ready(),
+            ngram_bonus_ready: super::ngram_bonus::ngram_bonus_enabled()
+                && !any_coupled_gumbel
+                && self.ngram_selector_ready(),
             shared_q_stride: self.scratch.shared_q_stride,
             shared_q_row_cap: self.scratch.shared_q_row_cap,
             gamma_eff,
@@ -1928,6 +2034,7 @@ impl BlockDiffusionDraftHead {
             selector_mode,
             BatchedSelectorMode::GumbelK32 { .. }
                 | BatchedSelectorMode::ProbabilisticRejection { .. }
+                | BatchedSelectorMode::GreedyNgramBatched { .. }
         );
 
         // ── Stage 1: Batched incremental PostRope context append ──
@@ -2070,6 +2177,20 @@ impl BlockDiffusionDraftHead {
                 rejection_mode.then_some(&q_row_bases_buf[..padded_b]),
                 stream,
             )?;
+            if matches!(
+                selector_mode,
+                BatchedSelectorMode::GreedyNgramBatched { .. }
+            ) {
+                cache.upload_ngram_tables_batched(
+                    gpu,
+                    dstates,
+                    last_tokens,
+                    padded_b,
+                    self.scratch.ngram_tables_dev,
+                    self.scratch.ngram_prev3_dev,
+                    stream,
+                )?;
+            }
             let split_kv_plan = if desired_split_kv > 1
                 && let Some((split_kernel, reduce_kernel)) =
                     cache.resolve_batched_split_kv_h128_kernels(gpu)
@@ -2716,6 +2837,8 @@ impl BlockDiffusionDraftHead {
                 selector_mode,
                 BatchedSelectorMode::ProbabilisticRejection {
                     use_radix_topk: true
+                } | BatchedSelectorMode::GreedyNgramBatched {
+                    use_radix_topk: true
                 } | BatchedSelectorMode::GumbelK32 {
                     use_radix_topk: true
                 } | BatchedSelectorMode::GumbelK16 {
@@ -2799,6 +2922,33 @@ impl BlockDiffusionDraftHead {
                         gamma_eff,
                         sel.rank,
                         b,
+                        stream,
+                    )?;
+                }
+                BatchedSelectorMode::GreedyNgramBatched { .. } => {
+                    let cfg = super::ngram_bonus::NgramBonusConfig::default();
+                    ops::dflash2_selector_walk_ngram_batched(
+                        gpu,
+                        self.kernels.dflash2_selector_walk_ngram_batched,
+                        &ops::Dflash2NgramWalkArgs {
+                            unary: self.scratch.topk_logits_dev,
+                            candidates: self.scratch.topk_tokens_dev,
+                            hidden: self.scratch.selector_hidden,
+                            pred: sel.predecessor_codebook.weight,
+                            succ: sel.successor_codebook.weight,
+                            out_tokens: self.scratch.draft_tokens_dev,
+                            out_probs: Some(self.scratch.batch_out_probs),
+                            anchor_ids: meta_ptrs.batch_anchor_ids,
+                            prev3_tokens: Some(self.scratch.ngram_prev3_dev),
+                            ngram_tables: Some(self.scratch.ngram_tables_dev),
+                            temperatures: None,
+                            margin_thresh: cfg.margin_thresh,
+                            max_bonus: cfg.effective_max_bonus(),
+                            top_k_shortlist: shortlist_k,
+                            gamma: gamma_eff,
+                            rank: sel.rank,
+                            batch_size: b,
+                        },
                         stream,
                     )?;
                 }
@@ -5420,6 +5570,7 @@ mod tests {
             any_coupled_gumbel: pure_greedy_active,
             sel_top_k: Some(16),
             rejection_selector_ready: true,
+            ngram_bonus_ready: false,
             shared_q_stride: REJECTION_Q_STRIDE,
             shared_q_row_cap: 16 * REJECTION_SLOT_STRIDE,
             gamma_eff: 7,
@@ -5500,6 +5651,31 @@ mod tests {
                 },
             }
         );
+
+        // Opt-in n-gram bonus engages ONLY for pure-greedy cohorts and is strictly
+        // bypassed for stochastic / mixed cohorts (Gate 0).
+        let ngram_greedy = resolve_batched_selector_plan(&BatchedSelectorPlanInput {
+            ngram_bonus_ready: true,
+            ..base
+        });
+        assert_eq!(
+            ngram_greedy,
+            BatchedSelectorPlan {
+                rejection_mode: false,
+                use_gumbel_selector: false,
+                shortlist_k: 16,
+                selector_mode: BatchedSelectorMode::GreedyNgramBatched {
+                    use_radix_topk: true,
+                },
+            }
+        );
+        let ngram_blocked_on_stochastic =
+            resolve_batched_selector_plan(&BatchedSelectorPlanInput {
+                ngram_bonus_ready: true,
+                any_coupled_gumbel: mixed_active,
+                ..base
+            });
+        assert_eq!(ngram_blocked_on_stochastic, stochastic_plan);
     }
 
     #[test]
