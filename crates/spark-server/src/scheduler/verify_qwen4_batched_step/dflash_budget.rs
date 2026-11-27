@@ -486,7 +486,13 @@ pub(in super::super) fn apply_dflash_pcum_truncation_for_cohort(
     is_dflash: bool,
     cohort_size: usize,
 ) {
-    if !is_dflash || a.pending_drafts.len() <= 1 {
+    if !is_dflash
+        || a.pending_drafts.len() <= 1
+        || !crate::scheduler::verify_dflash_step::dflash_pcum_enabled_for_seq_in_cohort(
+            a,
+            cohort_size,
+        )
+    {
         return;
     }
     let keep = {
@@ -838,25 +844,32 @@ pub(super) fn apply_dflash_pcum_and_upward_bucket_quantize_cohort(
             continue;
         }
         let before = a.pending_drafts.len();
-        let (keep, frontier) = a
-            .seq
-            .proposer_state
-            .as_ref()
-            .and_then(|s| {
-                s.as_any()
-                    .downcast_ref::<spark_model::layers::dflash_head::DflashProposerState>()
-            })
-            .map(spark_model::layers::dflash_head::DflashProposerState::last_draft_probs)
-            .map_or((before, 1.0), |probs| {
-                dflash_pcum_target_len_and_frontier(
-                    a,
-                    is_dflash,
-                    probs,
-                    cohort_size,
-                    policy,
-                    env_override,
-                )
-            });
+        let (keep, frontier) =
+            if !crate::scheduler::verify_dflash_step::dflash_pcum_enabled_for_seq_in_cohort(
+                a,
+                cohort_size,
+            ) {
+                (before, 1.0)
+            } else {
+                a.seq
+                    .proposer_state
+                    .as_ref()
+                    .and_then(|s| {
+                        s.as_any()
+                            .downcast_ref::<spark_model::layers::dflash_head::DflashProposerState>()
+                    })
+                    .map(spark_model::layers::dflash_head::DflashProposerState::last_draft_probs)
+                    .map_or((before, 1.0), |probs| {
+                        dflash_pcum_target_len_and_frontier(
+                            a,
+                            is_dflash,
+                            probs,
+                            cohort_size,
+                            policy,
+                            env_override,
+                        )
+                    })
+            };
         let rem_budget = if a.max_output_tokens > 0 {
             a.remaining
                 .min(a.max_output_tokens.saturating_sub(a.output_tokens.len()))

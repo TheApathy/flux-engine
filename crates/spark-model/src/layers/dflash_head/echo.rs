@@ -25,6 +25,14 @@
 //! ctx-hidden append running on echo steps (the append precedes every
 //! early-return in `propose_drafts`), so the drafter is never ctx-starved.
 
+/// Opt-in preset for `gamma = 7` (block-8 DFlash2) lowering the default
+/// `min_tail` floor from `4` to `3` so rejections at `num_accepted = 4`
+/// (leaving 3 verified tail tokens) can still salvage. Default OFF.
+pub const ECHO_GAMMA7_ENV: &str = "ATLAS_DFLASH_ECHO_GAMMA7";
+
+/// Calibrated minimum tail length for `gamma = 7` block-8 drafters.
+pub const ECHO_GAMMA7_MIN_TAIL: usize = 3;
+
 /// Parsed ECHO gate configuration (read once at first use).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EchoConfig {
@@ -34,7 +42,8 @@ pub struct EchoConfig {
     pub min_accept: usize,
     /// Fire only when the salvaged tail has at least this many tokens
     /// (short tails aren't worth pre-empting the drafter for).
-    /// `ATLAS_DFLASH_ECHO_MIN_TAIL`, default 4.
+    /// `ATLAS_DFLASH_ECHO_MIN_TAIL`, default 4 (or 3 when
+    /// `ATLAS_DFLASH_ECHO_GAMMA7=1`).
     pub min_tail: usize,
     /// Maximum CONSECUTIVE echo offers before the real drafter must run
     /// (anti-degenerate-loop: an echo step salvaging its own wreckage
@@ -53,20 +62,53 @@ impl Default for EchoConfig {
 }
 
 impl EchoConfig {
+    /// Calibrated opt-in preset for `gamma = 7` (block-8 DFlash2) where
+    /// `min_tail = 3` admits rejections at `num_accepted = 4` (3 tail tokens).
+    #[must_use]
+    pub const fn for_gamma7() -> Self {
+        Self {
+            min_accept: 2,
+            min_tail: ECHO_GAMMA7_MIN_TAIL,
+            max_streak: 2,
+        }
+    }
+
+    /// Pure lookup-based parser (unit-tested GPU-free).
+    #[must_use]
+    pub fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Option<Self> {
+        if get("ATLAS_DFLASH_ECHO").as_deref().map(str::trim) != Some("1") {
+            return None;
+        }
+        let gamma7_preset = get(ECHO_GAMMA7_ENV).as_deref().map(str::trim) == Some("1");
+        let base = if gamma7_preset {
+            Self::for_gamma7()
+        } else {
+            Self::default()
+        };
+        let min_accept = parse_from_opt(get("ATLAS_DFLASH_ECHO_MIN_ACCEPT"), base.min_accept);
+        let min_tail = parse_from_opt(get("ATLAS_DFLASH_ECHO_MIN_TAIL"), base.min_tail).max(1);
+        let max_streak =
+            parse_from_opt(get("ATLAS_DFLASH_ECHO_MAX_STREAK"), base.max_streak).max(1);
+        Some(Self {
+            min_accept,
+            min_tail,
+            max_streak,
+        })
+    }
+
     /// `None` when `ATLAS_DFLASH_ECHO` != "1" (feature off ⇒ byte-identical
     /// default path). Cached after the first read.
     pub fn from_env() -> Option<EchoConfig> {
         static CFG: std::sync::OnceLock<Option<EchoConfig>> = std::sync::OnceLock::new();
         *CFG.get_or_init(|| {
-            if std::env::var("ATLAS_DFLASH_ECHO").ok().as_deref() != Some("1") {
-                return None;
-            }
-            let d = EchoConfig::default();
-            let cfg = EchoConfig {
-                min_accept: parse_env("ATLAS_DFLASH_ECHO_MIN_ACCEPT", d.min_accept),
-                min_tail: parse_env("ATLAS_DFLASH_ECHO_MIN_TAIL", d.min_tail).max(1),
-                max_streak: parse_env("ATLAS_DFLASH_ECHO_MAX_STREAK", d.max_streak).max(1),
-            };
+            let cfg = Self::from_lookup(|k| match std::env::var(k) {
+                Ok(val) => Some(val),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    tracing::warn!("{k} contains non-UTF-8 bytes; failing closed to default");
+                    None
+                }
+            })?;
             tracing::info!(
                 "ATLAS_DFLASH_ECHO active: min_accept={} min_tail={} max_streak={} \
                  (target-authored salvage drafts; lossless, default-off)",
@@ -84,10 +126,8 @@ impl EchoConfig {
     }
 }
 
-fn parse_env<T: std::str::FromStr + Copy>(name: &str, default: T) -> T {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.trim().parse::<T>().ok())
+fn parse_from_opt<T: std::str::FromStr + Copy>(raw: Option<String>, default: T) -> T {
+    raw.and_then(|s| s.trim().parse::<T>().ok())
         .unwrap_or(default)
 }
 
@@ -256,5 +296,42 @@ mod tests {
         assert_eq!(c.min_accept, 2);
         assert_eq!(c.min_tail, 4);
         assert_eq!(c.max_streak, 2);
+    }
+
+    #[test]
+    fn gamma7_preset_lowers_min_tail_to_three_and_respects_overrides() {
+        let g7 = EchoConfig::for_gamma7();
+        assert_eq!(g7.min_accept, 2);
+        assert_eq!(g7.min_tail, 3);
+        assert_eq!(g7.max_streak, 2);
+        // gamma=7 (K=8 verified): rejecting at draft 4 leaves verified[5..8] (len=3).
+        let verified = [10, 11, 12, 13, 14, 15, 16, 17];
+        let tail = echo_tail(&verified, 4);
+        assert_eq!(tail.len(), 3);
+        assert!(!should_stash(&EchoConfig::default(), 4, tail.len()));
+        assert!(should_stash(&g7, 4, tail.len()));
+
+        // Default OFF when ATLAS_DFLASH_ECHO != "1".
+        assert_eq!(
+            EchoConfig::from_lookup(|k| (k == ECHO_GAMMA7_ENV).then(|| "1".to_string())),
+            None
+        );
+
+        // Opt-in ATLAS_DFLASH_ECHO=1 + ATLAS_DFLASH_ECHO_GAMMA7=1 selects min_tail=3.
+        let parsed = EchoConfig::from_lookup(|k| match k {
+            "ATLAS_DFLASH_ECHO" => Some("1".to_string()),
+            k if k == ECHO_GAMMA7_ENV => Some("1".to_string()),
+            _ => None,
+        });
+        assert_eq!(parsed, Some(g7));
+
+        // Explicit ATLAS_DFLASH_ECHO_MIN_TAIL still wins over preset.
+        let overridden = EchoConfig::from_lookup(|k| match k {
+            "ATLAS_DFLASH_ECHO" => Some("1".to_string()),
+            k if k == ECHO_GAMMA7_ENV => Some("1".to_string()),
+            "ATLAS_DFLASH_ECHO_MIN_TAIL" => Some("5".to_string()),
+            _ => None,
+        });
+        assert_eq!(overridden.map(|c| c.min_tail), Some(5));
     }
 }

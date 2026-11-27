@@ -98,6 +98,7 @@ unsafe extern "C" {
     // CUDA events for inter-stream synchronization
     pub(super) fn cuEventCreate(phEvent: *mut u64, flags: u32) -> i32;
     pub(super) fn cuEventRecord(hEvent: u64, hStream: u64) -> i32;
+    pub(super) fn cuEventRecordWithFlags(hEvent: u64, hStream: u64, flags: u32) -> i32;
     pub(super) fn cuStreamWaitEvent(hStream: u64, hEvent: u64, flags: u32) -> i32;
     pub(super) fn cuEventDestroy_v2(hEvent: u64) -> i32;
     // CUDA_ERROR_NOT_READY (600) on a still-pending event; CUDA_SUCCESS (0) once

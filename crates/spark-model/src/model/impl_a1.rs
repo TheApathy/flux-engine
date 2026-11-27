@@ -243,10 +243,20 @@ impl TransformerModel {
         let requested_ddtree_capacity = std::env::var("ATLAS_DDTREE_MAX_NODES")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok());
+        // Opt-in `ATLAS_MTP_DLOOP=1` on dense native-MTP targets widens Stage-2
+        // verify width to K=9 (`8` drafts + 1 anchor). Strictly zero-cost / no-op
+        // when OFF or on MoE targets (refused fail-closed).
+        let dloop_required_k = crate::layers::mtp_dloop::required_verify_k_for_model(
+            crate::layers::mtp_dloop::mtp_dloop_enabled(),
+            has_mtp,
+            dflash_enabled,
+            crate::layers::mtp_dloop::TargetFfnTopology::from_num_experts(config.num_experts),
+        );
+        let geometry_num_drafts = num_drafts.max(dloop_required_k.saturating_sub(1));
         let speculative_geometry = checked_ssm_speculative_geometry(
             has_mtp,
             dflash_enabled,
-            num_drafts,
+            geometry_num_drafts,
             requested_ddtree_capacity,
         )?;
         let dflash_kgamma = speculative_geometry.dflash_verify_width;
@@ -1016,6 +1026,21 @@ impl TransformerModel {
         // Secondary stream + event for pipelining checkpoint D2D with MTP propose.
         let secondary_stream = gpu.create_stream()?;
         let secondary_event = gpu.create_event()?;
+        let dflash_capture_done_event = if !dflash_capture_layers.is_empty()
+            && crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+        {
+            match gpu.create_event() {
+                Ok(ev) => ev,
+                Err(error) => {
+                    tracing::warn!(
+                        "ATLAS_DFLASH_EARLY_STAGE1: create_event failed ({error:#}); disabling early Stage-1"
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
 
         // EP: register moe_output buffer with NCCL and provide bf16_add kernel.
         if let Some(ref comm) = comm
@@ -1333,6 +1358,7 @@ impl TransformerModel {
             dflash_hidden_save_rows,
             dflash_batched_ffn_input: parking_lot::Mutex::new(None),
             dflash_capture_layers,
+            dflash_capture_done_event,
             dflash_capture_width,
             dflash_capture_offset,
             dflash_capture_mode,

@@ -239,7 +239,14 @@ pub(in super::super) fn propose_next_batch(
             );
         }
     } else {
-        for chunk in mtp_idxs.chunks(64) {
+        let total_chunks = mtp_idxs.len().div_ceil(64);
+        let mtp_dloop_max_k =
+            if !model.proposer_is_dflash() && spark_model::layers::mtp_dloop::mtp_dloop_enabled() {
+                model.mtp_dloop_max_verify_k()
+            } else {
+                0
+            };
+        for (chunk_idx, chunk) in mtp_idxs.chunks(64).enumerate() {
             if chunk.len() == 1 {
                 let (idx, seq_drafts) = chunk[0];
                 propose_next_with_seq_drafts_impl(
@@ -302,14 +309,22 @@ pub(in super::super) fn propose_next_batch(
                 Ok(all_drafts) => {
                     for (&(idx, seq_drafts), mut drafts) in chunk.iter().zip(all_drafts) {
                         let a = &mut active[idx];
-                        if drafts.len() > seq_drafts {
-                            drafts.truncate(seq_drafts);
-                            crate::scheduler::stochastic_verify_walk::truncate_seq_rejection_q(
-                                a,
-                                drafts.len(),
-                            );
+                        let is_async_placeholder = model.dflash_seq_has_async_placeholder(&a.seq);
+                        let effective_draft_cap = effective_batched_draft_cap(
+                            model.proposer_is_dflash(),
+                            seq_drafts,
+                            mtp_dloop_max_k,
+                        );
+                        if drafts.len() > effective_draft_cap {
+                            drafts.truncate(effective_draft_cap);
+                            if !is_async_placeholder {
+                                crate::scheduler::stochastic_verify_walk::truncate_seq_rejection_q(
+                                    a,
+                                    drafts.len(),
+                                );
+                            }
                         }
-                        if !drafts.is_empty() {
+                        if !is_async_placeholder && !drafts.is_empty() {
                             let before_splice = drafts.clone();
                             cfg_jf_splice_drafts(a, &mut drafts);
                             crate::scheduler::think_budget_nudge::splice_forced_drafts(
@@ -329,12 +344,45 @@ pub(in super::super) fn propose_next_batch(
                             tracing::error!("install proposal (batched native MTP): {error:#}");
                             continue;
                         }
-                        if !use_upward_rejection_pcum {
+                        if !is_async_placeholder && !use_upward_rejection_pcum {
                             apply_dflash_pcum_truncation_for_cohort(
                                 a,
                                 model.proposer_is_dflash(),
                                 chunk_idxs.len(),
                             );
+                        }
+                    }
+                    // `BlockDiffusionDraftHead` holds one `async_batched_inflight`
+                    // handle at a time. When `mtp_idxs.len() > 64` spans multiple
+                    // chunks, collect and finalize earlier chunks' async placeholders
+                    // before launching the next chunk so chunk `i + 1` never discards
+                    // chunk `i`'s in-flight drafts (leaving the final chunk async).
+                    if chunk_idx + 1 < total_chunks && model.proposer_is_dflash() {
+                        let mut chunk_collected = Vec::new();
+                        for &idx in &chunk_idxs {
+                            let a = &mut active[idx];
+                            if !model.dflash_seq_has_async_placeholder(&a.seq) {
+                                continue;
+                            }
+                            match model.dflash_collect_async_drafts(&mut a.seq) {
+                                Ok(Some(real_drafts)) => {
+                                    a.pending_drafts = real_drafts;
+                                    a.pending_tree_payload =
+                                        model.take_pending_tree_payload(&mut a.seq);
+                                    chunk_collected.push(idx);
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::error!(
+                                        "dflash_collect_async_drafts (multi-chunk barrier): {error:#}"
+                                    );
+                                    a.pending_drafts.clear();
+                                    a.pending_tree_payload = None;
+                                }
+                            }
+                        }
+                        if !chunk_collected.is_empty() {
+                            finalize_collected_async_dflash_drafts(model, active, &chunk_collected);
                         }
                     }
                 }
@@ -358,19 +406,89 @@ pub(in super::super) fn propose_next_batch(
             }
         }
     }
-    if use_upward_rejection_pcum {
-        apply_dflash_pcum_and_upward_bucket_quantize_cohort(
-            active,
-            propose_idxs,
-            model.proposer_is_dflash(),
-        );
-    } else if model.proposer_is_dflash() && ragged {
-        quantize_dflash_ragged_drafts_to_graph_bucket(active, propose_idxs);
+    let sync_propose_idxs: Vec<usize> = propose_idxs
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            active
+                .get(idx)
+                .is_some_and(|a| !model.dflash_seq_has_async_placeholder(&a.seq))
+        })
+        .collect();
+    if !sync_propose_idxs.is_empty() {
+        if use_upward_rejection_pcum {
+            apply_dflash_pcum_and_upward_bucket_quantize_cohort(
+                active,
+                &sync_propose_idxs,
+                model.proposer_is_dflash(),
+            );
+        } else if model.proposer_is_dflash() && ragged {
+            quantize_dflash_ragged_drafts_to_graph_bucket(active, &sync_propose_idxs);
+        }
+        if sync_propose_idxs.len() < 2 {
+            warm_ple_draft_ahead_for_seqs(model, active, &sync_propose_idxs);
+        } else {
+            warm_ple_verify_prefetch_for_seqs(model, active, &sync_propose_idxs, ragged);
+        }
     }
-    if propose_idxs.len() < 2 {
-        warm_ple_draft_ahead_for_seqs(model, active, propose_idxs);
+}
+
+/// Apply post-proposal splicing, `p_cum` truncation, and ragged verify-graph
+/// bucket quantization to freshly collected asynchronous DFlash drafts at the
+/// start of the next scheduler step (deferred from launch time while the
+/// placeholder chain was in flight).
+pub(in super::super) fn finalize_collected_async_dflash_drafts(
+    model: &dyn Model,
+    active: &mut [ActiveSeq],
+    collected_idxs: &[usize],
+) {
+    if collected_idxs.is_empty() || !model.proposer_is_dflash() {
+        return;
+    }
+    let vocab_size = model.vocab_size();
+    for &idx in collected_idxs {
+        let Some(a) = active.get_mut(idx) else {
+            continue;
+        };
+        if a.finished || a.pending_drafts.is_empty() || a.pending_tree_payload.is_some() {
+            continue;
+        }
+        let before_splice = a.pending_drafts.clone();
+        let mut drafts = std::mem::take(&mut a.pending_drafts);
+        cfg_jf_splice_drafts(a, &mut drafts);
+        crate::scheduler::think_budget_nudge::splice_forced_drafts(a, &mut drafts);
+        splice_grammar_drafts(a, &mut drafts, vocab_size);
+        let after_splice = drafts.clone();
+        a.pending_drafts = drafts;
+        crate::scheduler::stochastic_verify_walk::truncate_seq_rejection_q_after_splice(
+            a,
+            &before_splice,
+            &after_splice,
+        );
+    }
+    let ragged = batched_ragged_enabled() && !model.is_ep();
+    let has_stochastic_lane = collected_idxs.iter().any(|&idx| {
+        active
+            .get(idx)
+            .is_some_and(|a| !a.finished && a.temperature.is_finite() && a.temperature > 0.0)
+    });
+    let use_upward_rejection_pcum = ragged
+        && collected_idxs.len() >= 2
+        && has_stochastic_lane
+        && crate::scheduler::stochastic_verify_walk::spec_verify_policy()
+            == crate::scheduler::stochastic_verify_walk::SpecVerifyPolicy::Rejection;
+    if use_upward_rejection_pcum {
+        apply_dflash_pcum_and_upward_bucket_quantize_cohort(active, collected_idxs, true);
     } else {
-        warm_ple_verify_prefetch_for_seqs(model, active, propose_idxs, ragged);
+        let cohort_size = collected_idxs.len();
+        for &idx in collected_idxs {
+            if let Some(a) = active.get_mut(idx) {
+                apply_dflash_pcum_truncation_for_cohort(a, true, cohort_size);
+            }
+        }
+        if ragged && cohort_size >= 2 {
+            quantize_dflash_ragged_drafts_to_graph_bucket(active, collected_idxs);
+        }
     }
 }
 
@@ -612,5 +730,43 @@ fn notify_qwen4_external_draft(a: &mut ActiveSeq, chain: &[u32]) {
             .downcast_mut::<spark_model::layers::qwen4_mtp::Qwen4MtpState>()
     {
         mtp_state.notify_external_draft_with_tokens(chain);
+    }
+}
+
+/// Pure cap resolver for batched proposal truncation: preserves Stage-2
+/// extended drafts (`K = 9 -> 8` drafts) on dense native-MTP targets when
+/// `ATLAS_MTP_DLOOP=1` widens `mtp_dloop_max_k`, while keeping `seq_drafts`
+/// unchanged for DFlash, MoE (`mtp_dloop_max_k == 0`), and default-OFF runs.
+#[inline]
+#[must_use]
+const fn effective_batched_draft_cap(
+    proposer_is_dflash: bool,
+    seq_drafts: usize,
+    mtp_dloop_max_k: usize,
+) -> usize {
+    if !proposer_is_dflash
+        && seq_drafts >= spark_model::layers::mtp_dloop::MTP_DLOOP_STAGE1_DRAFTS
+        && mtp_dloop_max_k > seq_drafts + 1
+    {
+        mtp_dloop_max_k - 1
+    } else {
+        seq_drafts
+    }
+}
+
+#[cfg(test)]
+mod dloop_batched_cap_tests {
+    use super::effective_batched_draft_cap;
+
+    #[test]
+    fn dense_c2_native_mtp_dloop_preserves_stage2_drafts_while_moe_and_dflash_keep_seq_cap() {
+        // Dense native MTP with ATLAS_MTP_DLOOP=1 (max_verify_k=9): preserves all 8 drafts.
+        assert_eq!(effective_batched_draft_cap(false, 4, 9), 8);
+        // Sub-Stage-1 width (e.g. seq_drafts=2) never widens.
+        assert_eq!(effective_batched_draft_cap(false, 2, 9), 2);
+        // MoE or DLoop disabled (max_verify_k=0): strictly truncates to seq_drafts=4.
+        assert_eq!(effective_batched_draft_cap(false, 4, 0), 4);
+        // DFlash proposer never widens past seq_drafts.
+        assert_eq!(effective_batched_draft_cap(true, 7, 9), 7);
     }
 }

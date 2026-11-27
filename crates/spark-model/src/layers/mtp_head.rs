@@ -186,6 +186,7 @@ pub struct MtpHead {
     sigmoid_gate_mul_k: KernelHandle,
     bf16_concat_k: KernelHandle,
     argmax_k: KernelHandle,
+    argmax_prob_k: KernelHandle,
     embed_from_argmax_k: KernelHandle,
     /// Fixed device buffer (4 bytes) for deferred draft token ID readback.
     draft_token_id_dev: DevicePtr,

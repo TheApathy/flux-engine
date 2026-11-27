@@ -15,6 +15,7 @@ mod glm53_moe_overlap;
 mod glm53_moe_serial;
 mod glm53_target_schedule;
 pub mod moe;
+pub mod mtp_dloop;
 pub mod mtp_head;
 pub mod mtp_multi;
 pub mod nemotron_mamba2;

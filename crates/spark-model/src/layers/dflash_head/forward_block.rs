@@ -1328,7 +1328,7 @@ impl BlockDiffusionDraftHead {
                 && gamma_eff <= dstate.pending_draft_probs_gamma
                 && gamma_eff <= 64
                 && !self.scratch.batch_out_probs.is_null()
-                && super::dflash_pcum_enabled_for_target_env(self.target_is_moe);
+                && super::dflash_pcum_probs_readback_enabled(self.target_is_moe);
             if pack_probs {
                 let mut probs_buf = [0u8; 64 * size_of::<f32>()];
                 let probs_bytes = gamma_eff * size_of::<f32>();

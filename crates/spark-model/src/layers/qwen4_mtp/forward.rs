@@ -1082,7 +1082,49 @@ impl Qwen4MtpHead {
             self.argmax_prob_k.0 != 0,
             gumbel_spec.is_some(),
         );
-        let want_prob = conf_gate.want_prob;
+        // Zero-training Native-MTP DLoop (`ATLAS_MTP_DLOOP=1`, default OFF):
+        // strictly dense-only (`num_experts <= 1`), `C <= 2`, extending
+        // `K = 5 -> K = 9` when `c_1 = sum ln(p_i) >= -0.5`. MoE targets
+        // (e.g. Flash-Next 512E) are refused fail-closed before any extra GPU work.
+        let dloop_enabled = crate::layers::mtp_dloop::mtp_dloop_enabled();
+        let dloop_topology =
+            crate::layers::mtp_dloop::TargetFfnTopology::from_num_experts(ctx.config.num_experts);
+        let dloop_cohort = crate::layers::mtp_dloop::active_cohort_context();
+        let dloop_stage1_eligible = if dloop_enabled && gumbel_spec.is_none() {
+            let precheck = match dloop_cohort {
+                Some(cohort) => crate::layers::mtp_dloop::precheck_stage1_admission(
+                    &crate::layers::mtp_dloop::MtpDloopStage1PrecheckInput {
+                        enabled: true,
+                        topology: dloop_topology,
+                        live_seqs: cohort.live_seqs,
+                        stage1_drafts: num_drafts,
+                        max_verify_k: cohort.max_verify_k,
+                    },
+                ),
+                None => Err(
+                    crate::layers::mtp_dloop::MtpDloopRefusal::ConcurrencyTooHigh {
+                        live_seqs: 0,
+                        max_concurrency: crate::layers::mtp_dloop::MTP_DLOOP_MAX_CONCURRENCY,
+                    },
+                ),
+            };
+            if let Err(crate::layers::mtp_dloop::MtpDloopRefusal::MoeTargetRefused {
+                num_experts,
+            }) = precheck
+            {
+                static QWEN4_MOE_DLOOP_REFUSED: std::sync::Once = std::sync::Once::new();
+                QWEN4_MOE_DLOOP_REFUSED.call_once(|| {
+                    tracing::info!(
+                        num_experts,
+                        "QWEN4_MTP_DLOOP_REFUSED reason=moe_target (ATLAS_MTP_DLOOP=1 is dense-only)"
+                    );
+                });
+            }
+            precheck.is_ok() && self.argmax_prob_k.0 != 0
+        } else {
+            false
+        };
+        let want_prob = conf_gate.want_prob || dloop_stage1_eligible;
         ensure!(
             !want_prob || num_drafts * 4 <= CHAIN_PROB_SPAN,
             "Qwen4 MTP draft confidence supports at most {} drafts",
@@ -1247,6 +1289,85 @@ impl Qwen4MtpHead {
             }
             if conf_gate.apply_truncate {
                 drafts.truncate(keep);
+            }
+            if dloop_stage1_eligible
+                && drafts.len() == num_drafts
+                && computed == num_drafts
+                && let Some(cohort) = dloop_cohort
+                && let Some(&stage1_last_token) = drafts.last()
+            {
+                let decision = crate::layers::mtp_dloop::evaluate_stage2_extension(
+                    &crate::layers::mtp_dloop::MtpDloopInput {
+                        enabled: dloop_enabled,
+                        topology: dloop_topology,
+                        live_seqs: cohort.live_seqs,
+                        stage1_drafts: num_drafts,
+                        max_verify_k: cohort.max_verify_k,
+                        stage1_probs: &probs,
+                        threshold: crate::layers::mtp_dloop::mtp_dloop_thresh(),
+                    },
+                );
+                if let crate::layers::mtp_dloop::MtpDloopDecision::ExtendStage2 {
+                    extra_drafts,
+                    total_drafts,
+                } = decision
+                {
+                    static QWEN4_DLOOP_ENGAGED: std::sync::Once = std::sync::Once::new();
+                    QWEN4_DLOOP_ENGAGED.call_once(|| {
+                        tracing::info!(
+                            stage1_drafts = num_drafts,
+                            extra_drafts,
+                            total_drafts,
+                            live_seqs = cohort.live_seqs,
+                            threshold = crate::layers::mtp_dloop::mtp_dloop_thresh(),
+                            "QWEN4_MTP_DLOOP_STAGE2_ENGAGED"
+                        );
+                    });
+                    let mut stage2_drafts = Vec::with_capacity(extra_drafts);
+                    let mut stage2_tok = stage1_last_token;
+                    let mut stage2_hidden = ctx.buffers.hidden_states();
+                    let stage2_first_seq_len = state.seq_len;
+                    for s2 in 0..extra_drafts {
+                        let (qsa_required, reuse_action) = draft_step_qsa_plan(
+                            qsa_mode,
+                            has_qsa,
+                            stage2_first_seq_len,
+                            s2,
+                            extra_drafts,
+                        );
+                        let _reuse_guard = reuse_action.map(|action| match action {
+                            DraftStepReuseAction::SnapshotStep0 => {
+                                crate::layers::qwen4_qsa::DraftSelectionReuseGuard::snapshot_step0()
+                            }
+                            DraftStepReuseAction::ReuseStep {
+                                base_seq_len,
+                                step_offset,
+                                max_drafts,
+                            } => crate::layers::qwen4_qsa::DraftSelectionReuseGuard::reuse_step(
+                                base_seq_len,
+                                step_offset,
+                                max_drafts,
+                            ),
+                        });
+                        stage2_tok = self.forward_one(
+                            stage2_tok,
+                            stage2_hidden,
+                            position + num_drafts + s2,
+                            state,
+                            ctx,
+                            stream,
+                            None,
+                            true,
+                            qsa_required,
+                            None,
+                        )?;
+                        stage2_drafts.push(stage2_tok);
+                        stage2_hidden = ctx.buffers.hidden_states();
+                    }
+                    drafts.extend_from_slice(&stage2_drafts);
+                    state.last_drafts.extend_from_slice(&stage2_drafts);
+                    computed += extra_drafts;
+                }
             }
         }
         Ok((drafts, computed))

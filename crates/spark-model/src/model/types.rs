@@ -462,6 +462,11 @@ pub struct TransformerModel {
     /// Layer indices to capture for DFlash. Empty when DFlash is disabled.
     /// Sourced from drafter's `dflash_config.target_layer_ids` at model build.
     pub(super) dflash_capture_layers: Vec<usize>,
+    /// Opt-in (`ATLAS_DFLASH_EARLY_STAGE1=1`) CUDA event recorded inside target
+    /// verify right after the final DFlash capture layer (e.g. Layer 61 on 27B
+    /// or Layer 45 on Flash-Next) so Stage-1 `fc` + `hidden_norm` can overlap
+    /// with the trailing target layers + LM head + verify D2H. `0` when OFF.
+    pub(super) dflash_capture_done_event: u64,
     /// Width and source offset for each captured DFlash slice. Ordinary
     /// targets use the entire residual row; compatibility bridges may expose
     /// a narrower explicit slice.

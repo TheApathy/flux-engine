@@ -155,65 +155,35 @@ impl BlockDiffusionDraftHead {
         // propose() calls. Setting this flag uses ONLY prefill captures
         // — clean ctx isolation for diagnosing real-traffic acceptance.
         let skip_decode_append = policy.skip_decode_append;
-        // Drop the `first_propose_done` gate. The previous logic skipped
-        // the append on the very first propose call, assuming
-        // dflash_hidden_save was uninitialized. But after a regular
-        // bootstrap decode (mtp_step's Phase A), `decode_a.rs` has
-        // already populated dflash_hidden_save[0] with the
-        // bootstrap-decoded token's hidden at sequence position M (=
-        // seq_len after prefill, BEFORE bootstrap increment). Skipping
-        // the append left ctx_len = M (prefill captures) while
-        // seq.seq_len = M+1, so the drafter's RoPE positions for ctx
-        // were assigned [1..M] instead of [0..M-1] — an off-by-one
-        // that shifted every ctx position by 1 RoPE rotation. Every
-        // subsequent step inherited the off-by-one (ctx_len fell one
-        // behind seq.seq_len). Result: drafter accept rate collapsed
-        // to ~1% because attention K/V were rotated to the wrong
-        // positions. Verified by reading position=5, eff_ctx=4 from
-        // the very first propose dump.
+        // Pending ctx capture base to append into `dstate.ctx_hidden_acc`.
         //
-        // Fix: always append on every propose. On first propose,
-        // last_num_accepted=0 → num_append=1 → appends the bootstrap
-        // hidden, ctx_len becomes M+1 = seq.seq_len, RoPE positions
-        // align. On subsequent proposes, the existing logic
-        // (last_num_accepted+1 slots) keeps ctx_len in lockstep with
-        // seq.seq_len.
-        if !skip_decode_append && let Some(base) = target_hidden_stack {
-            // Append the new tokens' hidden states from the previous
-            // verify step.
-            //
-            // dflash_hidden_save layout (set during verify of
-            // [last_token, draft_0, ..., draft_{γ-1}]):
-            //   [0]   = hidden of verify input position 0 = last_token
-            //   [1..] = hidden of draft_0, draft_1, ...
-            //
-            // ctx_hidden_acc semantics: slot i = hidden of token at
-            // sequence position i. ctx_start in forward_block.rs is
-            // computed as `position - eff_ctx`, so position i in ctx
-            // corresponds to absolute position (position - eff_ctx + i).
-            //
-            // After step N's verify (last_token at sequence position P,
-            // num_accepted=N accepted drafts, bonus emitted next):
-            //   - decode_verify wrote last_token at KV position P,
-            //     draft_0 at P+1, ..., draft_{N-1} at P+N
-            //   - seq.seq_len = P + N + 1 after rollback
-            //   - The bonus is logically at position P+N+1 but has no
-            //     KV yet (will be written when next verify processes it
-            //     as input position 0)
-            //
-            // For step N+1 propose:
-            //   - position = P + N + 1
-            //   - We need ctx slots P, P+1, ..., P+N populated with
-            //     hiddens of (last_token, draft_0, ..., draft_{N-1})
-            //   - dflash_hidden_save[0..N+1] has EXACTLY this in order
-            //
-            // So src_idx 0..N+1 is correct and matches sequence order.
-            // The bonus's hidden is NOT needed in ctx — bonus appears
-            // as the first noise embedding (Q-side input).
-            // The ring cursor, target position, and verify accept count form
-            // one exact transaction.  This shared helper is also used by the
-            // pre-bootstrap boundary reconciler; it rejects holes instead of
-            // moving the cursor over captures that were never copied.
+        // When `ATLAS_DFLASH_ASYNC=1` (and especially `ATLAS_DFLASH_FUSED=1`),
+        // `arm_propose_overlap` recorded `async_order_event` on `default_stream`
+        // BEFORE `commit_verify_state_async`. Running `append_pending_ctx_captures`
+        // eagerly on `_stream` (`default_stream`) here would enqueue the D2D
+        // AFTER `async_order_event`, racing with `pstream`'s `forward_block`!
+        //
+        // Fix: defer the append until we know the execution stream:
+        //   - Async launch (`try_launch_async_propose`): wait on `async_order_event`
+        //     on `pstream` FIRST, then execute `append_pending_ctx_captures` ON
+        //     `pstream` strictly BEFORE `forward_block(..., pstream, ..., true)`.
+        //   - Host early-return (Echo/PLD/Retrieval/Recycle/accept_fallback) or
+        //     sync fallback: flush `append_pending_ctx_captures` on `_stream`
+        //     before returning/running sync `forward_block`, and disarm any
+        //     unused `fused_event_armed`.
+        //   - Async disabled (default OFF): append immediately on `_stream`
+        //     (100% byte-identical to legacy order).
+        let mut pending_ctx_base = (!skip_decode_append)
+            .then_some(target_hidden_stack)
+            .flatten();
+        let mut ctx_appended_span: Option<(usize, usize)> = None;
+        let flush_pending_ctx_on_default = |pending: &mut Option<DevicePtr>,
+                                            span_out: &mut Option<(usize, usize)>,
+                                            dstate: &mut DflashProposerState|
+         -> Result<()> {
+            let Some(base) = pending.take() else {
+                return Ok(());
+            };
             let last_num_accepted = dstate.last_num_accepted;
             let ctx_len_before = dstate.ctx_len;
             let num_append = dstate.append_pending_ctx_captures(
@@ -230,6 +200,11 @@ impl BlockDiffusionDraftHead {
                 ctx_len_before,
                 ctx_len_before,
             );
+            *span_out = Some((ctx_len_before, num_append));
+            Ok(())
+        };
+        if !super::async_propose::dflash_async_enabled() {
+            flush_pending_ctx_on_default(&mut pending_ctx_base, &mut ctx_appended_span, dstate)?;
         }
 
         // ── ATLAS_DFLASH_ECHO=1: echo-drafting / Jacobi salvage (default off) ──
@@ -309,6 +284,13 @@ impl BlockDiffusionDraftHead {
                     drafts.len(),
                     dstate.echo_streak,
                 );
+                self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
+                flush_pending_ctx_on_default(
+                    &mut pending_ctx_base,
+                    &mut ctx_appended_span,
+                    dstate,
+                )?;
                 return Ok(drafts);
             }
             // Echo did not fire this propose — every draft source below is
@@ -368,6 +350,13 @@ impl BlockDiffusionDraftHead {
                 dstate.last_num_drafted = drafts.len();
                 dstate.first_propose_done = true;
                 dstate.pending_tree_payload = None;
+                self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
+                flush_pending_ctx_on_default(
+                    &mut pending_ctx_base,
+                    &mut ctx_appended_span,
+                    dstate,
+                )?;
                 return Ok(drafts);
             }
         }
@@ -609,6 +598,13 @@ impl BlockDiffusionDraftHead {
                 // (Any prior async in-flight handle was already resolved at
                 // entry to `propose_drafts`.)
                 dstate.pending_tree_payload = None;
+                self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
+                flush_pending_ctx_on_default(
+                    &mut pending_ctx_base,
+                    &mut ctx_appended_span,
+                    dstate,
+                )?;
                 return Ok(hit.drafts);
             }
         }
@@ -718,6 +714,13 @@ impl BlockDiffusionDraftHead {
                 // Flat chain → requires_tree_kernel false → wy17 verify path,
                 // identical dispatch to drafter output. No tree payload.
                 dstate.pending_tree_payload = None;
+                self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
+                flush_pending_ctx_on_default(
+                    &mut pending_ctx_base,
+                    &mut ctx_appended_span,
+                    dstate,
+                )?;
                 return Ok(drafts);
             }
         }
@@ -763,6 +766,13 @@ impl BlockDiffusionDraftHead {
                     "DFlash accept-fallback: suppressed (remaining={})",
                     dstate.fallback_suppressed_remaining
                 );
+                self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
+                flush_pending_ctx_on_default(
+                    &mut pending_ctx_base,
+                    &mut ctx_appended_span,
+                    dstate,
+                )?;
                 return Ok(Vec::new());
             }
             // Not suppressed. If we have a stable accept signal and it's low,
@@ -787,6 +797,13 @@ impl BlockDiffusionDraftHead {
                         thresh,
                         cooldown
                     );
+                    self.disarm_fused_overlap_event();
+                    self.drain_early_stage1_impl(ctx.gpu)?;
+                    flush_pending_ctx_on_default(
+                        &mut pending_ctx_base,
+                        &mut ctx_appended_span,
+                        dstate,
+                    )?;
                     return Ok(Vec::new());
                 }
             }
@@ -811,21 +828,38 @@ impl BlockDiffusionDraftHead {
                 ctx,
                 _stream,
                 _grammar_bitmask.is_some(),
+                pending_ctx_base,
                 dstate,
             ) {
                 Ok(Some(placeholder)) => return Ok(placeholder),
                 Ok(None) => {
+                    self.disarm_fused_overlap_event();
                     if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
                         clear_proposal_outputs(dstate);
                         return Err(error);
                     }
                 }
                 Err(e) => {
+                    self.disarm_fused_overlap_event();
                     tracing::warn!("DFLASH_ASYNC launch failed ({e:#}); degrading to no-spec");
                     clear_proposal_outputs(dstate);
                     return Err(e);
                 }
             }
+        }
+        self.disarm_fused_overlap_event();
+        flush_pending_ctx_on_default(&mut pending_ctx_base, &mut ctx_appended_span, dstate)?;
+        if let Some((ctx_len_before, num_append)) = ctx_appended_span
+            && let Err(error) = self.try_commit_early_stage1_fc(
+                ctx.gpu,
+                dstate,
+                ctx_len_before,
+                num_append,
+                _stream,
+            )
+        {
+            clear_proposal_outputs(dstate);
+            return Err(error);
         }
 
         if policy.tps_router {

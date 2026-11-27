@@ -1490,6 +1490,19 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// True when `seq` currently holds an uncollected placeholder chain from an
+    /// in-flight asynchronous DFlash propose (`ATLAS_DFLASH_ASYNC=1`).
+    fn dflash_seq_has_async_placeholder(&self, seq: &SequenceState) -> bool {
+        let _ = seq;
+        false
+    }
+
+    /// Maximum physical verify width `K` available for zero-training native-MTP
+    /// DLoop (`ATLAS_MTP_DLOOP=1`). Returns `0` (fail-closed) by default.
+    fn mtp_dloop_max_verify_k(&self) -> usize {
+        0
+    }
+
     /// ATLAS_DFLASH_RECYCLE=1: stash the discarded draft tail on the DFlash
     /// proposer state so the next propose can re-offer it (lossless).
     ///

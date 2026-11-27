@@ -107,6 +107,7 @@ impl Model for TransformerModel {
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         crate::model::verify_failure::check()?;
         self.ensure_verify_healthy()?;
+        self.try_drain_dflash_early_stage1()?;
         self.qwen4_seqstate_cache_save_if_due(seq);
         self.qwen4_seqstate_roundtrip_if_due(seq)?;
         self.ep_head_sync_for_decode(seq)?;
@@ -120,6 +121,7 @@ impl Model for TransformerModel {
     ) -> Result<DevicePtr> {
         crate::model::verify_failure::check()?;
         self.ensure_verify_healthy()?;
+        self.try_drain_dflash_early_stage1()?;
         for seq in seqs.iter_mut() {
             self.qwen4_seqstate_cache_save_if_due(seq);
             self.qwen4_seqstate_roundtrip_if_due(seq)?;
@@ -139,6 +141,7 @@ impl Model for TransformerModel {
     ) -> Result<crate::traits::MixedForwardResult> {
         crate::model::verify_failure::check()?;
         self.ensure_verify_healthy()?;
+        self.try_drain_dflash_early_stage1()?;
         self.mixed_forward_dispatch(
             decode_tokens,
             decode_seqs,
@@ -172,6 +175,7 @@ impl Model for TransformerModel {
     ) -> Result<crate::traits::MixedBatchResult> {
         crate::model::verify_failure::check()?;
         self.ensure_verify_healthy()?;
+        self.try_drain_dflash_early_stage1()?;
         // The default trait path mutates decode state before it reaches the
         // guarded prefill entry. Multi-chunk is a C1-only experiment, so keep
         // the whole family suppressed across both halves of an N>1 mixed
@@ -357,6 +361,7 @@ impl Model for TransformerModel {
         stream: u64,
     ) -> Result<Vec<u32>> {
         crate::model::verify_failure::check()?;
+        self.try_drain_dflash_early_stage1()?;
         self.begin_verify_frame(seq, tokens.len())?;
         self.decode_verify_dispatch(tokens, seq, stream)
     }
@@ -485,6 +490,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 2]> {
         crate::model::verify_failure::check()?;
+        self.try_drain_dflash_early_stage1()?;
         self.ep_head_sync_for_verify(seq)?;
         self.begin_verify_frame(seq, tokens.len())?;
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
@@ -496,6 +502,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 3]> {
         crate::model::verify_failure::check()?;
+        self.try_drain_dflash_early_stage1()?;
         self.ep_head_sync_for_verify(seq)?;
         self.begin_verify_frame(seq, tokens.len())?;
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
@@ -553,6 +560,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 4]> {
         crate::model::verify_failure::check()?;
+        self.try_drain_dflash_early_stage1()?;
         self.ep_head_sync_for_verify(seq)?;
         self.begin_verify_frame(seq, tokens.len())?;
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
@@ -564,6 +572,7 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<Vec<Vec<u32>>> {
         crate::model::verify_failure::check()?;
+        self.try_drain_dflash_early_stage1()?;
         if self.config.is_qwen4_exp() {
             anyhow::ensure!(
                 tokens_per_seq.len() == seqs.len() && seqs.len() <= 1,
@@ -585,6 +594,7 @@ impl Model for TransformerModel {
         tokens_per_seq: &[Vec<u32>],
         seqs: &mut [&mut SequenceState],
     ) -> Result<Vec<Vec<u32>>> {
+        self.try_drain_dflash_early_stage1()?;
         self.decode_verify_qwen4_batched_dispatch(tokens_per_seq, seqs)
     }
     fn begin_verify_qwen4_batch(&self, seqs: &mut [&mut SequenceState], k: usize) -> Result<()> {
@@ -1087,6 +1097,27 @@ impl Model for TransformerModel {
             return Ok(());
         };
         proposer.arm_propose_overlap(self.gpu.as_ref(), self.gpu.default_stream())
+    }
+
+    fn dflash_seq_has_async_placeholder(&self, seq: &SequenceState) -> bool {
+        seq.proposer_state
+            .as_ref()
+            .and_then(|s| {
+                s.as_any()
+                    .downcast_ref::<crate::layers::DflashProposerState>()
+            })
+            .is_some_and(|ds| ds.async_placeholder)
+    }
+
+    fn mtp_dloop_max_verify_k(&self) -> usize {
+        if self.config.num_experts > 1 {
+            return 0;
+        }
+        if self.ssm_pool.num_ssm_layers > 0 {
+            self.ssm_pool.num_intermediates.saturating_sub(1)
+        } else {
+            self.buffers.max_batch_tokens()
+        }
     }
 
     fn dflash_stash_recycle(
