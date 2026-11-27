@@ -10,7 +10,69 @@
 //! - `NoPrefixCaching`: no-ops (zero overhead when disabled)
 //! - `RadixTree` (see `crate::radix_tree`): full radix tree with LRU eviction
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// Default TripleKV protection TTL for prefetched KV blocks (120 seconds, arXiv:2611.25112).
+pub const DEFAULT_PREFETCH_TTL: Duration = Duration::from_secs(120);
+
+/// TripleKV cache-line protection tier governing eviction priority in [`crate::radix_tree::RadixTree`].
+///
+/// Evictable leaf nodes are reclaimed strictly in ascending priority order:
+/// 1. [`Self::Cached`] (priority `0`) — ordinary historical blocks and expired prefetches.
+/// 2. [`Self::Backup`] (priority `1`) — demoted warm victim-protected blocks.
+/// 3. [`Self::Prefetched`] (priority `2`) — active tool-prefetched blocks until `expires_at`
+///    (still evictable as a last resort under sustained demand pressure).
+///
+/// Within the same tier, eviction uses strict LRU (`last_access` ascending). When every node
+/// remains in the default [`Self::Cached`] class, eviction is identical to legacy LRU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProtectionClass {
+    /// Ordinary historical cached KV blocks (evicted first).
+    #[default]
+    Cached,
+    /// Warm backup / recently demoted blocks (evicted after all `Cached` leaves).
+    Backup,
+    /// Proactively prefetched agentic KV blocks protected until `expires_at`.
+    Prefetched {
+        /// Monotonic deadline after which the block demotes back to [`Self::Cached`] priority.
+        expires_at: Instant,
+    },
+}
+
+impl ProtectionClass {
+    /// Construct a [`Self::Prefetched`] tag expiring `ttl` from `now`.
+    #[must_use]
+    pub fn prefetched_until(now: Instant, ttl: Duration) -> Self {
+        Self::Prefetched {
+            expires_at: now + ttl,
+        }
+    }
+
+    /// Construct a [`Self::Prefetched`] tag expiring after [`DEFAULT_PREFETCH_TTL`].
+    #[must_use]
+    pub fn prefetched_default() -> Self {
+        Self::prefetched_until(Instant::now(), DEFAULT_PREFETCH_TTL)
+    }
+
+    /// Numeric eviction tier at instant `now` (lower values are evicted first).
+    #[must_use]
+    pub fn eviction_priority(self, now: Instant) -> u8 {
+        match self {
+            Self::Cached => 0,
+            Self::Prefetched { expires_at } if now >= expires_at => 0,
+            Self::Backup => 1,
+            Self::Prefetched { .. } => 2,
+        }
+    }
+
+    /// True when this node holds an unexpired [`Self::Prefetched`] lease at `now`.
+    #[must_use]
+    pub fn is_active_prefetch(self, now: Instant) -> bool {
+        matches!(self, Self::Prefetched { expires_at } if now < expires_at)
+    }
+}
 
 // ── Global prefix cache counters (one RadixTree per server) ──
 
@@ -333,13 +395,28 @@ pub trait PrefixCache: Send + Sync {
     ///
     /// Reclaims any orphaned displaced partial-suffix blocks first, then picks
     /// LRU leaf nodes with no active borrowers (`ref_count <= 1`, baseline
-    /// cache ref only). Evicting a leaf with a `partial_suffix` frees both the
-    /// full block and its partial block (so up to `num_blocks + 1` physical
-    /// blocks may be returned). Returns fewer than requested if not enough
-    /// evictable blocks exist. The caller is responsible for `dec_disk_ref`-ing
-    /// every entry in `disk_block_ids` (releasing the cache's HSS-side
-    /// refcount). When HSS isn't in use the `disk_block_ids` vec is empty.
+    /// cache ref only) ordered by TripleKV [`ProtectionClass`] (`Cached` <
+    /// `Backup` < active `Prefetched`) and LRU within each tier. Evicting a
+    /// leaf with a `partial_suffix` frees both the full block and its partial
+    /// block (so up to `num_blocks + 1` physical blocks may be returned).
+    /// Returns fewer than requested if not enough evictable blocks exist.
     fn evict(&self, num_blocks: usize) -> EvictedBlocks;
+
+    /// Deterministic clock-injected counterpart of [`Self::evict`] for TTL testing.
+    fn evict_at(&self, num_blocks: usize, _now: Instant) -> EvictedBlocks {
+        self.evict(num_blocks)
+    }
+
+    /// Tag all live full-block radix nodes matching `tokens` with a TripleKV
+    /// [`ProtectionClass`]. Returns the number of nodes tagged.
+    fn set_prefix_protection(
+        &self,
+        _tokens: &[u32],
+        _block_size: usize,
+        _class: ProtectionClass,
+    ) -> usize {
+        0
+    }
 
     /// Drain any orphaned physical blocks and HSS disk-block IDs displaced
     /// when a `partial_suffix` was cleared or replaced during `insert*`.
@@ -472,6 +549,210 @@ pub trait PrefixCache: Send + Sync {
 
 /// No-op prefix cache (zero overhead when disabled).
 pub struct NoPrefixCaching;
+
+impl<T: PrefixCache + ?Sized> PrefixCache for Arc<T> {
+    fn is_active(&self) -> bool {
+        (**self).is_active()
+    }
+
+    fn lookup(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        (**self).lookup(tokens, block_size, session_hash)
+    }
+
+    fn lookup_paired(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        (**self).lookup_paired(tokens, block_size, session_hash)
+    }
+
+    fn lookup_qsa(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        (**self).lookup_qsa(tokens, block_size, session_hash)
+    }
+
+    fn lookup_paired_qsa(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        session_hash: u64,
+    ) -> PrefixMatch {
+        (**self).lookup_paired_qsa(tokens, block_size, session_hash)
+    }
+
+    fn mark_blocks_qsa_populated(&self, tokens: &[u32], block_table: &[u32], block_size: usize) {
+        (**self).mark_blocks_qsa_populated(tokens, block_table, block_size);
+    }
+
+    fn insert(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        matched_tokens: usize,
+    ) -> Vec<u32> {
+        (**self).insert(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            matched_tokens,
+        )
+    }
+
+    fn insert_with_snapshot(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+    ) -> (Option<usize>, Vec<u32>) {
+        (**self).insert_with_snapshot(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            snapshot_id,
+            session_hash,
+            matched_tokens,
+        )
+    }
+
+    fn insert_intermediate_snapshot(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+    ) -> Option<usize> {
+        (**self).insert_intermediate_snapshot(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            snapshot_id,
+            session_hash,
+            matched_tokens,
+        )
+    }
+
+    fn release(&self, tokens: &[u32], block_size: usize) {
+        (**self).release(tokens, block_size);
+    }
+
+    fn release_matched(&self, tokens: &[u32], block_size: usize, matched_tokens: usize) {
+        (**self).release_matched(tokens, block_size, matched_tokens);
+    }
+
+    fn evict(&self, num_blocks: usize) -> EvictedBlocks {
+        (**self).evict(num_blocks)
+    }
+
+    fn evict_at(&self, num_blocks: usize, now: Instant) -> EvictedBlocks {
+        (**self).evict_at(num_blocks, now)
+    }
+
+    fn set_prefix_protection(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        class: ProtectionClass,
+    ) -> usize {
+        (**self).set_prefix_protection(tokens, block_size, class)
+    }
+
+    fn drain_displaced_partials(&self) -> EvictedBlocks {
+        (**self).drain_displaced_partials()
+    }
+
+    fn evict_snapshot_lru(&self) -> Option<usize> {
+        (**self).evict_snapshot_lru()
+    }
+
+    fn evict_snapshot_lru_entry(&self) -> Option<EvictedSnapshot> {
+        (**self).evict_snapshot_lru_entry()
+    }
+
+    fn set_paired_truncate_to_snapshot_floor(&self, enabled: bool) {
+        (**self).set_paired_truncate_to_snapshot_floor(enabled);
+    }
+
+    fn insert_with_noncausal_spans(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        matched_tokens: usize,
+        noncausal_spans: &[NonCausalSpan],
+    ) -> Vec<u32> {
+        (**self).insert_with_noncausal_spans(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            matched_tokens,
+            noncausal_spans,
+        )
+    }
+
+    fn insert_with_snapshot_and_noncausal_spans(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+        noncausal_spans: &[NonCausalSpan],
+    ) -> (Option<usize>, Vec<u32>) {
+        (**self).insert_with_snapshot_and_noncausal_spans(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            snapshot_id,
+            session_hash,
+            matched_tokens,
+            noncausal_spans,
+        )
+    }
+
+    fn insert_intermediate_snapshot_with_noncausal_spans(
+        &self,
+        tokens: &[u32],
+        block_table: &[u32],
+        disk_block_ids: &[u32],
+        block_size: usize,
+        snapshot_id: usize,
+        session_hash: u64,
+        matched_tokens: usize,
+        noncausal_spans: &[NonCausalSpan],
+    ) -> Option<usize> {
+        (**self).insert_intermediate_snapshot_with_noncausal_spans(
+            tokens,
+            block_table,
+            disk_block_ids,
+            block_size,
+            snapshot_id,
+            session_hash,
+            matched_tokens,
+            noncausal_spans,
+        )
+    }
+
+    fn snapshot_count(&self) -> usize {
+        (**self).snapshot_count()
+    }
+
+    fn stats(&self) -> (usize, usize) {
+        (**self).stats()
+    }
+}
 
 impl PrefixCache for NoPrefixCaching {
     fn is_active(&self) -> bool {

@@ -210,6 +210,10 @@ pub(crate) async fn build_and_serve(
         .route("/v1/apply-template", post(api::apply_template))
         .route("/v1/decisions", post(api::decisions_endpoint))
         .route("/v1/memory", get(api::memory_telemetry))
+        .route(
+            "/v1/kv_cache/prefetch",
+            post(api::kv_cache_prefetch).get(api::kv_cache_prefetch_status),
+        )
         .route("/v1/experts/usage", get(api::experts_usage))
         .route("/v1/disagg/status", get(api::disagg_status))
         .route("/v1/disagg/prefill", post(api::disagg_prefill))

@@ -99,12 +99,21 @@ pub struct ModelHost {
     /// Both swap paths used to pass `None` here because neither had the
     /// sender; the host does.
     tui_handles: parking_lot::RwLock<Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>>,
+    /// Process-scoped TripleKV async L3 -> L2 prefix prefetcher (`/v1/kv_cache/prefetch`).
+    kv_prefetcher: Arc<crate::api::kv_prefetch::KvPrefetcher>,
 }
 
 impl ModelHost {
     /// A host with nothing loaded yet — `spark serve` with no arguments, where
     /// the dashboard is the front door.
     pub fn empty() -> Self {
+        Self::with_kv_prefetcher(Arc::new(
+            crate::api::kv_prefetch::KvPrefetcher::from_env_best_effort(),
+        ))
+    }
+
+    /// Construct an empty host wired to a caller-supplied [`KvPrefetcher`] (used in tests).
+    pub fn with_kv_prefetcher(kv_prefetcher: Arc<crate::api::kv_prefetch::KvPrefetcher>) -> Self {
         Self {
             current: parking_lot::RwLock::new(None),
             scheduler: parking_lot::Mutex::new(None),
@@ -117,7 +126,14 @@ impl ModelHost {
             auth: parking_lot::RwLock::new(None),
             process: parking_lot::RwLock::new(None),
             tui_handles: parking_lot::RwLock::new(None),
+            kv_prefetcher,
         }
+    }
+
+    /// The process-scoped TripleKV async prefix prefetcher.
+    #[must_use]
+    pub fn kv_prefetcher(&self) -> &Arc<crate::api::kv_prefetch::KvPrefetcher> {
+        &self.kv_prefetcher
     }
 
     /// The model serving right now, or `None` while none is loaded.

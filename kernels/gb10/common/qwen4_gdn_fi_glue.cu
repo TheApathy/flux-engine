@@ -54,7 +54,7 @@ __device__ __forceinline__ float qwen4_fi_div_approx(float a, float b) {
 // (common/causal_conv1d_prefill_parallel.cu): identical conv, SiLU and per-head
 // L2, then a BF16 store into a [T, output_stride] buffer.
 // Grid: (ceil(dim/256), num_tokens)  Block: (256, 1, 1)
-template <typename OutT>
+template <typename OutT, bool GATESIGHT = false>
 __device__ __forceinline__ void qwen4_conv1d_l2norm_16_body(
     const float* __restrict__ conv_state,
     const __nv_bfloat16* __restrict__ new_input,
@@ -68,7 +68,9 @@ __device__ __forceinline__ void qwen4_conv1d_l2norm_16_body(
     unsigned int head_dim,
     float l2_eps,
     unsigned int input_stride,
-    unsigned int output_stride
+    unsigned int output_stride,
+    __half* __restrict__ gatesight_out = nullptr,
+    unsigned int num_v_heads = 0u
 ) {
     const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int tid = threadIdx.x;
@@ -110,6 +112,27 @@ __device__ __forceinline__ void qwen4_conv1d_l2norm_16_body(
         }
         __syncthreads();
         if (valid) silu *= warp_sums[base_warp];
+    } else if constexpr (GATESIGHT) {
+        if (gatesight_out != nullptr) {
+            float sq = valid ? silu * silu : 0.0f;
+            const unsigned int warp_id = tid / 32;
+            const unsigned int lane = tid % 32;
+            for (int offset = 16; offset >= 1; offset >>= 1)
+                sq += __shfl_down_sync(0xFFFFFFFF, sq, offset);
+            if (lane == 0) warp_sums[warp_id] = sq;
+            __syncthreads();
+            const unsigned int head_in_block = tid / head_dim;
+            const unsigned int base_warp = head_in_block * (head_dim / 32);
+            if ((tid == 0 || tid == head_dim) && valid) {
+                float total = warp_sums[base_warp] + warp_sums[base_warp + 1]
+                            + warp_sums[base_warp + 2] + warp_sums[base_warp + 3];
+                const unsigned int vh = (ch - qk_channels) / head_dim;
+                if (vh < num_v_heads) {
+                    gatesight_out[((unsigned long long)token * num_v_heads + vh) * 3ull + 2ull] =
+                        __float2half_rn(sqrtf(total));
+                }
+            }
+        }
     }
 
     if (valid) {
@@ -125,14 +148,33 @@ __device__ __forceinline__ void qwen4_conv1d_l2norm_16_body(
         OUT_T* __restrict__ output, unsigned int num_tokens, unsigned int dim,        \
         unsigned int d_conv, unsigned int qk_channels, unsigned int head_dim,         \
         float l2_eps, unsigned int input_stride, unsigned int output_stride) {        \
-        qwen4_conv1d_l2norm_16_body<OUT_T>(conv_state, new_input, weight, bias,       \
-                                           output, num_tokens, dim, d_conv,           \
-                                           qk_channels, head_dim, l2_eps,             \
-                                           input_stride, output_stride);              \
+        qwen4_conv1d_l2norm_16_body<OUT_T, false>(conv_state, new_input, weight,      \
+                                                  bias, output, num_tokens, dim,      \
+                                                  d_conv, qk_channels, head_dim,      \
+                                                  l2_eps, input_stride,               \
+                                                  output_stride, nullptr, 0u);        \
+    }
+
+#define QWEN4_FI_CONV_GATESIGHT_ENTRY(NAME, OUT_T)                                    \
+    extern "C" __global__ void NAME(                                                  \
+        const float* __restrict__ conv_state,                                         \
+        const __nv_bfloat16* __restrict__ new_input,                                  \
+        const __nv_bfloat16* __restrict__ weight, const float* __restrict__ bias,     \
+        OUT_T* __restrict__ output, unsigned int num_tokens, unsigned int dim,        \
+        unsigned int d_conv, unsigned int qk_channels, unsigned int head_dim,         \
+        float l2_eps, unsigned int input_stride, unsigned int output_stride,          \
+        __half* __restrict__ gatesight_out, unsigned int num_v_heads) {               \
+        qwen4_conv1d_l2norm_16_body<OUT_T, true>(conv_state, new_input, weight, bias, \
+                                                 output, num_tokens, dim, d_conv,     \
+                                                 qk_channels, head_dim, l2_eps,       \
+                                                 input_stride, output_stride,         \
+                                                 gatesight_out, num_v_heads);         \
     }
 
 QWEN4_FI_CONV_ENTRY(qwen4_conv1d_l2norm_bf16_prefill_parallel, __nv_bfloat16)
 QWEN4_FI_CONV_ENTRY(qwen4_conv1d_l2norm_f16_prefill_parallel, __half)
+QWEN4_FI_CONV_GATESIGHT_ENTRY(qwen4_conv1d_l2norm_bf16_prefill_parallel_gatesight, __nv_bfloat16)
+QWEN4_FI_CONV_GATESIGHT_ENTRY(qwen4_conv1d_l2norm_f16_prefill_parallel_gatesight, __half)
 
 // ---------------------------------------------------------------------------
 // v2 of the conv/SiLU/L2 kernel above (ATLAS_QWEN4_PREFILL_GDN_CONV_V2=1): byte-identical output, fewer
@@ -1039,7 +1081,7 @@ __device__ __forceinline__ void qwen4_conv_v4_discard_l2(const void* p) {
 #define QWEN4_FI_CONV_V4_STRIP_DISC_COARSE 2u
 #define QWEN4_FI_CONV_V4_STRIP_DISC_EVERY_ROW 4u
 
-template <typename OutT>
+template <typename OutT, bool GATESIGHT = false>
 __device__ __forceinline__ void qwen4_conv1d_l2norm_16_v4_strip_body(
     float* __restrict__ conv_state,
     const __nv_bfloat16* __restrict__ new_input,
@@ -1053,7 +1095,9 @@ __device__ __forceinline__ void qwen4_conv1d_l2norm_16_v4_strip_body(
     float l2_eps,
     unsigned int input_stride,
     unsigned int output_stride,
-    unsigned int discard_flags
+    unsigned int discard_flags,
+    __half* __restrict__ gatesight_out = nullptr,
+    unsigned int num_v_heads = 0u
 ) {
     // 16-slot FP32 ring buffer (16 KiB/CTA, 2 bank-conflict-free float4s/lane/row).
     // Between barrier m and barrier m+1, active readers touch slots [4m..4m+5] while
@@ -1227,6 +1271,37 @@ __device__ __forceinline__ void qwen4_conv1d_l2norm_16_v4_strip_body(
                 const float inv = qwen4_conv_v4_rsqrt_approx(total + l2_eps);
 #pragma unroll
                 for (int c = 0; c < 8; ++c) silu[c] *= inv;
+            } else if constexpr (GATESIGHT) {
+                if (gatesight_out != nullptr) {
+                    float sq[8];
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) sq[c] = silu[c] * silu[c];
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) sq[c] += __shfl_down_sync(0xFFFFFFFFu, sq[c], 2);
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) sq[c] += __shfl_down_sync(0xFFFFFFFFu, sq[c], 1);
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) sq[c] += sq[c + 4];
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) sq[c] += sq[c + 2];
+                    sq[0] += sq[1];
+                    const unsigned int head_lane = lane & 16u;
+                    const float l0 = __shfl_sync(0xFFFFFFFFu, sq[0], head_lane | 0u);
+                    const float l1 = __shfl_sync(0xFFFFFFFFu, sq[0], head_lane | 4u);
+                    const float l2v = __shfl_sync(0xFFFFFFFFu, sq[0], head_lane | 8u);
+                    const float l3 = __shfl_sync(0xFFFFFFFFu, sq[0], head_lane | 12u);
+                    const float total = ((l0 + l1) + l2v) + l3;
+                    if ((lane & 15u) == 0u) {
+                        const unsigned int vh =
+                            ((blockIdx.x * QWEN4_FI_CONV_V4_STRIP_CHANNELS_PER_CTA - qk_channels) >> 7)
+                            + (lane >> 4);
+                        if (vh < num_v_heads) {
+                            gatesight_out[
+                                ((unsigned long long)(row_offset + t) * num_v_heads + vh) * 3ull + 2ull
+                            ] = __float2half_rn(sqrtf(total));
+                        }
+                    }
+                }
             }
 
             uint4 o;
@@ -1309,11 +1384,30 @@ __device__ __forceinline__ void qwen4_conv1d_l2norm_16_v4_strip_body(
         unsigned int qk_channels, float l2_eps,                                       \
         unsigned int input_stride, unsigned int output_stride,                        \
         unsigned int discard_flags) {                                                 \
-        qwen4_conv1d_l2norm_16_v4_strip_body<OUT_T>(                                  \
+        qwen4_conv1d_l2norm_16_v4_strip_body<OUT_T, false>(                           \
             conv_state, new_input, weight, bias, output, strip_tokens, row_offset,    \
             total_tokens, qk_channels, l2_eps, input_stride, output_stride,           \
-            discard_flags);                                                           \
+            discard_flags, nullptr, 0u);                                              \
+    }
+
+#define QWEN4_FI_CONV_V4_STRIP_GATESIGHT_ENTRY(NAME, OUT_T)                           \
+    extern "C" __global__ void __launch_bounds__(128, 4) NAME(                        \
+        float* __restrict__ conv_state,                                               \
+        const __nv_bfloat16* __restrict__ new_input,                                  \
+        const __nv_bfloat16* __restrict__ weight, const float* __restrict__ bias,     \
+        OUT_T* __restrict__ output, unsigned int strip_tokens,                        \
+        unsigned int row_offset, unsigned int total_tokens,                           \
+        unsigned int qk_channels, float l2_eps,                                       \
+        unsigned int input_stride, unsigned int output_stride,                        \
+        unsigned int discard_flags, __half* __restrict__ gatesight_out,               \
+        unsigned int num_v_heads) {                                                   \
+        qwen4_conv1d_l2norm_16_v4_strip_body<OUT_T, true>(                            \
+            conv_state, new_input, weight, bias, output, strip_tokens, row_offset,    \
+            total_tokens, qk_channels, l2_eps, input_stride, output_stride,           \
+            discard_flags, gatesight_out, num_v_heads);                               \
     }
 
 QWEN4_FI_CONV_V4_STRIP_ENTRY(qwen4_conv1d_l2norm_bf16_prefill_v4_strip, __nv_bfloat16)
 QWEN4_FI_CONV_V4_STRIP_ENTRY(qwen4_conv1d_l2norm_f16_prefill_v4_strip, __half)
+QWEN4_FI_CONV_V4_STRIP_GATESIGHT_ENTRY(qwen4_conv1d_l2norm_bf16_prefill_v4_strip_gatesight, __nv_bfloat16)
+QWEN4_FI_CONV_V4_STRIP_GATESIGHT_ENTRY(qwen4_conv1d_l2norm_f16_prefill_v4_strip_gatesight, __half)

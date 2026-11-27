@@ -23,6 +23,7 @@ pub mod engine;
 pub mod factory;
 pub mod forward;
 pub mod full_profile;
+pub mod gatesight;
 mod gpu_lifetime;
 pub mod layer;
 pub mod layers;

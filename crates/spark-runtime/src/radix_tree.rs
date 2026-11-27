@@ -9,10 +9,12 @@
 //! Thread-safe via `Mutex<RadixTreeInner>`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
 use crate::byte_resume::{ByteResumeMatch, heal_bpe_boundary_drift};
+pub use crate::prefix_cache::{DEFAULT_PREFETCH_TTL, ProtectionClass};
 use crate::prefix_cache::{
     EvictedBlocks, EvictedSnapshot, NonCausalSpan, PrefixCache, PrefixMatch,
     is_interior_of_noncausal_span,
@@ -312,6 +314,36 @@ impl RadixTree {
         }
         (self.lookup_paired(tokens, block_size, session_hash), None)
     }
+    /// Tag all live full-block nodes matching `tokens` with TripleKV [`ProtectionClass`].
+    /// Returns the number of nodes tagged along the matched prefix.
+    #[must_use]
+    pub fn set_prefix_protection(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        class: ProtectionClass,
+    ) -> usize {
+        self.inner
+            .lock()
+            .set_prefix_protection(tokens, block_size, class)
+    }
+
+    /// Inspect the [`ProtectionClass`] assigned to each live full-block node matching `tokens`.
+    #[must_use]
+    pub fn prefix_protection(&self, tokens: &[u32], block_size: usize) -> Vec<ProtectionClass> {
+        self.inner.lock().prefix_protection(tokens, block_size)
+    }
+
+    /// Evict up to `num_blocks` cached blocks evaluated at monotonic instant `now`.
+    #[must_use]
+    pub fn evict_at(&self, num_blocks: usize, now: Instant) -> EvictedBlocks {
+        let (physical, disk) = self.inner.lock().evict_at(num_blocks, now);
+        let disk_block_ids: Vec<u32> = disk.into_iter().filter(|&id| id != u32::MAX).collect();
+        EvictedBlocks {
+            physical,
+            disk_block_ids,
+        }
+    }
 }
 
 impl PrefixCache for RadixTree {
@@ -426,14 +458,20 @@ impl PrefixCache for RadixTree {
     }
 
     fn evict(&self, num_blocks: usize) -> EvictedBlocks {
-        let (physical, disk) = self.inner.lock().evict(num_blocks);
-        // Filter MAX sentinels out — the caller only needs disk_block_ids to
-        // dec_disk_ref on, and MAX entries don't correspond to a live HSS ref.
-        let disk_block_ids: Vec<u32> = disk.into_iter().filter(|&id| id != u32::MAX).collect();
-        EvictedBlocks {
-            physical,
-            disk_block_ids,
-        }
+        self.evict_at(num_blocks, Instant::now())
+    }
+
+    fn evict_at(&self, num_blocks: usize, now: Instant) -> EvictedBlocks {
+        RadixTree::evict_at(self, num_blocks, now)
+    }
+
+    fn set_prefix_protection(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        class: ProtectionClass,
+    ) -> usize {
+        RadixTree::set_prefix_protection(self, tokens, block_size, class)
     }
 
     fn drain_displaced_partials(&self) -> EvictedBlocks {

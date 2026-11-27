@@ -111,3 +111,5 @@ FLUX_QWEN4_TARGET_LMHEAD_MODE	NUMERICS	selects target lm_head precision (fp8/bf1
 ATLAS_DFLASH_HONOR_IS_CAUSAL	DEBUG	validated by cli_dflash_environment_rules.rs and pinned by built-in DFlash2 recipes
 ATLAS_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
 FLUX_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
+ATLAS_GATESIGHT_EVICT	NUMERICS	opt-in GateSight KV eviction mode (off/path_a/path_b), changes attention KV set when enabled
+ATLAS_GATESIGHT_RETENTION	NUMERICS	opt-in GateSight Zone-2 KV retention ratio, changes served output when eviction is enabled

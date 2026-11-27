@@ -488,4 +488,81 @@ pub fn dense_gemm_ba_gates_prefill(
         .launch(stream)
 }
 
+/// Opt-in GateSight twin of [`compute_gdn_gates`]: writes `(beta, log_decay g)`
+/// to `gatesight_out` (`[num_tokens, num_v_heads, 3]` FP16, slots 0 and 1) when
+/// `gatesight_out` is non-null, with zero extra DRAM reads.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_gdn_gates_gatesight(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    ba_interleaved: DevicePtr,
+    a_log: DevicePtr,
+    dt_bias: DevicePtr,
+    gate_out: DevicePtr,
+    beta_out: DevicePtr,
+    num_tokens: u32,
+    num_v_heads: u32,
+    num_groups: u32,
+    vheads_per_group: u32,
+    ba_stride: u32,
+    gatesight_out: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([num_v_heads, 1, 1])
+        .arg_ptr(ba_interleaved)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(gate_out)
+        .arg_ptr(beta_out)
+        .arg_u32(num_v_heads)
+        .arg_u32(num_groups)
+        .arg_u32(vheads_per_group)
+        .arg_u32(ba_stride)
+        .arg_ptr(gatesight_out)
+        .launch(stream)
+}
+
+/// Opt-in GateSight twin of [`dense_gemm_ba_gates_prefill`]: captures in-register
+/// `(beta, log_decay g)` into `gatesight_out` (`[m, nv, 3]` FP16, slots 0 and 1)
+/// when `gatesight_out` is non-null, with zero extra DRAM reads.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_ba_gates_prefill_gatesight(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    ba_weight: &DenseWeight,
+    a_log: DevicePtr,
+    dt_bias: DevicePtr,
+    gate_out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    k_stride: u32,
+    gate_stride: u32,
+    nv: u32,
+    vheads_per_group: u32,
+    gatesight_out: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), m, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(ba_weight.weight)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(gate_out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(k_stride)
+        .arg_u32(gate_stride)
+        .arg_u32(nv)
+        .arg_u32(vheads_per_group)
+        .arg_ptr(gatesight_out)
+        .launch(stream)
+}
+
 // ── Sampling ─────────────────────────────────────────────────────
