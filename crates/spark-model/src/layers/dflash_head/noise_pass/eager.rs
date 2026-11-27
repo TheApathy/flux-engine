@@ -489,14 +489,18 @@ impl BlockDiffusionDraftHead {
                 && !self.scratch.batch_anchor_ids.is_null()
                 && rejection_slot_valid.is_some();
             let effective_gumbel_spec = if rejection_env { None } else { gumbel_spec };
-            let use_ngram_selector = !is_probabilistic_sampled
-                && !use_rejection_selector
-                && effective_gumbel_spec.is_none()
-                && self.markov.is_none()
-                && self.draft_sample_method
-                    != crate::dflash_sampling::DflashDraftSampleMethod::Probabilistic
-                && super::super::ngram_bonus::ngram_bonus_enabled()
-                && self.ngram_selector_ready();
+            let use_ngram_selector = super::super::ngram_bonus::admit_c1_ngram_selector(
+                super::super::ngram_bonus::C1NgramAdmission {
+                    ngram_enabled: super::super::ngram_bonus::ngram_bonus_enabled(),
+                    ngram_ready: self.ngram_selector_ready(),
+                    use_rejection_selector,
+                    is_probabilistic_sampled,
+                    markov_active: self.markov.is_some(),
+                    probabilistic_method: self.draft_sample_method
+                        == crate::dflash_sampling::DflashDraftSampleMethod::Probabilistic,
+                    raw_gumbel_spec: gumbel_spec,
+                },
+            );
             let can_use_k32 = !is_probabilistic_sampled
                 && !use_rejection_selector
                 && !use_ngram_selector

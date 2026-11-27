@@ -158,6 +158,39 @@ const _: () = {
     assert!(std::mem::align_of::<NgramTableEntry>() == 8);
 };
 
+/// Inputs deciding whether C=1 DFlash2 selector dispatch may engage the
+/// 4-gate in-context n-gram walk.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct C1NgramAdmission {
+    pub ngram_enabled: bool,
+    pub ngram_ready: bool,
+    pub use_rejection_selector: bool,
+    pub is_probabilistic_sampled: bool,
+    pub markov_active: bool,
+    pub probabilistic_method: bool,
+    pub raw_gumbel_spec: Option<spark_runtime::sampler::gumbel::GumbelDraftSpec>,
+}
+
+/// Fail-closed Gate-0 admission check for C=1 eager and Stage-1/Stage-2 graph
+/// selector routing.
+///
+/// Inspects the **raw** `raw_gumbel_spec` BEFORE any rejection-fallback
+/// erasure (`staged_spec` / `effective_gumbel_spec`), guaranteeing that a
+/// stochastic `temperature > 0.0` request NEVER falls into the greedy n-gram
+/// walk even when rejection sampling declines rejection mode
+/// (e.g. missing slot or unready rejection scratch).
+#[inline]
+#[must_use]
+pub(super) fn admit_c1_ngram_selector(input: C1NgramAdmission) -> bool {
+    input.ngram_enabled
+        && input.ngram_ready
+        && !input.use_rejection_selector
+        && !input.is_probabilistic_sampled
+        && !input.markov_active
+        && !input.probabilistic_method
+        && !input.raw_gumbel_spec.is_some_and(|spec| spec.is_active())
+}
+
 /// Open-addressed 512-slot per-sequence n-gram lookup table (`8,192 B`).
 #[derive(Debug, Clone)]
 pub struct NgramSequenceTable {
@@ -193,9 +226,12 @@ impl NgramSequenceTable {
     /// Insert or update `(key, match_len) -> next_token` with bounded linear probing.
     ///
     /// More recent valid matches (outside the anti-loop window) overwrite older
-    /// entries for the exact same `(key, match_len)`. Returns `true` if stored.
+    /// entries for the exact same `(key, match_len)`. Returns `false` if `key == 0`
+    /// (reserved empty-slot sentinel), `match_len == 0`, or the probe window is full.
     pub fn insert(&mut self, key: u64, next_token: u32, match_len: u32) -> bool {
-        debug_assert!(key != 0);
+        if key == 0 || match_len == 0 {
+            return false;
+        }
         let mut slot = (key as usize) & NGRAM_TABLE_MASK;
         for _ in 0..NGRAM_MAX_PROBE {
             let entry = &mut self.entries[slot];
@@ -424,7 +460,10 @@ pub fn dflash2_selector_walk_ngram_cpu(
     gamma: usize,
     rank: usize,
 ) -> (Vec<u32>, Vec<f32>) {
-    let gate0_greedy_ok = !(temperature > 0.0 && temperature.is_finite());
+    if top_k_shortlist == 0 || top_k_shortlist > 32 || gamma == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let gate0_greedy_ok = temperature.is_finite() && temperature <= 0.0;
     let eff_max_bonus = cfg.effective_max_bonus();
     let ngram_active = gate0_greedy_ok
         && table.is_some()
@@ -611,7 +650,15 @@ mod tests {
             "T=0 must promote top-4 verbatim 4-gram"
         );
 
-        for temp in [1e-4_f32, 0.3, 0.6, 1.0] {
+        for temp in [
+            1e-4_f32,
+            0.3,
+            0.6,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
             let (sampled_toks, _) = dflash2_selector_walk_ngram_cpu(
                 &unary,
                 &cands,
@@ -633,6 +680,90 @@ mod tests {
                 "Gate 0 violated: n-gram fired at temperature={temp}"
             );
         }
+    }
+
+    #[test]
+    fn gate0_c1_admission_refuses_active_gumbel_spec_even_under_rejection_fallback() {
+        let active_spec = spark_runtime::sampler::gumbel::GumbelDraftSpec {
+            seed: 42,
+            step0_abs_pos: 100,
+            temperature: 0.6,
+            top_k: 20,
+            top_p: 0.95,
+            min_p: 0.0,
+        };
+        let greedy_spec = spark_runtime::sampler::gumbel::GumbelDraftSpec {
+            temperature: 0.0,
+            ..active_spec
+        };
+        let base = C1NgramAdmission {
+            ngram_enabled: true,
+            ngram_ready: true,
+            use_rejection_selector: false,
+            is_probabilistic_sampled: false,
+            markov_active: false,
+            probabilistic_method: false,
+            raw_gumbel_spec: None,
+        };
+        assert!(admit_c1_ngram_selector(base));
+        assert!(admit_c1_ngram_selector(C1NgramAdmission {
+            raw_gumbel_spec: Some(greedy_spec),
+            ..base
+        }));
+        // Even when rejection fallback sets `use_rejection_selector = false` and
+        // erases `staged_spec`, an active T>0 raw_gumbel_spec MUST stay blocked.
+        assert!(!admit_c1_ngram_selector(C1NgramAdmission {
+            raw_gumbel_spec: Some(active_spec),
+            ..base
+        }));
+    }
+
+    #[test]
+    fn table_insert_rejects_sentinel_zero_and_cpu_walk_handles_edge_shortlists() {
+        let mut table = NgramSequenceTable::empty();
+        assert!(!table.insert(0, 42, 4));
+        assert!(!table.insert(ngram_key4(1, 2, 3, 4), 42, 0));
+        let k = ngram_key4(1, 2, 3, 4);
+        assert!(table.insert(k, 99, 4));
+        assert_eq!(table.probe(k, 4), 99);
+
+        let cfg = NgramBonusConfig::default();
+        assert_eq!(
+            dflash2_selector_walk_ngram_cpu(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                [NGRAM_EMPTY_TOK; 3],
+                Some(&table),
+                0.0,
+                cfg,
+                0,
+                1,
+                4,
+            ),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            dflash2_selector_walk_ngram_cpu(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                [NGRAM_EMPTY_TOK; 3],
+                Some(&table),
+                0.0,
+                cfg,
+                33,
+                1,
+                4,
+            ),
+            (Vec::new(), Vec::new())
+        );
     }
 
     #[test]

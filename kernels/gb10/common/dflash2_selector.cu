@@ -1337,8 +1337,8 @@ extern "C" __global__ void __launch_bounds__(32) dflash2_selector_walk_ngram_bat
     const Df2NgramEntry* seq_table =
         (ngram_tables != nullptr) ? (ngram_tables + (size_t)b * DF2_NGRAM_TABLE_SLOTS) : nullptr;
     const float temp = (temperatures != nullptr) ? temperatures[b] : 0.0f;
-    // Gate 0: strict T=0 ONLY; never perturb logits when temperature > 0.
-    const bool gate0_greedy_ok = !(temp > 0.0f && isfinite(temp));
+    // Gate 0: strict T=0 ONLY (fail closed on T > 0 or non-finite temperature).
+    const bool gate0_greedy_ok = isfinite(temp) && (temp <= 0.0f);
     const float eff_max_bonus =
         (isfinite(max_bonus) && max_bonus > 0.0f) ? fminf(max_bonus, DF2_NGRAM_HARD_CAP) : 0.0f;
     const bool ngram_active =

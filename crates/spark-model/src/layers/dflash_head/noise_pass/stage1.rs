@@ -407,12 +407,19 @@ impl BlockDiffusionDraftHead {
             };
         let prefer_tc_lm_head =
             resolve_c1_lm_head_nvfp4_mode(staged_spec.is_some()) == LmHeadNvfp4Mode::CoalescedTc;
-        let use_ngram_graph_selector = super::super::ngram_bonus::ngram_bonus_enabled()
-            && !use_rejection_graph_selector
-            && staged_spec.is_none()
-            && self.markov.is_none()
-            && self.selector.is_some()
-            && self.ngram_selector_ready();
+        let use_ngram_graph_selector = self.selector.is_some()
+            && super::super::ngram_bonus::admit_c1_ngram_selector(
+                super::super::ngram_bonus::C1NgramAdmission {
+                    ngram_enabled: super::super::ngram_bonus::ngram_bonus_enabled(),
+                    ngram_ready: self.ngram_selector_ready(),
+                    use_rejection_selector: use_rejection_graph_selector,
+                    is_probabilistic_sampled: false,
+                    markov_active: self.markov.is_some(),
+                    probabilistic_method: self.draft_sample_method
+                        == crate::dflash_sampling::DflashDraftSampleMethod::Probabilistic,
+                    raw_gumbel_spec: gumbel_spec,
+                },
+            );
         let use_k32_graph_selector = !use_rejection_graph_selector
             && !use_ngram_graph_selector
             && self.selector.is_some()

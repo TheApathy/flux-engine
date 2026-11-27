@@ -835,6 +835,14 @@ pub fn dcoco_walk_cpu(
     top_k_shortlist: usize,
     params: DcocoWalkParams,
 ) -> DcocoWalkOutput {
+    if gamma == 0 || top_k_shortlist == 0 {
+        return DcocoWalkOutput {
+            tokens: Vec::new(),
+            max_probs: Vec::new(),
+            q_ids: Vec::new(),
+            q_probs: Vec::new(),
+        };
+    }
     let beta = if params.draft_temp_scale_beta.is_finite() && params.draft_temp_scale_beta > 0.0 {
         params.draft_temp_scale_beta
     } else {
@@ -1365,6 +1373,27 @@ mod tests {
             "Wave-15 maximal coupling overlap ({coupling_overlap}) must strictly exceed \
              point-mass acceptance p(argmax) ({p_argmax})"
         );
+
+        // 4. Empty edge inputs return cleanly without panicking.
+        let empty_out = dcoco_walk_cpu(
+            &[],
+            &[],
+            1,
+            0,
+            DcocoWalkParams {
+                mode: DcocoWalkMode::Greedy,
+                seed: 0,
+                step0_abs_pos: 0,
+                temperature: 0.0,
+                draft_temp_scale_beta: 1.0,
+                top_k: 0,
+                top_p: 1.0,
+                min_p: 0.0,
+                out_q_stride: 0,
+            },
+        );
+        assert!(empty_out.tokens.is_empty());
+        assert!(empty_out.max_probs.is_empty());
     }
 
     #[test]
