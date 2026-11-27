@@ -283,6 +283,13 @@ pub struct DenseFfnLayer {
     /// Fused `residual_add_rms_norm_quantize_nvfp4_128x4` kernel for static-scale
     /// prefill FFN on `sm_count > 64`.
     pub(super) nvfp4_residual_add_rms_norm_quant_128x4_k: KernelHandle,
+    /// Opt-in (`ATLAS_FUSED_RMSNORM_NVFP4=1`) single-pass Blackwell
+    /// `rms_norm_nvfp4_sm120` / `rms_norm_residual_nvfp4_sm120` /
+    /// `silu_mul_nvfp4_sm120` kernel bundle.
+    pub(super) fused_rmsnorm_nvfp4_k: ops::FusedRmsNormNvfp4Kernels,
+    /// Optional `residual_add::bf16_residual_add` handle used when the opt-in
+    /// fused residual-norm NVFP4 route finishes with a `beta=0` down projection.
+    pub(super) residual_add_k: KernelHandle,
     /// Lazily-swizzled `128x4` `UE4M3` weight block scales for the cuBLASLt
     /// NVFP4 prefill path (`SM103`/`SM120` auto or `ATLAS_CUBLASLT_NVFP4=1`).
     #[cfg(feature = "cuda")]
@@ -700,6 +707,8 @@ impl DenseFfnLayer {
                 "quantize_nvfp4",
                 "residual_add_rms_norm_quantize_nvfp4_128x4",
             ),
+            fused_rmsnorm_nvfp4_k: ops::FusedRmsNormNvfp4Kernels::load_optional(gpu),
+            residual_add_k: crate::layers::try_kernel(gpu, "residual_add", "bf16_residual_add"),
             #[cfg(feature = "cuda")]
             cublaslt_nvfp4_scales: Mutex::new(None),
             #[cfg(feature = "cuda")]

@@ -11,6 +11,7 @@ mod cublaslt_ffn;
 mod cublaslt_proj;
 mod decode;
 mod e2m1_flashinfer;
+mod fused_rmsnorm;
 mod kgamma;
 mod layer;
 mod policy;
@@ -38,6 +39,7 @@ pub(crate) use cublaslt_proj::{
     try_cublaslt_nvfp4_proj_single,
 };
 pub use e2m1_flashinfer::SharedE2m1Scratch;
+pub use fused_rmsnorm::PreparedRmsNormNvfp4;
 pub use layer::{DenseFfnLayer, DenseFfnWeights, DenseFfnWeightsBf16, FfnActivation};
 pub(crate) use policy::{CUBLASLT_NVFP4_MIN_M, prefill_fuse_absmax_enabled};
 pub(crate) use sm120_coalesced::{

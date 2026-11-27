@@ -89,7 +89,7 @@ impl DenseFfnLayer {
     /// buffer and (when permitted without unsafe VRAM duplication) a merged
     /// `[gate; up]` operand.
     #[cfg(feature = "cuda")]
-    fn ensure_cublaslt_nvfp4_scales(
+    pub(super) fn ensure_cublaslt_nvfp4_scales(
         &self,
         gpu: &dyn GpuBackend,
         h: u32,
@@ -564,17 +564,33 @@ impl DenseFfnLayer {
                     merged_scalars,
                     stream,
                 )?;
-                ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
-                    ctx.gpu,
-                    merged_silu_k,
-                    merged_out,
-                    a_packed,
-                    a_scale,
-                    scales.down,
-                    m_s,
-                    inter,
-                    stream,
-                )?;
+                if ops::fused_rmsnorm_nvfp4_policy()? == ops::FusedRmsNormNvfp4Policy::Enabled {
+                    self.launch_fused_silu_nvfp4(
+                        ctx.gpu,
+                        merged_out,
+                        merged_out.offset((inter as usize) * 2),
+                        a_packed,
+                        a_scale,
+                        scales.down,
+                        m_s,
+                        inter,
+                        ops::SwiGluInputLayout::MergedGateUp,
+                        ops::Nvfp4ScaleLayout::Swizzled128x4,
+                        stream,
+                    )?;
+                } else {
+                    ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+                        ctx.gpu,
+                        merged_silu_k,
+                        merged_out,
+                        a_packed,
+                        a_scale,
+                        scales.down,
+                        m_s,
+                        inter,
+                        stream,
+                    )?;
+                }
                 spark_runtime::cublaslt::nvfp4_gemm_block_scaled(
                     a_packed.0,
                     a_scale.0,
@@ -641,17 +657,33 @@ impl DenseFfnLayer {
                 )?;
                 let (down_a_packed, down_a_scale, _) =
                     self.ensure_e2m1_scratch(ctx.gpu, m as usize, inter as usize)?;
-                ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
-                    ctx.gpu,
-                    merged_silu_k,
-                    merged_out,
-                    down_a_packed,
-                    down_a_scale,
-                    scale2,
-                    m,
-                    inter,
-                    stream,
-                )?;
+                if ops::fused_rmsnorm_nvfp4_policy()? == ops::FusedRmsNormNvfp4Policy::Enabled {
+                    self.launch_fused_silu_nvfp4(
+                        ctx.gpu,
+                        merged_out,
+                        merged_out.offset((inter as usize) * 2),
+                        down_a_packed,
+                        down_a_scale,
+                        scale2,
+                        m,
+                        inter,
+                        ops::SwiGluInputLayout::MergedGateUp,
+                        ops::Nvfp4ScaleLayout::Swizzled128x4,
+                        stream,
+                    )?;
+                } else {
+                    ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+                        ctx.gpu,
+                        merged_silu_k,
+                        merged_out,
+                        down_a_packed,
+                        down_a_scale,
+                        scale2,
+                        m,
+                        inter,
+                        stream,
+                    )?;
+                }
                 (
                     down_a_packed,
                     down_a_scale,
@@ -1136,6 +1168,17 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if self.try_forward_prefill_fused_residual_rmsnorm_nvfp4(
+            hidden,
+            src,
+            norm_weight,
+            num_tokens,
+            eps,
+            ctx,
+            stream,
+        )? {
+            return Ok(true);
+        }
         let Ok(m) = u32::try_from(num_tokens) else {
             return Ok(false);
         };
@@ -1336,14 +1379,22 @@ impl DenseFfnLayer {
     )]
     pub(crate) fn try_forward_prefill_fused_residual_norm(
         &self,
-        _hidden: DevicePtr,
-        _src: DevicePtr,
-        _norm_weight: &DenseWeight,
-        _num_tokens: usize,
-        _eps: f32,
-        _ctx: &ForwardContext,
-        _stream: u64,
+        hidden: DevicePtr,
+        src: DevicePtr,
+        norm_weight: &DenseWeight,
+        num_tokens: usize,
+        eps: f32,
+        ctx: &ForwardContext,
+        stream: u64,
     ) -> Result<bool> {
-        Ok(false)
+        self.try_forward_prefill_fused_residual_rmsnorm_nvfp4(
+            hidden,
+            src,
+            norm_weight,
+            num_tokens,
+            eps,
+            ctx,
+            stream,
+        )
     }
 }
