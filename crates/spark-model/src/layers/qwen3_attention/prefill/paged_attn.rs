@@ -223,13 +223,49 @@ impl Qwen3AttentionLayer {
                 hd,
                 self.prefill_attn_paged_nvfp4_128_k.0 != 0,
             );
-            if self.active_bitfp4_kv(hd, bs_u).is_some() {
-                anyhow::bail!(
-                    "ATLAS_BITFP4_KV=1 chunked continuation prefill over block-16 transposed V^T \
-                     KV cache is not yet supported (layer {}); use single-chunk prefill \
-                     (--max-prefill-tokens >= prompt_len) or unset ATLAS_BITFP4_KV",
-                    self.attn_layer_idx
-                );
+            if let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(hd, bs_u) {
+                let q_stride = nq
+                    .checked_mul(hd)
+                    .ok_or_else(|| anyhow::anyhow!("BitDecoding-FP4 prefill q_stride overflow"))?;
+                let seq_start_u32 = u32::try_from(seq_len_start).map_err(|_| {
+                    anyhow::anyhow!("BitDecoding-FP4 prefill seq_len_start overflow")
+                })?;
+                ops::prefill_paged_bitfp4_sm120(
+                    ctx.gpu,
+                    bitfp4_k,
+                    q_contiguous,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    attn_out,
+                    meta.block_table,
+                    n,
+                    kv_len,
+                    seq_start_u32,
+                    nq,
+                    nkv,
+                    inv_sqrt_d,
+                    q_stride,
+                    q_stride,
+                    kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    kv_cache.nvfp4_data_bytes() as u64,
+                    ops::BitFp4CausalMask::Causal,
+                    flags,
+                    ops::BitFp4Bf16Sink::default(),
+                    stream,
+                )?;
+                static BITFP4_PREFILL_LOGGED: std::sync::Once = std::sync::Once::new();
+                BITFP4_PREFILL_LOGGED.call_once(|| {
+                    tracing::info!(
+                        layer = self.attn_layer_idx,
+                        seq_len_start,
+                        chunk_len = n,
+                        kv_len,
+                        razer = ?flags.razer,
+                        "ENGAGED ATLAS_BITFP4_KV chunked continuation prefill \
+                         (SM120/SM121 native FP4 Tensor Core over block-16 WHT+4/6 K + transposed V^T)"
+                    );
+                });
+                return Ok(PagedAttnOutcome::Continue);
             }
             match (self.kv_dtype, use_br64) {
                 (KvCacheDtype::Nvfp4, true) => match br128_route {

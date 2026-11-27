@@ -773,6 +773,13 @@ impl Qwen3AttentionLayer {
         })?;
         let nq = ctx.config.num_attention_heads;
         let hd = ctx.config.head_dim;
+        ensure!(
+            self.active_bitfp4_kv(u32::try_from(hd)?, u32::try_from(kv_cache.block_size())?)
+                .is_none(),
+            "ATLAS_BITFP4_KV=1 is incompatible with QSA Crop::Tail sparse attention \
+             over legacy token-major NVFP4 KV cache (layer {}); unset ATLAS_BITFP4_KV",
+            self.attn_layer_idx
+        );
         let q_dim = nq * hd;
         let row_stride = qkv_row_bytes / 2;
         let row_bytes = ctx.config.residual_width() * 2;
@@ -1313,42 +1320,65 @@ impl Qwen3AttentionLayer {
                 )?;
                 let layer_kv_dtype = kv_cache.dtype_for_layer(self.attn_layer_idx);
                 if layer_kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Nvfp4 {
-                    ensure!(
-                        self.active_bitfp4_kv(
-                            u32::try_from(hd)?,
-                            u32::try_from(kv_cache.block_size())?,
-                        )
-                        .is_none(),
-                        "ATLAS_BITFP4_KV=1 fast continuation prefill over block-16 transposed V^T \
-                         KV cache is not yet supported (layer {}); use single-chunk prefill or \
-                         unset ATLAS_BITFP4_KV",
-                        self.attn_layer_idx
-                    );
-                    ensure!(
-                        self.prefill_attn_paged_nvfp4_64_k.0 != 0,
-                        "fast NVFP4 continuation attention requires prefill_attn_paged_nvfp4_64"
-                    );
-                    ops::prefill_attention_paged_nvfp4_64(
-                        ctx.gpu,
-                        self.prefill_attn_paged_nvfp4_64_k,
-                        q_contiguous,
-                        kv_cache.k_pool_ptr(self.attn_layer_idx),
-                        kv_cache.v_pool_ptr(self.attn_layer_idx),
-                        raw_outputs,
-                        metadata.block_table,
-                        u32::try_from(num_tokens)?,
-                        kv_len,
-                        u32::try_from(seq_len_start)?,
-                        u32::try_from(nq)?,
-                        u32::try_from(nkv)?,
-                        u32::try_from(hd)?,
-                        u32::try_from(kv_cache.block_size())?,
-                        self.sliding_window.unwrap_or(0),
-                        self.effective_attn_scale(hd as u32),
-                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
-                        kv_cache.nvfp4_data_bytes() as u64,
-                        stream,
-                    )?;
+                    let hd_u32 = u32::try_from(hd)?;
+                    let bs_u32 = u32::try_from(kv_cache.block_size())?;
+                    if let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(hd_u32, bs_u32) {
+                        let nq_u32 = u32::try_from(nq)?;
+                        let nkv_u32 = u32::try_from(nkv)?;
+                        let q_stride = nq_u32.checked_mul(hd_u32).ok_or_else(|| {
+                            anyhow::anyhow!("BitDecoding-FP4 fast continuation q_stride overflow")
+                        })?;
+                        let o_stride = u32::try_from(attn_row_bytes / 2)?;
+                        ops::prefill_paged_bitfp4_sm120(
+                            ctx.gpu,
+                            bitfp4_k,
+                            q_contiguous,
+                            kv_cache.k_pool_ptr(self.attn_layer_idx),
+                            kv_cache.v_pool_ptr(self.attn_layer_idx),
+                            raw_outputs,
+                            metadata.block_table,
+                            u32::try_from(num_tokens)?,
+                            kv_len,
+                            u32::try_from(seq_len_start)?,
+                            nq_u32,
+                            nkv_u32,
+                            self.effective_attn_scale(hd_u32),
+                            q_stride,
+                            o_stride,
+                            kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                            kv_cache.nvfp4_data_bytes() as u64,
+                            ops::BitFp4CausalMask::Causal,
+                            flags,
+                            ops::BitFp4Bf16Sink::default(),
+                            stream,
+                        )?;
+                    } else {
+                        ensure!(
+                            self.prefill_attn_paged_nvfp4_64_k.0 != 0,
+                            "fast NVFP4 continuation attention requires prefill_attn_paged_nvfp4_64"
+                        );
+                        ops::prefill_attention_paged_nvfp4_64(
+                            ctx.gpu,
+                            self.prefill_attn_paged_nvfp4_64_k,
+                            q_contiguous,
+                            kv_cache.k_pool_ptr(self.attn_layer_idx),
+                            kv_cache.v_pool_ptr(self.attn_layer_idx),
+                            raw_outputs,
+                            metadata.block_table,
+                            u32::try_from(num_tokens)?,
+                            kv_len,
+                            u32::try_from(seq_len_start)?,
+                            u32::try_from(nq)?,
+                            u32::try_from(nkv)?,
+                            hd_u32,
+                            bs_u32,
+                            self.sliding_window.unwrap_or(0),
+                            self.effective_attn_scale(hd_u32),
+                            kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                            kv_cache.nvfp4_data_bytes() as u64,
+                            stream,
+                        )?;
+                    }
                 } else {
                     ensure!(
                         self.prefill_attn_paged_64_k.0 != 0,

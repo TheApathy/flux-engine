@@ -91,13 +91,38 @@ impl Qwen3AttentionLayer {
 
         match (self.kv_dtype, use_br64) {
             (KvCacheDtype::Nvfp4, _) => {
-                if self.active_bitfp4_kv(hd, bs_u).is_some() {
-                    anyhow::bail!(
-                        "ATLAS_BITFP4_KV=1 batched continuation prefill over block-16 transposed \
-                         V^T KV cache is not yet supported (layer {}); use single-chunk prefill \
-                         or unset ATLAS_BITFP4_KV",
-                        self.attn_layer_idx
-                    );
+                if let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(hd, bs_u) {
+                    let q_stride = nq.checked_mul(hd).ok_or_else(|| {
+                        anyhow::anyhow!("BitDecoding-FP4 batched prefill q_stride overflow")
+                    })?;
+                    let q_offset_checked = u32::try_from(seq_len_start).map_err(|_| {
+                        anyhow::anyhow!("BitDecoding-FP4 batched prefill seq_len_start overflow")
+                    })?;
+                    ops::prefill_paged_bitfp4_batched_sm120(
+                        ctx.gpu,
+                        bitfp4_k,
+                        q_contiguous,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        attn_out,
+                        block_table_ptrs,
+                        batch_size,
+                        chunk_len,
+                        kv_len,
+                        q_offset_checked,
+                        nq,
+                        nkv,
+                        inv_sqrt_d,
+                        q_stride,
+                        q_stride,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                        kv_cache.nvfp4_data_bytes() as u64,
+                        ops::BitFp4CausalMask::Causal,
+                        flags,
+                        ops::BitFp4Bf16Sink::default(),
+                        stream,
+                    )?;
+                    return Ok(());
                 }
                 if self.prefill_attn_paged_nvfp4_batched_k.0 == 0 {
                     anyhow::bail!(

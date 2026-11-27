@@ -114,6 +114,13 @@ impl Qwen3AttentionLayer {
         let nq = ctx.config.num_attention_heads;
         let hd = ctx.config.head_dim;
         ensure!(
+            self.active_bitfp4_kv(u32::try_from(hd)?, u32::try_from(kv_cache.block_size())?)
+                .is_none(),
+            "ATLAS_BITFP4_KV=1 is incompatible with QSA sparse prefill over legacy token-major \
+             NVFP4 KV cache (layer {}); unset ATLAS_BITFP4_KV or disable QSA sparse prefill",
+            self.attn_layer_idx
+        );
+        ensure!(
             out_row_elems == nq * hd,
             "{}: the sparse core writes a contiguous [rows, nq*hd] output",
             prefill_sparse::SELECTOR

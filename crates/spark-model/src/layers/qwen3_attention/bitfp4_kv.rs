@@ -548,6 +548,7 @@ pub(crate) mod reference {
 
     /// Self-contained block-16 transposed `V^T` representation matching
     /// `promote_block16_bitfp4_v_transposed` (`[HDIM][8]` bytes + `[HDIM]` scales).
+    #[derive(Clone)]
     pub struct Block16Vt {
         pub data: [[u8; 8]; HDIM],
         pub scales: [u8; HDIM],
@@ -576,6 +577,44 @@ pub(crate) mod reference {
                 scales,
                 razer,
             }
+        }
+
+        /// Incremental append into a partial block-16 `V^T` matching
+        /// `promote_block16_bitfp4_v_transposed` (`first_off > 0`): decodes existing
+        /// `[0..first_off)`, inserts `new_v` at `[first_off..first_off + new_v.len())`,
+        /// zeros trailing unused slots, and re-quantizes all 16 slots.
+        pub fn append_tokens(
+            &mut self,
+            first_off: usize,
+            new_v: &[[f32; HDIM]],
+            four_over_six: bool,
+            razer: bool,
+        ) {
+            assert!(
+                first_off + new_v.len() <= BLOCK_SIZE,
+                "block-16 V^T append out of bounds: first_off={first_off}, len={}",
+                new_v.len()
+            );
+            assert_eq!(self.razer, razer, "cannot mix RaZeR modes within one block");
+            let mut next_data = [[0u8; 8]; HDIM];
+            let mut next_scales = [0u8; HDIM];
+            for d in 0..HDIM {
+                let mut ch = [0.0f32; BLOCK_SIZE];
+                if first_off > 0 {
+                    let prev = self.decode_channel_via_swar(d);
+                    ch[..first_off].copy_from_slice(&prev[..first_off]);
+                }
+                for (i, tok) in new_v.iter().enumerate() {
+                    ch[first_off + i] = tok[d];
+                }
+                let (nibs, sc) = quantize_group16_bitfp4(&ch, four_over_six, razer);
+                next_scales[d] = sc;
+                for pair in 0..8 {
+                    next_data[d][pair] = (nibs[pair * 2] & 0xF) | ((nibs[pair * 2 + 1] & 0xF) << 4);
+                }
+            }
+            self.data = next_data;
+            self.scales = next_scales;
         }
 
         /// Decode via exact SWAR RaZeR split (`main + comp`) when `self.razer` is true.
@@ -611,6 +650,288 @@ pub(crate) mod reference {
             }
             out
         }
+    }
+
+    /// Reference model of the self-contained block-16 paged BitDecoding-FP4 KV cache
+    /// (`reshape_and_cache_bitfp4_k_block16` + `promote_block16_bitfp4_v_transposed`).
+    pub struct BitFp4PagedKvModel {
+        pub k_hat: Vec<[f32; HDIM]>,
+        pub vt_blocks: Vec<Block16Vt>,
+        pub razer: bool,
+    }
+
+    impl BitFp4PagedKvModel {
+        #[must_use]
+        pub fn new(razer: bool) -> Self {
+            Self {
+                k_hat: Vec::new(),
+                vt_blocks: Vec::new(),
+                razer,
+            }
+        }
+
+        /// Append a contiguous chunk of `(K, V)` tokens into the paged block-16 cache,
+        /// handling partial boundary blocks via `Block16Vt::append_tokens` identically
+        /// to `promote_block16_bitfp4_v_transposed`.
+        pub fn append_chunk(
+            &mut self,
+            k_chunk: &[[f32; HDIM]],
+            v_chunk: &[[f32; HDIM]],
+            mu_k: Option<&[f32; HDIM]>,
+            apply_wht: bool,
+            four_over_six: bool,
+        ) {
+            assert_eq!(k_chunk.len(), v_chunk.len());
+            let start_pos = self.k_hat.len();
+
+            // 1. Token-wise K write (`reshape_and_cache_bitfp4_k_block16`).
+            for k in k_chunk {
+                let mut k_work = *k;
+                if let Some(mu) = mu_k {
+                    for d in 0..HDIM {
+                        k_work[d] -= mu[d];
+                    }
+                }
+                if apply_wht {
+                    wht256(&mut k_work);
+                }
+                let mut k_rec = [0.0f32; HDIM];
+                for g in 0..(HDIM / 16) {
+                    let mut grp = [0.0f32; 16];
+                    grp.copy_from_slice(&k_work[g * 16..(g + 1) * 16]);
+                    let (nibs, sc_raw) = quantize_group16_bitfp4(&grp, four_over_six, self.razer);
+                    let sc = ue4m3_to_f32(sc_raw & 0x7F);
+                    let neg_sv = u32::from((sc_raw >> 7) & 1);
+                    for half in 0..2 {
+                        let mut word = 0u32;
+                        for j in 0..8 {
+                            word |= u32::from(nibs[half * 8 + j] & 0xF) << (j * 4);
+                        }
+                        if !self.razer {
+                            word = canonicalize_e2m1_neg_zero_u32(word);
+                        }
+                        let (w_main, w_comp) = if self.razer {
+                            razer_swar_split_u32(word, neg_sv)
+                        } else {
+                            (word, 0u32)
+                        };
+                        for j in 0..8 {
+                            let nm = ((w_main >> (j * 4)) & 0xF) as u8;
+                            let nc = ((w_comp >> (j * 4)) & 0xF) as u8;
+                            k_rec[g * 16 + half * 8 + j] = (e2m1_decode(nm) + e2m1_decode(nc)) * sc;
+                        }
+                    }
+                }
+                self.k_hat.push(k_rec);
+            }
+
+            // 2. Contiguous block-run transposed V^T promote (`promote_block16_bitfp4_v_transposed`).
+            let mut offset = 0usize;
+            while offset < v_chunk.len() {
+                let abs_pos = start_pos + offset;
+                let blk_idx = abs_pos / BLOCK_SIZE;
+                let tok_in_blk = abs_pos % BLOCK_SIZE;
+                let run_len = (BLOCK_SIZE - tok_in_blk).min(v_chunk.len() - offset);
+                let slice = &v_chunk[offset..offset + run_len];
+                if tok_in_blk == 0 {
+                    assert_eq!(blk_idx, self.vt_blocks.len());
+                    self.vt_blocks
+                        .push(Block16Vt::encode(slice, four_over_six, self.razer));
+                } else {
+                    self.vt_blocks[blk_idx].append_tokens(
+                        tok_in_blk,
+                        slice,
+                        four_over_six,
+                        self.razer,
+                    );
+                }
+                offset += run_len;
+            }
+        }
+    }
+
+    /// Exact CPU mirror of `prefill_paged_bitfp4_core` (`B_q = 32`, `B_k = 64` = 4 blocks)
+    /// supporting arbitrary `q_offset`, `q_len`, `kv_len`, causal masking, optional WHT,
+    /// optional BF16 sink tokens (`0`, partial `4`, or full block-0 `16`), and SWAR RaZeR-KV.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn prefill_paged_bitfp4_reference(
+        q_chunk: &[[f32; HDIM]],
+        kv: &BitFp4PagedKvModel,
+        q_offset: usize,
+        kv_len: usize,
+        inv_sqrt_d: f32,
+        causal: bool,
+        apply_wht: bool,
+        sink_bf16: Option<(&[[f32; HDIM]], &[[f32; HDIM]], usize)>,
+    ) -> Vec<[f32; HDIM]> {
+        const TILE_K_BLOCKS: usize = 4;
+        const NEG_INF: f32 = -1.0e30f32;
+        let log2e = std::f32::consts::LOG2_E;
+        let mut outputs = vec![[0.0f32; HDIM]; q_chunk.len()];
+
+        let (k_sink, v_sink, num_sink) = match sink_bf16 {
+            Some((ks, vs, n)) if n > 0 => (Some(ks), Some(vs), n),
+            _ => (None, None, 0usize),
+        };
+        let sink_skip = num_sink;
+        let first_fp4_blk = num_sink / BLOCK_SIZE;
+
+        for (r, q_raw) in q_chunk.iter().enumerate() {
+            let q_kv_lim = if causal {
+                (q_offset + r + 1).min(kv_len)
+            } else {
+                kv_len
+            };
+            if q_kv_lim == 0 {
+                continue;
+            }
+
+            let mut running_m = NEG_INF;
+            let mut running_l = 0.0f32;
+            let mut o_acc = [0.0f32; HDIM];
+
+            // Prologue: optional BF16 sink attention on raw unrotated Q.
+            if let (Some(ks), Some(vs)) = (k_sink, v_sink) {
+                let sink_lim = num_sink.min(q_kv_lim);
+                for ts in 0..sink_lim {
+                    let dot: f32 = q_raw.iter().zip(ks[ts].iter()).map(|(a, b)| a * b).sum();
+                    let s_log2 = dot * inv_sqrt_d * log2e;
+                    let m_new = running_m.max(s_log2);
+                    let a_old = if running_m > -1.0e29 {
+                        (running_m - m_new).exp2()
+                    } else {
+                        0.0
+                    };
+                    let p_c = (s_log2 - m_new + 3.0).exp2();
+                    running_l = running_l * a_old + p_c;
+                    for d in 0..HDIM {
+                        o_acc[d] = o_acc[d] * a_old + p_c * vs[ts][d];
+                    }
+                    running_m = m_new;
+                }
+            }
+
+            let total_blocks = q_kv_lim.div_ceil(BLOCK_SIZE);
+            let fp4_blocks = total_blocks.saturating_sub(first_fp4_blk);
+            let num_tiles = fp4_blocks.div_ceil(TILE_K_BLOCKS);
+
+            if num_tiles > 0 {
+                let mut q_rot = *q_raw;
+                if apply_wht {
+                    wht256(&mut q_rot);
+                }
+                let q_dual = quantize_query_dual_residual(&q_rot);
+
+                for tile in 0..num_tiles {
+                    let tile_blk0 = first_fp4_blk + tile * TILE_K_BLOCKS;
+                    let mut s_tile = [[NEG_INF; BLOCK_SIZE]; TILE_K_BLOCKS];
+                    let mut m_blk = [NEG_INF; TILE_K_BLOCKS];
+                    let mut mt = NEG_INF;
+
+                    for b in 0..TILE_K_BLOCKS {
+                        let blk_idx = tile_blk0 + b;
+                        if blk_idx >= total_blocks {
+                            continue;
+                        }
+                        for t_local in 0..BLOCK_SIZE {
+                            let key_pos = blk_idx * BLOCK_SIZE + t_local;
+                            if key_pos >= sink_skip && key_pos < q_kv_lim {
+                                let dot: f32 = q_dual
+                                    .iter()
+                                    .zip(kv.k_hat[key_pos].iter())
+                                    .map(|(a, k)| a * k)
+                                    .sum();
+                                let s_log2 = dot * inv_sqrt_d * log2e;
+                                s_tile[b][t_local] = s_log2;
+                                m_blk[b] = m_blk[b].max(s_log2);
+                            }
+                        }
+                        mt = mt.max(m_blk[b]);
+                    }
+
+                    let m_new = running_m.max(mt);
+                    let alpha = if running_m > -1.0e29 && m_new > -1.0e29 {
+                        (running_m - m_new).exp2()
+                    } else {
+                        0.0
+                    };
+                    for val in &mut o_acc {
+                        *val *= alpha;
+                    }
+                    let mut l_tile = 0.0f32;
+
+                    for b in 0..TILE_K_BLOCKS {
+                        let blk_idx = tile_blk0 + b;
+                        if blk_idx >= total_blocks {
+                            continue;
+                        }
+                        let mut p_unscaled = [0.0f32; BLOCK_SIZE];
+                        for t_local in 0..BLOCK_SIZE {
+                            let key_pos = blk_idx * BLOCK_SIZE + t_local;
+                            if key_pos >= sink_skip && key_pos < q_kv_lim && m_new > -1.0e29 {
+                                let p = (s_tile[b][t_local] - m_new).exp2();
+                                p_unscaled[t_local] = p;
+                                l_tile += UNDERFLOW_C * p;
+                            }
+                        }
+                        let (_, _, _, p_c_hat) = quantize_prob_block16_underflow_aware(&p_unscaled);
+                        for d in 0..HDIM {
+                            let v_ch = kv.vt_blocks[blk_idx].decode_channel_via_swar(d);
+                            for t_local in 0..BLOCK_SIZE {
+                                o_acc[d] += p_c_hat[t_local] * v_ch[t_local];
+                            }
+                        }
+                    }
+
+                    running_l = running_l * alpha + l_tile;
+                    running_m = m_new;
+                }
+            }
+
+            if running_l > 0.0 {
+                let inv_l = 1.0 / running_l;
+                for d in 0..HDIM {
+                    outputs[r][d] = o_acc[d] * inv_l;
+                }
+            }
+        }
+
+        outputs
+    }
+
+    /// Exact FP32 causal attention reference over `[0..seq_len)`.
+    #[must_use]
+    pub fn exact_causal_attention_fp32(
+        q_all: &[[f32; HDIM]],
+        k_all: &[[f32; HDIM]],
+        v_all: &[[f32; HDIM]],
+        inv_sqrt_d: f32,
+    ) -> Vec<[f32; HDIM]> {
+        assert_eq!(q_all.len(), k_all.len());
+        assert_eq!(q_all.len(), v_all.len());
+        let mut out = vec![[0.0f32; HDIM]; q_all.len()];
+        for (i, q) in q_all.iter().enumerate() {
+            let mut m = f32::NEG_INFINITY;
+            let mut scores = Vec::with_capacity(i + 1);
+            for k in &k_all[..=i] {
+                let s = q.iter().zip(k.iter()).map(|(a, b)| a * b).sum::<f32>() * inv_sqrt_d;
+                m = m.max(s);
+                scores.push(s);
+            }
+            let mut l = 0.0f32;
+            for (t, &s) in scores.iter().enumerate() {
+                let p = (s - m).exp();
+                l += p;
+                for d in 0..HDIM {
+                    out[i][d] += p * v_all[t][d];
+                }
+            }
+            for d in 0..HDIM {
+                out[i][d] /= l;
+            }
+        }
+        out
     }
 }
 
@@ -1202,10 +1523,20 @@ mod tests {
             reduce: KernelHandle(5),
             write_k: KernelHandle(6),
             promote_v: KernelHandle(7),
+            prefill_paged: KernelHandle(8),
+            prefill_paged_razer: KernelHandle(9),
+            prefill_paged_batched: KernelHandle(10),
+            prefill_paged_batched_razer: KernelHandle(11),
         };
         let base_only = BitFp4KvKernels {
             decode_razer: KernelHandle(0),
             kgamma_razer: KernelHandle(0),
+            prefill_paged_razer: KernelHandle(0),
+            prefill_paged_batched_razer: KernelHandle(0),
+            ..complete
+        };
+        let missing_prefill = BitFp4KvKernels {
+            prefill_paged: KernelHandle(0),
             ..complete
         };
 
@@ -1222,6 +1553,21 @@ mod tests {
                 Some(&complete),
             ),
             BitFp4KvRoute::Disabled
+        );
+
+        // Missing chunked prefill kernel fails closed before writing BitFP4 KV.
+        assert_eq!(
+            resolve_bitfp4_kv_route(
+                true,
+                false,
+                KvCacheDtype::Nvfp4,
+                256,
+                16,
+                false,
+                Some((12, 1)),
+                Some(&missing_prefill),
+            ),
+            BitFp4KvRoute::MissingKernel
         );
 
         // Non-Blackwell-12x (SM103 / SM90 / unset) fails closed.
@@ -1391,5 +1737,505 @@ mod tests {
         assert!(bitfp4_kgamma_eligible(2, true));
         assert!(bitfp4_kgamma_eligible(32, true));
         assert!(!bitfp4_kgamma_eligible(33, true));
+    }
+
+    fn cosine_sim(a: &[f32; HDIM], b: &[f32; HDIM]) -> f64 {
+        let dot: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| f64::from(x) * f64::from(y))
+            .sum();
+        let na: f64 = a.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|&y| f64::from(y).powi(2)).sum::<f64>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    }
+
+    #[test]
+    fn chunked_continuation_prefill_matches_single_shot_and_fp32_reference() {
+        let mut rng = 0x51A7_E213_B00B_C0DEu64;
+        let total_len = 113usize; // Non-multiple of 16, 32, and 64 (partial tail block & tile).
+        let inv_sqrt_d = 1.0 / (HDIM as f32).sqrt();
+
+        // Persistent channel outliers in K (simulating Qwen3.8 RoPE channel spikes).
+        let mut mu_k = [0.0f32; HDIM];
+        mu_k[5] = 7.5;
+        mu_k[89] = -6.2;
+        mu_k[211] = 5.4;
+
+        let mut q_all = vec![[0.0f32; HDIM]; total_len];
+        let mut k_all = vec![[0.0f32; HDIM]; total_len];
+        let mut v_all = vec![[0.0f32; HDIM]; total_len];
+        for t in 0..total_len {
+            for d in 0..HDIM {
+                q_all[t][d] = pseudo_gaussian(&mut rng);
+                k_all[t][d] = mu_k[d] + pseudo_gaussian(&mut rng);
+                v_all[t][d] = pseudo_gaussian(&mut rng);
+            }
+            // Inject local + long-range retrieval correlation for non-trivial softmax peaks.
+            if t >= 12 {
+                let target = if t % 3 == 0 { 3 } else { t - 9 };
+                for d in 0..HDIM {
+                    q_all[t][d] = 0.55 * (k_all[target][d] - mu_k[d]) + 0.65 * q_all[t][d];
+                }
+            }
+        }
+
+        let o_fp32 = exact_causal_attention_fp32(&q_all, &k_all, &v_all, inv_sqrt_d);
+
+        for &razer in &[false, true] {
+            // 1. Single-shot BitFP4 KV write + paged prefill over [0..113).
+            let mut kv_single = BitFp4PagedKvModel::new(razer);
+            kv_single.append_chunk(&k_all, &v_all, Some(&mu_k), true, true);
+            let o_single = prefill_paged_bitfp4_reference(
+                &q_all, &kv_single, 0, total_len, inv_sqrt_d, true, true, None,
+            );
+
+            // 2. Three non-16-aligned continuation chunks: [0..25), [25..73), [73..113).
+            //    Crosses partial block-16 boundaries at pos=25 (block 1) and pos=73 (block 4),
+            //    exercising incremental `V^T` re-promotion and a 1-token partial tail block (block 7).
+            let chunk_bounds = [(0usize, 25usize), (25, 73), (73, total_len)];
+            let mut kv_chunked = BitFp4PagedKvModel::new(razer);
+            let mut o_chunked = Vec::with_capacity(total_len);
+            for &(start, end) in &chunk_bounds {
+                kv_chunked.append_chunk(
+                    &k_all[start..end],
+                    &v_all[start..end],
+                    Some(&mu_k),
+                    true,
+                    true,
+                );
+                let out = prefill_paged_bitfp4_reference(
+                    &q_all[start..end],
+                    &kv_chunked,
+                    start,
+                    end,
+                    inv_sqrt_d,
+                    true,
+                    true,
+                    None,
+                );
+                o_chunked.extend_from_slice(&out);
+            }
+            assert_eq!(o_chunked.len(), total_len);
+            assert_eq!(kv_chunked.vt_blocks.len(), total_len.div_ceil(BLOCK_SIZE));
+
+            let mut sum_fp32_single = 0.0f64;
+            let mut sum_fp32_chunked = 0.0f64;
+            let mut sum_chunked_vs_single = 0.0f64;
+            for t in 0..total_len {
+                let c_single = cosine_sim(&o_fp32[t], &o_single[t]);
+                let c_chunked = cosine_sim(&o_fp32[t], &o_chunked[t]);
+                let c_equiv = cosine_sim(&o_single[t], &o_chunked[t]);
+                assert!(
+                    c_single > 0.975,
+                    "razer={razer} row={t}: single-shot vs FP32 cosine too low ({c_single:.5})"
+                );
+                assert!(
+                    c_chunked > 0.975,
+                    "razer={razer} row={t}: chunked vs FP32 cosine too low ({c_chunked:.5})"
+                );
+                assert!(
+                    c_equiv > 0.990,
+                    "razer={razer} row={t}: chunked vs single-shot drift too high ({c_equiv:.5})"
+                );
+                sum_fp32_single += c_single;
+                sum_fp32_chunked += c_chunked;
+                sum_chunked_vs_single += c_equiv;
+            }
+            let mean_single = sum_fp32_single / (total_len as f64);
+            let mean_chunked = sum_fp32_chunked / (total_len as f64);
+            let mean_equiv = sum_chunked_vs_single / (total_len as f64);
+            assert!(
+                mean_single > 0.990 && mean_chunked > 0.990 && mean_equiv > 0.998,
+                "razer={razer}: mean cosines single={mean_single:.5}, chunked={mean_chunked:.5}, equiv={mean_equiv:.5}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_prefill_causal_mask_blocks_adversarial_future_tokens_in_shared_block16() {
+        let mut rng = 0xA11C_E001_55AA_33CCu64;
+        let inv_sqrt_d = 1.0 / (HDIM as f32).sqrt();
+        // Continuation chunk at q_offset = 20, q_len = 23 -> kv_len = 43.
+        // Physical block 1 holds tokens [16..32), sharing past (<20), current, and future (>20)
+        // tokens in the EXACT same block-16 V^T and B_k=64 tile.
+        let q_offset = 20usize;
+        let q_len = 23usize;
+        let kv_len = q_offset + q_len;
+
+        let mut q_chunk = vec![[0.0f32; HDIM]; q_len];
+        let mut k_clean = vec![[0.0f32; HDIM]; kv_len];
+        let mut v_clean = vec![[0.0f32; HDIM]; kv_len];
+        for t in 0..kv_len {
+            for d in 0..HDIM {
+                k_clean[t][d] = pseudo_gaussian(&mut rng);
+                v_clean[t][d] = pseudo_gaussian(&mut rng);
+            }
+        }
+        for q in &mut q_chunk {
+            for d in 0..HDIM {
+                q[d] = pseudo_gaussian(&mut rng);
+            }
+        }
+
+        // Poison keys strictly AFTER query row `probe_r` (abs pos = q_offset + probe_r)
+        // inside the SAME physical block-16 (pos 26..31) and next block (pos 32..42).
+        let probe_r = 5usize; // abs pos = 25 (midway through block 1 [16..32))
+        let probe_abs = q_offset + probe_r;
+        let mut k_poisoned = k_clean.clone();
+        for k_tok in &mut k_poisoned[(probe_abs + 1)..kv_len] {
+            for d in 0..HDIM {
+                // Adversarial spike strongly aligned with probe query.
+                k_tok[d] = 250.0 * q_chunk[probe_r][d].signum();
+            }
+        }
+
+        for &razer in &[false, true] {
+            let mut kv_a = BitFp4PagedKvModel::new(razer);
+            kv_a.append_chunk(&k_clean, &v_clean, None, true, true);
+            let mut kv_b = BitFp4PagedKvModel::new(razer);
+            kv_b.append_chunk(&k_poisoned, &v_clean, None, true, true);
+
+            let out_a = prefill_paged_bitfp4_reference(
+                &q_chunk, &kv_a, q_offset, kv_len, inv_sqrt_d, true, true, None,
+            );
+            let out_b = prefill_paged_bitfp4_reference(
+                &q_chunk, &kv_b, q_offset, kv_len, inv_sqrt_d, true, true, None,
+            );
+
+            // Rows 0..=probe_r MUST be bit-identical: future keys in block 1 & block 2
+            // are strictly masked out before softmax and cannot leak even 1 ULP.
+            for r in 0..=probe_r {
+                assert_eq!(
+                    out_a[r],
+                    out_b[r],
+                    "razer={razer} row={r} (abs={}): future key leaked past causal mask!",
+                    q_offset + r
+                );
+            }
+
+            // Row `probe_r + 1` CAN see `probe_abs + 1`, so poisoned K MUST visibly change it
+            // (proves the causal boundary is exact `<=` and not over-masked!).
+            let diff_next: f32 = out_a[probe_r + 1]
+                .iter()
+                .zip(out_b[probe_r + 1].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                diff_next > 1e-2,
+                "razer={razer}: causal boundary at pos={} failed to attend to self-token (diff={diff_next:e})",
+                probe_abs + 1
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_prefill_bf16_block0_and_partial_sinks_eliminate_sink_quant_error() {
+        let mut rng = 0x51C0_BF16_0001_9999u64;
+        let inv_sqrt_d = 1.0 / (HDIM as f32).sqrt();
+        let total_len = 85usize; // 5 full blocks + 5-token partial tail block
+
+        let mut q_all = vec![[0.0f32; HDIM]; total_len];
+        let mut k_all = vec![[0.0f32; HDIM]; total_len];
+        let mut v_all = vec![[0.0f32; HDIM]; total_len];
+        for t in 0..total_len {
+            for d in 0..HDIM {
+                q_all[t][d] = pseudo_gaussian(&mut rng);
+                k_all[t][d] = pseudo_gaussian(&mut rng);
+                v_all[t][d] = pseudo_gaussian(&mut rng);
+            }
+        }
+        // Inject massive BOS/attention-sink spikes on tokens 0..4.
+        for t in 0..4 {
+            for d in 0..HDIM {
+                k_all[t][d] *= 6.0;
+                v_all[t][d] *= 4.0;
+            }
+        }
+
+        let o_fp32 = exact_causal_attention_fp32(&q_all, &k_all, &v_all, inv_sqrt_d);
+
+        // Test BOTH full block-0 sink (16 tokens) AND partial block-0 sink (4 tokens),
+        // covering queries inside block 0 (q_offset=0) and continuation queries (q_offset=48).
+        for &num_sink in &[4usize, 16usize] {
+            for &razer in &[false, true] {
+                let mut kv = BitFp4PagedKvModel::new(razer);
+                kv.append_chunk(&k_all[..48], &v_all[..48], None, true, true);
+                kv.append_chunk(&k_all[48..], &v_all[48..], None, true, true);
+
+                let sink = Some((&k_all[..num_sink], &v_all[..num_sink], num_sink));
+                // Full block-0 sink (16 tokens) skips FP4 block 0 completely; partial sink
+                // (4 tokens) exercises `first_fp4_blk = 0` + `key_pos >= 4` masking where
+                // block 0's shared V^T scale is still influenced by the 4x sink spikes in [0..4).
+                let row_cos_floor = if num_sink == BLOCK_SIZE { 0.985 } else { 0.975 };
+
+                // Chunk 0 (q_offset=0, q_len=48): covers rows INSIDE sink [0..num_sink),
+                // non-sink rows inside block 0 [num_sink..16), and FP4 blocks 1..3 [16..48).
+                let o_c0 = prefill_paged_bitfp4_reference(
+                    &q_all[..48],
+                    &kv,
+                    0,
+                    48,
+                    inv_sqrt_d,
+                    true,
+                    true,
+                    sink,
+                );
+                for r in 0..num_sink {
+                    let max_err = o_fp32[r]
+                        .iter()
+                        .zip(o_c0[r].iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        max_err < 1e-5,
+                        "num_sink={num_sink} razer={razer} row={r}: pure BF16 sink causal drift {max_err:e}"
+                    );
+                }
+                let mut sum_c0 = 0.0f64;
+                for r in num_sink..48 {
+                    let cos = cosine_sim(&o_fp32[r], &o_c0[r]);
+                    assert!(
+                        cos > row_cos_floor,
+                        "num_sink={num_sink} razer={razer} row={r}: sink+FP4 chunk-0 cosine too low ({cos:.5})"
+                    );
+                    sum_c0 += cos;
+                }
+                let mean_c0 = sum_c0 / ((48 - num_sink) as f64);
+                assert!(
+                    mean_c0 > 0.990,
+                    "num_sink={num_sink} razer={razer}: mean chunk-0 cosine too low ({mean_c0:.5})"
+                );
+
+                // Chunk 1 continuation (q_offset=48, q_len=37, kv_len=85):
+                // merges exact BF16 sink with FP4 blocks (including partial block 0 when num_sink=4
+                // and partial tail block 5 with 5 tokens).
+                let o_c1 = prefill_paged_bitfp4_reference(
+                    &q_all[48..],
+                    &kv,
+                    48,
+                    total_len,
+                    inv_sqrt_d,
+                    true,
+                    true,
+                    sink,
+                );
+                let o_c1_nosink = prefill_paged_bitfp4_reference(
+                    &q_all[48..],
+                    &kv,
+                    48,
+                    total_len,
+                    inv_sqrt_d,
+                    true,
+                    true,
+                    None,
+                );
+                let mut sum_c1 = 0.0f64;
+                let mut sum_c1_nosink = 0.0f64;
+                for (local_r, row_out) in o_c1.iter().enumerate() {
+                    let abs_r = 48 + local_r;
+                    let cos = cosine_sim(&o_fp32[abs_r], row_out);
+                    assert!(
+                        cos > row_cos_floor,
+                        "num_sink={num_sink} razer={razer} abs_row={abs_r}: sink+FP4 continuation cosine too low ({cos:.5})"
+                    );
+                    sum_c1 += cos;
+                    sum_c1_nosink += cosine_sim(&o_fp32[abs_r], &o_c1_nosink[local_r]);
+                }
+                let mean_c1 = sum_c1 / (o_c1.len() as f64);
+                let mean_c1_nosink = sum_c1_nosink / (o_c1.len() as f64);
+                assert!(
+                    mean_c1 > 0.990 && mean_c1 > mean_c1_nosink,
+                    "num_sink={num_sink} razer={razer}: BF16 sink should improve continuation accuracy \
+                     (mean_sink={mean_c1:.5}, mean_nosink={mean_c1_nosink:.5})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_launcher_validation_enforces_alignment_bounds_and_handles() {
+        use crate::layers::ops::{BitFp4Bf16Sink, BitFp4CausalMask, validate_bitfp4_prefill_args};
+        use spark_runtime::gpu::DevicePtr;
+
+        assert_eq!(BitFp4CausalMask::Disabled.to_u32(), 0);
+        assert_eq!(BitFp4CausalMask::Causal.to_u32(), 1);
+
+        let valid_k = KernelHandle(42);
+        let valid_bt = DevicePtr(0x1000);
+        let valid_stride = 24 * 256; // 6144 (multiple of 8)
+        let no_sink = BitFp4Bf16Sink::default();
+
+        // Valid 512K continuation call succeeds.
+        assert!(
+            validate_bitfp4_prefill_args(
+                valid_k,
+                valid_bt,
+                4096,
+                524_288,
+                520_192,
+                24,
+                4,
+                valid_stride,
+                valid_stride,
+                no_sink,
+                "prefill",
+            )
+            .is_ok()
+        );
+
+        // Null kernel handle fails closed.
+        assert!(
+            validate_bitfp4_prefill_args(
+                KernelHandle(0),
+                valid_bt,
+                256,
+                1024,
+                768,
+                24,
+                4,
+                valid_stride,
+                valid_stride,
+                no_sink,
+                "prefill",
+            )
+            .is_err()
+        );
+
+        // Non-16B-aligned stride or undersized stride fails closed.
+        for bad_stride in [valid_stride - 256, valid_stride + 4] {
+            assert!(
+                validate_bitfp4_prefill_args(
+                    valid_k,
+                    valid_bt,
+                    256,
+                    1024,
+                    768,
+                    24,
+                    4,
+                    bad_stride,
+                    valid_stride,
+                    no_sink,
+                    "prefill",
+                )
+                .is_err()
+            );
+            assert!(
+                validate_bitfp4_prefill_args(
+                    valid_k,
+                    valid_bt,
+                    256,
+                    1024,
+                    768,
+                    24,
+                    4,
+                    valid_stride,
+                    bad_stride,
+                    no_sink,
+                    "prefill",
+                )
+                .is_err()
+            );
+        }
+
+        // Null block_table when kv_len > 0 fails closed; kv_len == 0 permits null.
+        assert!(
+            validate_bitfp4_prefill_args(
+                valid_k,
+                DevicePtr::NULL,
+                256,
+                1024,
+                768,
+                24,
+                4,
+                valid_stride,
+                valid_stride,
+                no_sink,
+                "prefill",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_bitfp4_prefill_args(
+                valid_k,
+                DevicePtr::NULL,
+                256,
+                0,
+                0,
+                24,
+                4,
+                valid_stride,
+                valid_stride,
+                no_sink,
+                "prefill",
+            )
+            .is_ok()
+        );
+
+        // Non-zero sink token count with null sink pointers fails closed; both non-null passes.
+        let bad_sink = BitFp4Bf16Sink {
+            k_sink_bf16: DevicePtr(0x2000),
+            v_sink_bf16: DevicePtr::NULL,
+            num_sink_tokens: 16,
+        };
+        assert!(
+            validate_bitfp4_prefill_args(
+                valid_k,
+                valid_bt,
+                256,
+                1024,
+                768,
+                24,
+                4,
+                valid_stride,
+                valid_stride,
+                bad_sink,
+                "prefill",
+            )
+            .is_err()
+        );
+        let good_sink = BitFp4Bf16Sink {
+            k_sink_bf16: DevicePtr(0x2000),
+            v_sink_bf16: DevicePtr(0x3000),
+            num_sink_tokens: 16,
+        };
+        assert!(
+            validate_bitfp4_prefill_args(
+                valid_k,
+                valid_bt,
+                256,
+                1024,
+                768,
+                24,
+                4,
+                valid_stride,
+                valid_stride,
+                good_sink,
+                "prefill",
+            )
+            .is_ok()
+        );
+
+        // Position overflow (`q_offset + q_len`) fails closed.
+        assert!(
+            validate_bitfp4_prefill_args(
+                valid_k,
+                valid_bt,
+                16,
+                1024,
+                u32::MAX - 4,
+                24,
+                4,
+                valid_stride,
+                valid_stride,
+                no_sink,
+                "prefill",
+            )
+            .is_err()
+        );
     }
 }

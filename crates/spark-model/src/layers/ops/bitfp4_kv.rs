@@ -3,8 +3,11 @@
 //! Native Blackwell (SM120/SM121) BitDecoding-FP4 + 6-op SWAR RaZeR-KV kernel
 //! descriptors and launch wrappers.
 //!
-//! All 7 CUDA entrypoints live in `kernels/gb10/common/paged_decode_attn_bitfp4_sm120.cu`
-//! (auto-discovered as module `"paged_decode_attn_bitfp4_sm120"` by `atlas-kernels`).
+//! Decode/write entrypoints live in `kernels/gb10/common/paged_decode_attn_bitfp4_sm120.cu`
+//! (auto-discovered as module `"paged_decode_attn_bitfp4_sm120"` by `atlas-kernels`),
+//! and chunked continuation prefill entrypoints live in
+//! `kernels/gb10/common/prefill_paged_bitfp4_sm120.cu` (auto-discovered as module
+//! `"prefill_paged_bitfp4_sm120"`).
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -12,6 +15,9 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 /// Auto-discovered module name for `kernels/gb10/common/paged_decode_attn_bitfp4_sm120.cu`.
 pub const BITFP4_KV_MODULE: &str = "paged_decode_attn_bitfp4_sm120";
+
+/// Auto-discovered module name for `kernels/gb10/common/prefill_paged_bitfp4_sm120.cu`.
+pub const BITFP4_PREFILL_MODULE: &str = "prefill_paged_bitfp4_sm120";
 
 /// Head dimension supported by the SM120/SM121 BitDecoding-FP4 kernels.
 pub const BITFP4_KV_HEAD_DIM: u32 = 256;
@@ -25,9 +31,32 @@ pub const BITFP4_DECODE_Q_SUB: u32 = 8;
 /// Query sub-tile width processed per CTA in `K = gamma` multi-query verify.
 pub const BITFP4_KGAMMA_Q_SUB: u32 = 16;
 
+/// Query rows processed per CTA in BitDecoding-FP4 chunked paged prefill.
+pub const BITFP4_PREFILL_TILE_Q: u32 = 32;
+
 const BITFP4_FLAG_APPLY_WHT: u32 = 1 << 0;
 const BITFP4_FLAG_FOUR_OVER_SIX: u32 = 1 << 1;
 const BITFP4_FLAG_RAZER_KV: u32 = 1 << 2;
+
+/// Causal masking mode for BitDecoding-FP4 chunked paged prefill attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitFp4CausalMask {
+    /// Bidirectional attention over `[0, kv_len)`.
+    Disabled,
+    /// Causal attention: query at `q_offset + q_row` attends to keys `<= q_offset + q_row`.
+    Causal,
+}
+
+impl BitFp4CausalMask {
+    /// Encode into the `u32` flag expected by `prefill_paged_bitfp4_sm120.cu`.
+    #[must_use]
+    pub const fn to_u32(self) -> u32 {
+        match self {
+            Self::Disabled => 0,
+            Self::Causal => 1,
+        }
+    }
+}
 
 /// Whether orthogonal 256-point Walsh-Hadamard rotation (`K' = H(K - mu_k)`,
 /// `Q' = H Q`) is applied to suppress channel outliers under token-wise K scaling.
@@ -118,12 +147,17 @@ pub struct BitFp4KvKernels {
     pub reduce: KernelHandle,
     pub write_k: KernelHandle,
     pub promote_v: KernelHandle,
+    pub prefill_paged: KernelHandle,
+    pub prefill_paged_razer: KernelHandle,
+    pub prefill_paged_batched: KernelHandle,
+    pub prefill_paged_batched_razer: KernelHandle,
 }
 
 impl BitFp4KvKernels {
-    /// Probe all 7 optional entrypoints from `"paged_decode_attn_bitfp4_sm120"`.
-    /// Returns `None` if the base BitDecoding-FP4 set (write_k, promote_v, decode,
-    /// kgamma, reduce) is unavailable.
+    /// Probe all 11 optional entrypoints across `"paged_decode_attn_bitfp4_sm120"`
+    /// and `"prefill_paged_bitfp4_sm120"`. Returns `None` if the base
+    /// BitDecoding-FP4 set (write/promote, decode/kgamma/reduce, and chunked
+    /// prefill) is incomplete so layers never mix BitFP4 and legacy NVFP4 layouts.
     #[must_use]
     pub fn load_optional(gpu: &dyn GpuBackend) -> Option<Self> {
         let decode =
@@ -149,6 +183,23 @@ impl BitFp4KvKernels {
             crate::layers::try_kernel(gpu, BITFP4_KV_MODULE, "reshape_and_cache_bitfp4_k_block16");
         let promote_v =
             crate::layers::try_kernel(gpu, BITFP4_KV_MODULE, "promote_block16_bitfp4_v_transposed");
+        let prefill_paged =
+            crate::layers::try_kernel(gpu, BITFP4_PREFILL_MODULE, "prefill_paged_bitfp4_sm120");
+        let prefill_paged_razer = crate::layers::try_kernel(
+            gpu,
+            BITFP4_PREFILL_MODULE,
+            "prefill_paged_bitfp4_razer_sm120",
+        );
+        let prefill_paged_batched = crate::layers::try_kernel(
+            gpu,
+            BITFP4_PREFILL_MODULE,
+            "prefill_paged_bitfp4_batched_sm120",
+        );
+        let prefill_paged_batched_razer = crate::layers::try_kernel(
+            gpu,
+            BITFP4_PREFILL_MODULE,
+            "prefill_paged_bitfp4_batched_razer_sm120",
+        );
 
         let handles = Self {
             decode,
@@ -158,6 +209,10 @@ impl BitFp4KvKernels {
             reduce,
             write_k,
             promote_v,
+            prefill_paged,
+            prefill_paged_razer,
+            prefill_paged_batched,
+            prefill_paged_batched_razer,
         };
         if handles.is_complete_for(BitFp4RazerMode::Disabled) {
             Some(handles)
@@ -166,19 +221,44 @@ impl BitFp4KvKernels {
         }
     }
 
-    /// Returns `true` when every required symbol for `razer` mode is non-null.
+    /// Returns `true` when every required symbol for `razer` mode (write,
+    /// decode, verify, and chunked prefill) is non-null.
     #[must_use]
     pub const fn is_complete_for(&self, razer: BitFp4RazerMode) -> bool {
         let base_ok = self.write_k.0 != 0
             && self.promote_v.0 != 0
             && self.decode.0 != 0
             && self.kgamma.0 != 0
-            && self.reduce.0 != 0;
+            && self.reduce.0 != 0
+            && self.prefill_paged.0 != 0
+            && self.prefill_paged_batched.0 != 0;
         match razer {
             BitFp4RazerMode::Disabled => base_ok,
             BitFp4RazerMode::Enabled => {
-                base_ok && self.decode_razer.0 != 0 && self.kgamma_razer.0 != 0
+                base_ok
+                    && self.decode_razer.0 != 0
+                    && self.kgamma_razer.0 != 0
+                    && self.prefill_paged_razer.0 != 0
+                    && self.prefill_paged_batched_razer.0 != 0
             }
+        }
+    }
+
+    /// Select the single-sequence chunked prefill kernel handle for `razer`.
+    #[must_use]
+    pub const fn prefill_handle(&self, razer: BitFp4RazerMode) -> KernelHandle {
+        match razer {
+            BitFp4RazerMode::Disabled => self.prefill_paged,
+            BitFp4RazerMode::Enabled => self.prefill_paged_razer,
+        }
+    }
+
+    /// Select the same-chunk-len batched prefill kernel handle for `razer`.
+    #[must_use]
+    pub const fn prefill_batched_handle(&self, razer: BitFp4RazerMode) -> KernelHandle {
+        match razer {
+            BitFp4RazerMode::Disabled => self.prefill_paged_batched,
+            BitFp4RazerMode::Enabled => self.prefill_paged_batched_razer,
         }
     }
 }
@@ -431,5 +511,204 @@ pub fn paged_decode_attn_bitfp4_reduce(
         .arg_ptr(seq_lens)
         .arg_u32(num_q_heads)
         .arg_u32(num_splits)
+        .launch(stream)
+}
+
+/// Pure argument validation shared by single-sequence and batched
+/// BitDecoding-FP4 chunked continuation prefill launchers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_bitfp4_prefill_args(
+    kernel: KernelHandle,
+    block_table_or_ptrs: DevicePtr,
+    q_len: u32,
+    kv_len: u32,
+    q_offset: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    q_stride: u32,
+    o_stride: u32,
+    sink: BitFp4Bf16Sink,
+    label: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        kernel.0 != 0,
+        "BitDecoding-FP4 {label} kernel handle is null; rebuild atlas-kernels"
+    );
+    anyhow::ensure!(
+        num_kv_heads > 0 && num_q_heads > 0 && num_q_heads.is_multiple_of(num_kv_heads),
+        "BitDecoding-FP4 {label} requires non-zero num_q_heads ({num_q_heads}) divisible by num_kv_heads ({num_kv_heads})"
+    );
+    let min_stride = num_q_heads
+        .checked_mul(BITFP4_KV_HEAD_DIM)
+        .ok_or_else(|| anyhow::anyhow!("BitDecoding-FP4 {label} head stride overflow"))?;
+    anyhow::ensure!(
+        q_stride >= min_stride && q_stride.is_multiple_of(8),
+        "BitDecoding-FP4 {label} requires 16-byte aligned q_stride >= {min_stride} (got {q_stride})"
+    );
+    anyhow::ensure!(
+        o_stride >= min_stride && o_stride.is_multiple_of(8),
+        "BitDecoding-FP4 {label} requires 16-byte aligned o_stride >= {min_stride} (got {o_stride})"
+    );
+    anyhow::ensure!(
+        q_offset.checked_add(q_len).is_some(),
+        "BitDecoding-FP4 {label} q_offset ({q_offset}) + q_len ({q_len}) overflow"
+    );
+    anyhow::ensure!(
+        kv_len == 0 || !block_table_or_ptrs.is_null(),
+        "BitDecoding-FP4 {label} requires a non-null block table when kv_len={kv_len} > 0"
+    );
+    anyhow::ensure!(
+        sink.num_sink_tokens == 0 || (!sink.k_sink_bf16.is_null() && !sink.v_sink_bf16.is_null()),
+        "BitDecoding-FP4 {label} requires non-null BF16 sink K/V pointers when num_sink_tokens={} > 0",
+        sink.num_sink_tokens
+    );
+    Ok(())
+}
+
+/// Launch native SM120/SM121 BitDecoding-FP4 chunked continuation prefill
+/// attention directly over block-16 `WHT+4/6 K` and channel-transposed `V^T`.
+///
+/// Supports arbitrary `q_offset` (`seq_len_start`), `q_len`, `kv_len`, optional
+/// causal masking, optional 6-op SWAR RaZeR-KV (`±5.0`), and optional BF16
+/// block-0 attention sinks.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_paged_bitfp4_sm120(
+    gpu: &dyn GpuBackend,
+    kernels: &BitFp4KvKernels,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_table: DevicePtr,
+    q_len: u32,
+    kv_len: u32,
+    q_offset: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    inv_sqrt_d: f32,
+    q_stride: u32,
+    o_stride: u32,
+    block_stride_bytes: u64,
+    data_section_bytes: u64,
+    causal_mask: BitFp4CausalMask,
+    flags: BitFp4QuantFlags,
+    sink: BitFp4Bf16Sink,
+    stream: u64,
+) -> Result<()> {
+    let kernel = kernels.prefill_handle(flags.razer);
+    validate_bitfp4_prefill_args(
+        kernel,
+        block_table,
+        q_len,
+        kv_len,
+        q_offset,
+        num_q_heads,
+        num_kv_heads,
+        q_stride,
+        o_stride,
+        sink,
+        "prefill",
+    )?;
+    if q_len == 0 {
+        return Ok(());
+    }
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(q_len, BITFP4_PREFILL_TILE_Q), 1])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_table)
+        .arg_u32(q_len)
+        .arg_u32(kv_len)
+        .arg_u32(q_offset)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(q_stride)
+        .arg_u32(o_stride)
+        .arg_u64(block_stride_bytes)
+        .arg_u64(data_section_bytes)
+        .arg_u32(causal_mask.to_u32())
+        .arg_u32(flags.to_mask())
+        .arg_ptr(sink.k_sink_bf16)
+        .arg_ptr(sink.v_sink_bf16)
+        .arg_u32(sink.num_sink_tokens)
+        .launch(stream)
+}
+
+/// Launch native SM120/SM121 BitDecoding-FP4 same-chunk-length batched
+/// continuation prefill attention (`block_table_ptrs[b]`, stacked `[batch, q_len, ...]`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_paged_bitfp4_batched_sm120(
+    gpu: &dyn GpuBackend,
+    kernels: &BitFp4KvKernels,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_table_ptrs: DevicePtr,
+    batch_size: u32,
+    q_len: u32,
+    kv_len: u32,
+    q_offset: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    inv_sqrt_d: f32,
+    q_stride: u32,
+    o_stride: u32,
+    block_stride_bytes: u64,
+    data_section_bytes: u64,
+    causal_mask: BitFp4CausalMask,
+    flags: BitFp4QuantFlags,
+    sink: BitFp4Bf16Sink,
+    stream: u64,
+) -> Result<()> {
+    let kernel = kernels.prefill_batched_handle(flags.razer);
+    validate_bitfp4_prefill_args(
+        kernel,
+        block_table_ptrs,
+        q_len,
+        kv_len,
+        q_offset,
+        num_q_heads,
+        num_kv_heads,
+        q_stride,
+        o_stride,
+        sink,
+        "batched prefill",
+    )?;
+    if batch_size == 0 || q_len == 0 {
+        return Ok(());
+    }
+    KernelLaunch::new(gpu, kernel)
+        .grid([
+            num_q_heads,
+            div_ceil(q_len, BITFP4_PREFILL_TILE_Q),
+            batch_size,
+        ])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_table_ptrs)
+        .arg_u32(batch_size)
+        .arg_u32(q_len)
+        .arg_u32(kv_len)
+        .arg_u32(q_offset)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(q_stride)
+        .arg_u32(o_stride)
+        .arg_u64(block_stride_bytes)
+        .arg_u64(data_section_bytes)
+        .arg_u32(causal_mask.to_u32())
+        .arg_u32(flags.to_mask())
+        .arg_ptr(sink.k_sink_bf16)
+        .arg_ptr(sink.v_sink_bf16)
+        .arg_u32(sink.num_sink_tokens)
         .launch(stream)
 }
