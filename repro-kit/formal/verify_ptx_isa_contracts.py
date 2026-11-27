@@ -108,6 +108,22 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
     ("kernels/gb10/common/paged_decode_attn_fp8.cu", False, False, True, False, ()),
     ("kernels/gb10/common/paged_decode_attn_nvfp4.cu", False, False, True, False, ()),
     ("kernels/gb10/common/paged_decode_attn_kgamma_nvfp4.cu", False, False, True, False, ()),
+    (
+        "kernels/gb10/common/paged_decode_attn_bitfp4_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "paged_decode_attn_bitfp4_sm120",
+            "paged_decode_attn_bitfp4_razer_sm120",
+            "paged_decode_attn_bitfp4_kgamma_sm120",
+            "paged_decode_attn_bitfp4_kgamma_razer_sm120",
+            "paged_decode_attn_bitfp4_reduce",
+            "reshape_and_cache_bitfp4_k_block16",
+            "promote_block16_bitfp4_v_transposed",
+        ),
+    ),
     ("kernels/gb10/common/paged_decode_attn_turbo4.cu", False, False, True, False, ()),
     ("kernels/gb10/common/paged_decode_attn_fp8k_turbo4v.cu", False, False, True, False, ()),
     (

@@ -698,7 +698,9 @@ impl Qwen3AttentionLayer {
                     );
                 }
                 KvCacheDtype::Nvfp4 => {
-                    if batch_k.cache_nvfp4_multi_seq.0 != 0 {
+                    if self.active_bitfp4_kv(hd, bs).is_none()
+                        && batch_k.cache_nvfp4_multi_seq.0 != 0
+                    {
                         return ops::reshape_and_cache_nvfp4_multi_seq(
                             fwd.gpu,
                             batch_k.cache_nvfp4_multi_seq,
@@ -1109,6 +1111,74 @@ impl Qwen3AttentionLayer {
                 n as u32,
                 stream,
             )?;
+            return Ok(());
+        }
+
+        // Native Blackwell SM120/SM121 BitDecoding-FP4 K=gamma verify path
+        // (opt-in via `ATLAS_BITFP4_KV=1`, plus optional `ATLAS_BITFP4_RAZER_KV=1`).
+        // Stacks up to 16 `(q_row, q_head)` queries per CTA sharing a single
+        // double-buffered FP4 KV scan (`B_k = 64` = 4 Flux blocks).
+        if (2..=32).contains(&n)
+            && kv_indir == spark_runtime::gpu::DevicePtr::NULL
+            && fwd.ddtree_parent_ids_dev.is_none()
+            && let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(hd, bs)
+        {
+            let workspace = fwd.buffers.splitk_workspace();
+            let slot_bytes = n
+                .saturating_mul(nq as usize)
+                .saturating_mul(hd as usize + 2)
+                .saturating_mul(std::mem::size_of::<f32>());
+            let max_splits_cap =
+                if workspace == spark_runtime::gpu::DevicePtr::NULL || slot_bytes == 0 {
+                    1
+                } else {
+                    (fwd.buffers.sizes().splitk_workspace / slot_bytes).clamp(1, 64) as u32
+                };
+            let num_splits =
+                crate::layers::qwen3_attention::bitfp4_kv::compute_bitfp4_kgamma_splits(
+                    nq,
+                    nkv,
+                    n as u32,
+                    max_seq_len_host,
+                    atlas_core::device::active_sm_count(),
+                    max_splits_cap,
+                );
+            ops::paged_decode_attn_bitfp4_kgamma_sm120(
+                fwd.gpu,
+                bitfp4_k,
+                q_contiguous,
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                attn_out,
+                workspace,
+                meta.block_table,
+                meta.seq_len,
+                meta.max_blocks_per_seq,
+                nq,
+                nkv,
+                inv_sqrt_d,
+                num_splits,
+                q_stride_elems,
+                kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                kv_cache.nvfp4_data_bytes() as u64,
+                n as u32,
+                flags,
+                ops::BitFp4Bf16Sink::default(),
+                stream,
+            )?;
+            if num_splits > 1 {
+                ops::paged_decode_attn_bitfp4_reduce(
+                    fwd.gpu,
+                    bitfp4_k.reduce,
+                    workspace,
+                    attn_out,
+                    meta.seq_len,
+                    nq,
+                    num_splits,
+                    n as u32,
+                    stream,
+                )?;
+            }
             return Ok(());
         }
 

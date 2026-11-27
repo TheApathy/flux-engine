@@ -14,6 +14,7 @@
 //!   - `prefill`: batched prefill with paged attention
 //!   - `trait_impl`: `TransformerLayer` trait implementation
 
+mod bitfp4_kv;
 mod decode;
 mod helpers;
 mod init;

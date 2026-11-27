@@ -636,6 +636,12 @@ impl Qwen3AttentionLayer {
                 }
                 _ => None,
             },
+            bitfp4_kv_kernels: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    crate::layers::ops::BitFp4KvKernels::load_optional(gpu)
+                }
+                _ => None,
+            },
             residual_add_k: if config.use_fp32_residual() {
                 gpu.kernel("norm", "f32_residual_add")
                     .or_else(|_| gpu.kernel("residual_add", "bf16_residual_add"))?

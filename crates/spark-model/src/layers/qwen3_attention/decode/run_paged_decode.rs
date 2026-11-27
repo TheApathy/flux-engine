@@ -729,6 +729,60 @@ impl Qwen3AttentionLayer {
             KvCacheDtype::Nvfp4 => {
                 let num_splits = compute_num_splits(num_q_heads, num_seqs, max_seq_len_host);
 
+                if kv_indirection == DevicePtr::NULL
+                    && let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(head_dim, block_size)
+                {
+                    let bitfp4_splits = if workspace == DevicePtr::NULL {
+                        1
+                    } else {
+                        super::super::bitfp4_kv::compute_bitfp4_decode_splits(
+                            num_q_heads,
+                            num_kv_heads,
+                            num_seqs,
+                            max_seq_len_host,
+                            atlas_core::device::active_sm_count(),
+                            num_splits,
+                        )
+                    };
+                    ops::paged_decode_attn_bitfp4_sm120(
+                        gpu,
+                        bitfp4_k,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        workspace,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        inv_sqrt_d,
+                        bitfp4_splits,
+                        q_stride,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                        kv_cache.nvfp4_data_bytes() as u64,
+                        flags,
+                        ops::BitFp4Bf16Sink::default(),
+                        stream,
+                    )?;
+                    if bitfp4_splits > 1 {
+                        ops::paged_decode_attn_bitfp4_reduce(
+                            gpu,
+                            bitfp4_k.reduce,
+                            workspace,
+                            output,
+                            seq_lens,
+                            num_q_heads,
+                            bitfp4_splits,
+                            num_seqs,
+                            stream,
+                        )?;
+                    }
+                    return Ok(());
+                }
+
                 if num_splits > 1 && head_dim <= 256 {
                     let splitk_k = self
                         .paged_decode_splitk_k

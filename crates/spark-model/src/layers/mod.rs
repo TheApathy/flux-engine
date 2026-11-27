@@ -147,6 +147,61 @@ pub fn warn_kernel_fallback(
     });
 }
 
+fn parse_bitfp4_bool_env(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v.is_empty() || v == "0" => false,
+        Ok(other) => {
+            tracing::warn!(
+                "{name}={other:?} is unsupported (expected \"0\" or \"1\"); failing closed to disabled"
+            );
+            false
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!("{name} contains non-UTF-8 bytes; failing closed to disabled");
+            false
+        }
+    }
+}
+
+/// Returns true when `ATLAS_BITFP4_KV=1` is set in the process env.
+///
+/// Opt-in gate for native Blackwell (SM120/SM121) BitDecoding-FP4 paged KV
+/// cache write (`K' = H(K - mu_k)` + Four-Over-Six + self-contained block-16
+/// transposed `V^T`) and native FP4 Tensor Core decode/verify attention
+/// (`m16n8k64` `kind::mxf4nvf4`, Dual-Residual Stacked Q, Transposed Softmax,
+/// Underflow-Aware Probability Scaling). Default OFF so baseline NVFP4 KV
+/// remains byte-identical. Cached via `OnceLock`.
+#[must_use]
+pub fn bitfp4_kv_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| parse_bitfp4_bool_env("ATLAS_BITFP4_KV"))
+}
+
+/// Returns true when BOTH `ATLAS_BITFP4_KV=1` and `ATLAS_BITFP4_RAZER_KV=1` are
+/// set in the process env.
+///
+/// Enables 6-op branchless SWAR RaZeR-KV (`-0.0 -> ±4.0 + ±1.0`, storing
+/// `neg_sv` in bit 7 of `.ue4m3` scale bytes) on top of native BitDecoding-FP4.
+/// Fails closed with a one-time warning if `ATLAS_BITFP4_RAZER_KV=1` is set
+/// without `ATLAS_BITFP4_KV=1`. Default OFF. Cached via `OnceLock`.
+#[must_use]
+pub fn bitfp4_razer_kv_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        let requested = parse_bitfp4_bool_env("ATLAS_BITFP4_RAZER_KV");
+        if requested && !bitfp4_kv_enabled() {
+            tracing::warn!(
+                "ATLAS_BITFP4_RAZER_KV=1 requires ATLAS_BITFP4_KV=1; ignoring standalone \
+                 ATLAS_BITFP4_RAZER_KV and keeping baseline NVFP4 KV"
+            );
+            return false;
+        }
+        requested
+    })
+}
+
 /// Returns true when `ATLAS_TC_NVFP4_M16=1` is set in the process env.
 ///
 /// Gates the small-M `w4a16_gemm_t_m16` dispatch (K=γ verify path,

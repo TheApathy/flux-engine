@@ -2,6 +2,26 @@
 
 //! Per-layer KV cache dtype vector construction.
 
+/// Returns `true` when the positional first-N/last-N boundary policy silently
+/// promotes **100%** of attention layers from a quantized `kv_dtype` to
+/// `boundary_dtype` (i.e. `2 * high_precision_layers >= num_attention_layers`),
+/// eliminating all KV cache compression.
+///
+/// Example: Qwen3.8-27B has `num_attention_layers = 16`; setting
+/// `--kv-high-precision-layers 8` sets `0..8` and `8..16` to BF16 (`16/16` = 100% BF16).
+#[must_use]
+pub(crate) fn is_full_boundary_override(
+    kv_dtype: spark_runtime::kv_cache::KvCacheDtype,
+    num_attention_layers: usize,
+    high_precision_layers: usize,
+    boundary_dtype: spark_runtime::kv_cache::KvCacheDtype,
+) -> bool {
+    num_attention_layers > 0
+        && kv_dtype != boundary_dtype
+        && high_precision_layers > 0
+        && high_precision_layers.saturating_mul(2) >= num_attention_layers
+}
+
 /// Build per-attention-layer KV cache dtype vector.
 ///
 /// When `high_precision_layers` is 0, returns an empty vec (all layers use uniform dtype).
@@ -31,13 +51,36 @@ pub(crate) fn build_layer_kv_dtypes(
     }
 
     let hp_count = dtypes.iter().filter(|d| **d == boundary_dtype).count();
-    tracing::info!(
-        "Selective boundary KV cache: {}/{} attention layers at {}, rest at {}",
-        hp_count,
-        num_attention_layers,
-        boundary_dtype,
+    if is_full_boundary_override(
         kv_dtype,
-    );
+        num_attention_layers,
+        high_precision_layers,
+        boundary_dtype,
+    ) {
+        tracing::warn!(
+            "⚠ Selective boundary KV cache: --kv-high-precision-layers {} protects first {} \
+             and last {} of {} attention layers, silently promoting 100% ({}/{}) of layers from \
+             {} to {} (0% KV compression!). Pass --kv-high-precision-layers 0 (with \
+             ATLAS_BITFP4_KV=1 for native Blackwell FP4 KV) or --kv-high-precision-layer-set \
+             for partial protection.",
+            high_precision_layers,
+            hp,
+            hp,
+            num_attention_layers,
+            hp_count,
+            num_attention_layers,
+            kv_dtype,
+            boundary_dtype,
+        );
+    } else {
+        tracing::info!(
+            "Selective boundary KV cache: {}/{} attention layers at {}, rest at {}",
+            hp_count,
+            num_attention_layers,
+            boundary_dtype,
+            kv_dtype,
+        );
+    }
 
     dtypes
 }

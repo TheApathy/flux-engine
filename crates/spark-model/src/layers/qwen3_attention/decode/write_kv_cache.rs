@@ -34,24 +34,46 @@ impl Qwen3AttentionLayer {
         graph_capture: bool,
     ) -> Result<()> {
         match self.kv_dtype {
-            KvCacheDtype::Nvfp4 => ops::reshape_and_cache_nvfp4(
-                gpu,
-                self.reshape_cache_k,
-                k,
-                v,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                slot,
-                num_tokens,
-                num_kv_heads,
-                head_dim,
-                block_size,
-                key_stride,
-                value_stride,
-                kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
-                kv_cache.nvfp4_data_bytes() as u64,
-                stream,
-            ),
+            KvCacheDtype::Nvfp4 => {
+                if let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(head_dim, block_size) {
+                    return ops::reshape_and_cache_bitfp4_kv_block16(
+                        gpu,
+                        bitfp4_k,
+                        k,
+                        v,
+                        DevicePtr::NULL,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        slot,
+                        num_tokens,
+                        num_kv_heads,
+                        key_stride,
+                        value_stride,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                        kv_cache.nvfp4_data_bytes() as u64,
+                        flags,
+                        stream,
+                    );
+                }
+                ops::reshape_and_cache_nvfp4(
+                    gpu,
+                    self.reshape_cache_k,
+                    k,
+                    v,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    slot,
+                    num_tokens,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    key_stride,
+                    value_stride,
+                    kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    kv_cache.nvfp4_data_bytes() as u64,
+                    stream,
+                )
+            }
             KvCacheDtype::Turbo4
             | KvCacheDtype::Turbo3
             | KvCacheDtype::Turbo8

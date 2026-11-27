@@ -33,5 +33,7 @@ mod content_specials_tests;
 mod tests;
 
 pub(crate) use app_state::AppState;
+#[cfg(test)]
+pub(crate) use kv_dtypes::is_full_boundary_override;
 pub(crate) use kv_dtypes::{build_layer_kv_dtypes, build_layer_kv_dtypes_from_set};
 pub(crate) use serve::serve;

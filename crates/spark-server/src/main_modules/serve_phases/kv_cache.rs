@@ -869,12 +869,28 @@ pub(crate) fn resolve_kv_cache_config(
         && hp_layer_set.is_empty()
         && kv_dtype != spark_runtime::kv_cache::KvCacheDtype::Bf16
     {
-        tracing::warn!(
-            "⚠ --kv-high-precision-layers is 0: all KV cache layers use {} precision. \
-             NVFP4 models may hallucinate or lose coherence at long context. \
-             Consider --kv-high-precision-layers max (or 2-5) for better quality.",
-            effective_kv_dtype_str,
-        );
+        if kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Nvfp4
+            && spark_model::layers::bitfp4_kv_enabled()
+        {
+            tracing::info!(
+                "Uniform NVFP4 KV cache (--kv-high-precision-layers 0) with ATLAS_BITFP4_KV=1: \
+                 all {} attention layers use native Blackwell BitDecoding-FP4{}.",
+                num_attn_layers,
+                if spark_model::layers::bitfp4_razer_kv_enabled() {
+                    " + SWAR RaZeR-KV"
+                } else {
+                    ""
+                },
+            );
+        } else {
+            tracing::warn!(
+                "⚠ --kv-high-precision-layers is 0: all KV cache layers use {} precision. \
+                 Vanilla NVFP4 KV may hallucinate or lose coherence at long context. \
+                 Consider ATLAS_BITFP4_KV=1 (SM120/SM121 native BitDecoding-FP4) or \
+                 --kv-high-precision-layers 2-5 / --kv-high-precision-layer-set for better quality.",
+                effective_kv_dtype_str,
+            );
+        }
     }
     let layer_dtypes = if !hp_layer_set.is_empty() {
         tracing::info!(

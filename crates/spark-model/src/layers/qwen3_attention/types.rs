@@ -275,6 +275,9 @@ pub struct Qwen3AttentionLayer {
     /// GQA-grouped (up to 12 Q / 1 KV head, SK=32) + Warp-0 ragged partitioner
     /// `(main_kernel, reduce_kernel)` pair for HDIM=256 BF16 and FP8 KV caches.
     pub(super) paged_decode_gqa12_ragged_k: Option<(KernelHandle, KernelHandle)>,
+    /// Native Blackwell SM120/SM121 BitDecoding-FP4 + SWAR RaZeR-KV kernel set
+    /// (`NVFP4` KV cache + `HDIM=256` only; gated by `ATLAS_BITFP4_KV=1`).
+    pub(super) bitfp4_kv_kernels: Option<crate::layers::ops::BitFp4KvKernels>,
     pub(super) residual_add_k: KernelHandle,
     pub(super) sigmoid_gate_mul_k: KernelHandle,
     pub(super) deinterleave_qg_k: KernelHandle,

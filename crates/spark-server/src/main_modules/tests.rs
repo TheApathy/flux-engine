@@ -3,7 +3,9 @@
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
-use crate::main_modules::{build_layer_kv_dtypes, build_layer_kv_dtypes_from_set};
+use crate::main_modules::{
+    build_layer_kv_dtypes, build_layer_kv_dtypes_from_set, is_full_boundary_override,
+};
 
 #[test]
 fn test_cli_parse_positional_model() {
@@ -298,6 +300,69 @@ fn test_cli_default_kv_high_precision_layers() {
     assert!(cli.is_ok());
     match cli.unwrap().command {
         Command::Serve(args) => {
+            assert_eq!(args.kv_high_precision_layers, "0");
+        }
+    }
+}
+
+#[test]
+fn test_qwen38_27b_hp8_silent_100pct_bf16_override_detected() {
+    use spark_runtime::kv_cache::KvCacheDtype;
+    // Qwen3.8-27B has 16 full-attention layers; `--kv-high-precision-layers 8`
+    // expands 0..8 AND 8..16 to BF16 -> 16/16 (100%) BF16, zero NVFP4 compression.
+    assert!(is_full_boundary_override(
+        KvCacheDtype::Nvfp4,
+        16,
+        8,
+        KvCacheDtype::Bf16
+    ));
+    let dtypes = build_layer_kv_dtypes(KvCacheDtype::Nvfp4, 16, 8, KvCacheDtype::Bf16);
+    assert_eq!(dtypes.len(), 16);
+    assert!(
+        dtypes.iter().all(|d| *d == KvCacheDtype::Bf16),
+        "hp=8 on 16 attention layers promotes 16/16 layers to BF16"
+    );
+
+    // Partial boundary protection (e.g. hp=2 on 16 layers -> 4 BF16, 12 NVFP4)
+    // is NOT a full override.
+    assert!(!is_full_boundary_override(
+        KvCacheDtype::Nvfp4,
+        16,
+        2,
+        KvCacheDtype::Bf16
+    ));
+    let partial = build_layer_kv_dtypes(KvCacheDtype::Nvfp4, 16, 2, KvCacheDtype::Bf16);
+    let nvfp4_count = partial
+        .iter()
+        .filter(|d| **d == KvCacheDtype::Nvfp4)
+        .count();
+    assert_eq!(nvfp4_count, 12);
+
+    // Opt-in `--kv-high-precision-layers 0` (used with `ATLAS_BITFP4_KV=1`):
+    // returns empty vec (uniform NVFP4 across all 16 layers) and is NOT an override.
+    assert!(!is_full_boundary_override(
+        KvCacheDtype::Nvfp4,
+        16,
+        0,
+        KvCacheDtype::Bf16
+    ));
+    let uniform = build_layer_kv_dtypes(KvCacheDtype::Nvfp4, 16, 0, KvCacheDtype::Bf16);
+    assert!(uniform.is_empty());
+
+    // CLI parsing accepts explicit `--kv-high-precision-layers 0` alongside `--kv-cache-dtype nvfp4`.
+    let cli = Cli::try_parse_from([
+        "spark",
+        "serve",
+        "nvidia/qwen3.8-27b",
+        "--kv-cache-dtype",
+        "nvfp4",
+        "--kv-high-precision-layers",
+        "0",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Serve(args) => {
+            assert_eq!(args.kv_cache_dtype, "nvfp4");
             assert_eq!(args.kv_high_precision_layers, "0");
         }
     }

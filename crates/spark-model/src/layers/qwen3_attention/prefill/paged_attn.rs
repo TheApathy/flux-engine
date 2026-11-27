@@ -223,6 +223,14 @@ impl Qwen3AttentionLayer {
                 hd,
                 self.prefill_attn_paged_nvfp4_128_k.0 != 0,
             );
+            if self.active_bitfp4_kv(hd, bs_u).is_some() {
+                anyhow::bail!(
+                    "ATLAS_BITFP4_KV=1 chunked continuation prefill over block-16 transposed V^T \
+                     KV cache is not yet supported (layer {}); use single-chunk prefill \
+                     (--max-prefill-tokens >= prompt_len) or unset ATLAS_BITFP4_KV",
+                    self.attn_layer_idx
+                );
+            }
             match (self.kv_dtype, use_br64) {
                 (KvCacheDtype::Nvfp4, true) => match br128_route {
                     Nvfp4PagedBr128Route::Complete => {

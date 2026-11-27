@@ -111,3 +111,5 @@ FLUX_QWEN4_TARGET_LMHEAD_MODE	NUMERICS	selects target lm_head precision (fp8/bf1
 ATLAS_DFLASH_HONOR_IS_CAUSAL	DEBUG	validated by cli_dflash_environment_rules.rs and pinned by built-in DFlash2 recipes
 ATLAS_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
 FLUX_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
+ATLAS_BITFP4_KV	NUMERICS	opt-in Blackwell SM120/SM121 BitDecoding-FP4 native FP4 TC paged KV cache write/decode (layers/mod.rs)
+ATLAS_BITFP4_RAZER_KV	NUMERICS	opt-in 6-op SWAR RaZeR-KV ±5.0 remapping for BitDecoding-FP4 KV cache (layers/mod.rs)

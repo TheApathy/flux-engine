@@ -13,6 +13,8 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/bitfp4_kv.rs"]
+mod bitfp4_kv;
 #[path = "ops/dflash2_conv.rs"]
 mod dflash2_conv;
 #[path = "ops/embeddings.rs"]
@@ -147,6 +149,7 @@ mod ssm_mamba;
 mod ssm_preproc;
 
 pub use activations::*;
+pub use bitfp4_kv::*;
 pub use dflash2_conv::*;
 pub use embeddings::*;
 pub use fp8_moe::*;
