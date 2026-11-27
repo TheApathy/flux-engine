@@ -25,7 +25,7 @@
 use std::fmt;
 
 use spark_runtime::autoematic::{
-    AutoEmaticGateConfig, AutoEmaticPrecisionLevel, EntropyGateSignal,
+    AutoEmaticGateConfig, AutoEmaticGateError, AutoEmaticPrecisionLevel, EntropyGateSignal,
 };
 
 /// Environment variable enabling universal DualPlaneNvfp4 self-speculation.
@@ -185,23 +185,45 @@ impl LayerActivityProfile {
     }
 }
 
-/// Error returned when parsing `ATLAS_DUAL_PLANE_SELF_SPEC`.
+/// Error returned when parsing `ATLAS_DUAL_PLANE_SELF_SPEC` or its companion
+/// `ATLAS_AUTOEMATIC_GATE_ENTROPY` configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SelfSpecConfigError {
-    raw: String,
+pub enum SelfSpecConfigError {
+    /// `ATLAS_DUAL_PLANE_SELF_SPEC` is not valid UTF-8.
+    NonUtf8,
+    /// `ATLAS_DUAL_PLANE_SELF_SPEC` is not a recognized boolean token.
+    InvalidToken(String),
+    /// Companion `ATLAS_AUTOEMATIC_GATE_ENTROPY` failed fail-closed validation.
+    AutoEmaticGate(AutoEmaticGateError),
 }
 
 impl fmt::Display for SelfSpecConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{DUAL_PLANE_SELF_SPEC_ENV} must be one of 0/1/false/true/off/on, got {:?}",
-            self.raw
-        )
+        match self {
+            Self::NonUtf8 => write!(f, "{DUAL_PLANE_SELF_SPEC_ENV} must contain valid UTF-8"),
+            Self::InvalidToken(raw) => write!(
+                f,
+                "{DUAL_PLANE_SELF_SPEC_ENV} must be one of 0/1/false/true/off/on, got {raw:?}"
+            ),
+            Self::AutoEmaticGate(err) => write!(f, "invalid AutoEMatic entropy gate: {err}"),
+        }
     }
 }
 
-impl std::error::Error for SelfSpecConfigError {}
+impl std::error::Error for SelfSpecConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AutoEmaticGate(err) => Some(err),
+            Self::NonUtf8 | Self::InvalidToken(_) => None,
+        }
+    }
+}
+
+impl From<AutoEmaticGateError> for SelfSpecConfigError {
+    fn from(err: AutoEmaticGateError) -> Self {
+        Self::AutoEmaticGate(err)
+    }
+}
 
 /// Fail-closed refusal reason returned when self-speculation is not admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,16 +340,48 @@ impl SelfSpecConfig {
     /// `ATLAS_AUTOEMATIC_GATE_ENTROPY` (both default OFF).
     ///
     /// # Errors
-    /// Fails closed on invalid `ATLAS_DUAL_PLANE_SELF_SPEC` tokens.
+    /// Fails closed on non-UTF-8 or invalid `ATLAS_DUAL_PLANE_SELF_SPEC` tokens
+    /// and propagates any [`AutoEmaticGateError`] from `ATLAS_AUTOEMATIC_GATE_ENTROPY`.
     pub fn from_env() -> Result<Self, SelfSpecConfigError> {
-        let raw = std::env::var(DUAL_PLANE_SELF_SPEC_ENV).ok();
-        let enablement = Self::parse_enablement(raw.as_deref())?;
-        let autoematic_gate = AutoEmaticGateConfig::from_env().ok().flatten();
+        let enable_raw = std::env::var_os(DUAL_PLANE_SELF_SPEC_ENV);
+        let enablement = Self::parse_enablement_os(enable_raw.as_deref())?;
+        let autoematic_gate = AutoEmaticGateConfig::from_env()?;
         Ok(Self {
             enablement,
             autoematic_gate,
             ..Self::default()
         })
+    }
+
+    /// Construct from optional OS strings (used for fail-closed unit testing).
+    ///
+    /// # Errors
+    /// Fails closed on non-UTF-8, invalid enablement tokens, or invalid entropy thresholds.
+    pub fn from_os_values(
+        enablement: Option<&std::ffi::OsStr>,
+        gate_entropy: Option<&std::ffi::OsStr>,
+    ) -> Result<Self, SelfSpecConfigError> {
+        let enablement = Self::parse_enablement_os(enablement)?;
+        let autoematic_gate = AutoEmaticGateConfig::parse_os(gate_entropy)?;
+        Ok(Self {
+            enablement,
+            autoematic_gate,
+            ..Self::default()
+        })
+    }
+
+    /// Parse an optional OS string for `ATLAS_DUAL_PLANE_SELF_SPEC`.
+    ///
+    /// # Errors
+    /// Fails closed on non-UTF-8 or unrecognized non-empty tokens.
+    pub fn parse_enablement_os(
+        raw: Option<&std::ffi::OsStr>,
+    ) -> Result<SelfSpecEnablement, SelfSpecConfigError> {
+        let Some(os_val) = raw else {
+            return Ok(SelfSpecEnablement::Disabled);
+        };
+        let utf8 = os_val.to_str().ok_or(SelfSpecConfigError::NonUtf8)?;
+        Self::parse_enablement(Some(utf8))
     }
 
     /// Parse an optional `ATLAS_DUAL_PLANE_SELF_SPEC` value.
@@ -341,9 +395,7 @@ impl SelfSpecConfig {
         match trimmed.to_ascii_lowercase().as_str() {
             "0" | "false" | "off" => Ok(SelfSpecEnablement::Disabled),
             "1" | "true" | "on" => Ok(SelfSpecEnablement::Enabled),
-            _ => Err(SelfSpecConfigError {
-                raw: trimmed.to_owned(),
-            }),
+            _ => Err(SelfSpecConfigError::InvalidToken(trimmed.to_owned())),
         }
     }
 
@@ -597,6 +649,32 @@ mod tests {
             SelfSpecEnablement::Enabled
         );
         assert!(SelfSpecConfig::parse_enablement(Some("auto")).is_err());
+
+        // Companion ATLAS_AUTOEMATIC_GATE_ENTROPY errors must propagate fail-closed.
+        let gate_err = SelfSpecConfig::from_os_values(
+            Some(std::ffi::OsStr::new("1")),
+            Some(std::ffi::OsStr::new("NaN")),
+        )
+        .unwrap_err();
+        assert!(matches!(gate_err, SelfSpecConfigError::AutoEmaticGate(_)));
+        assert!(std::error::Error::source(&gate_err).is_some());
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let bad = OsStr::from_bytes(&[0xFF, 0xFE]);
+            assert_eq!(
+                SelfSpecConfig::from_os_values(Some(bad), None),
+                Err(SelfSpecConfigError::NonUtf8)
+            );
+            assert_eq!(
+                SelfSpecConfig::from_os_values(Some(OsStr::new("1")), Some(bad)),
+                Err(SelfSpecConfigError::AutoEmaticGate(
+                    AutoEmaticGateError::NonUtf8
+                ))
+            );
+        }
 
         let ctrl = SelfSpecController::new(SelfSpecConfig::default());
         let err = ctrl

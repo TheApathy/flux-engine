@@ -51,17 +51,22 @@ pub const DUAL_PLANE_E2M1_LUT: [f32; 16] = [
 
 /// Error returned when parsing `ATLAS_DUAL_PLANE_NVFP4`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DualPlaneConfigError {
-    raw: String,
+pub enum DualPlaneConfigError {
+    /// Environment value is not valid UTF-8.
+    NonUtf8,
+    /// Environment value is not a recognized boolean token.
+    InvalidToken(String),
 }
 
 impl fmt::Display for DualPlaneConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{DUAL_PLANE_NVFP4_ENV} must be one of 0/1/false/true/off/on, got {:?}",
-            self.raw
-        )
+        match self {
+            Self::NonUtf8 => write!(f, "{DUAL_PLANE_NVFP4_ENV} must contain valid UTF-8"),
+            Self::InvalidToken(raw) => write!(
+                f,
+                "{DUAL_PLANE_NVFP4_ENV} must be one of 0/1/false/true/off/on, got {raw:?}"
+            ),
+        }
     }
 }
 
@@ -83,10 +88,24 @@ impl DualPlaneLoadPolicy {
     /// Returns [`Self::Disabled`] when unset or empty.
     ///
     /// # Errors
-    /// Fails closed on unrecognized non-empty strings.
+    /// Fails closed on non-UTF-8 or unrecognized non-empty strings.
     pub fn from_env() -> std::result::Result<Self, DualPlaneConfigError> {
-        let raw = std::env::var(DUAL_PLANE_NVFP4_ENV).ok();
-        Self::parse_optional(raw.as_deref())
+        let raw = std::env::var_os(DUAL_PLANE_NVFP4_ENV);
+        Self::parse_os(raw.as_deref())
+    }
+
+    /// Parse an optional OS string (used by [`Self::from_env`] and tests).
+    ///
+    /// # Errors
+    /// Returns [`DualPlaneConfigError`] on non-UTF-8 or unrecognized tokens.
+    pub fn parse_os(
+        raw: Option<&std::ffi::OsStr>,
+    ) -> std::result::Result<Self, DualPlaneConfigError> {
+        let Some(os_val) = raw else {
+            return Ok(Self::Disabled);
+        };
+        let utf8 = os_val.to_str().ok_or(DualPlaneConfigError::NonUtf8)?;
+        Self::parse_optional(Some(utf8))
     }
 
     /// Parse an optional policy value.
@@ -100,9 +119,7 @@ impl DualPlaneLoadPolicy {
         match trimmed.to_ascii_lowercase().as_str() {
             "0" | "false" | "off" => Ok(Self::Disabled),
             "1" | "true" | "on" => Ok(Self::Enabled),
-            _ => Err(DualPlaneConfigError {
-                raw: trimmed.to_owned(),
-            }),
+            _ => Err(DualPlaneConfigError::InvalidToken(trimmed.to_owned())),
         }
     }
 }
@@ -135,10 +152,12 @@ impl DualPlaneNvfp4Weight {
         }
     }
 
-    /// Whether this weight holds null pointers.
+    /// Whether any required buffer (`w_hi`, `w_lo`, or `weight_scale`) is null.
     #[must_use]
     pub fn is_null(&self) -> bool {
-        self.w_hi == DevicePtr::NULL || self.w_lo == DevicePtr::NULL
+        self.w_hi == DevicePtr::NULL
+            || self.w_lo == DevicePtr::NULL
+            || self.weight_scale == DevicePtr::NULL
     }
 
     /// Zero-copy `4.5 bpw` draft view aliasing `w_hi` and the shared scales.
@@ -283,11 +302,13 @@ pub fn quantize_f32_to_dual_plane_host(
         k.is_multiple_of(DUAL_PLANE_GROUP_SIZE),
         "DualPlaneNvfp4 K={k} must be a multiple of {DUAL_PLANE_GROUP_SIZE}"
     );
+    let expected_len = n
+        .checked_mul(k)
+        .ok_or_else(|| anyhow::anyhow!("DualPlaneNvfp4 dimensions {n}x{k} overflow usize"))?;
     ensure!(
-        weights.len() == n * k,
-        "DualPlaneNvfp4 slice len {} != n*k ({})",
+        weights.len() == expected_len,
+        "DualPlaneNvfp4 slice len {} != n*k ({expected_len})",
         weights.len(),
-        n * k
     );
 
     let global_max = weights.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
@@ -299,9 +320,15 @@ pub fn quantize_f32_to_dual_plane_host(
     let inv_scale2 = 1.0 / scale2;
     let num_groups = k / DUAL_PLANE_GROUP_SIZE;
 
-    let mut w_hi = vec![0_u8; n * (k / 2)];
-    let mut w_lo = vec![0_u8; n * (k / 2)];
-    let mut scales = vec![0_u8; n * num_groups];
+    let plane_bytes = n
+        .checked_mul(k / 2)
+        .ok_or_else(|| anyhow::anyhow!("DualPlaneNvfp4 plane size overflow"))?;
+    let scale_bytes = n
+        .checked_mul(num_groups)
+        .ok_or_else(|| anyhow::anyhow!("DualPlaneNvfp4 scale size overflow"))?;
+    let mut w_hi = vec![0_u8; plane_bytes];
+    let mut w_lo = vec![0_u8; plane_bytes];
+    let mut scales = vec![0_u8; scale_bytes];
 
     for row in 0..n {
         let row_in = &weights[row * k..(row + 1) * k];
@@ -352,15 +379,20 @@ pub fn quantize_fp8_block128_host(
     k: usize,
 ) -> Result<(Vec<u8>, Vec<f32>)> {
     ensure!(n > 0 && k > 0, "FP8 block-128 dimensions must be positive");
+    let expected_len = n
+        .checked_mul(k)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block-128 dimensions {n}x{k} overflow usize"))?;
     ensure!(
-        weights.len() == n * k,
-        "FP8 slice len {} != n*k ({})",
+        weights.len() == expected_len,
+        "FP8 slice len {} != n*k ({expected_len})",
         weights.len(),
-        n * k
     );
     let n_blocks = n.div_ceil(128);
     let k_blocks = k.div_ceil(128);
-    let mut scales = vec![0.0_f32; n_blocks * k_blocks];
+    let num_blocks = n_blocks
+        .checked_mul(k_blocks)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block-128 scale count overflow"))?;
+    let mut scales = vec![0.0_f32; num_blocks];
 
     for nb in 0..n_blocks {
         let r_end = ((nb + 1) * 128).min(n);
@@ -376,7 +408,7 @@ pub fn quantize_fp8_block128_host(
         }
     }
 
-    let mut fp8 = vec![0_u8; n * k];
+    let mut fp8 = vec![0_u8; expected_len];
     for r in 0..n {
         let nb = r / 128;
         for c in 0..k {
@@ -398,14 +430,20 @@ pub fn dequantize_fp8_block128_host(
     n: usize,
     k: usize,
 ) -> Result<Vec<f32>> {
+    let expected_len = n
+        .checked_mul(k)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block-128 dimensions {n}x{k} overflow usize"))?;
     let n_blocks = n.div_ceil(128);
     let k_blocks = k.div_ceil(128);
-    ensure!(fp8.len() == n * k, "FP8 payload extent mismatch");
+    let expected_scales = n_blocks
+        .checked_mul(k_blocks)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block-128 scale count overflow"))?;
+    ensure!(fp8.len() == expected_len, "FP8 payload extent mismatch");
     ensure!(
-        block_scales.len() == n_blocks * k_blocks,
+        block_scales.len() == expected_scales,
         "FP8 block scale extent mismatch"
     );
-    let mut out = vec![0.0_f32; n * k];
+    let mut out = vec![0.0_f32; expected_len];
     for r in 0..n {
         let nb = r / 128;
         for c in 0..k {
@@ -637,5 +675,21 @@ mod tests {
         // 8.5 bpw for 64 x 256 = 64 * 256 * 8.5 / 8 = 17,408 bytes.
         assert_eq!(DualPlaneNvfp4Weight::storage_bytes(64, 256), Some(17_408));
         assert_eq!(DualPlaneNvfp4Weight::storage_bytes(64, 250), None);
+
+        // Overflowing dimensions must fail closed via checked_mul instead of panicking.
+        assert!(quantize_f32_to_dual_plane_host(&[], usize::MAX, 16).is_err());
+        assert!(quantize_fp8_block128_host(&[], usize::MAX, 16).is_err());
+        assert!(dequantize_fp8_block128_host(&[], &[], usize::MAX, 16).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let bad = OsStr::from_bytes(&[0xFF, 0xFE]);
+            assert_eq!(
+                DualPlaneLoadPolicy::parse_os(Some(bad)),
+                Err(DualPlaneConfigError::NonUtf8)
+            );
+        }
     }
 }

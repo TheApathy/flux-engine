@@ -152,14 +152,25 @@ impl EntropyGateSignal {
     /// Compute the combined AutoEMatic decode demand metric
     /// `M_D = lambda * L_A + (1 - lambda) * G_E`.
     ///
-    /// Falls back to `topk_entropy` when `layer_rel_delta` is absent.
+    /// Non-finite `topk_entropy` defaults to `0.0` and non-finite `lambda`
+    /// falls back to [`AUTOEMATIC_DECODE_LAMBDA`] so NaN inputs can never
+    /// poison downstream trackers. Falls back to clamped `topk_entropy` when
+    /// `layer_rel_delta` is absent or non-finite.
     #[must_use]
     pub fn decode_demand_metric(self, lambda: f32) -> f32 {
+        let ge = if self.topk_entropy.is_finite() {
+            self.topk_entropy.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let lam = if lambda.is_finite() {
+            lambda.clamp(0.0, 1.0)
+        } else {
+            AUTOEMATIC_DECODE_LAMBDA
+        };
         match self.layer_rel_delta {
-            Some(la) if la.is_finite() => {
-                lambda * la.max(0.0) + (1.0 - lambda) * self.topk_entropy.clamp(0.0, 1.0)
-            }
-            _ => self.topk_entropy.clamp(0.0, 1.0),
+            Some(la) if la.is_finite() => lam * la.max(0.0) + (1.0 - lam) * ge,
+            _ => ge,
         }
     }
 }
@@ -167,6 +178,8 @@ impl EntropyGateSignal {
 /// Error returned when parsing or constructing [`AutoEmaticGateConfig`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AutoEmaticGateError {
+    /// Environment value is not valid UTF-8.
+    NonUtf8,
     /// Environment value is not a valid finite float.
     InvalidFloat(String),
     /// Threshold lies outside the valid normalized entropy range `[0.0, 1.0]`.
@@ -176,6 +189,9 @@ pub enum AutoEmaticGateError {
 impl fmt::Display for AutoEmaticGateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NonUtf8 => {
+                write!(f, "{AUTOEMATIC_GATE_ENTROPY_ENV} must contain valid UTF-8")
+            }
             Self::InvalidFloat(raw) => {
                 write!(
                     f,
@@ -228,10 +244,22 @@ impl AutoEmaticGateConfig {
     /// Returns `Ok(None)` when unset or empty (default OFF).
     ///
     /// # Errors
-    /// Fails closed on non-numeric, NaN, infinite, or out-of-range values.
+    /// Fails closed on non-UTF-8, non-numeric, NaN, infinite, or out-of-range values.
     pub fn from_env() -> Result<Option<Self>, AutoEmaticGateError> {
-        let raw = std::env::var(AUTOEMATIC_GATE_ENTROPY_ENV).ok();
-        Self::parse_optional(raw.as_deref())
+        let raw = std::env::var_os(AUTOEMATIC_GATE_ENTROPY_ENV);
+        Self::parse_os(raw.as_deref())
+    }
+
+    /// Parse an optional OS string (used by both [`Self::from_env`] and tests).
+    ///
+    /// # Errors
+    /// Fails closed on invalid UTF-8, invalid floats, or values outside `[0.0, 1.0]`.
+    pub fn parse_os(raw: Option<&std::ffi::OsStr>) -> Result<Option<Self>, AutoEmaticGateError> {
+        let Some(os_val) = raw else {
+            return Ok(None);
+        };
+        let utf8 = os_val.to_str().ok_or(AutoEmaticGateError::NonUtf8)?;
+        Self::parse_optional(Some(utf8))
     }
 
     /// Parse an optional string value (used by both [`Self::from_env`] and tests).
@@ -322,6 +350,9 @@ impl AutoEmaticLayerTracker {
     /// to drop).
     pub fn observe_layer(&mut self, signal: EntropyGateSignal) -> AutoEmaticPrecisionLevel {
         let metric = f64::from(signal.decode_demand_metric(AUTOEMATIC_DECODE_LAMBDA));
+        if !metric.is_finite() {
+            return self.current;
+        }
         let prev_mean = if self.samples == 0 {
             metric
         } else {
@@ -437,6 +468,60 @@ mod tests {
         assert_eq!(
             tracker.observe_layer(high),
             AutoEmaticPrecisionLevel::AutoFp6
+        );
+    }
+
+    #[test]
+    fn nan_signals_and_lambda_cannot_poison_demand_metric_or_tracker() {
+        let nan_sig = EntropyGateSignal {
+            topk_entropy: f32::NAN,
+            top1_margin: f32::NAN,
+            layer_rel_delta: Some(f32::NAN),
+        };
+        assert_eq!(nan_sig.decode_demand_metric(f32::NAN), 0.0);
+        assert_eq!(nan_sig.decode_demand_metric(AUTOEMATIC_DECODE_LAMBDA), 0.0);
+
+        let partial_nan = EntropyGateSignal {
+            topk_entropy: f32::NAN,
+            top1_margin: 0.5,
+            layer_rel_delta: Some(0.4),
+        };
+        let metric = partial_nan.decode_demand_metric(f32::NAN);
+        assert!(metric.is_finite() && (metric - 0.70 * 0.4).abs() < 1e-6);
+
+        let mut tracker = AutoEmaticLayerTracker::new(AutoEmaticGateConfig::canonical());
+        for _ in 0..4 {
+            tracker.observe_layer(EntropyGateSignal {
+                topk_entropy: 0.05,
+                top1_margin: 0.95,
+                layer_rel_delta: Some(0.20),
+            });
+        }
+        // Inject NaN signal; tracker must stay healthy and not poison running_mean.
+        tracker.observe_layer(nan_sig);
+        tracker.begin_decode_step();
+        let high = EntropyGateSignal {
+            topk_entropy: 0.45,
+            top1_margin: 0.25,
+            layer_rel_delta: Some(0.65),
+        };
+        assert_eq!(tracker.observe_layer(high), AutoEmaticPrecisionLevel::Nvfp4);
+        assert_eq!(
+            tracker.observe_layer(high),
+            AutoEmaticPrecisionLevel::AutoFp6
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_os_fails_closed_on_non_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bad = OsStr::from_bytes(&[0xFF, 0xFE]);
+        assert_eq!(
+            AutoEmaticGateConfig::parse_os(Some(bad)),
+            Err(AutoEmaticGateError::NonUtf8)
         );
     }
 }

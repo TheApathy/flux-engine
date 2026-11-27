@@ -213,10 +213,13 @@ impl AutoEmaticProjectionSidecar {
         }
     }
 
-    /// Whether no refinement buffers are attached.
+    /// Whether any required refinement buffer is null or zero subgroups are refined.
     #[must_use]
     pub fn is_null(&self) -> bool {
         self.refine_codes == DevicePtr::NULL
+            || self.refine_mask == DevicePtr::NULL
+            || self.group_prefix == DevicePtr::NULL
+            || self.num_refined_sg == 0
     }
 
     /// Added bits-per-weight overhead of this sparse sidecar (`2.0 * rho_actual`).
@@ -484,6 +487,21 @@ pub struct AutoEmaticSidecarSession {
     installed: BTreeSet<usize>,
     awaiting_install: Option<usize>,
     poisoned: Option<String>,
+}
+
+impl fmt::Debug for AutoEmaticSidecarSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AutoEmaticSidecarSession")
+            .field("request", &self.request)
+            .field("artifact_bytes", &self.artifact.len())
+            .field("identity", &self.identity)
+            .field("validated_layers", &self.plans.len())
+            .field("uploaded", &self.uploaded)
+            .field("installed", &self.installed)
+            .field("awaiting_install", &self.awaiting_install)
+            .field("poisoned", &self.poisoned)
+            .finish()
+    }
 }
 
 impl AutoEmaticSidecarSession {
@@ -1698,6 +1716,11 @@ mod tests {
         // 2. Partial upload OOM rolls back every prior allocation to 0 live buffers.
         let mut rollback_session =
             AutoEmaticSidecarSession::prepare(req, &prefixes, 32, 64).unwrap();
+        let dbg = format!("{rollback_session:?}");
+        assert!(
+            dbg.contains("AutoEmaticSidecarSession") && dbg.contains("artifact_bytes"),
+            "Debug impl must format summary without dumping raw artifact bytes: {dbg}"
+        );
         let failing_tx = MockTx::new(Some(5));
         let err = rollback_session.upload_layer_with(0, |artifact, plan| {
             upload_layer_plan_with(&failing_tx, artifact, plan)

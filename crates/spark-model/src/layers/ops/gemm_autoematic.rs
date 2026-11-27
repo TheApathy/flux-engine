@@ -75,6 +75,63 @@ fn validate_repack_dims(op_name: &str, n: u32, k: u32, scale2: f32) -> Result<()
     Ok(())
 }
 
+fn validate_finite_positive_scale(op_name: &str, label: &str, scale: f32) -> Result<()> {
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "{op_name}: {label}={scale} must be finite and positive"
+    );
+    Ok(())
+}
+
+fn validate_quantized_weight(op_name: &str, weight: &QuantizedWeight) -> Result<()> {
+    ensure!(
+        !weight.is_null() && weight.weight_scale != DevicePtr::NULL,
+        "{op_name}: base NVFP4 weight or block scale pointer is NULL"
+    );
+    Ok(())
+}
+
+fn validate_dual_plane_weight(op_name: &str, weight: &DualPlaneNvfp4Weight) -> Result<()> {
+    ensure!(
+        !weight.is_null(),
+        "{op_name}: DualPlaneNvfp4Weight has a NULL w_hi, w_lo, or weight_scale pointer"
+    );
+    Ok(())
+}
+
+fn resolve_autoematic_sidecar(
+    op_name: &str,
+    sidecar: Option<&AutoEmaticProjectionSidecar>,
+    mode: AutoEmaticRefinementMode,
+    n: u32,
+    k: u32,
+) -> Result<(DevicePtr, DevicePtr, DevicePtr, u32, u32)> {
+    match (mode, sidecar) {
+        (AutoEmaticRefinementMode::BaseNvfp4Only, _) | (_, None) => {
+            Ok((DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL, 0, 0))
+        }
+        (AutoEmaticRefinementMode::AutoFp6Refined, Some(sc)) => {
+            ensure!(
+                !sc.is_null(),
+                "{op_name}: AutoFp6Refined requested with null or empty AutoEmaticProjectionSidecar"
+            );
+            ensure!(
+                sc.n == n as usize && sc.k == k as usize,
+                "{op_name}: AutoEMatic sidecar dims [{}x{}] do not match projection [{n}x{k}]",
+                sc.n,
+                sc.k
+            );
+            Ok((
+                sc.refine_codes,
+                sc.refine_mask,
+                sc.group_prefix,
+                sc.num_refined_sg,
+                mode.as_kernel_flag(),
+            ))
+        }
+    }
+}
+
 // ── AutoEMatic AutoFP6 dispatch ─────────────────────────────────────────────
 
 /// Launch `autoematic_fp6_gemm_sm120`: Extended-K native Blackwell FP4 TC GEMM.
@@ -82,7 +139,9 @@ fn validate_repack_dims(op_name: &str, n: u32, k: u32, scale2: f32) -> Result<()
 /// Grid: `(ceil(N/64), ceil(M/64), 1)`  Block: `(128, 1, 1)`
 ///
 /// # Errors
-/// Returns an error if `K % 64 != 0`, dimensions are zero, or CUDA launch fails.
+/// Returns an error if `K % 64 != 0`, dimensions are zero, `scale2_ab` is
+/// non-finite/non-positive, base/sidecar pointers are null, sidecar dims
+/// disagree with `[n, k]`, or CUDA launch fails.
 pub fn autoematic_fp6_gemm_sm120(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -99,16 +158,10 @@ pub fn autoematic_fp6_gemm_sm120(
     stream: u64,
 ) -> Result<()> {
     validate_sm120_mma_dims("autoematic_fp6_gemm_sm120", m, n, k)?;
-    let (codes, mask, prefix, num_sg, flag) = match (mode, sidecar) {
-        (AutoEmaticRefinementMode::AutoFp6Refined, Some(sc)) if !sc.is_null() => (
-            sc.refine_codes,
-            sc.refine_mask,
-            sc.group_prefix,
-            sc.num_refined_sg,
-            mode.as_kernel_flag(),
-        ),
-        _ => (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL, 0, 0),
-    };
+    validate_quantized_weight("autoematic_fp6_gemm_sm120", weight)?;
+    validate_finite_positive_scale("autoematic_fp6_gemm_sm120", "scale2_ab", scale2_ab)?;
+    let (codes, mask, prefix, num_sg, flag) =
+        resolve_autoematic_sidecar("autoematic_fp6_gemm_sm120", sidecar, mode, n, k)?;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -134,7 +187,9 @@ pub fn autoematic_fp6_gemm_sm120(
 /// Grid: `(ceil(N/4), 1, 1)`  Block: `(256, 1, 1)`
 ///
 /// # Errors
-/// Returns an error if `M` is outside `1..=8`, `K % 16 != 0`, or CUDA launch fails.
+/// Returns an error if `M` is outside `1..=8`, `K % 16 != 0`, `weight_scale_2`
+/// is non-finite/non-positive, base/sidecar pointers are null, sidecar dims
+/// disagree with `[n, k]`, or CUDA launch fails.
 pub fn autoematic_fp6_gemv_batch(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -149,16 +204,14 @@ pub fn autoematic_fp6_gemv_batch(
     stream: u64,
 ) -> Result<()> {
     validate_small_m_gemv_dims("autoematic_fp6_gemv_batch", m, n, k)?;
-    let (codes, mask, prefix, num_sg, flag) = match (mode, sidecar) {
-        (AutoEmaticRefinementMode::AutoFp6Refined, Some(sc)) if !sc.is_null() => (
-            sc.refine_codes,
-            sc.refine_mask,
-            sc.group_prefix,
-            sc.num_refined_sg,
-            mode.as_kernel_flag(),
-        ),
-        _ => (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL, 0, 0),
-    };
+    validate_quantized_weight("autoematic_fp6_gemv_batch", weight)?;
+    validate_finite_positive_scale(
+        "autoematic_fp6_gemv_batch",
+        "weight_scale_2",
+        weight.weight_scale_2,
+    )?;
+    let (codes, mask, prefix, num_sg, flag) =
+        resolve_autoematic_sidecar("autoematic_fp6_gemv_batch", sidecar, mode, n, k)?;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -185,7 +238,7 @@ pub fn autoematic_fp6_gemv_batch(
 /// Grid: `(N, 1, 1)`  Block: `(256, 1, 1)`
 ///
 /// # Errors
-/// Returns an error if `K % 16 != 0`, `scale2 <= 0`, or CUDA launch fails.
+/// Returns an error if `K % 16 != 0`, `dest` has null buffers, `scale2 <= 0`, or CUDA launch fails.
 pub fn repack_bf16_to_dual_plane_nvfp4(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -196,6 +249,7 @@ pub fn repack_bf16_to_dual_plane_nvfp4(
     stream: u64,
 ) -> Result<()> {
     validate_repack_dims("repack_bf16_to_dual_plane_nvfp4", n, k, dest.weight_scale_2)?;
+    validate_dual_plane_weight("repack_bf16_to_dual_plane_nvfp4", dest)?;
     KernelLaunch::new(gpu, kernel)
         .grid([n, 1, 1])
         .block([256, 1, 1])
@@ -214,7 +268,7 @@ pub fn repack_bf16_to_dual_plane_nvfp4(
 /// Grid: `(N, 1, 1)`  Block: `(256, 1, 1)`
 ///
 /// # Errors
-/// Returns an error if `K % 16 != 0`, `scale2 <= 0`, or CUDA launch fails.
+/// Returns an error if `K % 16 != 0`, `dest` has null buffers, `scale2 <= 0`, or CUDA launch fails.
 pub fn repack_fp8_blockscaled_to_dual_plane_nvfp4(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -231,6 +285,7 @@ pub fn repack_fp8_blockscaled_to_dual_plane_nvfp4(
         k,
         dest.weight_scale_2,
     )?;
+    validate_dual_plane_weight("repack_fp8_blockscaled_to_dual_plane_nvfp4", dest)?;
     KernelLaunch::new(gpu, kernel)
         .grid([n, 1, 1])
         .block([256, 1, 1])
@@ -250,7 +305,8 @@ pub fn repack_fp8_blockscaled_to_dual_plane_nvfp4(
 /// Grid: `(ceil(N/64), ceil(M/64), 1)`  Block: `(128, 1, 1)`
 ///
 /// # Errors
-/// Returns an error if `K % 64 != 0`, dimensions are zero, or CUDA launch fails.
+/// Returns an error if `K % 64 != 0`, dimensions are zero, `weight` has null
+/// buffers, `scale2_ab` is non-finite/non-positive, or CUDA launch fails.
 pub fn dual_plane_nvfp4_verify_gemm_sm120(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -265,6 +321,8 @@ pub fn dual_plane_nvfp4_verify_gemm_sm120(
     stream: u64,
 ) -> Result<()> {
     validate_sm120_mma_dims("dual_plane_nvfp4_verify_gemm_sm120", m, n, k)?;
+    validate_dual_plane_weight("dual_plane_nvfp4_verify_gemm_sm120", weight)?;
+    validate_finite_positive_scale("dual_plane_nvfp4_verify_gemm_sm120", "scale2_ab", scale2_ab)?;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -286,7 +344,8 @@ pub fn dual_plane_nvfp4_verify_gemm_sm120(
 /// Grid: `(ceil(N/4), 1, 1)`  Block: `(256, 1, 1)`
 ///
 /// # Errors
-/// Returns an error if `M` is outside `1..=8`, `K % 16 != 0`, or CUDA launch fails.
+/// Returns an error if `M` is outside `1..=8`, `K % 16 != 0`, `weight` has null
+/// buffers, `weight_scale_2` is non-finite/non-positive, or CUDA launch fails.
 pub fn dual_plane_nvfp4_verify_gemv_batch(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -299,6 +358,12 @@ pub fn dual_plane_nvfp4_verify_gemv_batch(
     stream: u64,
 ) -> Result<()> {
     validate_small_m_gemv_dims("dual_plane_nvfp4_verify_gemv_batch", m, n, k)?;
+    validate_dual_plane_weight("dual_plane_nvfp4_verify_gemv_batch", weight)?;
+    validate_finite_positive_scale(
+        "dual_plane_nvfp4_verify_gemv_batch",
+        "weight_scale_2",
+        weight.weight_scale_2,
+    )?;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -336,5 +401,99 @@ mod tests {
         assert!(validate_repack_dims("test", 64, 16, 0.5).is_ok());
         assert!(validate_repack_dims("test", 64, 16, 0.0).is_err());
         assert!(validate_repack_dims("test", 64, 12, 0.5).is_err());
+
+        assert!(validate_finite_positive_scale("test", "scale2_ab", 0.25).is_ok());
+        assert!(validate_finite_positive_scale("test", "scale2_ab", f32::NAN).is_err());
+        assert!(validate_finite_positive_scale("test", "scale2_ab", f32::INFINITY).is_err());
+        assert!(validate_finite_positive_scale("test", "scale2_ab", 0.0).is_err());
+    }
+
+    #[test]
+    fn sidecar_and_weight_bounds_fail_closed() {
+        let valid_sidecar = AutoEmaticProjectionSidecar {
+            refine_codes: DevicePtr(0x1000),
+            refine_mask: DevicePtr(0x2000),
+            group_prefix: DevicePtr(0x3000),
+            num_refined_sg: 4,
+            rho_actual: 0.25,
+            refinement_scale: 0.25,
+            n: 64,
+            k: 64,
+        };
+        assert!(!valid_sidecar.is_null());
+        let resolved = resolve_autoematic_sidecar(
+            "test",
+            Some(&valid_sidecar),
+            AutoEmaticRefinementMode::AutoFp6Refined,
+            64,
+            64,
+        )
+        .unwrap();
+        assert_eq!(resolved.3, 4);
+        assert_eq!(resolved.4, 1);
+
+        // Mismatched sidecar dims must fail closed before launch.
+        assert!(
+            resolve_autoematic_sidecar(
+                "test",
+                Some(&valid_sidecar),
+                AutoEmaticRefinementMode::AutoFp6Refined,
+                128,
+                64,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_autoematic_sidecar(
+                "test",
+                Some(&valid_sidecar),
+                AutoEmaticRefinementMode::AutoFp6Refined,
+                64,
+                128,
+            )
+            .is_err()
+        );
+
+        // Partial null pointers or zero refined subgroups must fail closed.
+        let mut missing_mask = valid_sidecar;
+        missing_mask.refine_mask = DevicePtr::NULL;
+        assert!(missing_mask.is_null());
+        assert!(
+            resolve_autoematic_sidecar(
+                "test",
+                Some(&missing_mask),
+                AutoEmaticRefinementMode::AutoFp6Refined,
+                64,
+                64,
+            )
+            .is_err()
+        );
+
+        let mut zero_sg = valid_sidecar;
+        zero_sg.num_refined_sg = 0;
+        assert!(zero_sg.is_null());
+        assert!(
+            resolve_autoematic_sidecar(
+                "test",
+                Some(&zero_sg),
+                AutoEmaticRefinementMode::AutoFp6Refined,
+                64,
+                64,
+            )
+            .is_err()
+        );
+
+        // DualPlaneNvfp4Weight requires w_hi, w_lo, and weight_scale all non-null.
+        let mut dp = DualPlaneNvfp4Weight {
+            w_hi: DevicePtr(0x1000),
+            w_lo: DevicePtr(0x2000),
+            weight_scale: DevicePtr(0x3000),
+            weight_scale_2: 0.5,
+            input_scale: DevicePtr::NULL,
+        };
+        assert!(validate_dual_plane_weight("test", &dp).is_ok());
+        dp.weight_scale = DevicePtr::NULL;
+        assert!(dp.is_null());
+        assert!(validate_dual_plane_weight("test", &dp).is_err());
     }
 }
