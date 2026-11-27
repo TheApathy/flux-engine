@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import hashlib
+import io
 import json
 import math
 import re
@@ -251,13 +253,27 @@ def _extract_choice_trace(
     return text, token_ids, parsed_logprobs, prompt_tokens, completion_tokens, cached_tokens
 
 
+def _is_strict_int(val: Any) -> bool:
+    """Return True only for plain ``int`` instances (excluding ``bool``)."""
+    return isinstance(val, int) and not isinstance(val, bool)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"duplicate JSON key `{k}`")
+        out[k] = v
+    return out
+
+
 def validate_prompt_token_ids(raw_ids: Any, label: str = "prompt_token_ids") -> list[int]:
     """Validate a non-empty list of unsigned 32-bit token IDs (rejecting bools/negatives)."""
     if not isinstance(raw_ids, list) or len(raw_ids) == 0:
         raise ValueError(f"{label} must be a non-empty list of u32 integers")
     out: list[int] = []
     for idx, val in enumerate(raw_ids):
-        if isinstance(val, bool) or not isinstance(val, int) or not (0 <= val <= 0xFFFFFFFF):
+        if not _is_strict_int(val) or not (0 <= val <= 0xFFFFFFFF):
             raise ValueError(f"{label}[{idx}]={val!r} is not a valid u32 token id")
         out.append(val)
     return out
@@ -270,30 +286,50 @@ def load_prompt_token_ids_file(path: Path) -> list[dict[str, Any]]:
       - ``{"case_a": [1, 2, 3], "case_b": [4, 5, 6]}``
       - ``{"cases": [{"case_id": "...", "prompt_token_ids": [...], "expected_substring": "..."}]}``
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
     entries: list[dict[str, Any]] = []
+    seen_case_ids: set[str] = set()
     if isinstance(raw, dict) and isinstance(raw.get("cases"), list):
         for idx, item in enumerate(raw["cases"]):
-            if not isinstance(item, dict) or not isinstance(item.get("case_id"), str) or not item["case_id"]:
+            if not isinstance(item, dict):
+                raise ValueError(f"cases[{idx}] must be a JSON object")
+            cid = item.get("case_id")
+            if not isinstance(cid, str) or not cid.strip():
                 raise ValueError(f"cases[{idx}] requires a non-empty string `case_id`")
+            if cid in seen_case_ids:
+                raise ValueError(f"duplicate case_id `{cid}` in prompt-token-ids JSON")
+            seen_case_ids.add(cid)
             tids = validate_prompt_token_ids(
                 item.get("prompt_token_ids"), f"cases[{idx}].prompt_token_ids"
             )
-            max_toks = int(item.get("max_tokens", 64))
-            if max_toks <= 0:
-                raise ValueError(f"cases[{idx}].max_tokens must be > 0, got {max_toks}")
+            raw_max = item.get("max_tokens", 64)
+            if not _is_strict_int(raw_max) or raw_max <= 0:
+                raise ValueError(
+                    f"cases[{idx}].max_tokens must be a positive int (not bool/float), got {raw_max!r}"
+                )
+            exp_sub = item.get("expected_substring")
+            if exp_sub is not None and not isinstance(exp_sub, str):
+                raise ValueError(
+                    f"cases[{idx}].expected_substring must be a string or null, got {exp_sub!r}"
+                )
             entries.append(
                 {
-                    "case_id": item["case_id"],
+                    "case_id": cid,
                     "prompt_token_ids": tids,
-                    "expected_substring": item.get("expected_substring"),
-                    "max_tokens": max_toks,
+                    "expected_substring": exp_sub,
+                    "max_tokens": raw_max,
                 }
             )
     elif isinstance(raw, dict) and raw:
         for cid, ids in raw.items():
-            if not isinstance(cid, str) or not cid:
+            if not isinstance(cid, str) or not cid.strip():
                 raise ValueError("prompt_token_ids map keys must be non-empty strings")
+            if cid in seen_case_ids:
+                raise ValueError(f"duplicate case_id `{cid}` in prompt-token-ids JSON")
+            seen_case_ids.add(cid)
             entries.append(
                 {
                     "case_id": cid,
@@ -513,6 +549,55 @@ def compare_two_traces(ref: dict[str, Any], cand: dict[str, Any]) -> dict[str, A
     }
 
 
+def _validate_cross_engine_parity_metadata(report: dict[str, Any], label: str) -> list[str]:
+    """Fail-closed validation of ``cross_engine_parity`` metadata on a certification report."""
+    errors: list[str] = []
+    if not isinstance(report, dict):
+        return [f"{label}: report must be a JSON object"]
+    meta = report.get("cross_engine_parity")
+    if not isinstance(meta, dict):
+        return [f"{label}: missing `cross_engine_parity` metadata object"]
+
+    if meta.get("raw_completions_think_prefix_warning") is not False:
+        errors.append(
+            f"{label}: cross_engine_parity.raw_completions_think_prefix_warning must be false, "
+            f"got {meta.get('raw_completions_think_prefix_warning')!r}"
+        )
+    if meta.get("enable_thinking") is not False:
+        errors.append(
+            f"{label}: cross_engine_parity.enable_thinking must be false, "
+            f"got {meta.get('enable_thinking')!r}"
+        )
+
+    mode = meta.get("mode")
+    endpoint = report.get("endpoint")
+    used_tids = meta.get("prompt_token_ids_used")
+    if mode == "completions_prompt_token_ids":
+        if used_tids is not True:
+            errors.append(
+                f"{label}: mode=completions_prompt_token_ids requires prompt_token_ids_used=true, got {used_tids!r}"
+            )
+        if endpoint != "/v1/completions":
+            errors.append(
+                f"{label}: mode=completions_prompt_token_ids requires endpoint='/v1/completions', got {endpoint!r}"
+            )
+    elif mode == "chat_enable_thinking_false":
+        if used_tids is not False:
+            errors.append(
+                f"{label}: mode=chat_enable_thinking_false requires prompt_token_ids_used=false, got {used_tids!r}"
+            )
+        if endpoint != "/v1/chat/completions":
+            errors.append(
+                f"{label}: mode=chat_enable_thinking_false requires endpoint='/v1/chat/completions', got {endpoint!r}"
+            )
+    else:
+        errors.append(
+            f"{label}: invalid cross_engine_parity.mode={mode!r} "
+            "(expected 'completions_prompt_token_ids' or 'chat_enable_thinking_false')"
+        )
+    return errors
+
+
 def compare_reports(
     ref_report: dict[str, Any],
     cand_report: dict[str, Any],
@@ -520,10 +605,24 @@ def compare_reports(
     max_top1_flip_rate: float = DEFAULT_MAX_TOP1_FLIP_RATE,
     require_exact: bool = True,
     require_batch_invariance: bool = False,
+    require_cross_engine_parity: bool = False,
 ) -> dict[str, Any]:
     """Compare a candidate exactness report against a reference report."""
-    ref_cases = {c["case_id"]: c for c in ref_report.get("cases", [])}
-    cand_cases = {c["case_id"]: c for c in cand_report.get("cases", [])}
+    ref_cases: dict[str, dict[str, Any]] = {}
+    dup_ref_ids: list[str] = []
+    for c in ref_report.get("cases", []):
+        cid = c["case_id"]
+        if cid in ref_cases:
+            dup_ref_ids.append(cid)
+        ref_cases[cid] = c
+
+    cand_cases: dict[str, dict[str, Any]] = {}
+    dup_cand_ids: list[str] = []
+    for c in cand_report.get("cases", []):
+        cid = c["case_id"]
+        if cid in cand_cases:
+            dup_cand_ids.append(cid)
+        cand_cases[cid] = c
 
     missing_in_cand = sorted(set(ref_cases.keys()) - set(cand_cases.keys()))
     extra_in_cand = sorted(set(cand_cases.keys()) - set(ref_cases.keys()))
@@ -553,6 +652,10 @@ def compare_reports(
     overall_max_kl = max((row["max_kl_divergence"] for row in per_case), default=0.0)
 
     failures: list[str] = []
+    if dup_ref_ids:
+        failures.append(f"reference report contains duplicate case_ids: {sorted(set(dup_ref_ids))}")
+    if dup_cand_ids:
+        failures.append(f"candidate report contains duplicate case_ids: {sorted(set(dup_cand_ids))}")
     if not shared_ids:
         failures.append("no shared case_ids between reference and candidate reports")
     if missing_in_cand:
@@ -574,10 +677,40 @@ def compare_reports(
             failures.append("require_batch_invariance set, but candidate report lacks batch_invariance results")
         else:
             for b_key, b_row in sorted(cand_batch_summary.items()):
-                if not isinstance(b_row, dict) or not b_row.get("passed"):
+                if not isinstance(b_row, dict):
+                    failures.append(f"candidate batch invariance `{b_key}` must be an object: {b_row!r}")
+                    continue
+                passed_flag = b_row.get("passed")
+                exact_cnt = b_row.get("exact_count")
+                total_cnt = b_row.get("total")
+                leaks_cnt = b_row.get("canary_leaks")
+                valid_row = (
+                    passed_flag is True
+                    and _is_strict_int(exact_cnt)
+                    and _is_strict_int(total_cnt)
+                    and _is_strict_int(leaks_cnt)
+                    and total_cnt > 0
+                    and exact_cnt == total_cnt
+                    and leaks_cnt == 0
+                )
+                if not valid_row:
                     failures.append(
-                        f"candidate batch invariance `{b_key}` failed: {b_row}"
+                        f"candidate batch invariance `{b_key}` failed strict gate "
+                        f"(require passed===true, total>0, exact_count==total, canary_leaks==0): {b_row}"
                     )
+
+    if require_cross_engine_parity:
+        failures.extend(_validate_cross_engine_parity_metadata(ref_report, "reference"))
+        failures.extend(_validate_cross_engine_parity_metadata(cand_report, "candidate"))
+        ref_meta = ref_report.get("cross_engine_parity")
+        cand_meta = cand_report.get("cross_engine_parity")
+        if isinstance(ref_meta, dict) and isinstance(cand_meta, dict):
+            ref_mode = ref_meta.get("mode")
+            cand_mode = cand_meta.get("mode")
+            if ref_mode and cand_mode and ref_mode != cand_mode:
+                failures.append(
+                    f"cross_engine_parity mode mismatch: reference={ref_mode!r} vs candidate={cand_mode!r}"
+                )
 
     return {
         "passed": len(failures) == 0,
@@ -587,6 +720,7 @@ def compare_reports(
             "max_top1_flip_rate": max_top1_flip_rate,
             "require_exact": require_exact,
             "require_batch_invariance": require_batch_invariance,
+            "require_cross_engine_parity": require_cross_engine_parity,
         },
         "summary": {
             "shared_cases": len(shared_ids),
@@ -615,15 +749,28 @@ def run_prompt_token_ids_suite(
     timeout: float = 120.0,
 ) -> dict[str, Any]:
     """Run exact pre-tokenized ``prompt_token_ids`` probes on ``/v1/completions`` for cross-engine parity."""
+    if not token_cases:
+        raise ValueError("token_cases must be non-empty")
     cases: list[CaseTrace] = []
     suite_failures: list[str] = []
     solo_by_id: dict[str, CaseTrace] = {}
 
-    for item in token_cases:
-        cid = item["case_id"]
-        prompt_ids = item["prompt_token_ids"]
+    for idx, item in enumerate(token_cases):
+        cid = item.get("case_id")
+        if not isinstance(cid, str) or not cid.strip():
+            raise ValueError(f"token_cases[{idx}] requires a non-empty string `case_id`")
+        if cid in solo_by_id:
+            raise ValueError(f"duplicate case_id `{cid}` in token_cases")
+        prompt_ids = validate_prompt_token_ids(
+            item.get("prompt_token_ids"), f"token_cases[{idx}].prompt_token_ids"
+        )
         expected_sub = item.get("expected_substring")
-        max_toks = int(item.get("max_tokens", 64))
+        if expected_sub is not None and not isinstance(expected_sub, str):
+            raise ValueError(f"token_cases[{idx}].expected_substring must be str or None")
+        raw_max = item.get("max_tokens", 64)
+        if not _is_strict_int(raw_max) or raw_max <= 0:
+            raise ValueError(f"token_cases[{idx}].max_tokens must be a positive int, got {raw_max!r}")
+        max_toks = raw_max
         text, tids, lps, p_toks, c_toks, cached, lat_ms = query_model(
             base_url=base_url,
             endpoint="/v1/completions",
@@ -711,22 +858,36 @@ def run_prompt_token_ids_suite(
             )
             cmp_b = compare_two_traces(asdict(solo_by_id[cid]), asdict(cand_trace))
             is_exact = bool(cmp_b["trajectory_exact_match"] and cmp_b["max_kl_divergence"] <= max_kl)
+            advisory_drift = False
             if is_exact:
                 exact_hits += 1
-            else:
+            elif require_batch_invariance:
                 cand_trace.passed = False
                 cand_trace.reason = (
                     f"prompt_token_ids batch B={b_size} mismatch on `{cid}`: "
-                    f"first_div={cmp_b['first_divergence_index']}"
+                    f"first_div={cmp_b['first_divergence_index']}, "
+                    f"max_kl={cmp_b['max_kl_divergence']:.3e}"
                 )
-                if require_batch_invariance:
-                    suite_failures.append(cand_trace.reason)
-            cand_trace.metadata = {"batch_size": b_size, "target_case": cid, "comparison_vs_b1": cmp_b}
+                suite_failures.append(f"{cand_trace.case_id}: {cand_trace.reason}")
+            else:
+                advisory_drift = True
+                cand_trace.reason = (
+                    f"advisory prompt_token_ids batch B={b_size} drift "
+                    f"(non-gating; require_batch_invariance=false) on `{cid}`: "
+                    f"first_div={cmp_b['first_divergence_index']}, "
+                    f"max_kl={cmp_b['max_kl_divergence']:.3e}"
+                )
+            cand_trace.metadata = {
+                "batch_size": b_size,
+                "target_case": cid,
+                "advisory_batch_drift": advisory_drift,
+                "comparison_vs_b1": cmp_b,
+            }
             cases.append(cand_trace)
             if idx + 1 >= 4:
                 break
         tested = min(len(token_cases), 4)
-        b_passed = exact_hits == tested
+        b_passed = tested > 0 and exact_hits == tested
         batch_invariance[f"b1_vs_b{b_size}"] = {
             "exact_count": exact_hits,
             "total": tested,
@@ -746,6 +907,7 @@ def run_prompt_token_ids_suite(
             "prompt_token_ids_used": True,
             "enable_thinking": False,
             "require_batch_invariance": require_batch_invariance,
+            "raw_completions_think_prefix_warning": False,
         },
         "batch_invariance": batch_invariance,
         "passed": len(suite_failures) == 0,
@@ -1105,9 +1267,10 @@ def run_certification_suite(
 
                 b_cmp = compare_two_traces(asdict(b1_trace), asdict(cand_batch_trace))
                 is_exact = bool(b_cmp["trajectory_exact_match"] and b_cmp["max_kl_divergence"] <= max_kl)
+                advisory_drift = False
                 if is_exact and not leaks:
                     exact_hits += 1
-                if leaks or (require_batch_invariance and not is_exact):
+                elif leaks or require_batch_invariance:
                     cand_batch_trace.passed = False
                     cand_batch_trace.reason = (
                         f"batch B={b_size} invariance failed on {traj_id}: leaks={leaks}, "
@@ -1115,10 +1278,19 @@ def run_certification_suite(
                         f"max_kl={b_cmp['max_kl_divergence']:.3e}"
                     )
                     suite_failures.append(f"{cand_batch_trace.case_id}: {cand_batch_trace.reason}")
+                else:
+                    advisory_drift = True
+                    cand_batch_trace.reason = (
+                        f"advisory batch B={b_size} drift (non-gating; require_batch_invariance=false) "
+                        f"on {traj_id}: exact={b_cmp['trajectory_exact_match']}, "
+                        f"first_div={b_cmp['first_divergence_index']}, "
+                        f"max_kl={b_cmp['max_kl_divergence']:.3e}"
+                    )
                 cand_batch_trace.metadata = {
                     "batch_size": b_size,
                     "trajectory": traj_id,
                     "canary_leaks": leaks,
+                    "advisory_batch_drift": advisory_drift,
                     "comparison_vs_b1": b_cmp,
                 }
                 cases.append(cand_batch_trace)
@@ -1129,7 +1301,7 @@ def run_certification_suite(
                 "total": total_trajs,
                 "ratio": f"{exact_hits}/{total_trajs}",
                 "canary_leaks": len(batch_leaks),
-                "passed": (exact_hits == total_trajs and len(batch_leaks) == 0),
+                "passed": (total_trajs > 0 and exact_hits == total_trajs and len(batch_leaks) == 0),
             }
 
     parity_mode = (
@@ -1177,34 +1349,66 @@ def run_verify_width_invariance(
     run_salt: str | None = None,
     max_kl: float = DEFAULT_MAX_KL,
     enable_thinking: bool = False,
+    token_cases: list[dict[str, Any]] | None = None,
+    batch_sizes: list[int] | None = None,
+    require_batch_invariance: bool = False,
+    require_cross_engine_parity: bool = False,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
-    """Run canonical prompts across ``W=1`` vs ``W=8`` vs ``W=16`` servers and certify exactness."""
+    """Run canonical prompts (or pre-tokenized ``token_cases``) across ``W=1`` vs ``W=8`` vs ``W=16`` servers."""
     if len(width_urls) < 2:
         raise ValueError("width invariance requires at least two labeled URLs (e.g. w1=...,w8=...,w16=...)")
+    if token_cases is not None and endpoint != "/v1/completions":
+        raise ValueError("token_cases requires endpoint='/v1/completions'")
+    if require_cross_engine_parity:
+        if endpoint == "/v1/completions" and token_cases is None:
+            raise ValueError(
+                "require_cross_engine_parity with endpoint='/v1/completions' requires token_cases"
+            )
+        if endpoint == "/v1/chat/completions" and enable_thinking:
+            raise ValueError(
+                "require_cross_engine_parity with endpoint='/v1/chat/completions' requires enable_thinking=False"
+            )
+
+    eff_batch_sizes = list(batch_sizes) if batch_sizes is not None else []
     salt = run_salt or hashlib.sha256(f"flux-v14-width-{seed}".encode("utf-8")).hexdigest()[:12]
     reports: dict[str, dict[str, Any]] = {}
     for label, url in width_urls.items():
-        reports[label] = run_certification_suite(
-            base_url=url,
-            endpoint=endpoint,
-            model=model,
-            needle_lengths=[512],
-            batch_sizes=[],
-            seed=seed,
-            top_logprobs=top_logprobs,
-            run_salt=salt,
-            max_kl=max_kl,
-            enable_thinking=enable_thinking,
-            require_batch_invariance=False,
-            timeout=timeout,
-        )
+        if token_cases is not None:
+            reports[label] = run_prompt_token_ids_suite(
+                base_url=url,
+                model=model,
+                token_cases=token_cases,
+                batch_sizes=eff_batch_sizes,
+                seed=seed,
+                max_kl=max_kl,
+                require_batch_invariance=require_batch_invariance,
+                timeout=timeout,
+            )
+        else:
+            reports[label] = run_certification_suite(
+                base_url=url,
+                endpoint=endpoint,
+                model=model,
+                needle_lengths=[512],
+                batch_sizes=eff_batch_sizes,
+                seed=seed,
+                top_logprobs=top_logprobs,
+                run_salt=salt,
+                max_kl=max_kl,
+                enable_thinking=enable_thinking,
+                require_batch_invariance=require_batch_invariance,
+                timeout=timeout,
+            )
 
     labels = list(width_urls.keys())
     ref_label = "w1" if "w1" in reports else labels[0]
     ref_report = reports[ref_label]
     comparisons: dict[str, Any] = {}
     failures: list[str] = []
+    for label, rep in reports.items():
+        if not rep["passed"]:
+            failures.extend(f"{label}: {f}" for f in (rep.get("failures") or ["suite failed"]))
     for label in labels:
         if label == ref_label:
             continue
@@ -1214,6 +1418,8 @@ def run_verify_width_invariance(
             max_kl=max_kl,
             max_top1_flip_rate=0.0,
             require_exact=True,
+            require_batch_invariance=require_batch_invariance,
+            require_cross_engine_parity=require_cross_engine_parity,
         )
         comparisons[f"{label}_vs_{ref_label}"] = cmp_res
         if not cmp_res["passed"]:
@@ -1222,6 +1428,11 @@ def run_verify_width_invariance(
     return {
         "passed": len(failures) == 0 and all(r["passed"] for r in reports.values()),
         "reference": ref_label,
+        "mode": (
+            "completions_prompt_token_ids"
+            if token_cases is not None
+            else ref_report["cross_engine_parity"]["mode"]
+        ),
         "failures": failures,
         "comparisons": comparisons,
     }
@@ -1283,6 +1494,12 @@ class _MockExactnessState:
                 cached_tokens = (prompt_tokens // 16) * 16 if was_cached else 0
             # Deterministic response keyed solely on exact input token IDs (zero think-prefix drift).
             answer = f"exact-tids-{prompt_hash[:12]}"
+            if self.simulate_batch_drift and ids == [151644, 872, 198, 22, 17, 151645]:
+                with self.lock:
+                    if key_str in self.seen_trajectories:
+                        answer = f"{answer}-drifted-b4"
+                    else:
+                        self.seen_trajectories.add(key_str)
         else:
             if is_chat:
                 msgs = body.get("messages") or []
@@ -1569,10 +1786,207 @@ def run_self_test() -> int:
                 )
                 assert tids_flux["passed"] and tids_peer["passed"]
                 assert tids_flux["batch_invariance"]["b1_vs_b4"]["ratio"] == "4/4"
-                assert compare_reports(tids_flux, tids_peer, require_batch_invariance=True)["passed"]
+                assert tids_flux["cross_engine_parity"]["raw_completions_think_prefix_warning"] is False
+                assert compare_reports(
+                    tids_flux,
+                    tids_peer,
+                    require_batch_invariance=True,
+                    require_cross_engine_parity=True,
+                )["passed"]
                 assert len(flux_think_state.received_token_id_requests) >= 4
 
-            # Strict --require-batch-invariance negative test: simulated B=8 drift MUST fail closed!
+                # --width-urls + --prompt-token-ids + --cross-engine-parity MUST forward token_cases
+                # (never silently dropping --prompt-token-ids to run raw /v1/completions text!).
+                ft_raw_before = len(flux_think_state.received_prompts)
+                pr_raw_before = len(peer_raw_state.received_prompts)
+                ft_tids_before = len(flux_think_state.received_token_id_requests)
+                pr_tids_before = len(peer_raw_state.received_token_id_requests)
+                cli_buf = io.StringIO()
+                with contextlib.redirect_stdout(cli_buf):
+                    rc_w_tids = main(
+                        [
+                            "--width-urls",
+                            f"w1={ft_url},w8={pr_url}",
+                            "--endpoint",
+                            "/v1/completions",
+                            "--prompt-token-ids",
+                            str(tids_file),
+                            "--cross-engine-parity",
+                        ]
+                    )
+                assert rc_w_tids == 0, f"--width-urls --prompt-token-ids failed: {cli_buf.getvalue()}"
+                w_tids_out = json.loads(cli_buf.getvalue())
+                assert w_tids_out["passed"] is True
+                assert w_tids_out["mode"] == "completions_prompt_token_ids"
+                assert len(flux_think_state.received_prompts) == ft_raw_before
+                assert len(peer_raw_state.received_prompts) == pr_raw_before
+                assert len(flux_think_state.received_token_id_requests) == ft_tids_before + 4
+                assert len(peer_raw_state.received_token_id_requests) == pr_tids_before + 4
+
+                # Fail-closed CLI/library guards on --width-urls + --prompt-token-ids / --cross-engine-parity.
+                for bad_argv in (
+                    [
+                        "--width-urls",
+                        f"w1={ft_url},w8={pr_url}",
+                        "--endpoint",
+                        "/v1/chat/completions",
+                        "--prompt-token-ids",
+                        str(tids_file),
+                    ],
+                    [
+                        "--width-urls",
+                        f"w1={ft_url},w8={pr_url}",
+                        "--endpoint",
+                        "/v1/completions",
+                        "--cross-engine-parity",
+                    ],
+                ):
+                    try:
+                        main(bad_argv)
+                        raise AssertionError(f"expected SystemExit for invalid CLI args: {bad_argv}")
+                    except SystemExit as exc:
+                        assert exc.code != 0
+                try:
+                    run_verify_width_invariance(
+                        width_urls={"w1": ft_url, "w8": pr_url},
+                        endpoint="/v1/chat/completions",
+                        model="mock-flux-v15",
+                        token_cases=loaded_tids,
+                    )
+                    raise AssertionError("token_cases with chat endpoint must raise ValueError")
+                except ValueError:
+                    pass
+
+                # Fail-closed input validation in load_prompt_token_ids_file:
+                # duplicate case_ids, duplicate JSON keys, bool/float/<=0 max_tokens, bool token_id.
+                bad_payloads = [
+                    '{"cases": [{"case_id": "dup", "prompt_token_ids": [1, 2]}, {"case_id": "dup", "prompt_token_ids": [3, 4]}]}',
+                    '{"dup": [1, 2], "dup": [3, 4]}',
+                    '{"cases": [{"case_id": "bool_max", "prompt_token_ids": [1, 2], "max_tokens": true}]}',
+                    '{"cases": [{"case_id": "float_max", "prompt_token_ids": [1, 2], "max_tokens": 1.5}]}',
+                    '{"cases": [{"case_id": "zero_max", "prompt_token_ids": [1, 2], "max_tokens": 0}]}',
+                    '{"cases": [{"case_id": "bool_tid", "prompt_token_ids": [true, 2]}]}',
+                ]
+                for idx_bad, raw_bad in enumerate(bad_payloads):
+                    bad_p = Path(tdir) / f"bad_{idx_bad}.json"
+                    bad_p.write_text(raw_bad, encoding="utf-8")
+                    try:
+                        load_prompt_token_ids_file(bad_p)
+                        raise AssertionError(f"bad prompt-token-ids payload #{idx_bad} was accepted")
+                    except ValueError:
+                        pass
+
+                # --compare + --cross-engine-parity CLI & library enforcement.
+                chat_ref_p = Path(tdir) / "chat_ref.json"
+                chat_cand_p = Path(tdir) / "chat_cand.json"
+                tids_ref_p = Path(tdir) / "tids_ref.json"
+                tids_cand_p = Path(tdir) / "tids_cand.json"
+                raw_ref_p = Path(tdir) / "raw_ref.json"
+                chat_ref_p.write_text(json.dumps(chat_flux), encoding="utf-8")
+                chat_cand_p.write_text(json.dumps(chat_peer), encoding="utf-8")
+                tids_ref_p.write_text(json.dumps(tids_flux), encoding="utf-8")
+                tids_cand_p.write_text(json.dumps(tids_peer), encoding="utf-8")
+                raw_ref_p.write_text(json.dumps(raw_flux), encoding="utf-8")
+
+                for ok_pair in ((chat_ref_p, chat_cand_p), (tids_ref_p, tids_cand_p)):
+                    buf_ok = io.StringIO()
+                    with contextlib.redirect_stdout(buf_ok):
+                        rc_ok = main(
+                            [
+                                "--compare",
+                                str(ok_pair[0]),
+                                str(ok_pair[1]),
+                                "--cross-engine-parity",
+                                "--require-batch-invariance",
+                            ]
+                        )
+                    assert rc_ok == 0, f"valid --compare --cross-engine-parity failed: {buf_ok.getvalue()}"
+
+                # Identical raw /v1/completions reports MUST still fail closed under --compare --cross-engine-parity!
+                buf_raw = io.StringIO()
+                with contextlib.redirect_stdout(buf_raw):
+                    rc_raw = main(
+                        [
+                            "--compare",
+                            str(raw_ref_p),
+                            str(raw_ref_p),
+                            "--cross-engine-parity",
+                        ]
+                    )
+                assert rc_raw == 1, "raw /v1/completions reports must fail closed under --compare --cross-engine-parity"
+
+                # Invalid cross_engine_parity metadata variants must fail closed.
+                bad_think_true = json.loads(json.dumps(chat_peer))
+                bad_think_true["cross_engine_parity"]["enable_thinking"] = True
+                assert not compare_reports(
+                    chat_flux, bad_think_true, require_cross_engine_parity=True
+                )["passed"]
+                bad_no_meta = json.loads(json.dumps(chat_peer))
+                bad_no_meta.pop("cross_engine_parity", None)
+                assert not compare_reports(
+                    chat_flux, bad_no_meta, require_cross_engine_parity=True
+                )["passed"]
+                assert not compare_reports(
+                    chat_flux, tids_flux, require_exact=False, require_cross_engine_parity=True
+                )["passed"]
+
+                # Aligned advisory (require_batch_invariance=False) vs gating (True) behavior on
+                # drifted traces across BOTH run_certification_suite and run_prompt_token_ids_suite.
+                drift_state.seen_trajectories.clear()
+                tids_advisory = run_prompt_token_ids_suite(
+                    base_url=dr_url,
+                    model="mock-flux-v15",
+                    token_cases=loaded_tids,
+                    batch_sizes=[4],
+                    seed=42,
+                    require_batch_invariance=False,
+                )
+                assert tids_advisory["passed"] is True
+                assert tids_advisory["summary"]["failed_cases"] == 0
+                assert tids_advisory["batch_invariance"]["b1_vs_b4"]["passed"] is False
+                assert tids_advisory["batch_invariance"]["b1_vs_b4"]["ratio"] == "3/4"
+                drifted_tok_case = next(
+                    c for c in tids_advisory["cases"] if c["case_id"] == "batch_b4_xe_tok_1"
+                )
+                assert drifted_tok_case["reason"] != "ok" and "advisory" in drifted_tok_case["reason"]
+                assert drifted_tok_case["metadata"]["advisory_batch_drift"] is True
+
+                drift_state.seen_trajectories.clear()
+                tids_strict_fail = run_prompt_token_ids_suite(
+                    base_url=dr_url,
+                    model="mock-flux-v15",
+                    token_cases=loaded_tids,
+                    batch_sizes=[4],
+                    seed=42,
+                    require_batch_invariance=True,
+                )
+                assert tids_strict_fail["passed"] is False
+                assert tids_strict_fail["summary"]["failed_cases"] == 1
+
+            # Strict vs advisory batch-invariance test on run_certification_suite:
+            drift_state.seen_trajectories.clear()
+            drifted_advisory = run_certification_suite(
+                base_url=dr_url,
+                endpoint="/v1/chat/completions",
+                model="mock-flux-v15",
+                needle_lengths=[256],
+                batch_sizes=[8],
+                seed=42,
+                top_logprobs=5,
+                run_salt="drift-salt-adv",
+                require_batch_invariance=False,
+            )
+            assert drifted_advisory["passed"] is True
+            assert drifted_advisory["summary"]["failed_cases"] == 0
+            assert drifted_advisory["batch_invariance"]["b1_vs_b8"]["passed"] is False
+            assert drifted_advisory["batch_invariance"]["b1_vs_b8"]["ratio"] == "3/4"
+            drifted_chat_case = next(
+                c for c in drifted_advisory["cases"] if c["case_id"] == "batch_b8_vs_b1_traj_code_ringbuf"
+            )
+            assert drifted_chat_case["reason"] != "ok" and "advisory" in drifted_chat_case["reason"]
+            assert drifted_chat_case["metadata"]["advisory_batch_drift"] is True
+
+            drift_state.seen_trajectories.clear()
             drifted_report = run_certification_suite(
                 base_url=dr_url,
                 endpoint="/v1/chat/completions",
@@ -1686,6 +2100,20 @@ def run_self_test() -> int:
             assert not cmp_trunc_fail["passed"], "truncated logprobs must fail top-1 flip gate"
             assert cmp_trunc_fail["summary"]["max_top1_flip_rate"] > 0.0
 
+            # Negative test E: forged/empty/leaky batch_invariance entries must fail closed under require_batch_invariance!
+            for forged_row in (
+                {"passed": True, "exact_count": 0, "total": 0, "canary_leaks": 0},
+                {"passed": True, "exact_count": 3, "total": 4, "canary_leaks": 0},
+                {"passed": True, "exact_count": 4, "total": 4, "canary_leaks": 1},
+                {"passed": 1, "exact_count": 4, "total": 4, "canary_leaks": 0},
+                {"passed": True, "exact_count": True, "total": True, "canary_leaks": False},
+            ):
+                bad_batch = json.loads(json.dumps(report_a))
+                bad_batch["batch_invariance"] = {"b1_vs_b4": forged_row}
+                assert not compare_reports(
+                    report_a, bad_batch, require_exact=False, require_batch_invariance=True
+                )["passed"], f"forged batch_invariance row was accepted: {forged_row}"
+
         # 4. Negative test C: canary leakage in mixed batch MUST fail closed.
         # Seed a canary on leaky_srv then run B=4 batch invariance.
         leaky_report = run_certification_suite(
@@ -1725,6 +2153,8 @@ def run_self_test() -> int:
                         "raw_completions_think_prefix_drift_reproduced",
                         "chat_enable_thinking_false_exact_parity",
                         "completions_prompt_token_ids_exact_parity",
+                        "width_urls_prompt_token_ids_parity_enforced",
+                        "compare_cross_engine_parity_enforced",
                         "cross_engine_cli_guard_enforced",
                     ],
                     "negative_gates_verified": [
@@ -1734,6 +2164,9 @@ def run_self_test() -> int:
                         "truncated_logprobs_rejected",
                         "canary_leak_rejected",
                         "batch_b8_drift_rejected",
+                        "forged_batch_invariance_rejected",
+                        "duplicate_and_typed_prompt_token_ids_rejected",
+                        "advisory_batch_drift_non_contradictory",
                     ],
                     "deterministic_width_prompts_verified": True,
                 },
@@ -1757,7 +2190,15 @@ def _parse_width_urls(raw: str) -> dict[str, str]:
         if "=" not in item:
             raise SystemExit(f"error: --width-urls entry `{item}` must be label=url (e.g. w1=http://...)")
         label, url = item.split("=", 1)
-        out[label.strip()] = url.strip()
+        label = label.strip()
+        url = url.strip()
+        if not label or not url:
+            raise SystemExit(f"error: --width-urls entry `{item}` has empty label or URL")
+        if label in out:
+            raise SystemExit(f"error: duplicate --width-urls label `{label}`")
+        out[label] = url
+    if len(out) < 2:
+        raise SystemExit("error: --width-urls requires at least two labeled URLs (e.g. w1=...,w8=...)")
     return out
 
 
@@ -1859,18 +2300,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     enable_thinking = args.enable_thinking == "true"
-    if args.cross_engine_parity:
-        if args.endpoint == "/v1/completions" and args.prompt_token_ids is None:
-            raise SystemExit(
-                "error: --cross-engine-parity with --endpoint /v1/completions requires --prompt-token-ids "
-                "(or use --endpoint /v1/chat/completions --enable-thinking false to avoid <think></think> prefix drift)"
-            )
-        if args.endpoint == "/v1/chat/completions" and enable_thinking:
-            raise SystemExit(
-                "error: --cross-engine-parity requires --enable-thinking false on /v1/chat/completions"
-            )
 
     if args.compare:
+        if args.width_urls is not None or args.prompt_token_ids is not None:
+            raise SystemExit(
+                "error: --compare cannot be combined with live probe flags (--width-urls / --prompt-token-ids)"
+            )
         if len(args.compare) < 2:
             raise SystemExit("error: --compare requires at least 2 JSON paths: <ref.json> <cand.json> [...]")
         ref_report = json.loads(args.compare[0].read_text(encoding="utf-8"))
@@ -1885,6 +2320,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_top1_flip_rate=args.max_top1_flip_rate,
                 require_exact=not args.allow_non_exact,
                 require_batch_invariance=args.require_batch_invariance,
+                require_cross_engine_parity=args.cross_engine_parity,
             )
             comparisons[cand_path.name] = res
             all_passed = all_passed and res["passed"]
@@ -1894,6 +2330,35 @@ def main(argv: list[str] | None = None) -> int:
             args.json_out.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(out, indent=2))
         return 0 if all_passed else 1
+
+    if args.cross_engine_parity:
+        if args.endpoint == "/v1/completions" and args.prompt_token_ids is None:
+            raise SystemExit(
+                "error: --cross-engine-parity with --endpoint /v1/completions requires --prompt-token-ids "
+                "(or use --endpoint /v1/chat/completions --enable-thinking false to avoid <think></think> prefix drift)"
+            )
+        if args.endpoint == "/v1/chat/completions" and enable_thinking:
+            raise SystemExit(
+                "error: --cross-engine-parity requires --enable-thinking false on /v1/chat/completions"
+            )
+
+    token_cases: list[dict[str, Any]] | None = None
+    if args.prompt_token_ids is not None:
+        if args.endpoint != "/v1/completions":
+            raise SystemExit(
+                "error: --prompt-token-ids requires --endpoint /v1/completions "
+                "(pre-tokenized prompt_token_ids is a /v1/completions wire field)"
+            )
+        try:
+            token_cases = load_prompt_token_ids_file(args.prompt_token_ids)
+        except (OSError, ValueError, json.JSONDecodeError) as err:
+            raise SystemExit(f"error: failed to load --prompt-token-ids: {err}") from err
+
+    batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",") if x.strip()]
+    if any(b < 1 for b in batch_sizes):
+        raise SystemExit(f"error: --batch-sizes values must be >= 1, got {batch_sizes}")
+    if args.require_batch_invariance and not any(b >= 2 for b in batch_sizes):
+        raise SystemExit("error: --require-batch-invariance requires at least one batch size >= 2 in --batch-sizes")
 
     if args.width_urls:
         width_map = _parse_width_urls(args.width_urls)
@@ -1906,6 +2371,10 @@ def main(argv: list[str] | None = None) -> int:
             run_salt=args.run_salt,
             max_kl=args.max_kl,
             enable_thinking=enable_thinking,
+            token_cases=token_cases,
+            batch_sizes=batch_sizes if args.require_batch_invariance else [],
+            require_batch_invariance=args.require_batch_invariance,
+            require_cross_engine_parity=args.cross_engine_parity,
         )
         if args.json_out is not None:
             args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1913,22 +2382,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2))
         return 0 if res["passed"] else 1
 
-    batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",") if x.strip()]
-    if any(b < 1 for b in batch_sizes):
-        raise SystemExit(f"error: --batch-sizes values must be >= 1, got {batch_sizes}")
-    if args.require_batch_invariance and not any(b >= 2 for b in batch_sizes):
-        raise SystemExit("error: --require-batch-invariance requires at least one batch size >= 2 in --batch-sizes")
-
-    if args.prompt_token_ids is not None:
-        if args.endpoint != "/v1/completions":
-            raise SystemExit(
-                "error: --prompt-token-ids requires --endpoint /v1/completions "
-                "(pre-tokenized prompt_token_ids is a /v1/completions wire field)"
-            )
-        try:
-            token_cases = load_prompt_token_ids_file(args.prompt_token_ids)
-        except (OSError, ValueError, json.JSONDecodeError) as err:
-            raise SystemExit(f"error: failed to load --prompt-token-ids: {err}") from err
+    if token_cases is not None:
         report = run_prompt_token_ids_suite(
             base_url=args.base_url,
             model=args.model,
