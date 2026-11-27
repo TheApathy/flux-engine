@@ -519,8 +519,8 @@ pub fn launch_rms_norm_tensor_fp8_sm120(
         "{NAME}: BF16 pointers must be 2-byte aligned"
     );
     ensure!(
-        args.eps.is_finite() && args.eps >= 0.0,
-        "{NAME}: eps must be finite and non-negative, got {}",
+        args.eps.is_finite() && args.eps > 0.0,
+        "{NAME}: eps must be finite and strictly positive, got {}",
         args.eps
     );
     if args.d_absmax_in.is_null() {
@@ -881,6 +881,27 @@ pub struct TensorFp8GemmArgs {
     pub ldc: u32,
 }
 
+/// Required `ldc` alignment in BF16 elements for cuBLASLt FP8 Tensor Core GEMM
+/// (`8 * 2 B = 16 B`).
+pub const TENSOR_FP8_GEMM_LDC_ALIGN: u32 = 8;
+
+/// Required device-pointer alignment in bytes for cuBLASLt FP8 matrix operands
+/// (`act_e4m3`, `weight_e4m3`, `out_bf16`).
+pub const TENSOR_FP8_GEMM_PTR_ALIGN: u64 = 16;
+
+/// True when the GPU compute capability supports native FP8 Tensor Core GEMM
+/// (`SM89` Ada, `SM90` Hopper, `SM100`/`SM103`/`SM120`/`SM121` Blackwell).
+///
+/// `None` (mock backends without a CUDA device) returns `true` so unit tests
+/// retain deterministic behavior.
+#[must_use]
+pub const fn supports_tensor_fp8_gemm(cc: Option<(u32, u32)>) -> bool {
+    match cc {
+        Some((major, minor)) => major > 8 || (major == 8 && minor >= 9),
+        None => true,
+    }
+}
+
 fn validate_tensor_fp8_gemm_args(args: &TensorFp8GemmArgs) -> Result<()> {
     ensure!(
         args.m > 0 && args.n > 0 && args.k > 0,
@@ -892,8 +913,9 @@ fn validate_tensor_fp8_gemm_args(args: &TensorFp8GemmArgs) -> Result<()> {
     ensure!(
         args.n.is_multiple_of(TENSOR_FP8_GEMM_ALIGN)
             && args.k.is_multiple_of(TENSOR_FP8_GEMM_ALIGN)
-            && args.ldc >= args.n,
-        "tensor_fp8 GEMM requires n,k % 16 == 0 and ldc >= n; got m={} n={} k={} ldc={}",
+            && args.ldc >= args.n
+            && args.ldc.is_multiple_of(TENSOR_FP8_GEMM_LDC_ALIGN),
+        "tensor_fp8 GEMM requires n,k % 16 == 0, ldc >= n, and ldc % 8 == 0; got m={} n={} k={} ldc={}",
         args.m,
         args.n,
         args.k,
@@ -908,10 +930,12 @@ fn validate_tensor_fp8_gemm_args(args: &TensorFp8GemmArgs) -> Result<()> {
         "tensor_fp8 GEMM received a NULL device pointer"
     );
     ensure!(
-        args.act_scale.0.is_multiple_of(4)
-            && args.weight_scale.0.is_multiple_of(4)
-            && args.out_bf16.0.is_multiple_of(2),
-        "tensor_fp8 GEMM scale/output alignment violation"
+        args.act_e4m3.0.is_multiple_of(TENSOR_FP8_GEMM_PTR_ALIGN)
+            && args.weight_e4m3.0.is_multiple_of(TENSOR_FP8_GEMM_PTR_ALIGN)
+            && args.out_bf16.0.is_multiple_of(TENSOR_FP8_GEMM_PTR_ALIGN)
+            && args.act_scale.0.is_multiple_of(4)
+            && args.weight_scale.0.is_multiple_of(4),
+        "tensor_fp8 GEMM requires 16-byte alignment on act/weight/out and 4-byte alignment on scales"
     );
 
     let act_bytes = tensor_fp8_e4m3_bytes(args.m, args.k)?;
@@ -1097,11 +1121,31 @@ pub fn try_tensor_fp8_prefill_proj_single(
     if !policy.is_enabled() {
         return Ok(false);
     }
+    let cc = gpu.compute_capability();
+    if !supports_tensor_fp8_gemm(cc) {
+        if policy.is_fail_closed() {
+            bail!(
+                "{TENSOR_FP8_PREFILL_ENV_VAR}=1 requires compute capability >= SM89, got {cc:?} ({label})"
+            );
+        }
+        return Ok(false);
+    }
     if !tensor_fp8_prefill_shape_ok(m, n, k)
         || act_bf16.is_null()
         || weight_e4m3.is_null()
         || out_bf16.is_null()
     {
+        return Ok(false);
+    }
+    if !act_bf16.0.is_multiple_of(2)
+        || !weight_e4m3.0.is_multiple_of(TENSOR_FP8_GEMM_PTR_ALIGN)
+        || !out_bf16.0.is_multiple_of(TENSOR_FP8_GEMM_PTR_ALIGN)
+    {
+        if policy.is_fail_closed() {
+            bail!(
+                "{TENSOR_FP8_PREFILL_ENV_VAR}=1 requires 2B-aligned act_bf16 and 16B-aligned weight/out ({label})"
+            );
+        }
         return Ok(false);
     }
     let deferral = TensorFp8EpilogueDeferral::new(partition_scale, per_block_k_uniform);
@@ -1148,7 +1192,12 @@ pub fn try_tensor_fp8_prefill_proj_single(
     };
     // Preflight all GEMM pointer, alignment, and non-aliasing invariants BEFORE
     // issuing any quantizer launch so invalid outputs cannot mutate scratch.
-    validate_tensor_fp8_gemm_args(&gemm_args)?;
+    if let Err(err) = validate_tensor_fp8_gemm_args(&gemm_args) {
+        if policy.is_fail_closed() {
+            return Err(err);
+        }
+        return Ok(false);
+    }
 
     gpu.memset_async(d_absmax, 0, 4, stream)?;
     launch_tensor_fp8_absmax_bf16_sm120(gpu, ks.absmax_bf16, act_bf16, d_absmax, m, k, stream)?;
@@ -1211,6 +1260,15 @@ pub fn try_tensor_fp8_prefill_proj_qkv(
     if !policy.is_enabled() {
         return Ok(false);
     }
+    let cc = gpu.compute_capability();
+    if !supports_tensor_fp8_gemm(cc) {
+        if policy.is_fail_closed() {
+            bail!(
+                "{TENSOR_FP8_PREFILL_ENV_VAR}=1 requires compute capability >= SM89, got {cc:?} (attn_qkv)"
+            );
+        }
+        return Ok(false);
+    }
     if !tensor_fp8_prefill_shape_ok(m, q_n, k)
         || !tensor_fp8_prefill_shape_ok(m, kv_n, k)
         || act_bf16.is_null()
@@ -1221,6 +1279,25 @@ pub fn try_tensor_fp8_prefill_proj_qkv(
         || k_out.is_null()
         || v_out.is_null()
     {
+        return Ok(false);
+    }
+    let aligned_ptrs = act_bf16.0.is_multiple_of(2)
+        && [
+            q_weight_e4m3,
+            k_weight_e4m3,
+            v_weight_e4m3,
+            q_out,
+            k_out,
+            v_out,
+        ]
+        .into_iter()
+        .all(|p| p.0.is_multiple_of(TENSOR_FP8_GEMM_PTR_ALIGN));
+    if !aligned_ptrs {
+        if policy.is_fail_closed() {
+            bail!(
+                "{TENSOR_FP8_PREFILL_ENV_VAR}=1 requires 2B-aligned act_bf16 and 16B-aligned Q/K/V weights and outputs (attn_qkv)"
+            );
+        }
         return Ok(false);
     }
 
@@ -1290,7 +1367,12 @@ pub fn try_tensor_fp8_prefill_proj_qkv(
     ];
     // Preflight all three Q/K/V GEMM descriptors BEFORE mutating device state.
     for args in &qkv_gemms {
-        validate_tensor_fp8_gemm_args(args)?;
+        if let Err(err) = validate_tensor_fp8_gemm_args(args) {
+            if policy.is_fail_closed() {
+                return Err(err);
+            }
+            return Ok(false);
+        }
     }
 
     gpu.memset_async(d_absmax, 0, 4, stream)?;
@@ -1526,8 +1608,8 @@ pub fn cpu_rms_norm_tensor_fp8(
         "cpu_rms_norm_tensor_fp8 shape mismatch"
     );
     ensure!(
-        eps.is_finite() && eps >= 0.0,
-        "eps must be finite and non-negative"
+        eps.is_finite() && eps > 0.0,
+        "eps must be finite and strictly positive"
     );
 
     let weight_offset = weight_mode.weight_offset();
@@ -2297,5 +2379,101 @@ mod tests {
             .unwrap();
         assert_ne!(act2, act1);
         assert_eq!(gpu.live_count(), 2);
+    }
+
+    #[test]
+    fn gemm_alignment_ldc_compute_capability_and_strict_eps_guards() {
+        // Compute capability gate: SM89+ and None (mock) admitted; pre-Ada rejected.
+        assert!(!supports_tensor_fp8_gemm(Some((7, 5))));
+        assert!(!supports_tensor_fp8_gemm(Some((8, 0))));
+        assert!(!supports_tensor_fp8_gemm(Some((8, 6))));
+        assert!(!supports_tensor_fp8_gemm(Some((8, 8))));
+        for cc in [
+            None,
+            Some((8, 9)),
+            Some((9, 0)),
+            Some((10, 0)),
+            Some((10, 3)),
+            Some((12, 0)),
+            Some((12, 1)),
+        ] {
+            assert!(supports_tensor_fp8_gemm(cc), "expected {cc:?} supported");
+        }
+
+        let valid = TensorFp8GemmArgs {
+            act_e4m3: DevicePtr(0x10_0000),
+            act_scale: DevicePtr(0x20_0000),
+            weight_e4m3: DevicePtr(0x30_0000),
+            weight_scale: DevicePtr(0x40_0000),
+            out_bf16: DevicePtr(0x50_0000),
+            gb10_scale_fence_slot: Some(DevicePtr(0x60_0000)),
+            m: 32,
+            n: 64,
+            k: 64,
+            ldc: 72, // >= n and multiple of 8
+        };
+        assert!(validate_tensor_fp8_gemm_args(&valid).is_ok());
+
+        // Non-16B-aligned act/weight/out and non-8-aligned ldc MUST fail closed.
+        assert!(
+            validate_tensor_fp8_gemm_args(&TensorFp8GemmArgs {
+                act_e4m3: DevicePtr(0x10_0008),
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            validate_tensor_fp8_gemm_args(&TensorFp8GemmArgs {
+                weight_e4m3: DevicePtr(0x30_0004),
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            validate_tensor_fp8_gemm_args(&TensorFp8GemmArgs {
+                out_bf16: DevicePtr(0x50_0002),
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(validate_tensor_fp8_gemm_args(&TensorFp8GemmArgs { ldc: 68, ..valid }).is_err());
+
+        // Strict eps > 0.0 on both GPU launcher and CPU reference.
+        let gpu = MockGpu::new();
+        for bad_eps in [0.0f32, -0.0, -1e-6, f32::NAN, f32::INFINITY] {
+            assert!(
+                launch_rms_norm_tensor_fp8_sm120(
+                    &gpu,
+                    KernelHandle(12),
+                    &RmsNormTensorFp8LaunchArgs {
+                        input_bf16: DevicePtr(0x10_0000),
+                        weight_bf16: DevicePtr(0x18_0000),
+                        out_fp8: DevicePtr(0x30_0000),
+                        out_bf16_opt: DevicePtr::NULL,
+                        d_absmax_in: DevicePtr::NULL,
+                        d_scale_out: DevicePtr::NULL,
+                        eps: bad_eps,
+                        weight_mode: RmsNormWeightMode::UnitOffset,
+                        static_scale: 1.0,
+                        rows: 4,
+                        cols: 16,
+                    },
+                    0,
+                )
+                .is_err()
+            );
+            assert!(
+                cpu_rms_norm_tensor_fp8(
+                    &[0u16; 64],
+                    &[0u16; 16],
+                    4,
+                    16,
+                    bad_eps,
+                    RmsNormWeightMode::UnitOffset,
+                    Some(1.0),
+                )
+                .is_err()
+            );
+        }
     }
 }

@@ -881,12 +881,18 @@ impl Qwen3SsmLayer {
             if gdn_c143.is_none() && l2_plan.is_windowed() {
                 super::gdn_l2_window::log_gdn_l2_window_engaged(&l2_plan, "prefill_inner");
                 let gb_stride = (nv * 2) as u32;
-                let qkvz_row_bytes = qkvz_size * bf16;
+                let qkvz_row_bytes = qkvz_size
+                    .checked_mul(bf16)
+                    .ok_or_else(|| anyhow::anyhow!("GDN L2 window qkvz row byte overflow"))?;
                 for win in l2_plan.windows() {
                     let win_k = u32::try_from(win.token_len).map_err(|_| {
                         anyhow::anyhow!("GDN L2 window token count {} exceeds u32", win.token_len)
                     })?;
-                    let deinterleaved_w = deinterleaved.offset(win.token_start * qkvz_row_bytes);
+                    let deinterleaved_off =
+                        win.token_start.checked_mul(qkvz_row_bytes).ok_or_else(|| {
+                            anyhow::anyhow!("GDN L2 window deinterleaved byte offset overflow")
+                        })?;
+                    let deinterleaved_w = deinterleaved.offset(deinterleaved_off);
                     let conv_out_w = conv_out_buf.offset(win.qkv_byte_offset);
                     let gates_w = gates_buf.offset(win.gate_beta_byte_offset);
                     let gdn_out_w = gdn_out_buf.offset(win.output_byte_offset);

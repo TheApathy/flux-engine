@@ -42,6 +42,11 @@ pub const GDN_L2_WINDOW_MAX_MIB: u32 = 4_096;
 /// never split across an L2 window boundary.
 pub const GDN_L2_WINDOW_ALIGN_TOKENS: usize = 32;
 
+/// Minimum token count per full L2 window (`2 * WY32_CHUNK_SIZE = 64`) so
+/// every full window satisfies the strict `total > 32` WY32 / gatecache / warp
+/// dispatch threshold instead of falling through to WY4.
+pub const GDN_L2_WINDOW_MIN_TOKENS: usize = 2 * GDN_L2_WINDOW_ALIGN_TOKENS;
+
 const BYTES_PER_MIB: usize = 1024 * 1024;
 const BF16_BYTES: usize = 2;
 const FP32_BYTES: usize = 4;
@@ -285,8 +290,8 @@ pub fn plan_gdn_l2_windows(
                 .context("GDN L2 budget_bytes overflow")?;
             let stream_budget = budget.saturating_sub(fixed_state_bytes);
             let raw_tokens = stream_budget / per_token_bytes;
-            let aligned =
-                (raw_tokens / GDN_L2_WINDOW_ALIGN_TOKENS).max(1) * GDN_L2_WINDOW_ALIGN_TOKENS;
+            let aligned = ((raw_tokens / GDN_L2_WINDOW_ALIGN_TOKENS) * GDN_L2_WINDOW_ALIGN_TOKENS)
+                .max(GDN_L2_WINDOW_MIN_TOKENS);
             (Some(budget), aligned.min(total_tokens))
         }
     };
@@ -479,16 +484,23 @@ mod tests {
         assert_eq!(plan_short.windows().len(), 1);
         assert_eq!(plan_short.windows()[0].token_len, 128);
 
-        // Tiny budget (1 MiB < h_state) safely clamps to min 32-token WY32 chunk.
-        let plan_tiny = plan_gdn_l2_windows(
-            200,
-            QWEN38_27B_GEOM,
-            GdnL2WindowPolicy::Enabled { budget_mib: 1 },
-        )
-        .unwrap();
-        assert_eq!(plan_tiny.window_tokens, 32);
-        assert_eq!(plan_tiny.windows().len(), 7);
-        assert_eq!(plan_tiny.windows().last().unwrap().token_len, 8);
+        // Small budgets (1..=4 MiB on 27B) clamp to GDN_L2_WINDOW_MIN_TOKENS (64 > 32)
+        // so full windows stay strictly eligible for WY32/gatecache/warp kernels.
+        for small_mib in 1u32..=4 {
+            let plan_small = plan_gdn_l2_windows(
+                200,
+                QWEN38_27B_GEOM,
+                GdnL2WindowPolicy::Enabled {
+                    budget_mib: small_mib,
+                },
+            )
+            .unwrap();
+            assert_eq!(plan_small.window_tokens, 64, "budget_mib={small_mib}");
+            assert!(plan_small.window_tokens > GDN_L2_WINDOW_ALIGN_TOKENS);
+            assert_eq!(plan_small.window_tokens % GDN_L2_WINDOW_ALIGN_TOKENS, 0);
+            assert_eq!(plan_small.windows().len(), 4);
+            assert_eq!(plan_small.windows().last().unwrap().token_len, 8);
+        }
 
         // Disabled policy keeps entire sequence unwindowed.
         let plan_off =

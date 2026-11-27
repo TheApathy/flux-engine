@@ -124,6 +124,39 @@ pub(super) fn gatecache_kernel_choice(
     Ok((v2, smem_v2, true))
 }
 
+/// Selected WY32 kernel tier for a GDN prefill window when `total > 32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GdnWy32KernelRoute {
+    /// `ATLAS_GDN_WY32_WARP=1` with warp-reduction kernel present.
+    Wy32Warp,
+    /// Default tuned WY32 kernel (`ATLAS_GDN_PREFILL_TUNED != "0"`).
+    Wy32Tuned,
+    /// Fall through to sub-chunk / WY4 / persistent / split4 ladder.
+    Fallback,
+}
+
+/// Pure selector honoring `ATLAS_GDN_WY32_WARP=1` and `ATLAS_GDN_PREFILL_TUNED=0`
+/// uniformly across both unwindowed and L2-windowed GDN prefill routes.
+#[must_use]
+pub(super) const fn select_gdn_wy32_route(
+    total: u32,
+    wy32_warp_enabled: bool,
+    has_wy32_warp_k: bool,
+    prefill_tuned_enabled: bool,
+    has_wy32_k: bool,
+) -> GdnWy32KernelRoute {
+    if total <= 32 {
+        return GdnWy32KernelRoute::Fallback;
+    }
+    if wy32_warp_enabled && has_wy32_warp_k {
+        GdnWy32KernelRoute::Wy32Warp
+    } else if prefill_tuned_enabled && has_wy32_k {
+        GdnWy32KernelRoute::Wy32Tuned
+    } else {
+        GdnWy32KernelRoute::Fallback
+    }
+}
+
 /// Public dumper used from the server shutdown / bench script if needed.
 #[allow(dead_code)]
 pub fn dump_gdn_profile() {
@@ -336,6 +369,16 @@ impl Qwen3SsmLayer {
             vd,
         )
         .map_err(anyhow::Error::msg)?;
+        let wy32_warp_enabled = std::env::var("ATLAS_GDN_WY32_WARP").ok().as_deref() == Some("1");
+        let prefill_tuned_enabled =
+            std::env::var("ATLAS_GDN_PREFILL_TUNED").ok().as_deref() != Some("0");
+        let wy32_route = select_gdn_wy32_route(
+            total,
+            wy32_warp_enabled,
+            self.gdn_prefill_wy32_warp_k.0 != 0,
+            prefill_tuned_enabled,
+            self.gdn_prefill_wy32_k.0 != 0,
+        );
         if super::qwen4_gdn_fi::try_dense_gdn_fi_prefill(
             qkv_base,
             gate_ptr,
@@ -389,10 +432,18 @@ impl Qwen3SsmLayer {
                 ops::GDN_PREFILL_BLOCK_X,
                 stream,
             )?;
-        } else if self.gdn_prefill_wy32_k.0 != 0 && total > 32 {
+        } else if matches!(
+            wy32_route,
+            GdnWy32KernelRoute::Wy32Warp | GdnWy32KernelRoute::Wy32Tuned
+        ) {
+            let kernel = match wy32_route {
+                GdnWy32KernelRoute::Wy32Warp => self.gdn_prefill_wy32_warp_k,
+                GdnWy32KernelRoute::Wy32Tuned => self.gdn_prefill_wy32_k,
+                GdnWy32KernelRoute::Fallback => unreachable!(),
+            };
             ops::gdn_prefill_persistent_smem(
                 ctx.gpu,
-                self.gdn_prefill_wy32_k,
+                kernel,
                 ssm_state.h_state,
                 q_ptr,
                 k_ptr,
@@ -688,5 +739,47 @@ impl Qwen3SsmLayer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wy32_window_dispatch_tests {
+    use super::{GdnWy32KernelRoute, select_gdn_wy32_route};
+
+    #[test]
+    fn wy32_window_dispatch_honors_tuned_opt_out_and_warp_override() {
+        // Default: WY32 tuned when total > 32 and kernel present.
+        assert_eq!(
+            select_gdn_wy32_route(64, false, true, true, true),
+            GdnWy32KernelRoute::Wy32Tuned
+        );
+        // Explicit ATLAS_GDN_PREFILL_TUNED=0 opts out of WY32 to WY4/fallback.
+        assert_eq!(
+            select_gdn_wy32_route(192, false, true, false, true),
+            GdnWy32KernelRoute::Fallback
+        );
+        // Explicit ATLAS_GDN_WY32_WARP=1 takes precedence over tuned when kernel present.
+        assert_eq!(
+            select_gdn_wy32_route(192, true, true, true, true),
+            GdnWy32KernelRoute::Wy32Warp
+        );
+        assert_eq!(
+            select_gdn_wy32_route(192, true, true, false, true),
+            GdnWy32KernelRoute::Wy32Warp
+        );
+        // Missing warp kernel falls cleanly to tuned (or fallback if tuned=0).
+        assert_eq!(
+            select_gdn_wy32_route(192, true, false, true, true),
+            GdnWy32KernelRoute::Wy32Tuned
+        );
+        assert_eq!(
+            select_gdn_wy32_route(192, true, false, false, true),
+            GdnWy32KernelRoute::Fallback
+        );
+        // Short tails (<= 32 tokens) always fall through to WY4/fallback.
+        assert_eq!(
+            select_gdn_wy32_route(32, true, true, true, true),
+            GdnWy32KernelRoute::Fallback
+        );
     }
 }
