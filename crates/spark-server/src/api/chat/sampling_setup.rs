@@ -431,6 +431,12 @@ pub(super) fn build_sampling(
     // top_logprobs (OpenAI spec: 0-20).
     let top_logprobs = req.top_logprobs.map(|n| n.min(20));
 
+    // Collapse mathematically greedy `top_k == 1` requests to canonical
+    // `temperature = 0.0` AFTER preset history/repetition penalty resolution
+    // so existing penalty semantics are untouched while greedy requests hit
+    // the exact argmax and `p_cum` verify-width fast paths.
+    let temperature = crate::api::canonical_greedy_temperature(temperature, top_k);
+
     Ok(SamplingSetup {
         temperature,
         top_k,
@@ -678,5 +684,135 @@ mod preset_selection_tests {
         assert_eq!(select_preset(&p, true, false, true).temperature, 0.25);
         assert_eq!(select_preset(&p, false, true, true).temperature, 1.0);
         assert_eq!(select_preset(&p, false, false, true).temperature, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod canonical_greedy_chat_tests {
+    use super::build_sampling;
+    use crate::AppState;
+    use crate::openai::ChatCompletionRequest;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn chat_test_state() -> Arc<AppState> {
+        let directory = tempfile::tempdir().unwrap();
+        let vocabulary = [("[UNK]".to_string(), 0), ("hi".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocabulary)
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer
+            .save(directory.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(
+            directory.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{{ messages }}"}"#,
+        )
+        .unwrap();
+        let tokenizer = crate::tokenizer::ChatTokenizer::from_model_dir(
+            directory.path(),
+            0,
+            false,
+            "sampling-setup-fixture",
+            None,
+        )
+        .unwrap();
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        Arc::new(AppState {
+            tokenizer,
+            model_name: "sampling-setup-fixture".into(),
+            max_seq_len: 128,
+            max_batch_size: 1,
+            serving: serde_json::Value::Null,
+            yarn_context: false,
+            request_tx,
+            vision_config: None,
+            dsv41: false,
+            dsv41_vision: None,
+            default_temperature: 0.7,
+            default_top_k: 20,
+            default_top_p: 0.95,
+            default_top_n_sigma: 0.0,
+            default_min_p: 0.0,
+            tool_call_parser: None,
+            reasoning_parser: None,
+            think_end_token_id: None,
+            think_start_token_id: None,
+            tool_max_tokens: 16,
+            default_max_tokens: None,
+            sampling_presets: Default::default(),
+            tool_call_start_token_id: None,
+            auto_compact_threshold: None,
+            model_ready: Arc::new(AtomicBool::new(true)),
+            request_timeout: 0,
+            effective_context: 0,
+            behavior: Default::default(),
+            disable_thinking: false,
+            disable_simhash_watchdog: true,
+            default_chat_template_kwargs: None,
+            runtime: crate::runtime_settings::RuntimeSettings::for_tests(128),
+            response_store: crate::response_store::ResponseStore::with_config(
+                4,
+                Duration::from_secs(60),
+            ),
+            rate_limiter: crate::rate_limiter::RateLimiter::with_config(
+                crate::rate_limiter::RateLimitConfig {
+                    rpm: 0,
+                    tpm: 0,
+                    burst_rpm: 0,
+                    burst_tpm: 0,
+                },
+            ),
+            conversation_store: crate::conversation_store::ConversationStore::with_config(
+                4,
+                Duration::from_secs(60),
+            ),
+            dump_writer: None,
+            auth: None,
+        })
+    }
+
+    #[test]
+    fn build_sampling_collapses_top_k_one_after_preset_penalty_resolution() {
+        let state = chat_test_state();
+        let mut defaults = (*state.runtime.snapshot()).clone();
+        defaults.sampling_presets.non_thinking.repetition_penalty = 1.08;
+        defaults.sampling_presets.non_thinking.presence_penalty = 0.35;
+
+        let req_greedy: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_k": 1,
+            "top_p": 0.8
+        }))
+        .unwrap();
+        let setup = build_sampling(&state, &defaults, &req_greedy, false, false, false, 0)
+            .expect("valid greedy-via-top_k=1 chat request");
+        assert_eq!(setup.temperature, 0.0);
+        assert_eq!(setup.top_k, 1);
+        // Preset penalties resolved against effective_req_temperature=Some(0.7) stay intact.
+        assert_eq!(setup.repetition_penalty, 1.08);
+        assert_eq!(setup.presence_penalty, 0.35);
+
+        let req_sampled: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.8
+        }))
+        .unwrap();
+        let sampled = build_sampling(&state, &defaults, &req_sampled, false, false, false, 0)
+            .expect("valid sampled chat request");
+        assert_eq!(sampled.temperature, 0.7);
+        assert_eq!(sampled.top_k, 20);
     }
 }

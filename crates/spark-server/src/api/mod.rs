@@ -105,3 +105,59 @@ pub use stubs::{
 };
 pub use telemetry::{experts_usage, memory_telemetry};
 pub use template_inspect::apply_template;
+
+/// Collapses mathematically greedy sampling (`top_k == 1` with finite `temperature > 0.0`)
+/// to canonical `temperature = 0.0`.
+///
+/// With `top_k == 1`, dividing finite logits by a positive finite temperature is strictly
+/// order-preserving, and top-k truncation leaves only the unique first-wins maximum token
+/// with probability `1.0` after history penalties and `logit_bias` have already been applied.
+///
+/// Leaving `temperature > 0.0` alongside `top_k == 1` routes requests into the stochastic
+/// speculative verification path (`dflash2_selector` writes `out_max_prob = 1.0`, disabling
+/// `p_cum` verify-width truncation and locking `K = 8`, and runs the multi-pass histogram
+/// rejection verifier instead of 1-pass exact greedy argmax). Normalizing at the API request
+/// boundary after preset penalty resolution preserves 0-ULP output parity while routing
+/// `top_k == 1` onto the exact greedy fast path.
+#[must_use]
+pub(crate) fn canonical_greedy_temperature(temperature: f32, top_k: u32) -> f32 {
+    if top_k == 1 && temperature.is_finite() && temperature > 0.0 {
+        0.0
+    } else {
+        temperature
+    }
+}
+
+#[cfg(test)]
+mod canonical_greedy_tests {
+    use super::canonical_greedy_temperature;
+
+    #[test]
+    fn top_k_one_with_positive_finite_temperature_collapses_to_zero() {
+        for temp in [f32::MIN_POSITIVE, 0.1, 0.7, 1.0, 2.0] {
+            assert_eq!(
+                canonical_greedy_temperature(temp, 1),
+                0.0,
+                "temperature={temp} with top_k=1 must collapse to canonical greedy 0.0"
+            );
+        }
+    }
+
+    #[test]
+    fn non_one_top_k_and_non_positive_or_non_finite_temperatures_are_preserved() {
+        for top_k in [0, 2, 20, u32::MAX] {
+            assert_eq!(
+                canonical_greedy_temperature(0.7, top_k),
+                0.7,
+                "top_k={top_k} must preserve positive temperature"
+            );
+        }
+        assert_eq!(canonical_greedy_temperature(0.0, 1), 0.0);
+        assert_eq!(canonical_greedy_temperature(-0.5, 1), -0.5);
+        assert!(canonical_greedy_temperature(f32::NAN, 1).is_nan());
+        assert_eq!(
+            canonical_greedy_temperature(f32::INFINITY, 1),
+            f32::INFINITY
+        );
+    }
+}
