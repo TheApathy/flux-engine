@@ -1250,15 +1250,6 @@ impl TransformerModel {
         Ok(logits)
     }
 
-    /// Opt-in fused two-stage NVFP4 LM-head + online warp/block argmax
-    /// (`ATLAS_LM_HEAD_FUSED_ARGMAX=1`, default OFF).
-    ///
-    /// Computes `[rows]` greedy argmax token IDs directly into `out_tokens`
-    /// using `self.buffers.logits()` purely as compact partial-reduction
-    /// scratch (`<= 124 KiB` for `rows <= 16`, `V = 248,077`), eliminating the
-    /// full `[rows, V]` BF16 logit write+read slab. Returns `Ok(false)` (failing
-    /// closed to standard `lm_head_batched` + `argmax_bf16*`) whenever disabled
-    /// or any admission guard is unmet.
     /// Opt-in (`ATLAS_LM_HEAD_INT8_BLOCK32=1`, default OFF) two-stage fused
     /// `INT8 Block-32 BF16-Scale (8.50 bpw)` LM-head + online warp/block argmax.
     fn try_lm_head_int8_block32_fused_argmax(
@@ -1269,10 +1260,13 @@ impl TransformerModel {
         vocab: u32,
         stream: u64,
     ) -> Result<bool> {
+        let policy = ops::LmHeadInt8Block32Policy::from_env()?;
+        if policy == ops::LmHeadInt8Block32Policy::Disabled {
+            return Ok(false);
+        }
         let h = self.config.hidden_size as u32;
         let full_vocab = self.config.vocab_size as u32;
-        if !ops::lm_head_int8_block32_enabled()
-            || self.use_fp32_logits
+        if self.use_fp32_logits
             || self.logit_softcap_kernel.0 != 0
             || self.config.final_logit_softcapping != 0.0
             || !self.config.final_logit_softcapping.is_finite()
@@ -1361,10 +1355,13 @@ impl TransformerModel {
         h: u32,
         stream: u64,
     ) -> Result<Option<DevicePtr>> {
+        let policy = ops::LmHeadInt8Block32Policy::from_env()?;
+        if policy == ops::LmHeadInt8Block32Policy::Disabled {
+            return Ok(None);
+        }
         let full_vocab = self.config.vocab_size as u32;
         let logits = self.buffers.logits();
-        if !ops::lm_head_int8_block32_enabled()
-            || self.use_fp32_logits
+        if self.use_fp32_logits
             || self.lm_head_weight.weight.is_null()
             || !self.lm_head_weight.weight.0.is_multiple_of(2)
             || num_tokens == 0
@@ -1437,6 +1434,15 @@ impl TransformerModel {
         Ok(Some(logits))
     }
 
+    /// Opt-in fused two-stage NVFP4 LM-head + online warp/block argmax
+    /// (`ATLAS_LM_HEAD_FUSED_ARGMAX=1`, default OFF).
+    ///
+    /// Computes `[rows]` greedy argmax token IDs directly into `out_tokens`
+    /// using `self.buffers.logits()` purely as compact partial-reduction
+    /// scratch (`<= 124 KiB` for `rows <= 16`, `V = 248,077`), eliminating the
+    /// full `[rows, V]` BF16 logit write+read slab. Returns `Ok(false)` (failing
+    /// closed to standard `lm_head_batched` + `argmax_bf16*`) whenever disabled
+    /// or any admission guard is unmet.
     pub(super) fn try_lm_head_fused_argmax(
         &self,
         hidden: DevicePtr,
@@ -2027,6 +2033,12 @@ impl TransformerModel {
         } else {
             (self.buffers.logits(), false)
         };
+        if !fp32
+            && let Some(int8_logits) =
+                self.try_lm_head_int8_block32_logits(hidden, 1, v, h, stream)?
+        {
+            return Ok(int8_logits);
+        }
         if !fp32 && self.use_target_fp8_lm_head() {
             return self.lm_head_fp8_rows(hidden, 1, v, h, stream);
         }
@@ -2206,6 +2218,13 @@ impl TransformerModel {
         num_tokens: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let h = self.config.hidden_size as u32;
+        let v = self.verify_lmhead_vocab();
+        if let Some(logits) =
+            self.try_lm_head_int8_block32_logits(hidden, num_tokens, v, h, stream)?
+        {
+            return Ok(logits);
+        }
         if self.use_target_fp8_lm_head() {
             anyhow::ensure!(
                 (1..=crate::layers::QWEN4_NATIVE_MAX_ROWS as u32).contains(&num_tokens),

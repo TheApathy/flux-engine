@@ -609,6 +609,46 @@ pub fn quantize_bf16_to_int8_block32_sm120(
         .launch(stream)
 }
 
+fn int8_block32_weight_cache()
+-> &'static Mutex<HashMap<(usize, u64, u32, u32), Int8Block32DeviceWeight>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, u64, u32, u32), Int8Block32DeviceWeight>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Evict and free a cached device `INT8 Block-32 BF16-Scale` LM-head weight.
+///
+/// Must be called from `TransformerModel::drop` (after device/stream sync and
+/// graph cache teardown) so model swaps never leak VRAM or alias freed
+/// `DevicePtr`s when a subsequent model reuses a virtual address.
+///
+/// Returns `true` if a cached entry was found, evicted, and freed.
+pub fn release_cached_lm_head_int8_block32_weight(
+    gpu: &dyn GpuBackend,
+    src_bf16: DevicePtr,
+    vocab: u32,
+    hidden: u32,
+) -> bool {
+    if src_bf16.is_null() {
+        return false;
+    }
+    let key = (
+        std::ptr::from_ref(gpu) as *const () as usize,
+        src_bf16.0,
+        vocab,
+        hidden,
+    );
+    let Ok(mut guard) = int8_block32_weight_cache().lock() else {
+        return false;
+    };
+    let Some(entry) = guard.remove(&key) else {
+        return false;
+    };
+    let _ = gpu.free(entry.w_i8);
+    let _ = gpu.free(entry.scales_bf16);
+    true
+}
+
 /// Lazily quantize and cache a device BF16 LM-head weight `[vocab, hidden]`
 /// into `INT8 Block-32 BF16-Scale` (`8.50 bpw`).
 ///
@@ -637,16 +677,13 @@ pub fn ensure_cached_lm_head_int8_block32_weight(
         "ensure_cached_lm_head_int8_block32_weight: src_bf16 must be non-null and 2B-aligned"
     );
 
-    static CACHE: OnceLock<Mutex<HashMap<(usize, u64, u32, u32), Int8Block32DeviceWeight>>> =
-        OnceLock::new();
     let key = (
         std::ptr::from_ref(gpu) as *const () as usize,
         src_bf16.0,
         vocab,
         hidden,
     );
-    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map
+    let mut guard = int8_block32_weight_cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("lm_head_int8_block32 weight cache lock poisoned"))?;
     if let Some(existing) = guard.get(&key).copied() {
@@ -846,6 +883,22 @@ pub fn lm_head_int8_block32_argmax_stage1_sm120(
         partial_ids,
         checked.partial_ids_bytes,
     )?;
+    ensure_disjoint(
+        "scales_bf16",
+        weight.scales_bf16,
+        checked.weight_plan.scales_bytes,
+        "partial_vals",
+        partial_vals,
+        checked.partial_vals_bytes,
+    )?;
+    ensure_disjoint(
+        "scales_bf16",
+        weight.scales_bf16,
+        checked.weight_plan.scales_bytes,
+        "partial_ids",
+        partial_ids,
+        checked.partial_ids_bytes,
+    )?;
 
     KernelLaunch::new(gpu, kernel)
         .grid([checked.num_v_tiles, 1, 1])
@@ -960,6 +1013,13 @@ pub fn lm_head_int8_block32_fused_argmax(
     ensure!(
         !out_tokens.is_null() && out_tokens.0.is_multiple_of(4),
         "lm_head_int8_block32_fused_argmax: out_tokens must be non-null and 4B-aligned"
+    );
+    ensure!(
+        scratch
+            .0
+            .checked_add(checked.total_scratch_bytes as u64)
+            .is_some(),
+        "lm_head_int8_block32_fused_argmax: scratch address range overflow"
     );
     let partial_vals = scratch;
     let partial_ids = scratch.offset(checked.partial_ids_offset);
@@ -1749,6 +1809,48 @@ mod tests {
             )
             .is_err()
         );
+        // Overlapping scales_bf16 with partial_vals or partial_ids rejects BEFORE launching stage1.
+        assert!(
+            lm_head_int8_block32_argmax_stage1_sm120(
+                &gpu_err,
+                kernels.argmax_stage1,
+                &aplan8,
+                DevicePtr(0x3_0000_0000),
+                &dev_w,
+                dev_w.scales_bf16,
+                DevicePtr(0x4_0000_0000),
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            lm_head_int8_block32_argmax_stage1_sm120(
+                &gpu_err,
+                kernels.argmax_stage1,
+                &aplan8,
+                DevicePtr(0x3_0000_0000),
+                &dev_w,
+                DevicePtr(0x4_0000_0000),
+                dev_w.scales_bf16,
+                0,
+            )
+            .is_err()
+        );
+        // Overflowing scratch address range rejects BEFORE computing partial_ids offset.
+        assert!(
+            lm_head_int8_block32_fused_argmax(
+                &gpu_err,
+                kernels,
+                &aplan8,
+                DevicePtr(0x3_0000_0000),
+                &dev_w,
+                DevicePtr(u64::MAX - 15),
+                aplan8.total_scratch_bytes,
+                DevicePtr(0x5_0000_0000),
+                0,
+            )
+            .is_err()
+        );
         assert_eq!(gpu_err.launch_count(), 0);
     }
 
@@ -1906,6 +2008,60 @@ mod tests {
         .unwrap();
         assert_eq!(hit, cached);
         assert_eq!(gpu.inner.alloc_count(), 2);
+
+        // 5. Releasing on model drop frees both buffers (0 leaks, 0 invalid frees)
+        //    and forces fresh quantization when the same VA key is later reused.
+        let launches_before_release = gpu.inner.launch_count();
+        assert!(release_cached_lm_head_int8_block32_weight(
+            gpu.as_ref(),
+            src,
+            128,
+            64
+        ));
+        assert_eq!(gpu.inner.alloc_count(), 0);
+        assert_eq!(gpu.inner.invalid_free_count(), 0);
+        assert!(!release_cached_lm_head_int8_block32_weight(
+            gpu.as_ref(),
+            src,
+            128,
+            64
+        ));
+        assert_eq!(
+            ensure_cached_lm_head_int8_block32_weight(
+                gpu.as_ref(),
+                KernelHandle(4),
+                src,
+                128,
+                64,
+                0,
+                Int8WeightAllocPolicy::CaptureNoAlloc,
+            )
+            .unwrap(),
+            None
+        );
+        let reloaded = ensure_cached_lm_head_int8_block32_weight(
+            gpu.as_ref(),
+            KernelHandle(4),
+            src,
+            128,
+            64,
+            0,
+            Int8WeightAllocPolicy::AllowAlloc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(reloaded.w_i8, cached.w_i8);
+        assert_ne!(reloaded.scales_bf16, cached.scales_bf16);
+        assert_eq!(gpu.inner.alloc_count(), 2);
+        assert_eq!(gpu.inner.launch_count(), launches_before_release + 1);
+        assert!(release_cached_lm_head_int8_block32_weight(
+            gpu.as_ref(),
+            src,
+            128,
+            64
+        ));
+        assert_eq!(gpu.inner.alloc_count(), 0);
+        assert_eq!(gpu.inner.invalid_free_count(), 0);
     }
 
     #[test]
