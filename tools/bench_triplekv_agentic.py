@@ -76,7 +76,11 @@ def compute_triplekv_schedule(
         raise ValueError(f"safety_margin_secs={safety_margin_secs} out of bounds")
     io_load_secs = float(snapshot_bytes) / float(nvme_bandwidth_bps)
     raw_delay = remaining_tool_secs + queue_wait_secs - io_load_secs - safety_margin_secs
-    issue_delay_secs = max(0.0, min(raw_delay, MAX_PREFETCH_ISSUE_DELAY_SECS))
+    if not math.isfinite(raw_delay) or raw_delay > MAX_PREFETCH_ISSUE_DELAY_SECS:
+        raise ValueError(
+            f"computed issue_delay={raw_delay} exceeds MAX_PREFETCH_ISSUE_DELAY_SECS={MAX_PREFETCH_ISSUE_DELAY_SECS}"
+        )
+    issue_delay_secs = max(0.0, raw_delay)
     return io_load_secs, issue_delay_secs
 
 
@@ -131,11 +135,10 @@ def _measure_completion_ttft(
         body = {
             "model": model,
             "prompt": prompt_text,
+            "prompt_token_ids": token_ids,
             "max_tokens": 1,
             "temperature": 0.0,
             "stream": stream,
-            # Carry canonical token_ids hint for mock / compatible endpoints.
-            "token_ids": token_ids,
         }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -290,12 +293,15 @@ def run_benchmark(
                     time.sleep(remaining_sleep)
                 last_obs_by_tool[tool_name] = time.perf_counter() - tool_start
 
+                # Append one turn-specific suffix token (< block_size) so the block-aligned
+                # prefix matches POST /v1/kv_cache/prefetch 1:1 on live Flux /v1/completions.
+                repeat_token_ids = tokens + [50_000 + turn]
                 ttft_ms, total_ms = _measure_completion_ttft(
                     base_url=base_url,
                     endpoint=endpoint,
                     model=model,
                     prompt_text=f"{prompt} [turn={turn} tool={tool_name}]",
-                    token_ids=tokens,
+                    token_ids=repeat_token_ids,
                     stream=stream,
                 )
                 measurements.append(
@@ -425,7 +431,14 @@ class _MockTripleKvState:
         token_ids = req.get("token_ids")
         prompt = req.get("prompt")
         if token_ids is not None:
-            if not isinstance(token_ids, list) or len(token_ids) == 0 or not all(isinstance(x, int) and x >= 0 for x in token_ids):
+            if (
+                not isinstance(token_ids, list)
+                or len(token_ids) == 0
+                or not all(
+                    isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 0xFFFFFFFF
+                    for x in token_ids
+                )
+            ):
                 return HTTPStatus.BAD_REQUEST, {"error": {"message": "token_ids must be a non-empty list of u32"}}
         elif isinstance(prompt, str) and prompt:
             token_ids = [ord(c) for c in prompt]
@@ -523,7 +536,7 @@ class _MockTripleKvState:
             }
 
     def serve_completion(self, req: dict[str, Any]) -> tuple[bool, float]:
-        token_ids = req.get("token_ids") or [1, 2, 3, 4] * 4
+        token_ids = req.get("prompt_token_ids") or [1, 2, 3, 4] * 4
         model_digest = str(req.get("model") or "mock-model")
         cid, _ = self.content_id(token_ids, 16, model_digest, "bf16")
         with self.lock:
@@ -654,6 +667,19 @@ def run_self_test() -> int:
         assert abs(io_s - 0.10) < 1.0e-9
         assert abs(delay_s - expected_delay) < 1.0e-9
 
+    # Verify raw_delay > MAX_PREFETCH_ISSUE_DELAY_SECS fails closed (matches kv_prefetch.rs:131).
+    try:
+        compute_triplekv_schedule(
+            remaining_tool_secs=MAX_PREFETCH_ISSUE_DELAY_SECS,
+            queue_wait_secs=60.0,
+            snapshot_bytes=0,
+            nvme_bandwidth_bps=DEFAULT_NVME_READ_BPS,
+            safety_margin_secs=0.0,
+        )
+        raise AssertionError("expected ValueError when raw_delay exceeds MAX_PREFETCH_ISSUE_DELAY_SECS")
+    except ValueError:
+        pass
+
     # 2. Spin up in-process stdlib ThreadingHTTPServer mock (scaled ~3.3x faster for fast CI).
     # 105 MB at 3.5 GB/s => 30ms I/O load; scaled tool latencies 60ms..600ms overlap with >=15ms margin.
     mock_state = _MockTripleKvState(
@@ -663,11 +689,17 @@ def run_self_test() -> int:
     )
     server, thread, base_url = _start_mock_server(mock_state)
     try:
-        # Contract test A: HTTP 400 on empty token_ids and invalid bandwidth.
+        # Contract test A: HTTP 400 on empty token_ids, bool token_ids, and invalid bandwidth.
         code_bad_empty, _, _ = _http_json(
             f"{base_url}/v1/kv_cache/prefetch", method="POST", payload={"token_ids": []}
         )
         assert code_bad_empty == HTTPStatus.BAD_REQUEST, f"expected 400, got {code_bad_empty}"
+        code_bad_bool, _, _ = _http_json(
+            f"{base_url}/v1/kv_cache/prefetch",
+            method="POST",
+            payload={"token_ids": [True, False] * 8},
+        )
+        assert code_bad_bool == HTTPStatus.BAD_REQUEST, f"expected 400 on bool token_ids, got {code_bad_bool}"
 
         # Contract test B: HTTP 200 miss_not_in_store on unseen prefix.
         unseen_tokens = list(range(100, 164))

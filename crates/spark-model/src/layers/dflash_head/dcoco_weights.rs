@@ -489,8 +489,9 @@ impl DcocoSidecarArtifact {
     /// Returns an error if any tensor length disagrees with `spec`, `ln_eps` is
     /// non-finite/non-positive, or any weight value is non-finite or overflows BF16.
     pub fn from_cpu_weights(spec: DcocoSpec, weights: &DcocoCpuWeights) -> Result<Self> {
+        let canonical_spec = DcocoSpec::new(spec.hidden_size, spec.top_k)?;
         ensure!(
-            spec.rank == DCOCO_RANK && spec.mlp_hidden == DCOCO_MLP_HIDDEN,
+            spec == canonical_spec,
             "DCOCO spec must match kernel ABI (rank={DCOCO_RANK}, mlp_hidden={DCOCO_MLP_HIDDEN})"
         );
         ensure!(
@@ -505,21 +506,34 @@ impl DcocoSidecarArtifact {
             weights.ln_eps
         );
 
-        let d = spec.hidden_size;
+        let layout = compute_tensor_layout(&spec)?;
+        let payload_bytes =
+            u64::try_from(layout.total_bytes).context("DCOCO payload byte length overflow")?;
+        let total_bytes = (DCOCO_SIDECAR_HEADER_BYTES as u64)
+            .checked_add(payload_bytes)
+            .context("DCOCO total sidecar size overflow")?;
+        ensure!(
+            total_bytes <= MAX_DCOCO_SIDECAR_BYTES,
+            "DCOCO total sidecar size {total_bytes} exceeds {MAX_DCOCO_SIDECAR_BYTES}-byte safety limit"
+        );
+
         let expected_slices: [(&str, &[f32], usize); 10] = [
-            ("w_cand", &weights.w_cand, DCOCO_RANK * d),
-            ("w_ctx", &weights.w_ctx, DCOCO_RANK * d),
-            ("w_fuse", &weights.w_fuse, DCOCO_RANK * 2 * DCOCO_RANK),
-            ("fuse_ln_w", &weights.fuse_ln_w, DCOCO_RANK),
-            ("fuse_ln_b", &weights.fuse_ln_b, DCOCO_RANK),
-            ("w_pair", &weights.w_pair, DCOCO_RANK * 2 * d),
-            ("mlp_w1", &weights.mlp_w1, DCOCO_MLP_HIDDEN * DCOCO_MLP_IN),
-            ("mlp_b1", &weights.mlp_b1, DCOCO_MLP_HIDDEN),
-            ("mlp_w2", &weights.mlp_w2, DCOCO_MLP_HIDDEN),
-            ("mlp_b2", std::slice::from_ref(&weights.mlp_b2), 1),
+            ("w_cand", &weights.w_cand, layout.w_cand.len() / 2),
+            ("w_ctx", &weights.w_ctx, layout.w_ctx.len() / 2),
+            ("w_fuse", &weights.w_fuse, layout.w_fuse.len() / 2),
+            ("fuse_ln_w", &weights.fuse_ln_w, layout.fuse_ln_w.len() / 2),
+            ("fuse_ln_b", &weights.fuse_ln_b, layout.fuse_ln_b.len() / 2),
+            ("w_pair", &weights.w_pair, layout.w_pair.len() / 2),
+            ("mlp_w1", &weights.mlp_w1, layout.mlp_w1.len() / 2),
+            ("mlp_b1", &weights.mlp_b1, layout.mlp_b1.len() / 2),
+            ("mlp_w2", &weights.mlp_w2, layout.mlp_w2.len() / 2),
+            (
+                "mlp_b2",
+                std::slice::from_ref(&weights.mlp_b2),
+                layout.mlp_b2.len() / 2,
+            ),
         ];
 
-        let layout = compute_tensor_layout(&spec)?;
         let mut payload = Vec::with_capacity(layout.total_bytes);
         for (name, slice, expected_len) in expected_slices {
             ensure!(
@@ -534,7 +548,6 @@ impl DcocoSidecarArtifact {
             }
         }
 
-        let payload_bytes = u64::try_from(payload.len()).context("payload length overflow")?;
         let prefix = encode_header_prefix(&spec, weights.ln_eps, payload_bytes)?;
         let embedded_digest = sha256_two_parts(&prefix, &payload);
         let header = DcocoSidecarHeader {
@@ -1669,5 +1682,61 @@ mod tests {
         corrector.release(&gpu);
         assert_eq!(gpu.alloc_count(), 0);
         assert_eq!(gpu.invalid_free_count(), 0);
+        // Public weight pointers MUST be nulled in lockstep with released sidecar buffers.
+        for ptr in [
+            corrector.weights.w_cand.weight,
+            corrector.weights.w_ctx.weight,
+            corrector.weights.w_fuse.weight,
+            corrector.weights.fuse_ln_w.weight,
+            corrector.weights.fuse_ln_b.weight,
+            corrector.weights.w_pair.weight,
+            corrector.weights.mlp_w1.weight,
+            corrector.weights.mlp_b1.weight,
+            corrector.weights.mlp_w2.weight,
+            corrector.weights.mlp_b2.weight,
+        ] {
+            assert!(
+                ptr.is_null(),
+                "dangling weight pointer {ptr:?} after release"
+            );
+        }
+    }
+
+    #[test]
+    fn from_cpu_weights_rejects_unvalidated_and_overflowing_specs() {
+        let cpu = make_synthetic_cpu_weights(32);
+        for bad_spec in [
+            DcocoSpec {
+                hidden_size: 0,
+                top_k: 4,
+                rank: DCOCO_RANK,
+                mlp_hidden: DCOCO_MLP_HIDDEN,
+            },
+            DcocoSpec {
+                hidden_size: 32,
+                top_k: 0,
+                rank: DCOCO_RANK,
+                mlp_hidden: DCOCO_MLP_HIDDEN,
+            },
+            DcocoSpec {
+                hidden_size: 32,
+                top_k: 17,
+                rank: DCOCO_RANK,
+                mlp_hidden: DCOCO_MLP_HIDDEN,
+            },
+            DcocoSpec {
+                hidden_size: usize::MAX,
+                top_k: 4,
+                rank: DCOCO_RANK,
+                mlp_hidden: DCOCO_MLP_HIDDEN,
+            },
+        ] {
+            let mut w = cpu.clone();
+            w.hidden_size = bad_spec.hidden_size;
+            assert!(
+                DcocoSidecarArtifact::from_cpu_weights(bad_spec, &w).is_err(),
+                "expected invalid spec {bad_spec:?} to fail closed without panic"
+            );
+        }
     }
 }

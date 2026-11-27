@@ -545,6 +545,7 @@ impl DcocoCorrector {
         self.scratch.free(gpu);
         if let Some(sidecar) = &mut self.owned_sidecar {
             sidecar.release(gpu);
+            self.weights = sidecar.as_weights();
         }
     }
 }
