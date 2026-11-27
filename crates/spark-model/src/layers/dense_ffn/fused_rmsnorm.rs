@@ -30,8 +30,8 @@ use super::layer::{DenseFfnLayer, FfnActivation};
 use super::policy::supports_warp_nvfp4_mma;
 #[cfg(feature = "cuda")]
 use super::policy::{
-    FlashInferFfnAvailability, cublaslt_nvfp4_route_enabled, ffn_prefill_l2_strip_rows,
-    prefill_ffn_cublaslt_nvfp4_policy,
+    FlashInferFfnAvailability, cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill,
+    ffn_prefill_l2_strip_rows, prefill_ffn_cublaslt_nvfp4_policy,
 };
 use crate::layer::ForwardContext;
 use crate::layers::ops::{
@@ -327,15 +327,19 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        let policy = ops::fused_rmsnorm_nvfp4_policy()?;
-        if policy == FusedRmsNormNvfp4Policy::Disabled {
+        let policy = ops::effective_fused_rmsnorm_nvfp4_policy()?;
+        if !policy.is_enabled() {
             return Ok(false);
         }
+        let fail_closed = policy.is_fail_closed();
         if !self.fused_prefill_context_eligible(ctx, stream) {
             return Ok(false);
         }
         let Ok(m) = u32::try_from(num_tokens) else {
-            bail!("ATLAS_FUSED_RMSNORM_NVFP4=1 token count {num_tokens} exceeds u32");
+            if fail_closed {
+                bail!("ATLAS_FUSED_RMSNORM_NVFP4=1 token count {num_tokens} exceeds u32");
+            }
+            return Ok(false);
         };
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
@@ -351,6 +355,7 @@ impl DenseFfnLayer {
             inter,
             eps,
             weight_mode,
+            fail_closed,
             ctx,
             stream,
         )? {
@@ -367,6 +372,7 @@ impl DenseFfnLayer {
             inter,
             eps,
             weight_mode,
+            fail_closed,
             ctx,
             stream,
         )? {
@@ -380,10 +386,10 @@ impl DenseFfnLayer {
     /// NVFP4 quantization + quantized FFN prefill block.
     ///
     /// Invoked from [`DenseFfnLayer::try_forward_prefill_fused_residual_norm`]
-    /// when `ATLAS_FUSED_RMSNORM_NVFP4=1` is explicitly enabled. Supports
-    /// FlashInfer (`Swizzled128x4`), cuBLASLt (`Swizzled128x4`), and linear
-    /// W4A4 (`Linear`), failing closed when any required kernel, scale, or
-    /// alignment contract is violated.
+    /// when `ATLAS_FUSED_RMSNORM_NVFP4=1` is explicitly enabled (or auto-enabled
+    /// via `ATLAS_GB10_FAST_PREFILL=1`). Supports FlashInfer (`Swizzled128x4`),
+    /// cuBLASLt (`Swizzled128x4`), and linear W4A4 (`Linear`), failing closed
+    /// when explicitly requested on an incompatible configuration.
     #[expect(
         clippy::too_many_arguments,
         reason = "fused residual + RMSNorm + NVFP4 FFN prefill entry point"
@@ -398,15 +404,19 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        let policy = ops::fused_rmsnorm_nvfp4_policy()?;
-        if policy == FusedRmsNormNvfp4Policy::Disabled {
+        let policy = ops::effective_fused_rmsnorm_nvfp4_policy()?;
+        if !policy.is_enabled() {
             return Ok(false);
         }
+        let fail_closed = policy.is_fail_closed();
         if !self.fused_prefill_context_eligible(ctx, stream) {
             return Ok(false);
         }
         let Ok(m) = u32::try_from(num_tokens) else {
-            bail!("ATLAS_FUSED_RMSNORM_NVFP4=1 token count {num_tokens} exceeds u32");
+            if fail_closed {
+                bail!("ATLAS_FUSED_RMSNORM_NVFP4=1 token count {num_tokens} exceeds u32");
+            }
+            return Ok(false);
         };
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
@@ -424,6 +434,7 @@ impl DenseFfnLayer {
             inter,
             eps,
             weight_mode,
+            fail_closed,
             ctx,
             stream,
         )? {
@@ -440,6 +451,7 @@ impl DenseFfnLayer {
             inter,
             eps,
             weight_mode,
+            fail_closed,
             ctx,
             stream,
         )? {
@@ -457,6 +469,7 @@ impl DenseFfnLayer {
             inter,
             eps,
             weight_mode,
+            fail_closed,
             ctx,
             stream,
         )? {
@@ -480,6 +493,7 @@ impl DenseFfnLayer {
         inter: u32,
         eps: f32,
         weight_mode: RmsNormWeightMode,
+        fail_closed: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
@@ -537,7 +551,12 @@ impl DenseFfnLayer {
             scale_layout: Nvfp4ScaleLayout::Swizzled128x4,
         }) {
             FusedRmsNormNvfp4Admission::Admitted => {}
-            FusedRmsNormNvfp4Admission::Incompatible(reason) => bail!("{reason}"),
+            FusedRmsNormNvfp4Admission::Incompatible(reason) => {
+                if fail_closed {
+                    bail!("{reason}");
+                }
+                return Ok(false);
+            }
             FusedRmsNormNvfp4Admission::Disabled => return Ok(false),
         }
 
@@ -740,6 +759,7 @@ impl DenseFfnLayer {
         inter: u32,
         eps: f32,
         weight_mode: RmsNormWeightMode,
+        fail_closed: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
@@ -756,7 +776,7 @@ impl DenseFfnLayer {
         let scales = self
             .cublaslt_checkpoint_scales
             .or(self.e2m1_checkpoint_scales);
-        if !cublaslt_nvfp4_route_enabled(
+        if !cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
             prefill_ffn_cublaslt_nvfp4_policy(),
             cc,
             flashinfer_ffn,
@@ -765,6 +785,7 @@ impl DenseFfnLayer {
             inter,
             true,
             scales.is_some(),
+            ops::gb10_fast_prefill_enabled(),
         ) {
             return Ok(false);
         }
@@ -791,18 +812,29 @@ impl DenseFfnLayer {
             scale_layout: Nvfp4ScaleLayout::Swizzled128x4,
         }) {
             FusedRmsNormNvfp4Admission::Admitted => {}
-            FusedRmsNormNvfp4Admission::Incompatible(reason) => bail!("{reason}"),
+            FusedRmsNormNvfp4Admission::Incompatible(reason) => {
+                if fail_closed {
+                    bail!("{reason}");
+                }
+                return Ok(false);
+            }
             FusedRmsNormNvfp4Admission::Disabled => return Ok(false),
         }
         let Some(scales) = scales else {
-            bail!("ATLAS_FUSED_RMSNORM_NVFP4=1 requires static activation scales for cuBLASLt");
+            if fail_closed {
+                bail!("ATLAS_FUSED_RMSNORM_NVFP4=1 requires static activation scales for cuBLASLt");
+            }
+            return Ok(false);
         };
         if self.weights.gate_proj.weight_scale_2.to_bits()
             != self.weights.up_proj.weight_scale_2.to_bits()
         {
-            bail!(
-                "ATLAS_FUSED_RMSNORM_NVFP4=1 cuBLASLt fused norm requires matching gate/up weight_scale_2"
-            );
+            if fail_closed {
+                bail!(
+                    "ATLAS_FUSED_RMSNORM_NVFP4=1 cuBLASLt fused norm requires matching gate/up weight_scale_2"
+                );
+            }
+            return Ok(false);
         }
 
         let _scratch_use = self.lock_e2m1_use(stream)?;
@@ -944,6 +976,7 @@ impl DenseFfnLayer {
         inter: u32,
         eps: f32,
         weight_mode: RmsNormWeightMode,
+        fail_closed: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
@@ -1021,7 +1054,12 @@ impl DenseFfnLayer {
             scale_layout: Nvfp4ScaleLayout::Linear,
         }) {
             FusedRmsNormNvfp4Admission::Admitted => {}
-            FusedRmsNormNvfp4Admission::Incompatible(reason) => bail!("{reason}"),
+            FusedRmsNormNvfp4Admission::Incompatible(reason) => {
+                if fail_closed {
+                    bail!("{reason}");
+                }
+                return Ok(false);
+            }
             FusedRmsNormNvfp4Admission::Disabled => return Ok(false),
         }
         let _ = ops::nvfp4_activation_extent(m, h, Nvfp4ScaleLayout::Linear)?;

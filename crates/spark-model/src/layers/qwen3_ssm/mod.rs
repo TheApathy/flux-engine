@@ -144,6 +144,7 @@ mod exact_flat_route;
 mod gdn_c143_prefill;
 #[cfg(test)]
 mod gdn_c143_prefill_tests;
+pub(crate) mod gdn_l2_window;
 #[cfg(test)]
 mod qkvz_e4m3_readiness_tests;
 pub(crate) mod ssm_h_fp16;

@@ -93,6 +93,36 @@ impl Qwen3AttentionLayer {
         {
             return Ok(());
         }
+        // Opt-in scalar Tensor-FP8 shared-quant Q/K/V (`ATLAS_TENSOR_FP8_PREFILL=1`
+        // or `ATLAS_GB10_FAST_PREFILL=1`) for pre-dequanted uniform-scale E4M3
+        // weights (excludes native 128x128 block-scaled FP8 weights).
+        if !dual_kv
+            && !self.k_eq_v
+            && self.q_fp8w_t.is_none()
+            && self.k_fp8w_t.is_none()
+            && self.v_fp8w_t.is_none()
+            && self.q_weight.as_ref().and_then(|w| w.as_fp8()).is_none()
+            && self.k_weight.as_ref().and_then(|w| w.as_fp8()).is_none()
+            && self.v_weight.as_ref().and_then(|w| w.as_fp8()).is_none()
+            && let (Some(q_fp8), Some(k_fp8), Some(v_fp8)) = (self.q_fp8, self.k_fp8, self.v_fp8)
+            && ops::try_tensor_fp8_prefill_proj_qkv(
+                ctx.gpu,
+                normed,
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                qg_out,
+                k_contiguous,
+                v_contiguous,
+                n,
+                q_proj_dim as u32,
+                nkv * hd,
+                h,
+                stream,
+            )?
+        {
+            return Ok(());
+        }
         self.cache_skip_one_proj(
             SkipProj::Q,
             normed,
@@ -228,6 +258,11 @@ impl Qwen3AttentionLayer {
         } else if weight_opt.and_then(|w| w.as_fp8()).is_some() {
             anyhow::bail!("w8a16_gemm kernel not loaded — cannot prefill with FP8 weights");
         } else if let Some(fp8p) = fp8 {
+            if ops::try_tensor_fp8_prefill_proj_single(
+                ctx.gpu, normed, fp8p, out, n, out_dim, h, 1.0, true, label, stream,
+            )? {
+                return Ok(());
+            }
             if n > 128 {
                 ops::fp8_fp8_gemm_n128_m128(
                     ctx.gpu,

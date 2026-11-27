@@ -210,6 +210,112 @@ impl Qwen3SsmLayer {
         let beta_ptr = gdn_bufs.gate_beta.offset(nv * fp32);
         let gb_stride = (nv * 2) as u32;
 
+        if let Some(gdn_c143) = gdn_c143.as_ref() {
+            gdn_c143.launch(ctx.gpu)?;
+        } else {
+            let l2_policy = super::gdn_l2_window::gdn_l2_window_policy()?;
+            let l2_geom = super::gdn_l2_window::GdnL2WindowGeometry {
+                num_key_heads: nk,
+                key_head_dim: kd,
+                num_value_heads: nv,
+                value_head_dim: vd,
+                d_conv: ctx.config.linear_conv_kernel_dim,
+            };
+            let l2_plan =
+                super::gdn_l2_window::plan_gdn_l2_windows(gdn_bufs.total_len, l2_geom, l2_policy)?;
+            if l2_plan.is_windowed() {
+                super::gdn_l2_window::log_gdn_l2_window_engaged(&l2_plan, "prefill_gdn_full");
+            }
+            for win in l2_plan.windows() {
+                let win_tokens = u32::try_from(win.token_len).map_err(|_| {
+                    anyhow::anyhow!("GDN L2 window token count {} exceeds u32", win.token_len)
+                })?;
+                self.launch_gdn_prefill_window(
+                    ssm_state,
+                    gdn_bufs.qkv.offset(win.qkv_byte_offset),
+                    q_ptr.offset(win.qkv_byte_offset),
+                    k_ptr.offset(win.qkv_byte_offset),
+                    v_ptr.offset(win.qkv_byte_offset),
+                    gate_ptr.offset(win.gate_beta_byte_offset),
+                    beta_ptr.offset(win.gate_beta_byte_offset),
+                    gdn_bufs.output.offset(win.output_byte_offset),
+                    win_tokens,
+                    nk,
+                    nv,
+                    kd,
+                    vd,
+                    conv_dim,
+                    value_dim,
+                    gb_stride,
+                    ctx,
+                    stream,
+                )?;
+            }
+        }
+
+        if let Some(t0) = __gdn_t0 {
+            ctx.gpu.synchronize(stream)?;
+            let ns = t0.elapsed().as_nanos() as u64;
+            GDN_CALLS.fetch_add(1, Ordering::Relaxed);
+            GDN_TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+            // "large" bucket = total >= 256 (typical chunked-prefill chunk).
+            if total >= 256 {
+                GDN_LARGE_CALLS.fetch_add(1, Ordering::Relaxed);
+                GDN_LARGE_NS.fetch_add(ns, Ordering::Relaxed);
+            }
+            // Track per-call max so a single very-large call shows up.
+            let mut prev = GDN_MAX_NS.load(Ordering::Relaxed);
+            while ns > prev {
+                match GDN_MAX_NS.compare_exchange_weak(
+                    prev,
+                    ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        GDN_MAX_TOTAL.store(total as u64, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(p) => prev = p,
+                }
+            }
+            tracing::info!(
+                "GDN_PROF call total={total} us={} max_us={}",
+                ns / 1000,
+                GDN_MAX_NS.load(Ordering::Relaxed) / 1000
+            );
+        }
+
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "GDN recurrence window dispatcher forwarding packed QKV/gate/output pointers and layer geometry"
+    )]
+    pub(super) fn launch_gdn_prefill_window(
+        &self,
+        ssm_state: &mut SsmLayerState,
+        qkv_base: spark_runtime::gpu::DevicePtr,
+        q_ptr: spark_runtime::gpu::DevicePtr,
+        k_ptr: spark_runtime::gpu::DevicePtr,
+        v_ptr: spark_runtime::gpu::DevicePtr,
+        gate_ptr: spark_runtime::gpu::DevicePtr,
+        beta_ptr: spark_runtime::gpu::DevicePtr,
+        out_ptr: spark_runtime::gpu::DevicePtr,
+        total: u32,
+        nk: usize,
+        nv: usize,
+        kd: usize,
+        vd: usize,
+        conv_dim: usize,
+        value_dim: usize,
+        gb_stride: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let bf16 = 2usize;
+        let fp32 = 4usize;
         // WY32 persistent: processes 32 tokens per WY iteration with H in
         // shared memory (~84KB). ~30× faster than per-token for 14k+ sequences.
         // Falls through to WY4 or sub-chunked persistent for shorter sequences.
@@ -230,12 +336,10 @@ impl Qwen3SsmLayer {
             vd,
         )
         .map_err(anyhow::Error::msg)?;
-        if let Some(gdn_c143) = gdn_c143.as_ref() {
-            gdn_c143.launch(ctx.gpu)?;
-        } else if super::qwen4_gdn_fi::try_dense_gdn_fi_prefill(
-            gdn_bufs.qkv,
-            gdn_bufs.gate_beta,
-            gdn_bufs.output,
+        if super::qwen4_gdn_fi::try_dense_gdn_fi_prefill(
+            qkv_base,
+            gate_ptr,
+            out_ptr,
             ssm_state.h_state,
             ssm_state.h_is_f16,
             total,
@@ -271,7 +375,7 @@ impl Qwen3SsmLayer {
                 v_ptr,
                 gate_ptr,
                 beta_ptr,
-                gdn_bufs.output,
+                out_ptr,
                 1,
                 total,
                 nk as u32,
@@ -295,7 +399,7 @@ impl Qwen3SsmLayer {
                 v_ptr,
                 gate_ptr,
                 beta_ptr,
-                gdn_bufs.output,
+                out_ptr,
                 1,
                 total,
                 nk as u32,
@@ -319,7 +423,7 @@ impl Qwen3SsmLayer {
                 let v_chunk = v_ptr.offset(offset as usize * conv_dim * bf16);
                 let gate_chunk = gate_ptr.offset(offset as usize * gb_stride as usize * fp32);
                 let beta_chunk = beta_ptr.offset(offset as usize * gb_stride as usize * fp32);
-                let out_chunk = gdn_bufs.output.offset(offset as usize * value_dim * bf16);
+                let out_chunk = out_ptr.offset(offset as usize * value_dim * bf16);
 
                 if self.gdn_prefill_persistent_k.0 != 0 && chunk >= 256 {
                     ops::gdn_prefill_persistent(
@@ -379,7 +483,7 @@ impl Qwen3SsmLayer {
                 v_ptr,
                 gate_ptr,
                 beta_ptr,
-                gdn_bufs.output,
+                out_ptr,
                 1,
                 total,
                 nk as u32,
@@ -402,7 +506,7 @@ impl Qwen3SsmLayer {
                 v_ptr,
                 gate_ptr,
                 beta_ptr,
-                gdn_bufs.output,
+                out_ptr,
                 1,
                 total,
                 nk as u32,
@@ -424,7 +528,7 @@ impl Qwen3SsmLayer {
                 v_ptr,
                 gate_ptr,
                 beta_ptr,
-                gdn_bufs.output,
+                out_ptr,
                 1,
                 total,
                 nk as u32,
@@ -437,40 +541,6 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
-
-        if let Some(t0) = __gdn_t0 {
-            ctx.gpu.synchronize(stream)?;
-            let ns = t0.elapsed().as_nanos() as u64;
-            GDN_CALLS.fetch_add(1, Ordering::Relaxed);
-            GDN_TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
-            // "large" bucket = total >= 256 (typical chunked-prefill chunk).
-            if total >= 256 {
-                GDN_LARGE_CALLS.fetch_add(1, Ordering::Relaxed);
-                GDN_LARGE_NS.fetch_add(ns, Ordering::Relaxed);
-            }
-            // Track per-call max so a single very-large call shows up.
-            let mut prev = GDN_MAX_NS.load(Ordering::Relaxed);
-            while ns > prev {
-                match GDN_MAX_NS.compare_exchange_weak(
-                    prev,
-                    ns,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        GDN_MAX_TOTAL.store(total as u64, Ordering::Relaxed);
-                        break;
-                    }
-                    Err(p) => prev = p,
-                }
-            }
-            tracing::info!(
-                "GDN_PROF call total={total} us={} max_us={}",
-                ns / 1000,
-                GDN_MAX_NS.load(Ordering::Relaxed) / 1000
-            );
-        }
-
         Ok(())
     }
 

@@ -24,7 +24,7 @@ use super::layer::FfnActivation;
 use super::policy::{
     CublasLtMergedGateUpPolicy, FlashInferFfnAvailability, cublaslt_fused_silu_quantize_scale,
     cublaslt_merged_gate_up_allow_materialize, cublaslt_merged_gate_up_policy,
-    cublaslt_merged_gate_up_vram_ok_for_sm, cublaslt_nvfp4_route_enabled,
+    cublaslt_merged_gate_up_vram_ok_for_sm, cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill,
     ffn_prefill_fused_norm_enabled, ffn_prefill_l2_strip_rows, gpu_sm_count,
     prefill_ffn_cublaslt_nvfp4_policy, select_cublaslt_quantize_128x4_kernel,
     select_merged_silu_quant_kernel,
@@ -402,7 +402,7 @@ impl DenseFfnLayer {
             self.nvfp4_quantize_128x4_k,
         )
         .0 != 0;
-        if !cublaslt_nvfp4_route_enabled(
+        if !cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
             prefill_ffn_cublaslt_nvfp4_policy(),
             cc,
             flashinfer_ffn,
@@ -411,6 +411,7 @@ impl DenseFfnLayer {
             inter,
             has_quantizer_128x4,
             has_scale_source,
+            ops::gb10_fast_prefill_enabled(),
         ) {
             return Ok(false);
         }
@@ -564,7 +565,11 @@ impl DenseFfnLayer {
                     merged_scalars,
                     stream,
                 )?;
-                if ops::fused_rmsnorm_nvfp4_policy()? == ops::FusedRmsNormNvfp4Policy::Enabled {
+                let fused_silu_policy = ops::effective_fused_rmsnorm_nvfp4_policy()?;
+                let use_fused_silu = fused_silu_policy.is_fail_closed()
+                    || (fused_silu_policy.is_enabled()
+                        && self.fused_rmsnorm_nvfp4_k.has_silu_mul());
+                if use_fused_silu {
                     self.launch_fused_silu_nvfp4(
                         ctx.gpu,
                         merged_out,
@@ -657,7 +662,11 @@ impl DenseFfnLayer {
                 )?;
                 let (down_a_packed, down_a_scale, _) =
                     self.ensure_e2m1_scratch(ctx.gpu, m as usize, inter as usize)?;
-                if ops::fused_rmsnorm_nvfp4_policy()? == ops::FusedRmsNormNvfp4Policy::Enabled {
+                let fused_silu_policy = ops::effective_fused_rmsnorm_nvfp4_policy()?;
+                let use_fused_silu = fused_silu_policy.is_fail_closed()
+                    || (fused_silu_policy.is_enabled()
+                        && self.fused_rmsnorm_nvfp4_k.has_silu_mul());
+                if use_fused_silu {
                     self.launch_fused_silu_nvfp4(
                         ctx.gpu,
                         merged_out,
@@ -875,7 +884,7 @@ impl DenseFfnLayer {
             self.nvfp4_quantize_128x4_k,
         )
         .0 != 0;
-        if !cublaslt_nvfp4_route_enabled(
+        if !cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
             prefill_ffn_cublaslt_nvfp4_policy(),
             cc,
             flashinfer_ffn,
@@ -884,6 +893,7 @@ impl DenseFfnLayer {
             inter,
             has_quantizer_128x4,
             true,
+            ops::gb10_fast_prefill_enabled(),
         ) {
             return Ok(false);
         }
@@ -1230,7 +1240,7 @@ impl DenseFfnLayer {
         {
             return Ok(false);
         }
-        if !cublaslt_nvfp4_route_enabled(
+        if !cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
             prefill_ffn_cublaslt_nvfp4_policy(),
             cc,
             flashinfer_ffn,
@@ -1239,6 +1249,7 @@ impl DenseFfnLayer {
             inter,
             true,
             true,
+            ops::gb10_fast_prefill_enabled(),
         ) {
             return Ok(false);
         }

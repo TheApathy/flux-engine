@@ -891,7 +891,10 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<(DevicePtr, DevicePtr, f32)> {
         let (a_packed, a_scale, _) = self.ensure_e2m1_scratch(ctx.gpu, m as usize, k as usize)?;
-        if ops::fused_rmsnorm_nvfp4_policy()? == ops::FusedRmsNormNvfp4Policy::Enabled {
+        let fused_silu_policy = ops::effective_fused_rmsnorm_nvfp4_policy()?;
+        let use_fused_silu = fused_silu_policy.is_fail_closed()
+            || (fused_silu_policy.is_enabled() && self.fused_rmsnorm_nvfp4_k.has_silu_mul());
+        if use_fused_silu {
             self.launch_fused_silu_nvfp4(
                 ctx.gpu,
                 gate,
@@ -1381,7 +1384,7 @@ impl DenseFfnLayer {
             down_plan.k,
             1,
         )?;
-        let fused_rmsnorm_policy = ops::fused_rmsnorm_nvfp4_policy()?;
+        let fused_rmsnorm_policy = ops::effective_fused_rmsnorm_nvfp4_policy()?;
         let mut merged_launch =
             route
                 .library
@@ -1447,7 +1450,9 @@ impl DenseFfnLayer {
             },
             stream,
         )?;
-        if fused_rmsnorm_policy == ops::FusedRmsNormNvfp4Policy::Enabled {
+        if fused_rmsnorm_policy.is_fail_closed()
+            || (fused_rmsnorm_policy.is_enabled() && self.fused_rmsnorm_nvfp4_k.has_silu_mul())
+        {
             self.launch_fused_silu_nvfp4(
                 ctx.gpu,
                 merged_out,
