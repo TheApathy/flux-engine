@@ -278,6 +278,17 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "dual_plane_nvfp4_verify_gemv_batch",
         ),
     ),
+    (
+        "kernels/gb10/common/lm_head_nvfp4_argmax_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "lm_head_nvfp4_argmax_partial_sm120",
+            "lm_head_argmax_reduce_sm120",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(

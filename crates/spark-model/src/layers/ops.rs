@@ -97,6 +97,8 @@ mod kv_cache;
 mod kv_cache_fp8k;
 #[path = "ops/kv_cache_turbok.rs"]
 mod kv_cache_turbok;
+#[path = "ops/lm_head_argmax.rs"]
+pub mod lm_head_argmax;
 #[path = "ops/moe_down_act.rs"]
 mod moe_down_act;
 #[path = "ops/moe_expert.rs"]
@@ -206,6 +208,7 @@ pub use glm53_vision::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
+pub use lm_head_argmax::*;
 pub use moe_down_act::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;
