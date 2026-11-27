@@ -902,6 +902,8 @@ pub fn step_mtp(
         think,
         cache_on_finish,
     );
+    let _suppress_single_async = (live_seqs > 1)
+        .then(spark_model::layers::dflash_head::async_propose::SingleSeqAsyncSuppressGuard::enter);
     for &idx in &serial_bootstrap_idxs {
         let a = &mut active[idx];
         if retire_cancelled_speculation(a, "mtp_before_bootstrap") {
@@ -1220,6 +1222,7 @@ pub fn step_mtp(
             fail_bootstrap(a, &mut cache_on_finish[idx], "start_checkpoint_async", e);
         }
     }
+    drop(_suppress_single_async);
 
     // A request may be cancelled while another sequence is bootstrapping.
     // Re-check the verify cohort before any batched or per-sequence verifier
@@ -1486,12 +1489,65 @@ pub fn step_mtp(
             leftover_idxs.extend(batched_idxs);
         }
         // Per-seq path for anything that didn't batch.
-        for &idx in &leftover_idxs {
+        {
+            let _suppress_single_async = (live_seqs > 1).then(
+                spark_model::layers::dflash_head::async_propose::SingleSeqAsyncSuppressGuard::enter,
+            );
+            for &idx in &leftover_idxs {
+                let a = &mut active[idx];
+                let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
+                if drafts.is_empty() {
+                    continue;
+                }
+                if !a.inside_thinking
+                    && let Some(ref mut gs) = a.grammar_state
+                {
+                    let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
+                    if !retain_prefix(
+                        &mut drafts,
+                        &mut a.pending_tree_payload,
+                        &mut a.pending_dflash_sampled_proposal,
+                        kept,
+                    ) {
+                        super::stochastic_verify_walk::invalidate_seq_rejection_q(a);
+                        continue;
+                    }
+                    super::stochastic_verify_walk::truncate_seq_rejection_q(a, drafts.len());
+                }
+                dispatch_verify(model, a, &drafts, num_drafts, think, depth_policy);
+            }
+        }
+        suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
+        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy);
+        return;
+    }
+
+    // ── Phase B (default per-seq path): Verify with pipelined checkpoint ──
+    {
+        let _suppress_single_async = (live_seqs > 1).then(
+            spark_model::layers::dflash_head::async_propose::SingleSeqAsyncSuppressGuard::enter,
+        );
+        for &idx in &verify_idxs {
             let a = &mut active[idx];
             let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
             if drafts.is_empty() {
                 continue;
             }
+
+            // Spec-decode boundary awareness (arXiv:2512.15834): when a
+            // grammar is active, validate the draft sequence against the
+            // matcher and truncate at the first token that crosses a
+            // grammar transition. Without this, a draft span that crosses
+            // `</function>` (or any other structural boundary) gets
+            // accepted by the verifier and emitted, but the post-emit
+            // `accept_token` silently fails — desync'ing the grammar
+            // from the output stream. Truncating here downgrades K=4 →
+            // K=3 → K=2 cleanly.
+            //
+            // Skipped inside `<think>` (reachable under default native-MTP
+            // thinking speculation or DFlash `ATLAS_THINK_SPEC=1`): thinking
+            // tokens never advance the grammar, so matcher validation would
+            // spuriously truncate to zero.
             if !a.inside_thinking
                 && let Some(ref mut gs) = a.grammar_state
             {
@@ -1507,62 +1563,19 @@ pub fn step_mtp(
                 }
                 super::stochastic_verify_walk::truncate_seq_rejection_q(a, drafts.len());
             }
+
+            // DFlash γ-block drafters return ≥4 drafts per step (γ=15 for a
+            // block-16 checkpoint, whose first row is the known anchor), so
+            // wide windows route through `step_verify_dflash`. Neutral MTP windows
+            // keep the fixed K2/K3/K4 graphs; short policy-sensitive windows also
+            // use the generic path because the fixed paths expose only raw argmax.
+            //
+            // Fix (2026-05-12): route by `drafts.len()` not `num_drafts`. DFlash
+            // produces a full γ-block regardless of `num_drafts`; capping via
+            // ATLAS_DFLASH_DRAFT_CAP should not force K=2 verify and discard
+            // valid drafts.
             dispatch_verify(model, a, &drafts, num_drafts, think, depth_policy);
         }
-        suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
-        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy);
-        return;
-    }
-
-    // ── Phase B (default per-seq path): Verify with pipelined checkpoint ──
-    for &idx in &verify_idxs {
-        let a = &mut active[idx];
-        let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
-        if drafts.is_empty() {
-            continue;
-        }
-
-        // Spec-decode boundary awareness (arXiv:2512.15834): when a
-        // grammar is active, validate the draft sequence against the
-        // matcher and truncate at the first token that crosses a
-        // grammar transition. Without this, a draft span that crosses
-        // `</function>` (or any other structural boundary) gets
-        // accepted by the verifier and emitted, but the post-emit
-        // `accept_token` silently fails — desync'ing the grammar
-        // from the output stream. Truncating here downgrades K=4 →
-        // K=3 → K=2 cleanly.
-        //
-        // Skipped inside `<think>` (reachable under default native-MTP
-        // thinking speculation or DFlash `ATLAS_THINK_SPEC=1`): thinking
-        // tokens never advance the grammar, so matcher validation would
-        // spuriously truncate to zero.
-        if !a.inside_thinking
-            && let Some(ref mut gs) = a.grammar_state
-        {
-            let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
-            if !retain_prefix(
-                &mut drafts,
-                &mut a.pending_tree_payload,
-                &mut a.pending_dflash_sampled_proposal,
-                kept,
-            ) {
-                super::stochastic_verify_walk::invalidate_seq_rejection_q(a);
-                continue;
-            }
-            super::stochastic_verify_walk::truncate_seq_rejection_q(a, drafts.len());
-        }
-
-        // DFlash γ-block drafters return ≥4 drafts per step (γ=15 for a
-        // block-16 checkpoint, whose first row is the known anchor), so
-        // wide windows route through `step_verify_dflash`. Neutral MTP windows
-        // keep the fixed K2/K3/K4 graphs; short policy-sensitive windows also
-        // use the generic path because the fixed paths expose only raw argmax.
-        //
-        // Fix (2026-05-12): route by `drafts.len()` not `num_drafts`. DFlash
-        // produces a full γ-block regardless of `num_drafts`; capping via
-        // ATLAS_DFLASH_DRAFT_CAP should not force K=2 verify and discard
-        // valid drafts.
-        dispatch_verify(model, a, &drafts, num_drafts, think, depth_policy);
     }
     suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
     post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy);

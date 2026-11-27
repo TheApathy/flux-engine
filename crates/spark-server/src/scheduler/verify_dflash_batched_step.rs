@@ -244,6 +244,8 @@ pub(super) fn step_verify_dflash_batched(
         }
     }
 
+    let _suppress_single_async = (propose_idxs.len() > 1)
+        .then(spark_model::layers::dflash_head::async_propose::SingleSeqAsyncSuppressGuard::enter);
     for &idx in &propose_idxs {
         let a = &mut active[idx];
         let token = a.last_token;

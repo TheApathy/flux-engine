@@ -97,6 +97,44 @@ pub fn dflash_early_stage1_enabled() -> bool {
     })
 }
 
+thread_local! {
+    static SINGLE_SEQ_ASYNC_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returns `true` while the current scheduler thread is executing a serial
+/// per-sequence loop over multiple live sequences (`live_seqs > 1`).
+///
+/// Single-sequence `try_launch_async_propose` owns one shared `async_inflight`
+/// slot and one shared scratch buffer; launching it inside a serial loop for
+/// sequence `i + 1` discards sequence `i`'s in-flight placeholder and causes
+/// repeated bootstrap degradation. Cross-sequence batched `propose_batch_dflash2`
+/// (`AsyncBatchedInflight`) is unaffected by this guard.
+#[inline]
+#[must_use]
+pub fn single_seq_async_suppressed() -> bool {
+    SINGLE_SEQ_ASYNC_SUPPRESSED.with(std::cell::Cell::get)
+}
+
+/// Panic-safe RAII guard that suppresses single-sequence `try_launch_async_propose`
+/// while a serial multi-sequence loop runs, restoring the previous state on drop.
+pub struct SingleSeqAsyncSuppressGuard {
+    prev: bool,
+}
+
+impl SingleSeqAsyncSuppressGuard {
+    #[must_use]
+    pub fn enter() -> Self {
+        let prev = SINGLE_SEQ_ASYNC_SUPPRESSED.with(|cell| cell.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for SingleSeqAsyncSuppressGuard {
+    fn drop(&mut self) {
+        SINGLE_SEQ_ASYNC_SUPPRESSED.with(|cell| cell.set(self.prev));
+    }
+}
+
 /// Returns `true` iff `layer_idx` is the deepest (final) DFlash capture layer
 /// in `capture_layers` (e.g. Layer `61` for 27B `[5, 19, 33, 47, 61]` or Layer
 /// `45` for Flash-Next `[5, 15, 25, 35, 45]`). Empty `capture_layers` returns `false`.
@@ -909,7 +947,7 @@ impl BlockDiffusionDraftHead {
         dstate: &mut DflashProposerState,
     ) -> Result<Option<Vec<u32>>> {
         budget.validate_flat_width(budget.flat)?;
-        if !dflash_async_enabled() {
+        if !dflash_async_enabled() || single_seq_async_suppressed() {
             return Ok(None);
         }
         // Sampled q has three paired D2H outputs and a drain-once scheduler
@@ -2329,5 +2367,20 @@ mod tests {
 
         head.resolve_async_inflight_impl(&gpu, None).unwrap();
         head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn single_seq_async_suppress_guard_nests_and_restores_on_drop() {
+        assert!(!single_seq_async_suppressed());
+        {
+            let _outer = SingleSeqAsyncSuppressGuard::enter();
+            assert!(single_seq_async_suppressed());
+            {
+                let _inner = SingleSeqAsyncSuppressGuard::enter();
+                assert!(single_seq_async_suppressed());
+            }
+            assert!(single_seq_async_suppressed());
+        }
+        assert!(!single_seq_async_suppressed());
     }
 }
