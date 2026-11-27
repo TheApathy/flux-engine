@@ -265,6 +265,14 @@ fn path_b_mlp_sidecar_roundtrip_auth_and_scoring() {
         Err(GateSightError::InvalidSidecar(_))
     ));
 
+    // Tampering with header byte 32 (`activation` tag: Relu 0 -> Silu 1) must also fail SHA-256.
+    let mut header_tampered = bytes.clone();
+    header_tampered[32] = 1;
+    assert!(matches!(
+        GateSightMlpSidecar::from_bytes(&header_tampered),
+        Err(GateSightError::InvalidSidecar(_))
+    ));
+
     // Score two tokens: token 1 has much higher beta on (layer 0, head 0) -> strictly higher score.
     let desc = GdnSignalRingDescriptor::new(window_gdn_layers, 16, num_v_heads).expect("ring");
     let mut ring = GdnSignalRingHost::new(desc);
@@ -316,7 +324,51 @@ fn env_config_defaults_off_and_rejects_invalid_values() {
     assert_eq!(path_a.mode, GateSightMode::PathABlock16);
     assert!((path_a.target_retention - 0.5).abs() < 1e-6);
 
+    // Path B fails closed without a sidecar path and succeeds when one is provided.
+    assert!(GateSightConfig::from_env_values(Some("path_b"), Some("0.25"), None).is_err());
+    let path_b =
+        GateSightConfig::from_env_values(Some("path_b"), Some("0.25"), Some("/tmp/gatesight.bin"))
+            .expect("path_b with sidecar");
+    assert_eq!(path_b.mode, GateSightMode::PathBMlp);
+    assert!(path_b.sidecar_path.is_some());
+
     assert!(GateSightConfig::from_env_values(Some("bogus"), None, None).is_err());
     assert!(GateSightConfig::from_env_values(Some("path_a"), Some("1.5"), None).is_err());
     assert!(GateSightConfig::from_env_values(Some("path_a"), Some("0.0"), None).is_err());
+}
+
+#[test]
+fn scorer_and_allocator_reject_nan_shape_mismatch_and_overflow_without_panicking() {
+    // Mismatched w2 length in score_feature must return Err, not panic.
+    let bad_w2 = HeadMlpWeights {
+        w1: vec![0.0; 4],
+        b1: vec![0.0; 2],
+        w2: vec![0.0; 1], // shorter than hidden_dim=2
+        b2: 0.0,
+    };
+    assert!(matches!(
+        bad_w2.score_feature(&[1.0, 2.0], MlpActivation::Relu),
+        Err(GateSightError::DimensionMismatch { .. })
+    ));
+
+    // Non-finite weights must fail validation.
+    let nan_head = HeadMlpWeights {
+        w1: vec![f32::NAN; 4],
+        b1: vec![0.0; 2],
+        w2: vec![0.0; 2],
+        b2: 0.0,
+    };
+    assert!(matches!(
+        nan_head.validate(2, 2),
+        Err(GateSightError::InvalidSidecar(_))
+    ));
+
+    // Overflowing min_per_layer * n returns InvalidConfig; usize::MAX max_per_layer saturates cleanly.
+    assert!(matches!(
+        allocate_layer_budgets(&[0.5, 0.5], 10, usize::MAX, usize::MAX),
+        Err(GateSightError::InvalidConfig(_))
+    ));
+    let sat = allocate_layer_budgets(&[0.25, 0.75], 100, 0, usize::MAX)
+        .expect("saturating max_per_layer");
+    assert_eq!(sat[0].kept_items + sat[1].kept_items, 100);
 }

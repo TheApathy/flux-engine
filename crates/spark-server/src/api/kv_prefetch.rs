@@ -21,7 +21,7 @@ use spark_storage::{
     PrefixSnapshotKey, PrefixSnapshotPayload, PrefixSnapshotStore, PrefixSnapshotStoreConfig,
     SnapshotKvDtype,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 use super::compact::openai_error_response;
 use crate::main_modules::model_host::ModelHost;
@@ -34,6 +34,9 @@ pub const DEFAULT_PREFETCH_SAFETY_MARGIN_SECS: f64 = 0.05;
 
 /// Maximum client-requested TTL to prevent unbounded eternal pinning (1 hour).
 pub const MAX_PREFETCH_TTL_SECS: u64 = 3600;
+
+/// Maximum permitted TripleKV Eq. (1) issue delay (seconds) to prevent unbounded sleep DoS.
+pub const MAX_PREFETCH_ISSUE_DELAY_SECS: f64 = MAX_PREFETCH_TTL_SECS as f64;
 
 /// Maximum number of concurrent async L3 -> L2 snapshot reads.
 const MAX_CONCURRENT_PREFETCH_IO: usize = 4;
@@ -79,20 +82,28 @@ pub struct PrefetchSchedule {
 /// Compute TripleKV Eq. (1) relative issue delay:
 /// `delta_t_issue = max(0, remaining_tool_secs + queue_wait_secs - snapshot_bytes / B - eps)`.
 ///
+/// Rejects non-finite, negative, or excessively large delays (`> MAX_PREFETCH_ISSUE_DELAY_SECS`)
+/// without panicking so untrusted HTTP JSON cannot crash handlers or pin long-lived sleeping tasks.
+///
 /// # Errors
-/// Returns an error message when bandwidth is non-positive/non-finite or timing inputs are invalid.
+/// Returns an error message when bandwidth is non-positive/non-finite or timing inputs are invalid
+/// or exceed [`MAX_PREFETCH_ISSUE_DELAY_SECS`].
 pub fn compute_prefetch_schedule(
     input: PrefetchScheduleInput,
 ) -> std::result::Result<PrefetchSchedule, String> {
-    if !input.remaining_tool_secs.is_finite() || input.remaining_tool_secs < 0.0 {
+    if !input.remaining_tool_secs.is_finite()
+        || !(0.0..=MAX_PREFETCH_ISSUE_DELAY_SECS).contains(&input.remaining_tool_secs)
+    {
         return Err(format!(
-            "remaining_tool_secs={} must be finite and >= 0",
+            "remaining_tool_secs={} must be finite and in [0, {MAX_PREFETCH_ISSUE_DELAY_SECS}]",
             input.remaining_tool_secs
         ));
     }
-    if !input.queue_wait_secs.is_finite() || input.queue_wait_secs < 0.0 {
+    if !input.queue_wait_secs.is_finite()
+        || !(0.0..=MAX_PREFETCH_ISSUE_DELAY_SECS).contains(&input.queue_wait_secs)
+    {
         return Err(format!(
-            "queue_wait_secs={} must be finite and >= 0",
+            "queue_wait_secs={} must be finite and in [0, {MAX_PREFETCH_ISSUE_DELAY_SECS}]",
             input.queue_wait_secs
         ));
     }
@@ -102,16 +113,26 @@ pub fn compute_prefetch_schedule(
             input.nvme_bandwidth_bps
         ));
     }
-    if !input.safety_margin_secs.is_finite() || input.safety_margin_secs < 0.0 {
+    if !input.safety_margin_secs.is_finite()
+        || !(0.0..=MAX_PREFETCH_ISSUE_DELAY_SECS).contains(&input.safety_margin_secs)
+    {
         return Err(format!(
-            "safety_margin_secs={} must be finite and >= 0",
+            "safety_margin_secs={} must be finite and in [0, {MAX_PREFETCH_ISSUE_DELAY_SECS}]",
             input.safety_margin_secs
         ));
     }
 
     let io_load_secs = (input.snapshot_bytes as f64) / input.nvme_bandwidth_bps;
+    if !io_load_secs.is_finite() {
+        return Err("computed io_load_secs overflowed f64".to_string());
+    }
     let raw_delay =
         input.remaining_tool_secs + input.queue_wait_secs - io_load_secs - input.safety_margin_secs;
+    if !raw_delay.is_finite() || raw_delay > MAX_PREFETCH_ISSUE_DELAY_SECS {
+        return Err(format!(
+            "computed issue delay ({raw_delay}s) exceeds max allowed {MAX_PREFETCH_ISSUE_DELAY_SECS}s"
+        ));
+    }
     if raw_delay <= 0.0 {
         Ok(PrefetchSchedule {
             io_load_secs,
@@ -119,9 +140,11 @@ pub fn compute_prefetch_schedule(
             immediate: true,
         })
     } else {
+        let issue_delay = Duration::try_from_secs_f64(raw_delay)
+            .map_err(|err| format!("invalid issue delay {raw_delay}s: {err}"))?;
         Ok(PrefetchSchedule {
             io_load_secs,
-            issue_delay: Duration::from_secs_f64(raw_delay),
+            issue_delay,
             immediate: false,
         })
     }
@@ -365,7 +388,7 @@ pub struct PrefetchParams {
 
 /// Async TripleKV L3 -> L2 prefetch coordinator wired into [`ModelHost`].
 pub struct KvPrefetcher {
-    store: Option<Arc<Mutex<PrefixSnapshotStore>>>,
+    store: Option<Arc<AsyncMutex<PrefixSnapshotStore>>>,
     radix_tree: RwLock<Option<Arc<RadixTree>>>,
     staged: Arc<Mutex<StagedPrefetchCache>>,
     predictor: Mutex<ToolLatencyPredictor>,
@@ -422,7 +445,7 @@ impl KvPrefetcher {
         radix_tree: Option<Arc<RadixTree>>,
     ) -> Self {
         Self {
-            store: store.map(|s| Arc::new(Mutex::new(s))),
+            store: store.map(|s| Arc::new(AsyncMutex::new(s))),
             radix_tree: RwLock::new(radix_tree),
             staged: Arc::new(Mutex::new(StagedPrefetchCache::new(
                 DEFAULT_MAX_STAGED_ENTRIES,
@@ -470,10 +493,13 @@ impl KvPrefetcher {
 
     /// Schedule an async TripleKV L3 -> L2 prefetch and tag matching live `RadixTree` nodes.
     ///
+    /// Uses an async-aware [`tokio::sync::Mutex`] around [`PrefixSnapshotStore`] so concurrent
+    /// requests never block a Tokio worker thread while a `spawn_blocking` NVMe read runs.
+    ///
     /// # Errors
     /// Returns `(StatusCode, String)` on invalid parameters (empty tokens, zero block_size,
-    /// invalid Eq. (1) schedule inputs).
-    pub fn schedule_prefetch(
+    /// invalid Eq. (1) schedule inputs, or out-of-range durations).
+    pub async fn schedule_prefetch(
         &self,
         params: PrefetchParams,
     ) -> std::result::Result<(StatusCode, KvPrefetchResponse), (StatusCode, String)> {
@@ -495,8 +521,19 @@ impl KvPrefetcher {
                 ),
             ));
         }
+        if let Some(obs) = params.tool_duration_observation_secs
+            && (!obs.is_finite() || !(0.0..=MAX_PREFETCH_ISSUE_DELAY_SECS).contains(&obs))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "tool_duration_observation_secs={obs} must be finite and in [0, {MAX_PREFETCH_ISSUE_DELAY_SECS}]"
+                ),
+            ));
+        }
 
-        // Update and query the per-tool latency predictor.
+        // Resolve tool remaining duration and validate Eq. (1) schedule parameters UPFRONT
+        // before any `already_hot`, `store_disabled`, or `miss_not_in_store` early return.
         let predicted_remaining = {
             let mut pred = self.predictor.lock();
             if let (Some(tool), Some(obs)) = (
@@ -514,6 +551,15 @@ impl KvPrefetcher {
                     .unwrap_or(0.0),
             }
         };
+
+        let zero_byte_sched = compute_prefetch_schedule(PrefetchScheduleInput {
+            remaining_tool_secs: predicted_remaining,
+            queue_wait_secs: params.queue_wait_secs,
+            snapshot_bytes: 0,
+            nvme_bandwidth_bps: params.nvme_bandwidth_bps,
+            safety_margin_secs: params.safety_margin_secs,
+        })
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
 
         let aligned_slice = &params.tokens[..aligned_tokens];
         let key = PrefixSnapshotKey::from_tokens(
@@ -557,14 +603,6 @@ impl KvPrefetcher {
         }
 
         let Some(store) = self.store.as_ref().map(Arc::clone) else {
-            let sched = compute_prefetch_schedule(PrefetchScheduleInput {
-                remaining_tool_secs: predicted_remaining,
-                queue_wait_secs: params.queue_wait_secs,
-                snapshot_bytes: 0,
-                nvme_bandwidth_bps: params.nvme_bandwidth_bps,
-                safety_margin_secs: params.safety_margin_secs,
-            })
-            .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
             return Ok((
                 StatusCode::OK,
                 KvPrefetchResponse {
@@ -573,15 +611,15 @@ impl KvPrefetcher {
                     aligned_tokens,
                     block_size: params.block_size,
                     snapshot_bytes: None,
-                    issue_delay_secs: sched.issue_delay.as_secs_f64(),
-                    io_load_secs: sched.io_load_secs,
+                    issue_delay_secs: zero_byte_sched.issue_delay.as_secs_f64(),
+                    io_load_secs: zero_byte_sched.io_load_secs,
                     ttl_secs: ttl.as_secs(),
                     radix_nodes_protected,
                 },
             ));
         };
 
-        let snapshot_bytes = store.lock().contains_bytes(&key);
+        let snapshot_bytes = store.lock().await.contains_bytes(&key);
         let Some(bytes) = snapshot_bytes else {
             self.miss_total.fetch_add(1, Ordering::Relaxed);
             return Ok((
@@ -627,13 +665,16 @@ impl KvPrefetcher {
             let Ok(_permit) = io_permits.acquire_owned().await else {
                 return;
             };
-            let load_result = tokio::task::spawn_blocking(move || store.lock().get(&key)).await;
+            let mut store_guard = store.lock_owned().await;
+            let load_result = tokio::task::spawn_blocking(move || store_guard.get(&key)).await;
             match load_result {
                 Ok(Ok(Some(payload))) => {
                     let finish_now = Instant::now();
-                    staged
-                        .lock()
-                        .insert(task_content_id, payload, finish_now + ttl);
+                    let expires_at = finish_now
+                        .checked_add(ttl)
+                        .or_else(|| finish_now.checked_add(DEFAULT_PREFETCH_TTL))
+                        .unwrap_or(finish_now);
+                    staged.lock().insert(task_content_id, payload, expires_at);
                     if let Some(tree) = radix_tree {
                         let _ = tree.set_prefix_protection(
                             &aligned_owned,
@@ -777,7 +818,7 @@ pub async fn kv_cache_prefetch(
         tool_duration_observation_secs: req.tool_duration_observation_secs,
     };
 
-    match host.kv_prefetcher().schedule_prefetch(params) {
+    match host.kv_prefetcher().schedule_prefetch(params).await {
         Ok((status, body)) => (status, Json(body)).into_response(),
         Err((status, msg)) => openai_error_response(status, msg),
     }

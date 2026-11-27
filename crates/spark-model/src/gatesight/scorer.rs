@@ -217,12 +217,15 @@ pub struct HeadMlpWeights {
 }
 
 impl HeadMlpWeights {
-    /// Validate tensor shapes against `(input_dim, hidden_dim)`.
+    /// Validate tensor shapes and finiteness against `(input_dim, hidden_dim)`.
     ///
     /// # Errors
-    /// Returns [`GateSightError::DimensionMismatch`] on any shape mismatch.
+    /// Returns [`GateSightError::DimensionMismatch`] on any shape mismatch or
+    /// [`GateSightError::InvalidSidecar`] if any weight or bias is NaN/Inf.
     pub fn validate(&self, input_dim: usize, hidden_dim: usize) -> Result<()> {
-        let expected_w1 = hidden_dim * input_dim;
+        let expected_w1 = hidden_dim.checked_mul(input_dim).ok_or_else(|| {
+            GateSightError::InvalidSidecar("HeadMlpWeights w1 size overflow".to_string())
+        })?;
         if self.w1.len() != expected_w1 {
             return Err(GateSightError::DimensionMismatch {
                 context: "HeadMlpWeights::w1",
@@ -244,13 +247,22 @@ impl HeadMlpWeights {
                 actual: self.w2.len(),
             });
         }
+        if !self.b2.is_finite()
+            || !self.w1.iter().all(|v| v.is_finite())
+            || !self.b1.iter().all(|v| v.is_finite())
+            || !self.w2.iter().all(|v| v.is_finite())
+        {
+            return Err(GateSightError::InvalidSidecar(
+                "MLP weights and biases must all be finite".to_string(),
+            ));
+        }
         Ok(())
     }
 
     /// Evaluate `sigmoid(w2 . act(w1 . x + b1) + b2)` for one feature vector `x`.
     ///
     /// # Errors
-    /// Returns [`GateSightError::DimensionMismatch`] if `x.len()` does not match `w1`.
+    /// Returns [`GateSightError::DimensionMismatch`] if `x`, `w1`, `b1`, or `w2` shapes disagree.
     pub fn score_feature(&self, x: &[f32], activation: MlpActivation) -> Result<f32> {
         let hidden_dim = self.b1.len();
         if hidden_dim == 0 {
@@ -258,14 +270,24 @@ impl HeadMlpWeights {
                 "MLP hidden_dim must be > 0".to_string(),
             ));
         }
-        let input_dim = self.w1.len() / hidden_dim;
-        if x.len() != input_dim {
+        if self.w2.len() != hidden_dim {
             return Err(GateSightError::DimensionMismatch {
-                context: "HeadMlpWeights::score_feature",
-                expected: input_dim,
-                actual: x.len(),
+                context: "HeadMlpWeights::w2",
+                expected: hidden_dim,
+                actual: self.w2.len(),
             });
         }
+        let expected_w1 = hidden_dim.checked_mul(x.len()).ok_or_else(|| {
+            GateSightError::InvalidConfig("HeadMlpWeights::w1 size overflow".to_string())
+        })?;
+        if self.w1.len() != expected_w1 {
+            return Err(GateSightError::DimensionMismatch {
+                context: "HeadMlpWeights::w1",
+                expected: expected_w1,
+                actual: self.w1.len(),
+            });
+        }
+        let input_dim = x.len();
         let mut logit = self.b2;
         for h in 0..hidden_dim {
             let row = &self.w1[h * input_dim..(h + 1) * input_dim];
@@ -325,7 +347,19 @@ impl GateSightMlpSidecar {
                 actual: self.layer_gate_weights.len(),
             });
         }
-        let expected_heads = self.num_attn_layers * self.num_kv_heads;
+        if !self
+            .layer_gate_weights
+            .iter()
+            .all(|w| w.is_finite() && *w >= 0.0)
+        {
+            return Err(GateSightError::InvalidSidecar(
+                "layer_gate_weights must all be finite and >= 0".to_string(),
+            ));
+        }
+        let expected_heads = self
+            .num_attn_layers
+            .checked_mul(self.num_kv_heads)
+            .ok_or_else(|| GateSightError::InvalidSidecar("head count overflow".to_string()))?;
         if self.heads.len() != expected_heads {
             return Err(GateSightError::DimensionMismatch {
                 context: "sidecar heads",
@@ -333,7 +367,12 @@ impl GateSightMlpSidecar {
                 actual: self.heads.len(),
             });
         }
-        let input_dim = self.input_dim();
+        let input_dim = self
+            .window_gdn_layers
+            .checked_mul(self.num_v_heads)
+            .and_then(|v| v.checked_mul(GATESIGHT_SIGNALS_PER_HEAD))
+            .and_then(|v| v.checked_add(GATESIGHT_AGE_FEATURES))
+            .ok_or_else(|| GateSightError::InvalidSidecar("input_dim overflow".to_string()))?;
         for head in &self.heads {
             head.validate(input_dim, self.hidden_dim)?;
         }
@@ -364,15 +403,43 @@ impl GateSightMlpSidecar {
 
     /// Serialize this sidecar into the SHA-256-authenticated `ATLGTS01` binary format.
     ///
+    /// The SHA-256 digest covers both the 40-byte header prefix (`magic`, `version`, dimensions,
+    /// `activation`, `payload_len`) and the full float payload so neither header fields nor weights
+    /// can be altered undetected.
+    ///
     /// # Errors
-    /// Propagates validation errors if dimensions are inconsistent.
+    /// Propagates validation errors if dimensions are inconsistent or exceed `u32::MAX`.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
+        let to_u32 = |val: usize, field: &'static str| -> Result<u32> {
+            u32::try_from(val).map_err(|_| {
+                GateSightError::InvalidSidecar(format!("{field}={val} exceeds u32::MAX"))
+            })
+        };
         let input_dim = self.input_dim();
-        let floats_per_head = self.hidden_dim * input_dim + 2 * self.hidden_dim + 1;
-        let payload_floats = self.num_attn_layers + self.heads.len() * floats_per_head;
-        let mut payload = Vec::with_capacity(payload_floats * std::mem::size_of::<f32>());
+        let floats_per_head = self
+            .hidden_dim
+            .checked_mul(input_dim)
+            .and_then(|v| {
+                self.hidden_dim
+                    .checked_mul(2)
+                    .and_then(|b| b.checked_add(1))
+                    .and_then(|b| v.checked_add(b))
+            })
+            .ok_or_else(|| {
+                GateSightError::InvalidSidecar("head parameter count overflow".into())
+            })?;
+        let payload_floats = self
+            .heads
+            .len()
+            .checked_mul(floats_per_head)
+            .and_then(|v| self.num_attn_layers.checked_add(v))
+            .ok_or_else(|| GateSightError::InvalidSidecar("payload float count overflow".into()))?;
+        let payload_bytes = payload_floats
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| GateSightError::InvalidSidecar("payload byte overflow".into()))?;
 
+        let mut payload = Vec::with_capacity(payload_bytes);
         for &w in &self.layer_gate_weights {
             payload.extend_from_slice(&w.to_le_bytes());
         }
@@ -389,20 +456,26 @@ impl GateSightMlpSidecar {
             payload.extend_from_slice(&head.b2.to_le_bytes());
         }
 
+        let mut header_prefix = Vec::with_capacity(40);
+        header_prefix.extend_from_slice(&GATESIGHT_SIDECAR_MAGIC);
+        header_prefix.extend_from_slice(&SIDECAR_FORMAT_VERSION.to_le_bytes());
+        header_prefix
+            .extend_from_slice(&to_u32(self.num_attn_layers, "num_attn_layers")?.to_le_bytes());
+        header_prefix.extend_from_slice(&to_u32(self.num_kv_heads, "num_kv_heads")?.to_le_bytes());
+        header_prefix
+            .extend_from_slice(&to_u32(self.window_gdn_layers, "window_gdn_layers")?.to_le_bytes());
+        header_prefix.extend_from_slice(&to_u32(self.num_v_heads, "num_v_heads")?.to_le_bytes());
+        header_prefix.extend_from_slice(&to_u32(self.hidden_dim, "hidden_dim")?.to_le_bytes());
+        header_prefix.extend_from_slice(&self.activation.wire_tag().to_le_bytes());
+        header_prefix.extend_from_slice(&to_u32(payload.len(), "payload_len")?.to_le_bytes());
+
         let mut sha = Sha256Context::new(&SHA256);
+        sha.update(&header_prefix);
         sha.update(&payload);
         let digest = sha.finish();
 
         let mut out = Vec::with_capacity(SIDECAR_HEADER_BYTES + payload.len());
-        out.extend_from_slice(&GATESIGHT_SIDECAR_MAGIC);
-        out.extend_from_slice(&SIDECAR_FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&(self.num_attn_layers as u32).to_le_bytes());
-        out.extend_from_slice(&(self.num_kv_heads as u32).to_le_bytes());
-        out.extend_from_slice(&(self.window_gdn_layers as u32).to_le_bytes());
-        out.extend_from_slice(&(self.num_v_heads as u32).to_le_bytes());
-        out.extend_from_slice(&(self.hidden_dim as u32).to_le_bytes());
-        out.extend_from_slice(&self.activation.wire_tag().to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&header_prefix);
         out.extend_from_slice(digest.as_ref());
         out.extend_from_slice(&payload);
         Ok(out)
@@ -456,11 +529,12 @@ impl GateSightMlpSidecar {
         }
 
         let mut sha = Sha256Context::new(&SHA256);
+        sha.update(&bytes[0..40]);
         sha.update(payload);
         let actual_digest = sha.finish();
         if actual_digest.as_ref() != expected_digest {
             return Err(GateSightError::InvalidSidecar(
-                "SHA-256 payload checksum mismatch".to_string(),
+                "SHA-256 header+payload checksum mismatch".to_string(),
             ));
         }
 
@@ -472,14 +546,23 @@ impl GateSightMlpSidecar {
         let total_heads = num_attn_layers
             .checked_mul(num_kv_heads)
             .ok_or_else(|| GateSightError::InvalidSidecar("head count overflow".into()))?;
-        let floats_per_head = hidden_dim
-            .checked_mul(input_dim)
-            .and_then(|v| v.checked_add(2 * hidden_dim + 1))
+        let bias_and_out = hidden_dim
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
             .ok_or_else(|| {
                 GateSightError::InvalidSidecar("head parameter count overflow".into())
             })?;
+        let floats_per_head = hidden_dim
+            .checked_mul(input_dim)
+            .and_then(|v| v.checked_add(bias_and_out))
+            .ok_or_else(|| {
+                GateSightError::InvalidSidecar("head parameter count overflow".into())
+            })?;
+        let head_floats = total_heads
+            .checked_mul(floats_per_head)
+            .ok_or_else(|| GateSightError::InvalidSidecar("payload float count overflow".into()))?;
         let expected_bytes = num_attn_layers
-            .checked_add(total_heads.saturating_mul(floats_per_head))
+            .checked_add(head_floats)
             .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
             .ok_or_else(|| GateSightError::InvalidSidecar("payload byte overflow".into()))?;
 

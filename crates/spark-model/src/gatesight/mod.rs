@@ -179,14 +179,15 @@ impl GateSightConfig {
     /// Parse opt-in configuration from process environment variables.
     ///
     /// Defaults cleanly to [`GateSightMode::Disabled`] when [`GATESIGHT_EVICT_ENV`] is unset.
+    /// Fails closed on non-UTF-8 environment values (`VarError::NotUnicode`).
     ///
     /// # Errors
-    /// Returns [`GateSightError::InvalidConfig`] on unrecognized mode values, out-of-range
-    /// retention ratios, or missing sidecar path when `path_b` is explicitly requested.
+    /// Returns [`GateSightError::InvalidConfig`] on non-UTF-8 or unrecognized mode values,
+    /// out-of-range retention ratios, or missing sidecar path when `path_b` is selected.
     pub fn from_env() -> Result<Self> {
-        let mode_raw = std::env::var(GATESIGHT_EVICT_ENV).ok();
-        let retention_raw = std::env::var(GATESIGHT_RETENTION_ENV).ok();
-        let sidecar_raw = std::env::var(GATESIGHT_SIDECAR_PATH_ENV).ok();
+        let mode_raw = read_optional_env(GATESIGHT_EVICT_ENV)?;
+        let retention_raw = read_optional_env(GATESIGHT_RETENTION_ENV)?;
+        let sidecar_raw = read_optional_env(GATESIGHT_SIDECAR_PATH_ENV)?;
         Self::from_env_values(
             mode_raw.as_deref(),
             retention_raw.as_deref(),
@@ -273,7 +274,22 @@ impl GateSightConfig {
                 self.slow_head_half_life_tokens
             )));
         }
+        if self.mode == GateSightMode::PathBMlp && self.sidecar_path.is_none() {
+            return Err(GateSightError::InvalidConfig(format!(
+                "path_b requires {GATESIGHT_SIDECAR_PATH_ENV} to point to an ATLGTS01 sidecar"
+            )));
+        }
         Ok(())
+    }
+}
+
+fn read_optional_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(GateSightError::InvalidConfig(format!(
+            "{name} contains non-UTF-8 bytes"
+        ))),
     }
 }
 

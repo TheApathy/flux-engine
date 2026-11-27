@@ -43,11 +43,16 @@ pub enum ProtectionClass {
 
 impl ProtectionClass {
     /// Construct a [`Self::Prefetched`] tag expiring `ttl` from `now`.
+    ///
+    /// Guards against [`Instant`] overflow on extreme durations by falling back to
+    /// [`DEFAULT_PREFETCH_TTL`].
     #[must_use]
     pub fn prefetched_until(now: Instant, ttl: Duration) -> Self {
-        Self::Prefetched {
-            expires_at: now + ttl,
-        }
+        let expires_at = now
+            .checked_add(ttl)
+            .or_else(|| now.checked_add(DEFAULT_PREFETCH_TTL))
+            .unwrap_or(now);
+        Self::Prefetched { expires_at }
     }
 
     /// Construct a [`Self::Prefetched`] tag expiring after [`DEFAULT_PREFETCH_TTL`].

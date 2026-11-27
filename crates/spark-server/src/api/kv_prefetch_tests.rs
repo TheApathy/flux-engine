@@ -65,6 +65,28 @@ fn eq1_issue_time_schedule_computes_exact_delay_and_clamps_to_zero() {
         })
         .is_err()
     );
+
+    // Extreme finite floats (`1e308`, `1e12`), NaN, and sum overflow must return Err (no panic / no sleep DoS).
+    for (rem, q) in [
+        (1e308, 0.0),
+        (1e308, 1e308),
+        (1e12, 0.0),
+        (3600.0, 1.0), // combined 3601s > MAX_PREFETCH_ISSUE_DELAY_SECS
+        (f64::NAN, 0.0),
+        (-1.0, 0.0),
+    ] {
+        assert!(
+            compute_prefetch_schedule(PrefetchScheduleInput {
+                remaining_tool_secs: rem,
+                queue_wait_secs: q,
+                snapshot_bytes: 0,
+                nvme_bandwidth_bps: 3.5e9,
+                safety_margin_secs: 0.0,
+            })
+            .is_err(),
+            "schedule with rem={rem}, q={q} must be rejected"
+        );
+    }
 }
 
 #[test]
@@ -176,7 +198,41 @@ async fn http_prefetch_route_loads_snapshot_tags_radix_and_serves_hot_hit() {
         "background prefetch must complete and stage L2 payload"
     );
 
-    // 2. Second request for the same prefix must report `already_hot` (200 OK).
+    // 2. Bad schedule parameters must fail closed with 400 EVEN when payload is already hot or missing!
+    let bad_hot_resp = kv_cache_prefetch(
+        State(Arc::clone(&host)),
+        Ok(axum::Json(
+            serde_json::from_value(serde_json::json!({
+                "token_ids": tokens,
+                "model_digest": "qwen3.8-27b",
+                "kv_dtype": "nvfp4",
+                "block_size": 16,
+                "predicted_tool_remaining_secs": 1e308,
+                "nvme_bandwidth_bps": -1.0
+            }))
+            .expect("bad hot req"),
+        )),
+    )
+    .await;
+    assert_eq!(bad_hot_resp.status(), StatusCode::BAD_REQUEST);
+
+    let bad_miss_resp = kv_cache_prefetch(
+        State(Arc::clone(&host)),
+        Ok(axum::Json(
+            serde_json::from_value(serde_json::json!({
+                "token_ids": (900..932).collect::<Vec<u32>>(),
+                "model_digest": "qwen3.8-27b",
+                "kv_dtype": "nvfp4",
+                "block_size": 16,
+                "nvme_bandwidth_bps": 0.0
+            }))
+            .expect("bad miss req"),
+        )),
+    )
+    .await;
+    assert_eq!(bad_miss_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Second valid request for the same prefix must report `already_hot` (200 OK).
     let resp2 = kv_cache_prefetch(
         State(Arc::clone(&host)),
         Ok(axum::Json(serde_json::from_value(req_body).expect("req"))),

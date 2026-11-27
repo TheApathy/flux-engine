@@ -144,17 +144,22 @@ impl StreamingTopKReservoir {
             self.heap.push(MinScoreEntry(item));
             return None;
         }
-        let weakest = self.heap.peek().expect("non-empty heap").0;
+        let Some(weakest) = self.heap.peek().copied().map(|entry| entry.0) else {
+            self.heap.push(MinScoreEntry(item));
+            return None;
+        };
         let incoming_beats_weakest = match item.score.total_cmp(&weakest.score) {
             Ordering::Greater => true,
             Ordering::Equal => item.index > weakest.index,
             Ordering::Less => false,
         };
         if incoming_beats_weakest {
-            let displaced = self.heap.pop().expect("non-empty heap").0.index;
+            let displaced = self.heap.pop().map(|entry| entry.0.index);
             self.heap.push(MinScoreEntry(item));
-            self.evicted_indices.push(displaced);
-            Some(displaced)
+            if let Some(idx) = displaced {
+                self.evicted_indices.push(idx);
+            }
+            displaced
         } else {
             self.evicted_indices.push(item.index);
             Some(item.index)
@@ -410,9 +415,15 @@ pub fn allocate_layer_budgets(
     }
 
     let n = layer_gate_weights.len();
-    let clamped_total = total_budget.clamp(min_per_layer * n, max_per_layer * n);
+    let min_total = min_per_layer.checked_mul(n).ok_or_else(|| {
+        GateSightError::InvalidConfig(format!(
+            "min_per_layer ({min_per_layer}) * num_layers ({n}) overflows usize"
+        ))
+    })?;
+    let max_total = max_per_layer.saturating_mul(n);
+    let clamped_total = total_budget.clamp(min_total, max_total);
     let mut alloc = vec![min_per_layer; n];
-    let mut remaining = clamped_total - min_per_layer * n;
+    let mut remaining = clamped_total - min_total;
 
     // Iteratively distribute remaining budget proportionally among layers below `max_per_layer`.
     while remaining > 0 {
