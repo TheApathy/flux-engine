@@ -21,6 +21,9 @@ use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
+use super::dcoco_weights::{
+    DcocoSidecarArtifact, DcocoSidecarReceipt, DcocoSidecarRequest, DcocoSidecarWeights,
+};
 use crate::device_allocations::DeviceAllocations;
 use crate::layers::ops::{
     DCOCO_PAIR_MAX_K, DcocoPairMlpArgs, DcocoProjFuseArgs, DcocoWalkArgs, DcocoWalkMode,
@@ -349,6 +352,7 @@ pub struct DcocoCorrector {
     pub weights: DcocoWeights,
     pub kernels: DcocoKernels,
     pub scratch: DcocoScratch,
+    owned_sidecar: Option<DcocoSidecarWeights>,
 }
 
 impl DcocoCorrector {
@@ -369,7 +373,70 @@ impl DcocoCorrector {
             weights,
             kernels,
             scratch,
+            owned_sidecar: None,
         })
+    }
+
+    /// Construct a DCOCO corrector by authenticating and uploading an `ATLDC001` sidecar.
+    ///
+    /// Rolls back all uploaded sidecar weight buffers automatically if kernel
+    /// loading or scratch allocation fails.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on sidecar authentication failure, `hidden_size` mismatch,
+    /// GPU upload failure, kernel load failure, or scratch allocation failure.
+    pub fn from_sidecar_request(
+        gpu: &dyn GpuBackend,
+        request: &DcocoSidecarRequest,
+        expected_hidden_size: usize,
+        max_batch: usize,
+        max_gamma: usize,
+    ) -> Result<Self> {
+        let artifact =
+            DcocoSidecarArtifact::load_authenticated(request, Some(expected_hidden_size))?;
+        let mut owned = artifact.upload_to_gpu(gpu)?;
+        let weights = owned.as_weights();
+        match Self::new(gpu, weights, max_batch, max_gamma) {
+            Ok(mut corrector) => {
+                corrector.owned_sidecar = Some(owned);
+                Ok(corrector)
+            }
+            Err(err) => {
+                owned.release(gpu);
+                Err(err)
+            }
+        }
+    }
+
+    /// Construct an optional DCOCO corrector from the three `ATLAS_DCOCO_SIDECAR*` env vars.
+    ///
+    /// Returns `Ok(None)` with zero allocations when all three env vars are absent
+    /// or empty (default OFF, bit-identical baseline).
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on partial or malformed env configuration, authentication
+    /// failure, or GPU initialization failure.
+    pub fn from_sidecar_env(
+        gpu: &dyn GpuBackend,
+        expected_hidden_size: usize,
+        max_batch: usize,
+        max_gamma: usize,
+    ) -> Result<Option<Self>> {
+        let Some(request) = DcocoSidecarRequest::from_env()? else {
+            return Ok(None);
+        };
+        Self::from_sidecar_request(gpu, &request, expected_hidden_size, max_batch, max_gamma)
+            .map(Some)
+    }
+
+    /// Cryptographic audit receipt when constructed from an authenticated `ATLDC001` sidecar.
+    #[must_use]
+    pub fn sidecar_receipt(&self) -> Option<&DcocoSidecarReceipt> {
+        self.owned_sidecar
+            .as_ref()
+            .and_then(DcocoSidecarWeights::receipt)
     }
 
     /// Execute the 3-stage DCOCO pipeline (`proj_fuse -> pair_mlp -> walk_and_export_q`)
@@ -473,9 +540,12 @@ impl DcocoCorrector {
         )
     }
 
-    /// Release owned device scratch buffers.
+    /// Release owned device scratch buffers and any uploaded sidecar weights.
     pub fn release(&mut self, gpu: &dyn GpuBackend) {
         self.scratch.free(gpu);
+        if let Some(sidecar) = &mut self.owned_sidecar {
+            sidecar.release(gpu);
+        }
     }
 }
 

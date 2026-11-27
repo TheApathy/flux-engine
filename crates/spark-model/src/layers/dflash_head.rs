@@ -2963,6 +2963,7 @@ pub(super) fn read_draft_probs_into(
 pub mod async_propose;
 mod batched_propose;
 pub mod dcoco;
+pub mod dcoco_weights;
 pub mod ddtree;
 pub mod ddtree_gdn_contract;
 pub mod ddtree_gdn_dispatch;
