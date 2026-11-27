@@ -267,6 +267,9 @@ impl DraftProposer for Qwen4MtpHead {
             || !mtp_chain_enabled()
             || self.embed_from_argmax_k.0 == 0
             || !self.propose_batch_rows_admits(b, ctx)
+            || (ctx.config.num_experts <= 1
+                && crate::layers::mtp_dloop::mtp_dloop_enabled()
+                && b <= crate::layers::mtp_dloop::MTP_DLOOP_MAX_CONCURRENCY)
         {
             return Ok(None);
         }

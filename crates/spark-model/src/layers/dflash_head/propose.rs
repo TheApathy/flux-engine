@@ -285,6 +285,7 @@ impl BlockDiffusionDraftHead {
                     dstate.echo_streak,
                 );
                 self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
                 flush_pending_ctx_on_default(
                     &mut pending_ctx_base,
                     &mut ctx_appended_span,
@@ -350,6 +351,7 @@ impl BlockDiffusionDraftHead {
                 dstate.first_propose_done = true;
                 dstate.pending_tree_payload = None;
                 self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
                 flush_pending_ctx_on_default(
                     &mut pending_ctx_base,
                     &mut ctx_appended_span,
@@ -597,6 +599,7 @@ impl BlockDiffusionDraftHead {
                 // entry to `propose_drafts`.)
                 dstate.pending_tree_payload = None;
                 self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
                 flush_pending_ctx_on_default(
                     &mut pending_ctx_base,
                     &mut ctx_appended_span,
@@ -712,6 +715,7 @@ impl BlockDiffusionDraftHead {
                 // identical dispatch to drafter output. No tree payload.
                 dstate.pending_tree_payload = None;
                 self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
                 flush_pending_ctx_on_default(
                     &mut pending_ctx_base,
                     &mut ctx_appended_span,
@@ -763,6 +767,7 @@ impl BlockDiffusionDraftHead {
                     dstate.fallback_suppressed_remaining
                 );
                 self.disarm_fused_overlap_event();
+                self.drain_early_stage1_impl(ctx.gpu)?;
                 flush_pending_ctx_on_default(
                     &mut pending_ctx_base,
                     &mut ctx_appended_span,
@@ -793,6 +798,7 @@ impl BlockDiffusionDraftHead {
                         cooldown
                     );
                     self.disarm_fused_overlap_event();
+                    self.drain_early_stage1_impl(ctx.gpu)?;
                     flush_pending_ctx_on_default(
                         &mut pending_ctx_base,
                         &mut ctx_appended_span,

@@ -2475,6 +2475,9 @@ impl TransformerModel {
                 .expect("unified PLE graph requires qwen4_ple");
             ple.upload_verify_records_inline_mmap(tokens, &seq.tokens, self.gpu.as_ref(), stream)?;
         }
+        // Drain any unconsumed early-started Stage-1 work on `pstream` BEFORE
+        // any layer or verify CUDA graph overwrites `self.dflash_hidden_save`.
+        self.try_drain_dflash_early_stage1()?;
         let mut active_layer0_cache_key: Option<VerifyKgammaGraphKey> = None;
         if qwen4_split_graph_prefix {
             if let Some(token_ids_dev) = layer0_token_ids_dev {
@@ -3445,7 +3448,24 @@ impl TransformerModel {
         // `hidden_norm` on `pstream` waiting on `dflash_capture_done_event`
         // BEFORE blocking on Phase 3's verify D2H so Stage-1 overlaps the
         // target's final layers + LM head + verify readback.
+        // RAII guard guarantees `pstream` is synchronized and cleared if any
+        // Phase 3 D2H / decode step returns an error.
         self.try_launch_dflash_early_stage1(seq, k, ctx.ddtree_parent_ids_dev.is_some())?;
+        struct EarlyStage1ErrorGuard<'a> {
+            model: &'a TransformerModel,
+            armed: bool,
+        }
+        impl Drop for EarlyStage1ErrorGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = self.model.try_drain_dflash_early_stage1();
+                }
+            }
+        }
+        let mut early_stage1_err_guard = EarlyStage1ErrorGuard {
+            model: self,
+            armed: true,
+        };
 
         // ── Phase 3: Post-graph (D2H copy only) ──
 
@@ -3671,6 +3691,7 @@ impl TransformerModel {
         }
         seq.seq_len += k;
 
+        early_stage1_err_guard.armed = false;
         Ok(out)
     }
 
@@ -3871,6 +3892,25 @@ impl TransformerModel {
             self.dflash_capture_done_event,
             state.as_mut(),
         )
+    }
+
+    /// Synchronize and clear any unconsumed early-started Stage-1 (`fc` +
+    /// `hidden_norm`) work on `pstream` before any target forward overwrites
+    /// `self.dflash_hidden_save`, or on Phase 3 readback errors.
+    /// Zero-cost single-branch no-op when `ATLAS_DFLASH_EARLY_STAGE1` is OFF.
+    pub(super) fn try_drain_dflash_early_stage1(&self) -> Result<()> {
+        if self.dflash_capture_done_event == 0
+            || !crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+        {
+            return Ok(());
+        }
+        let Some(proposer) = self.active_proposer() else {
+            return Ok(());
+        };
+        if !proposer.is_dflash() {
+            return Ok(());
+        }
+        proposer.drain_dflash_early_stage1(self.gpu.as_ref())
     }
 
     fn lookup_verify_kgamma_graph(&self, key: &VerifyKgammaGraphKey) -> Option<GraphHandle> {

@@ -2795,7 +2795,16 @@ pub fn parse_dflash_dense_pcum_opt_in(raw: Option<&str>) -> bool {
 /// Process-lifetime cached gate for `ATLAS_DFLASH_DENSE_PCUM=1` (default OFF).
 #[must_use]
 pub fn dflash_dense_pcum_opt_in() -> bool {
-    let read_live = || std::env::var(DFLASH_DENSE_PCUM_ENV).ok();
+    let read_live = || match std::env::var(DFLASH_DENSE_PCUM_ENV) {
+        Ok(val) => Some(val),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "{DFLASH_DENSE_PCUM_ENV} contains non-UTF-8 bytes; failing closed to OFF"
+            );
+            None
+        }
+    };
     #[cfg(not(test))]
     let raw = {
         static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -3786,6 +3795,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             capture_done_event,
             dstate,
         )
+    }
+
+    fn drain_dflash_early_stage1(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        self.drain_early_stage1_impl(gpu)
     }
 
     fn sync_target_config(

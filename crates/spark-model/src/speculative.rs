@@ -397,6 +397,16 @@ pub trait DraftProposer: Send + Sync {
         Ok(())
     }
 
+    /// ATLAS_DFLASH_EARLY_STAGE1=1: synchronize and discard any unconsumed
+    /// early-started Stage-1 (`fc` + `hidden_norm`) work on the propose stream
+    /// before `dflash_hidden_save` is overwritten by a subsequent target forward,
+    /// after a Phase 3 verify readback error, or on host-preempted early returns.
+    /// Default no-op; only `BlockDiffusionDraftHead` overrides.
+    fn drain_dflash_early_stage1(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        let _ = gpu;
+        Ok(())
+    }
+
     /// Drain any pending DDTree payload built by the most recent `propose()`
     /// call. Default returns `None` (flat MTP / ngram / flat DFlash).
     /// DDTree-capable drafters override to return + clear the payload stashed

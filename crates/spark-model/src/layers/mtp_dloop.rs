@@ -230,7 +230,14 @@ pub fn parse_mtp_dloop_thresh(raw: Option<&str>) -> f32 {
 #[must_use]
 pub fn mtp_dloop_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| parse_mtp_dloop_enabled(std::env::var(MTP_DLOOP_ENV).ok().as_deref()))
+    *ENABLED.get_or_init(|| match std::env::var(MTP_DLOOP_ENV) {
+        Ok(val) => parse_mtp_dloop_enabled(Some(&val)),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!("{MTP_DLOOP_ENV} contains non-UTF-8 bytes; failing closed to OFF");
+            false
+        }
+    })
 }
 
 /// Process-lifetime cached Stage-1 confidence threshold (`ATLAS_MTP_DLOOP_THRESH`,
@@ -238,8 +245,17 @@ pub fn mtp_dloop_enabled() -> bool {
 #[must_use]
 pub fn mtp_dloop_thresh() -> f32 {
     static THRESH: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *THRESH
-        .get_or_init(|| parse_mtp_dloop_thresh(std::env::var(MTP_DLOOP_THRESH_ENV).ok().as_deref()))
+    *THRESH.get_or_init(|| match std::env::var(MTP_DLOOP_THRESH_ENV) {
+        Ok(val) => parse_mtp_dloop_thresh(Some(&val)),
+        Err(std::env::VarError::NotPresent) => MTP_DLOOP_DEFAULT_LOGPROB_THRESH,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "{MTP_DLOOP_THRESH_ENV} contains non-UTF-8 bytes; using default \
+                 {MTP_DLOOP_DEFAULT_LOGPROB_THRESH}"
+            );
+            MTP_DLOOP_DEFAULT_LOGPROB_THRESH
+        }
+    })
 }
 
 /// Compute the required minimum SSM intermediate capacity for a model at load time.

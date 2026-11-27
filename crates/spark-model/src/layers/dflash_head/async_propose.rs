@@ -85,8 +85,15 @@ pub fn parse_dflash_early_stage1_enabled(raw: Option<&str>) -> bool {
 #[must_use]
 pub fn dflash_early_stage1_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        parse_dflash_early_stage1_enabled(std::env::var(DFLASH_EARLY_STAGE1_ENV).ok().as_deref())
+    *GATE.get_or_init(|| match std::env::var(DFLASH_EARLY_STAGE1_ENV) {
+        Ok(val) => parse_dflash_early_stage1_enabled(Some(&val)),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "{DFLASH_EARLY_STAGE1_ENV} contains non-UTF-8 bytes; failing closed to OFF"
+            );
+            false
+        }
     })
 }
 
@@ -770,6 +777,21 @@ impl BlockDiffusionDraftHead {
         Ok(true)
     }
 
+    /// Synchronize and discard any unconsumed early-started Stage-1 (`fc` +
+    /// `hidden_norm`) launch without disturbing `async_inflight` or
+    /// `async_batched_inflight`.
+    ///
+    /// Called before any target forward overwrites `dflash_hidden_save`, on
+    /// Phase 3 verify readback errors, and on host-preempted `propose_drafts`
+    /// early returns (Echo / PLD / Retrieval / Recycle / accept-fallback) so
+    /// `pstream` can never suffer a cross-stream WAR race on `dflash_hidden_save`.
+    pub(crate) fn drain_early_stage1_impl(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        if let Some(early) = self.early_stage1_staged.lock().take() {
+            gpu.synchronize(early.stream)?;
+        }
+        Ok(())
+    }
+
     /// Register a newly enqueued cross-sequence batched (`C >= 2`) async launch.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn register_async_batched_inflight(
@@ -1190,18 +1212,13 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .and_then(|batch| batch.owners.iter().position(|&id| id == owner_id))
         else {
-            // Foreign batched inflight handle while a different sequence is
-            // collecting: drain it only if its GPU work has not synchronized yet.
-            if let Some(stale) = guard.take() {
-                drop(guard);
-                if stale.materialized.is_none() {
-                    if let Err(error) = gpu.synchronize(stale.stream) {
-                        clear_proposal_outputs(dstate);
-                        return Err(error);
-                    }
-                    ASYNC_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            // Foreign sequence (either a non-placeholder Echo/PLD/Retrieval/
+            // Recycle/sync sequence sitting before or between cohort owners in
+            // `active`, or a placeholder owned by a single-seq handle): NEVER
+            // discard `self.async_batched_inflight` here — remaining cohort
+            // owners still need to collect from it, and genuinely abandoned
+            // handles are drained by `resolve_async_inflight_impl` before any
+            // new launch or `free_sequence`.
             return Ok(None);
         };
 
@@ -2155,6 +2172,162 @@ mod tests {
             vec![RecordedGpuOp::Sync { stream: pstream }]
         );
 
+        head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn batched_async_foreign_sequence_before_and_between_owners_preserves_cohort_drafts() {
+        let gpu = RecordingAsyncGpu::new();
+        // 4 active sequences:
+        //   states[0]: foreign sync/Echo sequence BEFORE the cohort (!async_placeholder)
+        //   states[1]: batched cohort owner 0
+        //   states[2]: foreign sync/PLD sequence BETWEEN cohort owners (!async_placeholder)
+        //   states[3]: batched cohort owner 1
+        let (head, mut states, _save_buf) = make_test_head_and_states(&gpu, 4);
+        let pstream = head.propose_stream_lazy(&gpu);
+
+        let gamma_eff = 2usize;
+        let budget = DflashDraftBudget::new(gamma_eff, 7, 8).unwrap();
+        let tokens: [u32; 4] = [101, 102, 201, 202];
+        let probs: [f32; 4] = [0.95, 0.85, 0.75, 0.65];
+        let tok_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let prob_bytes: Vec<u8> = probs.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let pri_tok_ptr = head
+            .scratch
+            .draft_tokens_dev_for_slot(AsyncScratchSlot::Primary);
+        let pri_prob_ptr = head
+            .scratch
+            .batch_out_probs_for_slot(AsyncScratchSlot::Primary);
+        gpu.copy_h2d(&tok_bytes, pri_tok_ptr).unwrap();
+        gpu.copy_h2d(&prob_bytes, pri_prob_ptr).unwrap();
+
+        let owner1 = {
+            let ds = as_dstate_mut(states[1].as_mut());
+            ds.draft_budget = Some(budget);
+            ds.async_placeholder = true;
+            dstate_id(ds)
+        };
+        let owner3 = {
+            let ds = as_dstate_mut(states[3].as_mut());
+            ds.draft_budget = Some(budget);
+            ds.async_placeholder = true;
+            dstate_id(ds)
+        };
+        head.register_async_batched_inflight(
+            AsyncScratchSlot::Primary,
+            vec![owner1, owner3],
+            budget,
+            gamma_eff,
+            pstream,
+            true,
+            false,
+            vec![None, None],
+        );
+        gpu.take_ops();
+
+        // Foreign seq 0 BEFORE cohort must NOT sync or wipe async_batched_inflight.
+        assert_eq!(
+            head.collect_async_drafts_impl(&gpu, as_dstate_mut(states[0].as_mut()))
+                .unwrap(),
+            None
+        );
+        assert!(gpu.take_ops().is_empty());
+        assert!(head.async_batched_inflight.lock().is_some());
+
+        // Cohort owner 1 materializes the cohort in ONE sync + D2H.
+        assert_eq!(
+            head.collect_async_drafts_impl(&gpu, as_dstate_mut(states[1].as_mut()))
+                .unwrap(),
+            Some(vec![101, 102])
+        );
+        assert_eq!(
+            as_dstate_ref(states[1].as_ref()).last_draft_probs,
+            vec![0.95, 0.85]
+        );
+        assert_eq!(
+            gpu.take_ops(),
+            vec![
+                RecordedGpuOp::Sync { stream: pstream },
+                RecordedGpuOp::CopyD2h {
+                    src: pri_tok_ptr.0,
+                    bytes: 16,
+                },
+                RecordedGpuOp::CopyD2h {
+                    src: pri_prob_ptr.0,
+                    bytes: 16,
+                },
+            ]
+        );
+
+        // Foreign seq 2 BETWEEN cohort owners must NOT wipe materialized cohort outputs.
+        assert_eq!(
+            head.collect_async_drafts_impl(&gpu, as_dstate_mut(states[2].as_mut()))
+                .unwrap(),
+            None
+        );
+        assert!(gpu.take_ops().is_empty());
+        assert!(head.async_batched_inflight.lock().is_some());
+
+        // Cohort owner 3 collects cleanly with ZERO extra GPU ops and frees the handle.
+        assert_eq!(
+            head.collect_async_drafts_impl(&gpu, as_dstate_mut(states[3].as_mut()))
+                .unwrap(),
+            Some(vec![201, 202])
+        );
+        assert_eq!(
+            as_dstate_ref(states[3].as_ref()).last_draft_probs,
+            vec![0.75, 0.65]
+        );
+        assert!(gpu.take_ops().is_empty());
+        assert!(head.async_batched_inflight.lock().is_none());
+
+        head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn early_stage1_drain_synchronizes_pstream_before_verify_overwrite_or_early_return() {
+        let gpu = RecordingAsyncGpu::new();
+        let (head, states, _save_buf) = make_test_head_and_states(&gpu, 2);
+        let pstream = head.propose_stream_lazy(&gpu);
+
+        // Stage early Stage-1 work reading `dflash_hidden_save` on `pstream`, alongside
+        // an unrelated batched inflight handle to prove drain does not clobber it.
+        let budget = DflashDraftBudget::new(2, 7, 8).unwrap();
+        let owner0 = dstate_id(as_dstate_ref(states[0].as_ref()));
+        let owner1 = dstate_id(as_dstate_ref(states[1].as_ref()));
+        head.register_async_batched_inflight(
+            AsyncScratchSlot::Primary,
+            vec![owner1],
+            budget,
+            2,
+            pstream,
+            false,
+            false,
+            vec![None],
+        );
+        *head.early_stage1_staged.lock() = Some(EarlyStage1Staged {
+            owner: owner0,
+            start_pos: 0,
+            num_rows: 4,
+            stream: pstream,
+        });
+        gpu.take_ops();
+
+        // Pre-verify / Phase-3-error / early-return drain MUST sync pstream exactly once,
+        // clear early_stage1_staged, and leave async_batched_inflight untouched.
+        head.drain_dflash_early_stage1(&gpu).unwrap();
+        assert_eq!(
+            gpu.take_ops(),
+            vec![RecordedGpuOp::Sync { stream: pstream }]
+        );
+        assert!(head.early_stage1_staged.lock().is_none());
+        assert!(head.async_batched_inflight.lock().is_some());
+
+        // Idempotent: a second drain issues zero GPU ops.
+        head.drain_dflash_early_stage1(&gpu).unwrap();
+        assert!(gpu.take_ops().is_empty());
+
+        head.resolve_async_inflight_impl(&gpu, None).unwrap();
         head.release_rejection_resources(&gpu);
     }
 }

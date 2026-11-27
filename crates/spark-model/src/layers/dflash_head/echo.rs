@@ -101,7 +101,14 @@ impl EchoConfig {
     pub fn from_env() -> Option<EchoConfig> {
         static CFG: std::sync::OnceLock<Option<EchoConfig>> = std::sync::OnceLock::new();
         *CFG.get_or_init(|| {
-            let cfg = Self::from_lookup(|k| std::env::var(k).ok())?;
+            let cfg = Self::from_lookup(|k| match std::env::var(k) {
+                Ok(val) => Some(val),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    tracing::warn!("{k} contains non-UTF-8 bytes; failing closed to default");
+                    None
+                }
+            })?;
             tracing::info!(
                 "ATLAS_DFLASH_ECHO active: min_accept={} min_tail={} max_streak={} \
                  (target-authored salvage drafts; lossless, default-off)",
