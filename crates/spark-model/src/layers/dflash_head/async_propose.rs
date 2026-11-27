@@ -109,6 +109,27 @@ pub fn parse_dflash_opt_branch0_enabled(raw: Option<&str>) -> bool {
     raw.map(str::trim) == Some("1")
 }
 
+/// Whether `propose_drafts` may eagerly flush `pending_ctx_base` on the default
+/// stream at entry (true only when BOTH `ATLAS_DFLASH_ASYNC` and
+/// `ATLAS_DFLASH_OPT_BRANCH0` are OFF; either mode defers the append so
+/// `dstate.ctx_len` stays at `ctx_len_before` until async or opt-branch0
+/// consumption/fallback runs).
+#[inline]
+#[must_use]
+pub(super) fn should_flush_pending_ctx_eagerly_for(
+    async_enabled: bool,
+    opt_branch0_enabled: bool,
+) -> bool {
+    !async_enabled && !opt_branch0_enabled
+}
+
+/// Process-lifetime check for eager default-stream ctx append in `propose_drafts`.
+#[inline]
+#[must_use]
+pub(super) fn should_flush_pending_ctx_eagerly() -> bool {
+    should_flush_pending_ctx_eagerly_for(dflash_async_enabled(), dflash_opt_branch0_enabled())
+}
+
 /// Cached gate for `ATLAS_DFLASH_OPT_BRANCH0=1` (default OFF).
 #[must_use]
 pub fn dflash_opt_branch0_enabled() -> bool {
@@ -1060,6 +1081,23 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
+    /// Synchronize and discard any unconsumed optimistic branch-0 prefetch
+    /// without disturbing `early_stage1_staged`, `async_inflight`, or
+    /// `async_batched_inflight`.
+    ///
+    /// Called before entering async or sync `forward_block` whenever the
+    /// `try_consume_opt_branch0` gate was bypassed (e.g. grammar mask,
+    /// sampled-q, portfolio/corroborate, or flag OFF) so `pstream` can never
+    /// race with `forward_block` on `scratch.draft_tokens_dev_alt`.
+    pub(super) fn drain_opt_branch0_only(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        if let Some(opt) = self.opt_branch0_staged.lock().take() {
+            gpu.synchronize(opt.stream)?;
+            OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log_opt_branch0_telemetry();
+        }
+        Ok(())
+    }
+
     /// Stage an optimistic branch-0 draft prefetch (`ATLAS_DFLASH_OPT_BRANCH0=1`)
     /// from a device draft buffer into the isolated `scratch.draft_tokens_dev_alt`
     /// slot on `pstream`, ordered strictly after `capture_done_event`.
@@ -1112,10 +1150,21 @@ impl BlockDiffusionDraftHead {
             return Ok(false);
         }
         budget.validate_flat_width(budget.flat)?;
+        anyhow::ensure!(
+            budget.flat <= self.gamma,
+            "DFlash opt-branch0 width {} exceeds head gamma {}",
+            budget.flat,
+            self.gamma
+        );
         let copy_bytes = budget
             .flat
             .checked_mul(size_of::<u32>())
             .ok_or_else(|| anyhow::anyhow!("DFlash opt-branch0 draft byte count overflow"))?;
+        let pinned_cap = dstate.draft_output_pinned.len();
+        anyhow::ensure!(
+            copy_bytes <= pinned_cap,
+            "DFlash opt-branch0 copy_bytes {copy_bytes} B exceeds draft_output_pinned capacity {pinned_cap} B"
+        );
         // Never alias an active single-seq or batched async launch that owns
         // scratch/draft_tokens_dev_alt.
         if self.async_inflight.lock().is_some() || self.async_batched_inflight.lock().is_some() {
@@ -1189,25 +1238,42 @@ impl BlockDiffusionDraftHead {
         );
         match resolution {
             OptBranch0Resolution::ExactHit => {
-                staged.budget.validate_flat_width(staged.budget.flat)?;
-                let host_bytes = staged
-                    .budget
-                    .flat
-                    .checked_mul(size_of::<u32>())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("DFlash opt-branch0 host readback byte count overflow")
-                    })?;
-                if self.scratch.draft_tokens_dev_alt.is_null() {
-                    gpu.synchronize(staged.stream)?;
-                    OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    log_opt_branch0_telemetry();
-                    return Ok(None);
-                }
                 if let Err(error) = gpu.synchronize(staged.stream) {
                     clear_proposal_outputs(dstate);
                     return Err(error);
                 }
-                let host_buf = &mut dstate.draft_output_pinned.as_mut_slice()[..host_bytes];
+                if let Err(error) = staged.budget.validate_flat_width(staged.budget.flat) {
+                    clear_proposal_outputs(dstate);
+                    return Err(error);
+                }
+                if staged.budget.flat > self.gamma {
+                    clear_proposal_outputs(dstate);
+                    anyhow::bail!(
+                        "DFlash opt-branch0 width {} exceeds head gamma {}",
+                        staged.budget.flat,
+                        self.gamma
+                    );
+                }
+                let Some(host_bytes) = staged.budget.flat.checked_mul(size_of::<u32>()) else {
+                    clear_proposal_outputs(dstate);
+                    anyhow::bail!("DFlash opt-branch0 host readback byte count overflow");
+                };
+                if self.scratch.draft_tokens_dev_alt.is_null() {
+                    OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log_opt_branch0_telemetry();
+                    return Ok(None);
+                }
+                let pinned_cap = dstate.draft_output_pinned.len();
+                let Some(host_buf) = dstate
+                    .draft_output_pinned
+                    .as_mut_slice()
+                    .get_mut(..host_bytes)
+                else {
+                    clear_proposal_outputs(dstate);
+                    anyhow::bail!(
+                        "DFlash opt-branch0 host readback {host_bytes} B exceeds draft_output_pinned capacity {pinned_cap} B"
+                    );
+                };
                 if let Err(error) = gpu.copy_d2h(self.scratch.draft_tokens_dev_alt, host_buf) {
                     clear_proposal_outputs(dstate);
                     return Err(error);
@@ -3189,6 +3255,163 @@ mod tests {
         assert!(t1.old_fc_copy_rows_skipped >= t0.old_fc_copy_rows_skipped + 4090);
 
         head.resolve_async_inflight_impl(&gpu, None).unwrap();
+        head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn opt_branch0_drain_only_quiesces_pstream_without_clobbering_early_stage1() {
+        let gpu = RecordingAsyncGpu::new();
+        let (head, states, _save_buf) = make_test_head_and_states(&gpu, 1);
+        let pstream = head.propose_stream_lazy(&gpu);
+        let budget = DflashDraftBudget::new(2, 7, 8).unwrap();
+        let owner0 = dstate_id(as_dstate_ref(states[0].as_ref()));
+
+        // Simulate sync fallback where try_consume_opt_branch0 was bypassed
+        // (e.g. grammar mask / sampled-q / portfolio): drain_opt_branch0_only
+        // must sync pstream and discard opt_branch0_staged while preserving
+        // early_stage1_staged for Stage-1 fc reuse.
+        *head.early_stage1_staged.lock() = Some(EarlyStage1Staged {
+            owner: owner0,
+            start_pos: 0,
+            num_rows: 4,
+            stream: pstream,
+        });
+        *head.opt_branch0_staged.lock() = Some(OptBranch0Staged {
+            owner: owner0,
+            ctx_len_before: 0,
+            assumed_num_accepted: 0,
+            assumed_last_token: 55,
+            budget,
+            stream: pstream,
+            noise_graph_engaged: true,
+            stage1_graph_engaged: true,
+        });
+        let before = opt_branch0_telemetry_snapshot();
+        gpu.take_ops();
+
+        head.drain_opt_branch0_only(&gpu).unwrap();
+        assert_eq!(
+            gpu.take_ops(),
+            vec![RecordedGpuOp::Sync { stream: pstream }]
+        );
+        assert!(head.opt_branch0_staged.lock().is_none());
+        assert!(head.early_stage1_staged.lock().is_some());
+        assert!(opt_branch0_telemetry_snapshot().discards > before.discards);
+
+        // Idempotent when empty.
+        head.drain_opt_branch0_only(&gpu).unwrap();
+        assert!(gpu.take_ops().is_empty());
+
+        head.resolve_async_inflight_impl(&gpu, None).unwrap();
+        head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn opt_branch0_defer_pending_ctx_policy_preserves_ctx_len_when_async_is_off() {
+        // Only flush eagerly when BOTH async and opt_branch0 are OFF.
+        assert!(should_flush_pending_ctx_eagerly_for(false, false));
+        assert!(!should_flush_pending_ctx_eagerly_for(true, false));
+        assert!(!should_flush_pending_ctx_eagerly_for(false, true));
+        assert!(!should_flush_pending_ctx_eagerly_for(true, true));
+
+        // Prove ATLAS_DFLASH_ASYNC=0 + ATLAS_DFLASH_OPT_BRANCH0=1 succeeds with
+        // ExactHit when pending_ctx_base is deferred until try_consume_opt_branch0.
+        let gpu = RecordingAsyncGpu::new();
+        let (head, mut states, save_buf) = make_test_head_and_states(&gpu, 1);
+        let budget = DflashDraftBudget::new(2, 7, 8).unwrap();
+        let alt_bytes: Vec<u8> = [410u32, 411].iter().flat_map(|t| t.to_le_bytes()).collect();
+        let src_dev = gpu.alloc(8).unwrap();
+        gpu.copy_h2d(&alt_bytes, src_dev).unwrap();
+
+        let d0 = as_dstate_mut(states[0].as_mut());
+        d0.draft_budget = Some(budget);
+        d0.ctx_len = 0;
+        d0.last_num_accepted = 1; // 2 pending rows (root + 1 accepted)
+        assert!(
+            head.stage_opt_branch0_from_device_slot_inner(&gpu, src_dev, 0x88, d0, 1, 99, budget)
+                .unwrap()
+        );
+        // With eager flush suppressed, ctx_len stays 0 and try_consume_opt_branch0
+        // resolves ExactHit and advances ctx_len to 2 on default_stream.
+        let mut pending = Some(save_buf);
+        let consumed = head
+            .try_consume_opt_branch0(&gpu, gpu.default_stream(), d0, 99, 2, budget, &mut pending)
+            .unwrap();
+        assert_eq!(consumed, Some(vec![410, 411]));
+        assert!(pending.is_none());
+        assert_eq!(d0.ctx_len, 2);
+
+        gpu.free(src_dev).unwrap();
+        head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn opt_branch0_rejects_oversized_budget_and_short_pinned_buffer_without_panic_or_copy() {
+        let gpu = RecordingAsyncGpu::new();
+        let (head, mut states, save_buf) = make_test_head_and_states(&gpu, 1);
+        let pstream = head.propose_stream_lazy(&gpu);
+        let src_dev = gpu.alloc(64).unwrap();
+
+        let d0 = as_dstate_mut(states[0].as_mut());
+        d0.ctx_len = 0;
+        d0.last_num_accepted = 0;
+
+        // 1. budget.flat > head.gamma (test head has gamma=7) fails closed with 0 GPU ops.
+        let over_gamma = DflashDraftBudget::new(8, 15, 16).unwrap();
+        gpu.take_ops();
+        let err = head
+            .stage_opt_branch0_from_device_slot_inner(&gpu, src_dev, 0x99, d0, 0, 7, over_gamma)
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds head gamma"), "{err}");
+        assert!(gpu.take_ops().is_empty());
+        assert!(head.opt_branch0_staged.lock().is_none());
+
+        // 2. draft_output_pinned shorter than copy_bytes fails closed on BOTH stage and consume.
+        let short_pinned = gpu.alloc_host_pinned(4).unwrap(); // only 1 u32 slot
+        let orig_pinned = std::mem::replace(&mut d0.draft_output_pinned, short_pinned);
+        let budget2 = DflashDraftBudget::new(2, 7, 8).unwrap(); // needs 8 B > 4 B
+        d0.draft_budget = Some(budget2);
+        gpu.take_ops();
+        let err = head
+            .stage_opt_branch0_from_device_slot_inner(&gpu, src_dev, 0x99, d0, 0, 7, budget2)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("draft_output_pinned capacity"),
+            "{err}"
+        );
+        assert!(gpu.take_ops().is_empty());
+        assert!(head.opt_branch0_staged.lock().is_none());
+
+        // Also test try_consume_opt_branch0 directly against an oversized staged handle:
+        // must sync pstream and return Err instead of panicking on unchecked slice indexing.
+        *head.opt_branch0_staged.lock() = Some(OptBranch0Staged {
+            owner: dstate_id(d0),
+            ctx_len_before: 0,
+            assumed_num_accepted: 0,
+            assumed_last_token: 7,
+            budget: budget2,
+            stream: pstream,
+            noise_graph_engaged: false,
+            stage1_graph_engaged: false,
+        });
+        gpu.take_ops();
+        let mut pending = Some(save_buf);
+        let err = head
+            .try_consume_opt_branch0(&gpu, gpu.default_stream(), d0, 7, 1, budget2, &mut pending)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("draft_output_pinned capacity"),
+            "{err}"
+        );
+        assert_eq!(
+            gpu.take_ops(),
+            vec![RecordedGpuOp::Sync { stream: pstream }]
+        );
+        assert!(head.opt_branch0_staged.lock().is_none());
+
+        let short_pinned = std::mem::replace(&mut d0.draft_output_pinned, orig_pinned);
+        drop(short_pinned);
+        gpu.free(src_dev).unwrap();
         head.release_rejection_resources(&gpu);
     }
 }

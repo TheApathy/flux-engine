@@ -211,7 +211,7 @@ impl BlockDiffusionDraftHead {
             *span_out = Some((ctx_len_before, num_append));
             Ok(())
         };
-        if !super::async_propose::dflash_async_enabled() {
+        if super::async_propose::should_flush_pending_ctx_eagerly() {
             flush_pending_ctx_on_default(&mut pending_ctx_base, &mut ctx_appended_span, dstate)?;
         }
 
@@ -840,6 +840,14 @@ impl BlockDiffusionDraftHead {
             )?
         {
             return Ok(opt_drafts);
+        }
+        // Unconditionally quiesce any unconsumed optimistic branch-0 prefetch
+        // before entering async or sync `forward_block` (e.g. when the consume
+        // gate above was bypassed due to sampled-q, grammar, portfolio,
+        // corroborate, or flag OFF) while preserving `early_stage1_staged`.
+        if let Err(error) = self.drain_opt_branch0_only(ctx.gpu) {
+            clear_proposal_outputs(dstate);
+            return Err(error);
         }
 
         // ── ATLAS_DFLASH_ASYNC=1 (task #20): async propose‖commit-tail ──
