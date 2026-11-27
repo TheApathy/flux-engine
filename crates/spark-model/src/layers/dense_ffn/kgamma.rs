@@ -441,6 +441,221 @@ impl DenseFfnLayer {
     /// `out_proj` and DFlash drafter routings.
     /// BF16-weight fallback is not supported on this path (Gemma-4 dense
     /// has no MTP / DFlash, so n is always 1 there).
+    /// Opt-in (`ATLAS_W4A4_DECODE_SK3=1`, default OFF) 48-SM roofline W4A4
+    /// decode/verify GEMM route (`w4a4_gemm_m16_sk3_sm120` +
+    /// `reduce_w4a4_sk3_bf16_sm120`) for `M in 1..=16`.
+    ///
+    /// Preserves bit-exact `W=1 == W=8 == W=16` and `B=1 == B=4/8` invariance
+    /// by using row-independent activation scaling (checkpoint scale or `1.0`,
+    /// never batch-dependent absmax) and an `M`-independent `split_k` factor
+    /// (`3` on `<= 64`-SM GB10). Returns `Ok(false)` immediately when disabled
+    /// or when any precondition is not met, leaving the baseline 100% unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn try_forward_kgamma_w4a4_sk3(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        n: u32,
+        h: u32,
+        inter: u32,
+        gate_out: DevicePtr,
+        up_out: DevicePtr,
+        stream: u64,
+    ) -> Result<bool> {
+        if !ops::w4a4_decode_sk3_enabled()
+            || n == 0
+            || n > ops::W4A4_DECODE_SK3_MAX_M
+            || self.bf16_weights.is_some()
+            || self.has_w3_gemm()
+            || self.activation != FfnActivation::SiLU
+            || self.nvfp4_quantize_k.0 == 0
+            || self.weights.gate_proj.is_null()
+            || self.weights.up_proj.is_null()
+            || self.weights.down_proj.is_null()
+            || h < ops::W4A4_DECODE_SK3_K_STEP
+            || !h.is_multiple_of(ops::W4A4_DECODE_SK3_K_STEP)
+            || inter < ops::W4A4_DECODE_SK3_K_STEP
+            || !inter.is_multiple_of(ops::W4A4_DECODE_SK3_K_STEP)
+        {
+            return Ok(false);
+        }
+
+        let kernels = ops::cached_w4a4_decode_sk3_kernels(ctx.gpu);
+        if !kernels.is_ready() {
+            return Ok(false);
+        }
+
+        let sm_count = atlas_core::device::active_sm_count();
+        let split_k_gu = ops::default_w4a4_decode_split_k(sm_count, h);
+        let split_k_down = ops::default_w4a4_decode_split_k(sm_count, inter);
+        let plan_gu = ops::plan_w4a4_decode_sk3(n, inter, h, split_k_gu)?;
+        let plan_down = ops::plan_w4a4_decode_sk3(n, h, inter, split_k_down)?;
+
+        let req_ws_bytes = plan_gu.workspace_bytes.max(plan_down.workspace_bytes);
+        let (ws_ptr, ws_bytes) = if req_ws_bytes == 0 {
+            (DevicePtr::NULL, 0)
+        } else if ctx.buffers.sizes().ssm_conv_out_f32 >= req_ws_bytes
+            && !ctx.buffers.ssm_conv_out_f32().is_null()
+            && ctx.buffers.ssm_conv_out_f32().0.is_multiple_of(4)
+        {
+            (
+                ctx.buffers.ssm_conv_out_f32(),
+                ctx.buffers.sizes().ssm_conv_out_f32,
+            )
+        } else {
+            let alloc_policy = if ctx.graph_capture {
+                ops::W4a4WorkspaceAllocPolicy::CaptureNoAlloc
+            } else {
+                ops::W4a4WorkspaceAllocPolicy::AllowAlloc
+            };
+            let Some(ws) =
+                ops::ensure_w4a4_decode_sk3_workspace(ctx.gpu, stream, req_ws_bytes, alloc_policy)?
+            else {
+                return Ok(false);
+            };
+            ws
+        };
+
+        let _e2m1_stream_guard = self.lock_e2m1_use(stream)?;
+        let req_k = (h.max(inter)) as usize;
+        if ctx.graph_capture {
+            let has_scratch = {
+                let slot = self
+                    .e2m1_scratch
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("W4A4 activation scratch lock poisoned"))?;
+                slot.as_ref()
+                    .is_some_and(|s| s.cap_m >= (n as usize) && s.cap_k >= req_k)
+            };
+            if !has_scratch {
+                return Ok(false);
+            }
+        }
+        let (a_packed, a_scale, _a_max) = self.ensure_e2m1_scratch(ctx.gpu, n as usize, req_k)?;
+
+        let a_scale2_gu = self
+            .e2m1_checkpoint_scales
+            .map(|s| s.gate_up)
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0);
+        let a_scale2_down = self
+            .e2m1_checkpoint_scales
+            .map(|s| s.down)
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0);
+        let scale2_gate = a_scale2_gu * self.weights.gate_proj.weight_scale_2;
+        let scale2_up = a_scale2_gu * self.weights.up_proj.weight_scale_2;
+        let scale2_down = a_scale2_down * self.weights.down_proj.weight_scale_2;
+        if !(scale2_gate.is_finite()
+            && scale2_gate > 0.0
+            && scale2_up.is_finite()
+            && scale2_up > 0.0
+            && scale2_down.is_finite()
+            && scale2_down > 0.0)
+        {
+            return Ok(false);
+        }
+
+        // Quantize shared [n, H] BF16 input ONCE with row-independent scale2.
+        ops::quantize_bf16_to_nvfp4(
+            ctx.gpu,
+            self.nvfp4_quantize_k,
+            input,
+            a_packed,
+            a_scale,
+            a_scale2_gu,
+            n,
+            h,
+            stream,
+        )?;
+        crate::kprof!(ctx.gpu, stream, "ffn_gate_w4a4_sk3_kgamma", {
+            ops::w4a4_decode_roofline_gemm(
+                ctx.gpu,
+                kernels,
+                &plan_gu,
+                a_packed,
+                a_scale,
+                &self.weights.gate_proj,
+                ws_ptr,
+                ws_bytes,
+                gate_out,
+                scale2_gate,
+                stream,
+            )?;
+            anyhow::Result::<()>::Ok(())
+        })?;
+        crate::kprof!(ctx.gpu, stream, "ffn_up_w4a4_sk3_kgamma", {
+            ops::w4a4_decode_roofline_gemm(
+                ctx.gpu,
+                kernels,
+                &plan_gu,
+                a_packed,
+                a_scale,
+                &self.weights.up_proj,
+                ws_ptr,
+                ws_bytes,
+                up_out,
+                scale2_up,
+                stream,
+            )?;
+            anyhow::Result::<()>::Ok(())
+        })?;
+        crate::kprof!(ctx.gpu, stream, "ffn_silu_mul_w4a4_sk3_kgamma", {
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                n * inter,
+                stream,
+            )?;
+            anyhow::Result::<()>::Ok(())
+        })?;
+
+        ops::quantize_bf16_to_nvfp4(
+            ctx.gpu,
+            self.nvfp4_quantize_k,
+            gate_out,
+            a_packed,
+            a_scale,
+            a_scale2_down,
+            n,
+            inter,
+            stream,
+        )?;
+        let output = ctx.buffers.moe_output();
+        crate::kprof!(ctx.gpu, stream, "ffn_down_w4a4_sk3_kgamma", {
+            ops::w4a4_decode_roofline_gemm(
+                ctx.gpu,
+                kernels,
+                &plan_down,
+                a_packed,
+                a_scale,
+                &self.weights.down_proj,
+                ws_ptr,
+                ws_bytes,
+                output,
+                scale2_down,
+                stream,
+            )?;
+            anyhow::Result::<()>::Ok(())
+        })?;
+
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                rows = n,
+                split_k_gu,
+                split_k_down,
+                sm_count,
+                graph_capture = ctx.graph_capture,
+                "FFN_KGAMMA_W4A4_DECODE_SK3_ENGAGED"
+            );
+        });
+        Ok(true)
+    }
+
     pub fn forward_kgamma(
         &self,
         input: DevicePtr,
@@ -449,7 +664,7 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<()> {
         debug_assert!(
-            n > 1 || self.decode_tc_parity_route(),
+            n > 1 || self.decode_tc_parity_route() || ops::w4a4_decode_sk3_enabled(),
             "forward_kgamma is for batched verify; use forward() at n=1"
         );
         let h = ctx.config.hidden_size as u32;
@@ -457,6 +672,10 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        if self.try_forward_kgamma_w4a4_sk3(input, ctx, n, h, inter, gate_out, up_out, stream)? {
+            return Ok(());
+        }
 
         let exact_w4_silu_eligible = self.exact_kgamma_internal_eligible(n);
         let exact_tier_present = matches!(
