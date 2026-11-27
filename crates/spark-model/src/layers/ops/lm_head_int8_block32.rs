@@ -1064,23 +1064,9 @@ pub fn lm_head_int8_block32_fused_argmax(
 // ── Bit-Exact Host Packer & Reference Oracles ──────────────────────────────
 
 /// Exact IEEE-754 FP32 -> BF16 round-to-nearest-even mirroring PTX
-/// `cvt.rn.bf16.f32`.
-#[inline]
-#[must_use]
-pub const fn f32_to_bf16_rn_cpu(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let exp = bits & 0x7F80_0000;
-    let mant = bits & 0x007F_FFFF;
-    if exp == 0x7F80_0000 {
-        if mant != 0 {
-            return ((bits >> 16) as u16) | 0x0040;
-        }
-        return (bits >> 16) as u16;
-    }
-    let lsb = (bits >> 16) & 1;
-    let rounding_bias = 0x7FFF_u32.wrapping_add(lsb);
-    (bits.wrapping_add(rounding_bias) >> 16) as u16
-}
+/// `cvt.rn.bf16.f32` (shared with [`super::w4a4_decode_sk3`] to avoid duplicate
+/// glob re-exports in `layers::ops`).
+pub use super::w4a4_decode_sk3::f32_to_bf16_rn_cpu;
 
 /// Convert raw BF16 `u16` bits to FP32.
 #[inline]
