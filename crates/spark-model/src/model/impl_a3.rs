@@ -1250,6 +1250,44 @@ impl TransformerModel {
         Ok(logits)
     }
 
+    /// Resolve the `INT8 Block-32 BF16-Scale` LM-head weight, preferring the
+    /// startup-quantized owned weight on `self` (so it remains available even
+    /// after `QWEN4_RELEASE_*_UNUSED` frees BF16 `self.lm_head_weight.weight`)
+    /// and falling back to the capture-safe lazy cache when BF16 is still live.
+    fn resolve_lm_head_int8_block32_weight(
+        &self,
+        full_vocab: u32,
+        h: u32,
+        quantize_k: KernelHandle,
+        stream: u64,
+    ) -> Result<Option<ops::Int8Block32DeviceWeight>> {
+        if let Some(owned) = self.lm_head_int8_block32 {
+            if owned.rows >= full_vocab && owned.cols == h {
+                return Ok(Some(owned));
+            }
+            return Ok(None);
+        }
+        if self.lm_head_weight.weight.is_null() || !self.lm_head_weight.weight.0.is_multiple_of(2) {
+            return Ok(None);
+        }
+        let capturing = spark_runtime::gpu_capture_region::active_capture_region().is_some()
+            || self.gpu.stream_is_capturing(stream);
+        let alloc_policy = if capturing {
+            ops::Int8WeightAllocPolicy::CaptureNoAlloc
+        } else {
+            ops::Int8WeightAllocPolicy::AllowAlloc
+        };
+        ops::ensure_cached_lm_head_int8_block32_weight(
+            self.gpu.as_ref(),
+            quantize_k,
+            self.lm_head_weight.weight,
+            full_vocab,
+            h,
+            stream,
+            alloc_policy,
+        )
+    }
+
     /// Opt-in (`ATLAS_LM_HEAD_INT8_BLOCK32=1`, default OFF) two-stage fused
     /// `INT8 Block-32 BF16-Scale (8.50 bpw)` LM-head + online warp/block argmax.
     fn try_lm_head_int8_block32_fused_argmax(
@@ -1270,8 +1308,6 @@ impl TransformerModel {
             || self.logit_softcap_kernel.0 != 0
             || self.config.final_logit_softcapping != 0.0
             || !self.config.final_logit_softcapping.is_finite()
-            || self.lm_head_weight.weight.is_null()
-            || !self.lm_head_weight.weight.0.is_multiple_of(2)
             || rows == 0
             || rows > ops::LM_HEAD_INT8_ARGMAX_MAX_M
             || vocab == 0
@@ -1300,22 +1336,8 @@ impl TransformerModel {
         {
             return Ok(false);
         }
-        let capturing = spark_runtime::gpu_capture_region::active_capture_region().is_some()
-            || self.gpu.stream_is_capturing(stream);
-        let alloc_policy = if capturing {
-            ops::Int8WeightAllocPolicy::CaptureNoAlloc
-        } else {
-            ops::Int8WeightAllocPolicy::AllowAlloc
-        };
-        let Some(dev_weight) = ops::ensure_cached_lm_head_int8_block32_weight(
-            self.gpu.as_ref(),
-            kernels.quantize,
-            self.lm_head_weight.weight,
-            full_vocab,
-            h,
-            stream,
-            alloc_policy,
-        )?
+        let Some(dev_weight) =
+            self.resolve_lm_head_int8_block32_weight(full_vocab, h, kernels.quantize, stream)?
         else {
             return Ok(false);
         };
@@ -1334,19 +1356,23 @@ impl TransformerModel {
         LOGGED.call_once(|| {
             tracing::info!(
                 target: "atlas::lm_head",
+                mode = "fused_argmax",
+                eager_owned = self.lm_head_int8_block32.is_some(),
+                bf16_reclaimed = self.lm_head_weight.weight.is_null(),
                 rows = plan.rows,
                 vocab = plan.vocab,
                 hidden = plan.hidden,
                 num_v_tiles = plan.num_v_tiles,
                 scratch_bytes = plan.total_scratch_bytes,
-                "ENGAGED ATLAS_LM_HEAD_INT8_BLOCK32: fused INT8 Block-32 BF16-scale LM-head + online argmax"
+                "LM_HEAD_INT8_BLOCK32_ENGAGED"
             );
         });
         Ok(true)
     }
 
     /// Opt-in (`ATLAS_LM_HEAD_INT8_BLOCK32=1`, default OFF) full BF16 logit
-    /// GEMM (`M = 1..=64`) using `INT8 Block-32 BF16-Scale (8.50 bpw)` weights.
+    /// GEMM (`M = 1..=64`, single-CTA `grid.y = 1`) using `INT8 Block-32
+    /// BF16-Scale (8.50 bpw)` weights.
     fn try_lm_head_int8_block32_logits(
         &self,
         hidden: DevicePtr,
@@ -1362,8 +1388,6 @@ impl TransformerModel {
         let full_vocab = self.config.vocab_size as u32;
         let logits = self.buffers.logits();
         if self.use_fp32_logits
-            || self.lm_head_weight.weight.is_null()
-            || !self.lm_head_weight.weight.0.is_multiple_of(2)
             || num_tokens == 0
             || num_tokens > ops::LM_HEAD_INT8_GEMM_MAX_M
             || vocab == 0
@@ -1388,22 +1412,8 @@ impl TransformerModel {
         if logits_bytes < plan.c_bytes {
             return Ok(None);
         }
-        let capturing = spark_runtime::gpu_capture_region::active_capture_region().is_some()
-            || self.gpu.stream_is_capturing(stream);
-        let alloc_policy = if capturing {
-            ops::Int8WeightAllocPolicy::CaptureNoAlloc
-        } else {
-            ops::Int8WeightAllocPolicy::AllowAlloc
-        };
-        let Some(dev_weight) = ops::ensure_cached_lm_head_int8_block32_weight(
-            self.gpu.as_ref(),
-            kernels.quantize,
-            self.lm_head_weight.weight,
-            full_vocab,
-            h,
-            stream,
-            alloc_policy,
-        )?
+        let Some(dev_weight) =
+            self.resolve_lm_head_int8_block32_weight(full_vocab, h, kernels.quantize, stream)?
         else {
             return Ok(None);
         };
@@ -1425,10 +1435,15 @@ impl TransformerModel {
         LOGGED.call_once(|| {
             tracing::info!(
                 target: "atlas::lm_head",
+                mode = "full_logits",
+                eager_owned = self.lm_head_int8_block32.is_some(),
+                bf16_reclaimed = self.lm_head_weight.weight.is_null(),
                 rows = plan.rows,
                 vocab = plan.vocab,
                 hidden = plan.hidden,
-                "ENGAGED ATLAS_LM_HEAD_INT8_BLOCK32: full BF16 logit GEMM"
+                grid_y = plan.grid_y,
+                m_blocks = plan.m_blocks,
+                "LM_HEAD_INT8_BLOCK32_ENGAGED"
             );
         });
         Ok(Some(logits))

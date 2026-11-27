@@ -198,6 +198,9 @@ impl Drop for TransformerModel {
         self.clear_model_slot_tracking();
         self.clear_ssm_norm_cached_slot();
         self.clear_serial_batch_suppress();
+        if let Some(owned) = self.lm_head_int8_block32.take() {
+            crate::layers::ops::free_lm_head_int8_block32_weight(self.gpu.as_ref(), owned);
+        }
         crate::layers::ops::release_cached_lm_head_int8_block32_weight(
             self.gpu.as_ref(),
             self.lm_head_weight.weight,
