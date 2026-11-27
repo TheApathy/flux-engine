@@ -9,7 +9,7 @@ use super::{
 };
 
 const PREFIX: &str = "ATLAS_DFLASH_";
-const CENSUS_COUNT: usize = 139;
+const CENSUS_COUNT: usize = 140;
 
 fn collect_tokens(text: &str, found: &mut BTreeSet<String>) {
     let mut remaining = text;

@@ -15,6 +15,8 @@
 mod activations;
 #[path = "ops/bitfp4_kv.rs"]
 mod bitfp4_kv;
+#[path = "ops/dcoco_selector.rs"]
+mod dcoco_selector;
 #[path = "ops/dflash2_conv.rs"]
 mod dflash2_conv;
 #[path = "ops/embeddings.rs"]
@@ -152,6 +154,7 @@ mod ssm_preproc;
 
 pub use activations::*;
 pub use bitfp4_kv::*;
+pub use dcoco_selector::*;
 pub use dflash2_conv::*;
 pub use embeddings::*;
 pub use fp8_moe::*;

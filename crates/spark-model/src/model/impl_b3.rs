@@ -202,7 +202,8 @@ impl TransformerModel {
         // extra copy, legacy behavior byte-for-byte).
         let want_token_mirror = std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_DFLASH_RETRIEVAL").ok().as_deref() == Some("1")
-            || std::env::var("ATLAS_DFLASH_SAM").ok().as_deref() == Some("1");
+            || std::env::var("ATLAS_DFLASH_SAM").ok().as_deref() == Some("1")
+            || crate::layers::dflash_head::ngram_bonus::ngram_bonus_enabled();
         if want_token_mirror
             && let Some(ds) = prop_state
                 .as_any_mut()
@@ -377,7 +378,8 @@ impl TransformerModel {
         }
         let want_token_mirror = std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_DFLASH_RETRIEVAL").ok().as_deref() == Some("1")
-            || std::env::var("ATLAS_DFLASH_SAM").ok().as_deref() == Some("1");
+            || std::env::var("ATLAS_DFLASH_SAM").ok().as_deref() == Some("1")
+            || crate::layers::dflash_head::ngram_bonus::ngram_bonus_enabled();
         if want_token_mirror {
             for seq in seqs.iter_mut() {
                 if let Some(ds) = seq.proposer_state.as_mut().and_then(|ps| {

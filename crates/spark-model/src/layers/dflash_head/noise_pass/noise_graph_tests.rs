@@ -526,6 +526,7 @@ fn c1_stage2_graph_key_isolates_shortlist_k_and_tc_lm_head_modes() {
         lm_head_path_tag: 2,
         prefer_tc_lm_head: false,
         rejection_mode: false,
+        ngram_mode: false,
         shortlist_k: 16,
         mask_id: 248_077,
         stream: 7,
@@ -557,6 +558,10 @@ fn c1_stage2_graph_key_isolates_shortlist_k_and_tc_lm_head_modes() {
         shortlist_k: 20,
         ..base.clone()
     };
+    let ngram_only = NoiseGraphRuntimeKey {
+        ngram_mode: true,
+        ..base.clone()
+    };
     let set: HashSet<NoiseGraphRuntimeKey> = [
         base,
         split_kv_mode,
@@ -565,10 +570,11 @@ fn c1_stage2_graph_key_isolates_shortlist_k_and_tc_lm_head_modes() {
         tc_only,
         k32_only,
         rejection_only,
+        ngram_only,
     ]
     .into_iter()
     .collect();
-    assert_eq!(set.len(), 7);
+    assert_eq!(set.len(), 8);
 }
 
 #[test]

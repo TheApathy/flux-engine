@@ -407,11 +407,26 @@ impl BlockDiffusionDraftHead {
             };
         let prefer_tc_lm_head =
             resolve_c1_lm_head_nvfp4_mode(staged_spec.is_some()) == LmHeadNvfp4Mode::CoalescedTc;
+        let use_ngram_graph_selector = self.selector.is_some()
+            && super::super::ngram_bonus::admit_c1_ngram_selector(
+                super::super::ngram_bonus::C1NgramAdmission {
+                    ngram_enabled: super::super::ngram_bonus::ngram_bonus_enabled(),
+                    ngram_ready: self.ngram_selector_ready(),
+                    use_rejection_selector: use_rejection_graph_selector,
+                    is_probabilistic_sampled: false,
+                    markov_active: self.markov.is_some(),
+                    probabilistic_method: self.draft_sample_method
+                        == crate::dflash_sampling::DflashDraftSampleMethod::Probabilistic,
+                    raw_gumbel_spec: gumbel_spec,
+                },
+            );
         let use_k32_graph_selector = !use_rejection_graph_selector
+            && !use_ngram_graph_selector
             && self.selector.is_some()
             && self.markov.is_none()
             && self.gumbel_selector_k32_ready();
         let use_gumbel_graph_selector = !use_rejection_graph_selector
+            && !use_ngram_graph_selector
             && (use_k32_graph_selector
                 || (self.selector.is_some()
                     && self.markov.is_none()
@@ -471,6 +486,17 @@ impl BlockDiffusionDraftHead {
                 self.layers.len(),
                 stream,
             )?;
+            if use_ngram_graph_selector {
+                state.upload_ngram_meta_c1(
+                    ctx.gpu,
+                    &dstate.pld_tokens,
+                    last_token,
+                    self.scratch.ngram_tables_dev,
+                    self.scratch.ngram_prev3_dev,
+                    None,
+                    stream,
+                )?;
+            }
             let split_kv_plan = if desired_split_kv > 1
                 && let Some((split_kernel, reduce_kernel)) =
                     state.resolve_split_kv_h128_kernels(ctx.gpu, attn_mode)
@@ -505,6 +531,7 @@ impl BlockDiffusionDraftHead {
                 lm_head_path_tag: lm_head_path_tag(lm_head_path),
                 prefer_tc_lm_head,
                 rejection_mode: use_rejection_graph_selector,
+                ngram_mode: use_ngram_graph_selector,
                 shortlist_k: shortlist_k as u8,
                 mask_id,
                 stream,
@@ -572,6 +599,7 @@ impl BlockDiffusionDraftHead {
                 use_radix_topk,
                 use_k32_selector,
                 use_rejection_graph_selector,
+                use_ngram_graph_selector,
                 dstate,
                 ctx,
                 stream,
@@ -601,6 +629,7 @@ impl BlockDiffusionDraftHead {
                 use_radix_topk,
                 use_k32_selector,
                 use_rejection_graph_selector,
+                use_ngram_graph_selector,
                 dstate,
                 ctx,
                 stream,
@@ -637,7 +666,9 @@ impl BlockDiffusionDraftHead {
             });
         }
 
-        if (use_k32_selector || use_rejection_graph_selector) && self.markov.is_none() {
+        if (use_k32_selector || use_rejection_graph_selector || use_ngram_graph_selector)
+            && self.markov.is_none()
+        {
             dstate.pending_draft_probs_gamma = gamma_eff;
         }
         if use_rejection_graph_selector {
@@ -678,6 +709,7 @@ impl BlockDiffusionDraftHead {
         // to the post-graph scalar walk only when all batched symbols are absent.
         let selector_walk_ran_in_graph = self.markov.is_none()
             && (use_rejection_graph_selector
+                || use_ngram_graph_selector
                 || use_gumbel_graph_selector
                 || self.kernels.dflash2_selector_walk_batched.0 != 0);
         if let Some(sel) = &self.selector

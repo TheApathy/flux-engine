@@ -317,6 +317,7 @@ impl BlockDiffusionDraftHead {
         use_radix_topk: bool,
         use_k32_selector: bool,
         rejection_mode: bool,
+        use_ngram_selector: bool,
         dstate: &DflashProposerState,
         ctx: &ForwardContext,
         stream: u64,
@@ -609,6 +610,33 @@ impl BlockDiffusionDraftHead {
                     gamma_eff,
                     sel.rank,
                     1,
+                    stream,
+                )?;
+            } else if self.markov.is_none() && use_ngram_selector {
+                let cfg = super::super::ngram_bonus::NgramBonusConfig::default();
+                ops::dflash2_selector_walk_ngram_batched(
+                    gpu,
+                    self.kernels.dflash2_selector_walk_ngram_batched,
+                    &ops::Dflash2NgramWalkArgs {
+                        unary: self.scratch.topk_logits_dev,
+                        candidates: self.scratch.topk_tokens_dev,
+                        hidden: self.scratch.selector_hidden,
+                        pred: sel.predecessor_codebook.weight,
+                        succ: sel.successor_codebook.weight,
+                        out_tokens: self.scratch.draft_tokens_dev,
+                        out_probs: (!self.scratch.batch_out_probs.is_null())
+                            .then_some(self.scratch.batch_out_probs),
+                        anchor_ids: last_token_dev,
+                        prev3_tokens: Some(self.scratch.ngram_prev3_dev),
+                        ngram_tables: Some(self.scratch.ngram_tables_dev),
+                        temperatures: Some(gumbel_ptrs.temps),
+                        margin_thresh: cfg.margin_thresh,
+                        max_bonus: cfg.effective_max_bonus(),
+                        top_k_shortlist: shortlist_k,
+                        gamma: gamma_eff,
+                        rank: sel.rank,
+                        batch_size: 1,
+                    },
                     stream,
                 )?;
             } else if self.markov.is_none() && use_k32_selector {

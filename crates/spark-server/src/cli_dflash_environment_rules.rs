@@ -124,6 +124,7 @@ pub(super) const RELEASE_ENVIRONMENT_RULES: &[EnvironmentRule] = &[
     rule("ATLAS_DFLASH_MARKOV", UNSET),
     rule("ATLAS_DFLASH_MASK_OVERRIDE", UNSET),
     rule("ATLAS_DFLASH_METHOD", FLAT),
+    rule("ATLAS_DFLASH_NGRAM_BONUS", UNSET),
     // Two-stage CUDA-graphed DFlash noise pass opt-in (`noise_pass.rs`):
     // strict "0"/"1" parser, defaults off when unset.
     rule("ATLAS_DFLASH_NOISE_GRAPH", ZERO_OR_ONE),

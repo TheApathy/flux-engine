@@ -513,6 +513,10 @@ pub struct DflashKernels {
     /// normalized shortlist `(q_cand_ids, q_probs)` directly into GPU shared scratch
     /// at per-sequence `out_q_row_bases[b]`. Sentinel zero on miss.
     pub dflash2_selector_walk_probabilistic_batched: KernelHandle,
+    /// Opt-in 4-gate safe in-context n-gram bonus DFlash2 selector walk
+    /// (`dflash2_selector_walk_ngram_batched`, `ATLAS_DFLASH_NGRAM_BONUS=1`, T=0 only).
+    /// Sentinel zero on miss.
+    pub dflash2_selector_walk_ngram_batched: KernelHandle,
     /// Cross-sequence batched HD=128 split-context attention
     /// (`inferspark_prefill_split_ctx_h128_batched`) reading circular PostRope
     /// per-sequence `ctx_{k,v}_cache` via pointer tables. Sentinel zero on miss.
@@ -768,6 +772,14 @@ pub struct DflashScratch {
     pub shared_q_row_cap: usize,
     /// Candidate stride of `shared_q_ids` / `shared_q_probs` (20 when bound).
     pub shared_q_stride: usize,
+    /// Per-sequence open-addressed n-gram tables `[DFLASH_BATCH_MAX_SEQS, 512]`
+    /// (`NgramTableEntry`, 512 KiB) for `dflash2_selector_walk_ngram_batched`.
+    /// Allocated ONLY when `ATLAS_DFLASH_NGRAM_BONUS=1` and a selector is present;
+    /// `DevicePtr::NULL` when OFF (zero VRAM overhead on baseline).
+    pub ngram_tables_dev: DevicePtr,
+    /// Per-sequence `[t-3, t-2, t-1]` history tokens `[DFLASH_BATCH_MAX_SEQS, 3]` u32
+    /// (768 B) for `dflash2_selector_walk_ngram_batched`. `DevicePtr::NULL` when OFF.
+    pub ngram_prev3_dev: DevicePtr,
 }
 
 impl DflashScratch {
@@ -2950,6 +2962,7 @@ pub(super) fn read_draft_probs_into(
 
 pub mod async_propose;
 mod batched_propose;
+pub mod dcoco;
 pub mod ddtree;
 pub mod ddtree_gdn_contract;
 pub mod ddtree_gdn_dispatch;
@@ -2966,6 +2979,7 @@ mod from_weights;
 mod logits_layout;
 pub mod lookup_stats;
 mod markov;
+pub mod ngram_bonus;
 mod noise_pass;
 mod pctree;
 mod proposal_inputs;
@@ -4078,6 +4092,7 @@ mod seq_buf_pool_tests {
             dflash2_selector_walk_gumbel_batched_k32: k0,
             dflash2_selector_walk_probabilistic: k0,
             dflash2_selector_walk_probabilistic_batched: k0,
+            dflash2_selector_walk_ngram_batched: k0,
             split_ctx_h128_batched: k0,
             argmax_add: k0,
             topk: k0,
@@ -4149,6 +4164,8 @@ mod seq_buf_pool_tests {
             shared_q_probs: p0,
             shared_q_row_cap: 0,
             shared_q_stride: 0,
+            ngram_tables_dev: p0,
+            ngram_prev3_dev: p0,
         };
         Box::new(BlockDiffusionDraftHead {
             checkpoint_family: DrafterCheckpointFamily::Dflash,

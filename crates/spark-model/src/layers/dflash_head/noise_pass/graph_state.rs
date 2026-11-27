@@ -353,6 +353,8 @@ pub(in super::super) struct NoiseGraphHeadState {
     pub(in super::super) c1_bundle_slot_bytes: usize,
     pub(in super::super) gumbel_pinned: Option<PinnedHostBuffer>,
     pub(in super::super) gumbel_slot: usize,
+    pub(in super::super) ngram_upload_pinned: Option<PinnedHostBuffer>,
+    pub(in super::super) ngram_upload_slot: usize,
     pub(in super::super) mask_tokens_dev: DevicePtr,
     pub(in super::super) mask_tokens_pinned: Option<PinnedHostBuffer>,
     pub(in super::super) uploaded_mask_id: Option<u32>,
@@ -400,6 +402,8 @@ impl NoiseGraphHeadState {
             c1_bundle_slot_bytes: 0,
             gumbel_pinned: None,
             gumbel_slot: 0,
+            ngram_upload_pinned: None,
+            ngram_upload_slot: 0,
             mask_tokens_dev: DevicePtr::NULL,
             mask_tokens_pinned: None,
             uploaded_mask_id: None,
@@ -965,6 +969,71 @@ impl NoiseGraphHeadState {
         Ok(())
     }
 
+    /// Build a Gate-4 anti-loop n-gram table for C=1 and enqueue stream-ordered
+    /// pinned async H2D copies into `(tables_dev, prev3_dev)` (plus optional
+    /// `anchor_dev` on the eager path) with zero host synchronization.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors C=1 upload_gumbel_meta_c1_with_q_base stream-ordered upload signature"
+    )]
+    pub(in super::super) fn upload_ngram_meta_c1(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        haystack: &[u32],
+        anchor_id: u32,
+        tables_dev: DevicePtr,
+        prev3_dev: DevicePtr,
+        anchor_dev: Option<DevicePtr>,
+        stream: u64,
+    ) -> Result<()> {
+        use super::super::ngram_bonus::{
+            NGRAM_PREV3_BYTES, NGRAM_TABLE_BYTES, NgramBonusConfig, build_sequence_ngram_table,
+        };
+        const ANCHOR_BYTES: usize = std::mem::size_of::<u32>();
+        const SLOT_BYTES: usize = NGRAM_TABLE_BYTES + NGRAM_PREV3_BYTES + ANCHOR_BYTES;
+
+        let cfg = NgramBonusConfig::default();
+        let (table, prev3) = build_sequence_ngram_table(haystack, anchor_id, cfg);
+        if self.ngram_upload_pinned.is_none() {
+            self.ngram_upload_pinned =
+                Some(gpu.alloc_host_pinned(SLOT_BYTES * NOISE_META_PINNED_SLOTS)?);
+        }
+        let slot = self.ngram_upload_slot;
+        self.ngram_upload_slot = (self.ngram_upload_slot + 1) % NOISE_META_PINNED_SLOTS;
+        let base = slot * SLOT_BYTES;
+
+        let pinned = self
+            .ngram_upload_pinned
+            .as_mut()
+            .context("DFlash C=1 n-gram pinned staging buffer missing")?;
+        let dst = &mut pinned.as_mut_slice()[base..base + SLOT_BYTES];
+        table.write_le_bytes_into(&mut dst[..NGRAM_TABLE_BYTES])?;
+        for (i, &tok) in prev3.iter().enumerate() {
+            let off = NGRAM_TABLE_BYTES + i * 4;
+            dst[off..off + 4].copy_from_slice(&tok.to_le_bytes());
+        }
+        let anchor_off = NGRAM_TABLE_BYTES + NGRAM_PREV3_BYTES;
+        dst[anchor_off..anchor_off + 4].copy_from_slice(&anchor_id.to_le_bytes());
+
+        let tbl_slice = pinned.pinned_slice_range(base, NGRAM_TABLE_BYTES)?;
+        let prev3_slice = pinned.pinned_slice_range(base + NGRAM_TABLE_BYTES, NGRAM_PREV3_BYTES)?;
+        // SAFETY: `ngram_upload_pinned` is page-locked and owned by the static
+        // per-head state; rotating across `NOISE_META_PINNED_SLOTS` disjoint
+        // slots ensures no in-flight async H2D transfer is overwritten.
+        unsafe {
+            gpu.copy_h2d_pinned_async(tbl_slice, tables_dev, stream)?;
+            gpu.copy_h2d_pinned_async(prev3_slice, prev3_dev, stream)?;
+        }
+        if let Some(dev_anchor) = anchor_dev {
+            let anchor_slice = pinned.pinned_slice_range(base + anchor_off, ANCHOR_BYTES)?;
+            // SAFETY: same rotating page-locked slot invariant as above.
+            unsafe {
+                gpu.copy_h2d_pinned_async(anchor_slice, dev_anchor, stream)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(in super::super) fn insert_graph(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -1036,6 +1105,8 @@ pub(in super::super) fn clear_noise_graph_head_state(head_ptr: usize, gpu: &dyn 
         state.c1_bundle_pinned = None;
         state.c1_bundle_layers = 0;
         state.c1_bundle_slot_bytes = 0;
+        state.ngram_upload_pinned = None;
+        state.ngram_upload_slot = 0;
         let s = &mut *state;
         for ptr in [
             &mut s.stage1_fc_dev,

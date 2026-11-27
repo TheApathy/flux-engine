@@ -1226,3 +1226,252 @@ extern "C" __global__ void dflash2_selector_walk_probabilistic_batched(
         __syncthreads();
     }
 }
+
+// ── 4-Gate Safe In-Context N-Gram Bonus DFlash2 Selector Walk (T=0 ONLY) ─────
+//
+// Opt-in (`ATLAS_DFLASH_NGRAM_BONUS=1`, default OFF). Appended as a separate
+// symbol so every existing selector kernel above remains bit-for-bit unchanged.
+//
+// Safety invariants enforced in-kernel:
+//   Gate 0 (T=0 ONLY): bypassed whenever `temperatures != nullptr &&
+//          temperatures[b] > 0.0f && isfinite(temperatures[b])`.
+//   Gate 1 (Uncertainty): fires ONLY when `top1 - top2 < margin_thresh`.
+//   Gate 2 (Top-4 verbatim 3/4-gram): probes open-addressed sequence table for
+//          4-gram first then 3-gram; boosts ONLY if matched `next_token` is
+//          already ranked inside top-4 (`0..min(4, top_k_shortlist)`).
+//   Gate 3 (Hard logit cap): bonus strictly clamped `<= min(max_bonus, 0.75f)`
+//          (`0.50f` for 3-gram, `0.75f` for 4-gram).
+//   Gate 4 (Anti-loop <= 64): host table builder excludes all matches inside
+//          the trailing 64-token window and any locally repeating 3-gram cycle.
+
+#define DF2_NGRAM_TABLE_SLOTS 512u
+#define DF2_NGRAM_TABLE_MASK  (DF2_NGRAM_TABLE_SLOTS - 1u)
+#define DF2_NGRAM_MAX_PROBE   8u
+#define DF2_NGRAM_TOP_RANK    4
+#define DF2_NGRAM_HARD_CAP    0.75f
+#define DF2_NGRAM_SALT3       0x9E3779B97F4A7C15ull
+#define DF2_NGRAM_SALT4       0xBF58476D1CE4E5B9ull
+#define DF2_NGRAM_EMPTY_TOK   0xFFFFFFFFu
+
+struct Df2NgramEntry {
+    unsigned long long key;
+    unsigned int next_token;
+    unsigned int match_len;
+};
+
+__device__ __forceinline__ unsigned long long df2_ngram_key3(
+    unsigned int a, unsigned int b, unsigned int c
+) {
+    unsigned long long h = df2_splitmix64_mix((unsigned long long)a ^ DF2_NGRAM_SALT3);
+    h = df2_splitmix64_mix(h ^ (unsigned long long)b);
+    h = df2_splitmix64_mix(h ^ (unsigned long long)c);
+    return (h == 0ull) ? 1ull : h;
+}
+
+__device__ __forceinline__ unsigned long long df2_ngram_key4(
+    unsigned int a, unsigned int b, unsigned int c, unsigned int d
+) {
+    unsigned long long h = df2_splitmix64_mix((unsigned long long)a ^ DF2_NGRAM_SALT4);
+    h = df2_splitmix64_mix(h ^ (unsigned long long)b);
+    h = df2_splitmix64_mix(h ^ (unsigned long long)c);
+    h = df2_splitmix64_mix(h ^ (unsigned long long)d);
+    return (h == 0ull) ? 1ull : h;
+}
+
+__device__ __forceinline__ unsigned int df2_ngram_probe(
+    const Df2NgramEntry* __restrict__ table,
+    unsigned long long key,
+    unsigned int expected_len
+) {
+    unsigned int slot = (unsigned int)(key & (unsigned long long)DF2_NGRAM_TABLE_MASK);
+    #pragma unroll
+    for (unsigned int step = 0u; step < DF2_NGRAM_MAX_PROBE; ++step) {
+        const Df2NgramEntry entry = table[slot];
+        if (entry.key == 0ull) {
+            return DF2_NGRAM_EMPTY_TOK;
+        }
+        if (entry.key == key && entry.match_len == expected_len) {
+            return entry.next_token;
+        }
+        slot = (slot + 1u) & DF2_NGRAM_TABLE_MASK;
+    }
+    return DF2_NGRAM_EMPTY_TOK;
+}
+
+// Grid: [batch_size, 1, 1], Block: [32, 1, 1].
+extern "C" __global__ void __launch_bounds__(32) dflash2_selector_walk_ngram_batched(
+    const float* __restrict__ unary,               // [batch_size * gamma, top_k_shortlist]
+    const unsigned int* __restrict__ candidates,   // [batch_size * gamma, top_k_shortlist]
+    const __nv_bfloat16* __restrict__ hidden,      // [batch_size * gamma, rank]
+    const __nv_bfloat16* __restrict__ pred,        // [vocab, rank]
+    const __nv_bfloat16* __restrict__ succ,        // [vocab, rank]
+    unsigned int* __restrict__ out_tokens,         // [batch_size * gamma] out
+    float* __restrict__ out_probs,                 // [batch_size * gamma] optional out
+    const unsigned int* __restrict__ anchor_ids,   // [batch_size]
+    const unsigned int* __restrict__ prev3_tokens, // [batch_size, 3] ([t-3, t-2, t-1], 0xFFFFFFFF if absent)
+    const Df2NgramEntry* __restrict__ ngram_tables,// [batch_size, 512]
+    const float* __restrict__ temperatures,        // [batch_size] optional (nullptr -> greedy T=0)
+    float margin_thresh,
+    float max_bonus,
+    int top_k_shortlist,
+    int gamma,
+    int rank,
+    int batch_size
+) {
+    const int b = (int)blockIdx.x;
+    if (b >= batch_size || batch_size <= 0 || gamma <= 0 || rank <= 0
+        || top_k_shortlist <= 0 || top_k_shortlist > DF2_TOPK_MAX) {
+        return;
+    }
+
+    const size_t stride_k = (size_t)top_k_shortlist;
+    const size_t row_base = (size_t)b * (size_t)gamma;
+    unary      += row_base * stride_k;
+    candidates += row_base * stride_k;
+    hidden     += row_base * (size_t)rank;
+    out_tokens += row_base;
+    if (out_probs != nullptr) {
+        out_probs += row_base;
+    }
+
+    const Df2NgramEntry* seq_table =
+        (ngram_tables != nullptr) ? (ngram_tables + (size_t)b * DF2_NGRAM_TABLE_SLOTS) : nullptr;
+    const float temp = (temperatures != nullptr) ? temperatures[b] : 0.0f;
+    // Gate 0: strict T=0 ONLY (fail closed on T > 0 or non-finite temperature).
+    const bool gate0_greedy_ok = isfinite(temp) && (temp <= 0.0f);
+    const float eff_max_bonus =
+        (isfinite(max_bonus) && max_bonus > 0.0f) ? fminf(max_bonus, DF2_NGRAM_HARD_CAP) : 0.0f;
+    const bool ngram_active =
+        gate0_greedy_ok && (seq_table != nullptr)
+        && isfinite(margin_thresh) && (margin_thresh > 0.0f)
+        && (eff_max_bonus > 0.0f);
+
+    __shared__ float s_score[DF2_TOPK_MAX];
+    __shared__ unsigned int s_cand[DF2_TOPK_MAX];
+    __shared__ unsigned int s_hist[4]; // [h_{t-4}, h_{t-3}, h_{t-2}, h_{t-1}=s_prev]
+
+    const unsigned int k = threadIdx.x;
+    if (k == 0u) {
+        if (prev3_tokens != nullptr) {
+            s_hist[0] = prev3_tokens[(size_t)b * 3u + 0u];
+            s_hist[1] = prev3_tokens[(size_t)b * 3u + 1u];
+            s_hist[2] = prev3_tokens[(size_t)b * 3u + 2u];
+        } else {
+            s_hist[0] = DF2_NGRAM_EMPTY_TOK;
+            s_hist[1] = DF2_NGRAM_EMPTY_TOK;
+            s_hist[2] = DF2_NGRAM_EMPTY_TOK;
+        }
+        s_hist[3] = anchor_ids[b];
+    }
+    __syncthreads();
+
+    for (int t = 0; t < gamma; ++t) {
+        const unsigned int prev_tok = s_hist[3];
+        const __nv_bfloat16* pr = pred + (size_t)prev_tok * (size_t)rank;
+        const __nv_bfloat16* hr = hidden + (size_t)t * (size_t)rank;
+
+        if ((int)k < top_k_shortlist) {
+            const unsigned int cand = candidates[(size_t)t * stride_k + k];
+            const __nv_bfloat16* sr = succ + (size_t)cand * (size_t)rank;
+            float acc = 0.0f;
+            for (int r = 0; r < rank; ++r) {
+                acc += __bfloat162float(pr[r]) * __bfloat162float(hr[r])
+                     * __bfloat162float(sr[r]);
+            }
+            s_score[k] = unary[(size_t)t * stride_k + k] + acc;
+            s_cand[k] = cand;
+        }
+        __syncthreads();
+
+        if (k == 0u) {
+            // Find top-4 slots descending by (s_score[j], ~s_cand[j]) without sorting all K.
+            int top_idx[DF2_NGRAM_TOP_RANK];
+            const int rank_cap = (top_k_shortlist < DF2_NGRAM_TOP_RANK)
+                ? top_k_shortlist
+                : DF2_NGRAM_TOP_RANK;
+            unsigned int used_mask = 0u;
+            for (int r = 0; r < rank_cap; ++r) {
+                int best = -1;
+                for (int j = 0; j < top_k_shortlist; ++j) {
+                    if ((used_mask & (1u << j)) != 0u) continue;
+                    if (best < 0 || s_score[j] > s_score[best]
+                        || (s_score[j] == s_score[best] && s_cand[j] < s_cand[best])) {
+                        best = j;
+                    }
+                }
+                top_idx[r] = best;
+                used_mask |= (1u << best);
+            }
+
+            // Gate 1: uncertainty margin `top1 - top2 < margin_thresh`.
+            if (ngram_active && rank_cap >= 2) {
+                const float margin = s_score[top_idx[0]] - s_score[top_idx[1]];
+                if (isfinite(margin) && margin < margin_thresh) {
+                    unsigned int matched_tok = DF2_NGRAM_EMPTY_TOK;
+                    float bonus = 0.0f;
+                    // Gate 2a: verbatim 4-gram first (bonus <= 0.75), then 3-gram (bonus <= 0.50).
+                    if (s_hist[0] != DF2_NGRAM_EMPTY_TOK && s_hist[1] != DF2_NGRAM_EMPTY_TOK
+                        && s_hist[2] != DF2_NGRAM_EMPTY_TOK) {
+                        matched_tok = df2_ngram_probe(
+                            seq_table,
+                            df2_ngram_key4(s_hist[0], s_hist[1], s_hist[2], s_hist[3]),
+                            4u
+                        );
+                        if (matched_tok != DF2_NGRAM_EMPTY_TOK) {
+                            bonus = eff_max_bonus;
+                        }
+                    }
+                    if (matched_tok == DF2_NGRAM_EMPTY_TOK
+                        && s_hist[1] != DF2_NGRAM_EMPTY_TOK
+                        && s_hist[2] != DF2_NGRAM_EMPTY_TOK) {
+                        matched_tok = df2_ngram_probe(
+                            seq_table,
+                            df2_ngram_key3(s_hist[1], s_hist[2], s_hist[3]),
+                            3u
+                        );
+                        if (matched_tok != DF2_NGRAM_EMPTY_TOK) {
+                            bonus = fminf(eff_max_bonus, 0.50f);
+                        }
+                    }
+                    // Gate 2b + Gate 3: apply capped bonus ONLY if matched_tok is inside top-4.
+                    if (matched_tok != DF2_NGRAM_EMPTY_TOK && bonus > 0.0f) {
+                        for (int r = 0; r < rank_cap; ++r) {
+                            const int slot = top_idx[r];
+                            if (s_cand[slot] == matched_tok) {
+                                s_score[slot] += bonus;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Final greedy argmax (exact tie-break matching existing selector).
+            float best = s_score[0];
+            int best_k = 0;
+            for (int j = 1; j < top_k_shortlist; ++j) {
+                if (s_score[j] > best) {
+                    best = s_score[j];
+                    best_k = j;
+                }
+            }
+            const unsigned int chosen = s_cand[best_k];
+            if (out_probs != nullptr) {
+                float denom = 0.0f;
+                for (int j = 0; j < top_k_shortlist; ++j) {
+                    const float term = expf(s_score[j] - best);
+                    denom += isfinite(term) ? term : 0.0f;
+                }
+                out_probs[t] = (denom > 0.0f && isfinite(denom))
+                    ? __fdiv_rn(1.0f, denom)
+                    : 1.0f;
+            }
+            out_tokens[t] = chosen;
+            s_hist[0] = s_hist[1];
+            s_hist[1] = s_hist[2];
+            s_hist[2] = s_hist[3];
+            s_hist[3] = chosen;
+        }
+        __syncthreads();
+    }
+}

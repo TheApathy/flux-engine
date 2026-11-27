@@ -466,6 +466,15 @@ impl BlockDiffusionDraftHead {
             } else {
                 KernelHandle(0)
             },
+            dflash2_selector_walk_ngram_batched: if weights.selector.is_some() {
+                crate::layers::try_kernel(
+                    gpu,
+                    "dflash2_selector",
+                    "dflash2_selector_walk_ngram_batched",
+                )
+            } else {
+                KernelHandle(0)
+            },
             split_ctx_h128_batched: if head_dim == 128 {
                 crate::layers::try_kernel(
                     gpu,
@@ -776,6 +785,22 @@ impl BlockDiffusionDraftHead {
             shared_q_probs: DevicePtr::NULL,
             shared_q_row_cap: 0,
             shared_q_stride: 0,
+            ngram_tables_dev: if weights.selector.is_some()
+                && super::ngram_bonus::ngram_bonus_enabled()
+            {
+                alloc_tx
+                    .alloc(super::DFLASH_BATCH_MAX_SEQS * super::ngram_bonus::NGRAM_TABLE_BYTES)?
+            } else {
+                DevicePtr::NULL
+            },
+            ngram_prev3_dev: if weights.selector.is_some()
+                && super::ngram_bonus::ngram_bonus_enabled()
+            {
+                alloc_tx
+                    .alloc(super::DFLASH_BATCH_MAX_SEQS * super::ngram_bonus::NGRAM_PREV3_BYTES)?
+            } else {
+                DevicePtr::NULL
+            },
         };
         // Initialize the FC-layernorm weight buffer to BF16 `1.0` (`0x3F80`) so
         // `rms_norm_vanilla` (`x * w / RMS(x)`) computes plain unit-variance
@@ -815,6 +840,20 @@ impl BlockDiffusionDraftHead {
             ),
         ] {
             gpu.memset(ptr, 0, bytes)?;
+        }
+        if !scratch.ngram_tables_dev.is_null() {
+            gpu.memset(
+                scratch.ngram_tables_dev,
+                0,
+                super::DFLASH_BATCH_MAX_SEQS * super::ngram_bonus::NGRAM_TABLE_BYTES,
+            )?;
+        }
+        if !scratch.ngram_prev3_dev.is_null() {
+            gpu.memset(
+                scratch.ngram_prev3_dev,
+                0,
+                super::DFLASH_BATCH_MAX_SEQS * super::ngram_bonus::NGRAM_PREV3_BYTES,
+            )?;
         }
 
         // Capture the DSpark Markov head weights before `weights.layers` is
