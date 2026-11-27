@@ -140,12 +140,36 @@ fn raw_cublas_gemm_override() -> SmEnvOverride {
     *RAW.get_or_init(|| parse_sm_env_override(std::env::var("ATLAS_CUBLAS_GEMM").ok().as_deref()))
 }
 
+const fn resolve_ssm_proj_tc_for_sm_with_policy(
+    env_override: SmEnvOverride,
+    sm_count: u32,
+    rows: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    resolve_ssm_proj_tc_for_sm(env_override, sm_count, rows)
+}
+
 const fn resolve_ssm_proj_tc_for_sm(env_override: SmEnvOverride, sm_count: u32, rows: u32) -> bool {
     match env_override {
         SmEnvOverride::Disabled => false,
         SmEnvOverride::Enabled => true,
         SmEnvOverride::Auto => sm_count > 64 && rows >= 16,
     }
+}
+
+const fn resolve_cublas_ba_for_sm_with_policy(
+    env_override: SmEnvOverride,
+    sm_count: u32,
+    rows: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    resolve_cublas_ba_for_sm(env_override, sm_count, rows)
 }
 
 const fn resolve_cublas_ba_for_sm(env_override: SmEnvOverride, sm_count: u32, rows: usize) -> bool {
@@ -195,6 +219,48 @@ const fn select_multi_seq_nvfp4_proj_route(
     } else {
         MultiSeqNvfp4ProjRoute::SerialGemv
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "policy-aware multi-seq NVFP4 projection route over hardware and kernel capabilities"
+)]
+const fn select_multi_seq_nvfp4_proj_route_for_sm_with_policy(
+    rows: u32,
+    n: u32,
+    sm_count: u32,
+    tc_enabled: bool,
+    has_transposed: bool,
+    splitk_splits: u32,
+    has_m32_n64_splitk: bool,
+    has_m32_n64: bool,
+    has_m128: bool,
+    has_t_n128: bool,
+    has_legacy_gemm: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> MultiSeqNvfp4ProjRoute {
+    if det_batch.is_enabled() {
+        return if rows >= 2
+            && rows <= crate::layers::deterministic_batch::DETERMINISTIC_BATCH_MAX_ROWS as u32
+        {
+            MultiSeqNvfp4ProjRoute::ExactRows
+        } else {
+            MultiSeqNvfp4ProjRoute::SerialGemv
+        };
+    }
+    select_multi_seq_nvfp4_proj_route_for_sm(
+        rows,
+        n,
+        sm_count,
+        tc_enabled,
+        has_transposed,
+        splitk_splits,
+        has_m32_n64_splitk,
+        has_m32_n64,
+        has_m128,
+        has_t_n128,
+        has_legacy_gemm,
+    )
 }
 
 #[expect(
@@ -326,9 +392,12 @@ impl Qwen3SsmLayer {
         label: &'static str,
         stream: u64,
     ) -> Result<()> {
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
         let sm_count = atlas_core::device::active_sm_count();
         let tc_override = raw_ssm_proj_tc_override();
-        let tc_enabled = resolve_ssm_proj_tc_for_sm(tc_override, sm_count, rows);
+        let tc_enabled =
+            resolve_ssm_proj_tc_for_sm_with_policy(tc_override, sm_count, rows, det_batch);
 
         // On wide discrete GPUs (`sm_count > 64`) at `M = 4..=sm120_max_m`
         // (up to `C=64` when `ATLAS_SM120_COALESCED_WIDE_M!=0`, else `C=16`),
@@ -338,7 +407,8 @@ impl Qwen3SsmLayer {
         // full 188-SM 600W saturation, graph-capture-safe). Always skipped on
         // GB10 (`<= 64` SMs) or when `ATLAS_SSM_PROJ_TC=0`.
         let sm120_max_m = crate::layers::dense_ffn::sm120_coalesced_max_m();
-        if rows >= 4
+        if !det_batch.is_enabled()
+            && rows >= 4
             && (rows as usize) <= sm120_max_m
             && tc_override != SmEnvOverride::Disabled
             && crate::layers::dense_ffn::try_coalesced_nvfp4_sm120_small_m(
@@ -360,7 +430,8 @@ impl Qwen3SsmLayer {
         // `M <= 16` coalesced BF16 MMA tier, or `M > 64` when wide coalesced
         // is enabled), route through native block-scaled cuBLASLt NVFP4 unless
         // the caller explicitly disabled TC via `ATLAS_SSM_PROJ_TC=0`.
-        if rows >= crate::layers::dense_ffn::CUBLASLT_NVFP4_MIN_M
+        if !det_batch.is_enabled()
+            && rows >= crate::layers::dense_ffn::CUBLASLT_NVFP4_MIN_M
             && tc_override != SmEnvOverride::Disabled
             && ops::try_cublaslt_nvfp4_multiseq_single(
                 gpu,
@@ -379,7 +450,7 @@ impl Qwen3SsmLayer {
             return Ok(());
         }
 
-        let ws = if splitk_splits > 0 {
+        let ws = if splitk_splits > 0 && !det_batch.is_enabled() {
             *self
                 .ssm_splitk_workspace
                 .lock()
@@ -387,7 +458,7 @@ impl Qwen3SsmLayer {
         } else {
             None
         };
-        let route = select_multi_seq_nvfp4_proj_route_for_sm(
+        let route = select_multi_seq_nvfp4_proj_route_for_sm_with_policy(
             rows,
             n,
             sm_count,
@@ -401,6 +472,7 @@ impl Qwen3SsmLayer {
             self.w4a16_gemm_t_m128_k.0 != 0,
             self.w4a16_gemm_t_k.0 != 0,
             self.w4a16_gemm_k.0 != 0,
+            det_batch,
         );
         match route {
             MultiSeqNvfp4ProjRoute::TcM32N64SplitK => {
@@ -733,13 +805,17 @@ impl Qwen3SsmLayer {
             //   in step 4) + one `compute_gdn_gates_multi_seq` consuming
             //   the BA output.
             // Fallback: per-seq `dense_gemv_ba_gates` loop.
+            let det_batch =
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
             let use_cublas_ba = cfg!(feature = "cuda")
-                && resolve_cublas_ba_for_sm(
+                && resolve_cublas_ba_for_sm_with_policy(
                     raw_cublas_gemm_override(),
                     atlas_core::device::active_sm_count(),
                     num_seqs,
+                    det_batch,
                 );
-            let ba_batched_split = (self.dense_gemm_k.0 != 0 || use_cublas_ba)
+            let ba_batched_split = !det_batch.is_enabled()
+                && (self.dense_gemm_k.0 != 0 || use_cublas_ba)
                 && self.compute_gdn_gates_multi_seq_k.0 != 0;
             if ba_batched_split {
                 // Scratch: `conv_out_f32` reinterpreted as BF16 head. We
@@ -970,7 +1046,7 @@ impl Qwen3SsmLayer {
                             ctx.graph_capture,
                             stream,
                         )?;
-                    } else if self.dense_gemm_k.0 != 0 {
+                    } else if !det_batch.is_enabled() && self.dense_gemm_k.0 != 0 {
                         ops::dense_gemm(
                             ctx.gpu,
                             self.dense_gemm_k,
@@ -1275,8 +1351,9 @@ impl Qwen3SsmLayer {
         // (splitting a 33-row tail into `17 + 16`) so default exactness holds
         // and legacy `w4a16_gemm` is never hit. MoE / BF16-dense / None return
         // `Ok(false)` on the first chunk and execute the per-seq loop below.
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let mut ffn_batched = false;
-        if num_seqs >= 2 {
+        if should_use_multi_seq_batched_ffn_with_policy(num_seqs, det_batch) {
             let wide_ready = self.ffn.wide_kgamma_ready(num_seqs as u32);
             let chunks = plan_multi_seq_ffn_chunks(num_seqs, wide_ready);
             ffn_batched = !chunks.is_empty();
@@ -1642,13 +1719,74 @@ impl Qwen3SsmLayer {
     }
 }
 
+#[inline]
+#[must_use]
+const fn should_use_multi_seq_batched_ffn_with_policy(
+    num_seqs: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    num_seqs >= 2 && !det_batch.is_enabled()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MultiSeqNvfp4ProjRoute, SmEnvOverride, parse_sm_env_override, plan_multi_seq_ffn_chunks,
-        resolve_cublas_ba_for_sm, resolve_ssm_proj_tc_for_sm, select_multi_seq_nvfp4_proj_route,
+        resolve_cublas_ba_for_sm, resolve_cublas_ba_for_sm_with_policy, resolve_ssm_proj_tc_for_sm,
+        resolve_ssm_proj_tc_for_sm_with_policy, select_multi_seq_nvfp4_proj_route,
         select_multi_seq_nvfp4_proj_route_for_sm,
+        select_multi_seq_nvfp4_proj_route_for_sm_with_policy,
     };
+    use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+    #[test]
+    fn deterministic_batch_pins_ssm_multi_seq_routes_across_1_to_128() {
+        for sm in [48u32, 188u32] {
+            for m in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+                for ov in [
+                    SmEnvOverride::Auto,
+                    SmEnvOverride::Enabled,
+                    SmEnvOverride::Disabled,
+                ] {
+                    assert!(!resolve_ssm_proj_tc_for_sm_with_policy(
+                        ov,
+                        sm,
+                        m,
+                        DeterministicBatchPolicy::Enabled,
+                    ));
+                    assert!(!resolve_cublas_ba_for_sm_with_policy(
+                        ov,
+                        sm,
+                        m as usize,
+                        DeterministicBatchPolicy::Enabled,
+                    ));
+                }
+                let expected = if m == 1 {
+                    MultiSeqNvfp4ProjRoute::SerialGemv
+                } else {
+                    MultiSeqNvfp4ProjRoute::ExactRows
+                };
+                assert_eq!(
+                    select_multi_seq_nvfp4_proj_route_for_sm_with_policy(
+                        m,
+                        5_120,
+                        sm,
+                        true,
+                        true,
+                        4,
+                        true,
+                        true,
+                        true,
+                        true,
+                        true,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    expected,
+                    "M={m} sm={sm}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn sm120_auto_defaults_leave_gb10_untouched() {
@@ -1790,5 +1928,30 @@ mod tests {
         // Wide TC mode dispatches C=48/64 in a single shot.
         assert_eq!(plan_multi_seq_ffn_chunks(48, true), vec![(0, 48)]);
         assert_eq!(plan_multi_seq_ffn_chunks(64, true), vec![(0, 64)]);
+    }
+
+    #[test]
+    fn deterministic_batch_disables_multi_seq_batched_ffn_across_1_to_128() {
+        use super::should_use_multi_seq_batched_ffn_with_policy;
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert!(
+                !should_use_multi_seq_batched_ffn_with_policy(m, DeterministicBatchPolicy::Enabled),
+                "multi-seq batched FFN must stay disabled at M={m}"
+            );
+        }
+        assert!(!should_use_multi_seq_batched_ffn_with_policy(
+            1,
+            DeterministicBatchPolicy::Disabled
+        ));
+        assert!(should_use_multi_seq_batched_ffn_with_policy(
+            2,
+            DeterministicBatchPolicy::Disabled
+        ));
+        assert!(should_use_multi_seq_batched_ffn_with_policy(
+            8,
+            DeterministicBatchPolicy::Disabled
+        ));
     }
 }

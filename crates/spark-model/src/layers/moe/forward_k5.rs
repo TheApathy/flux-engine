@@ -312,6 +312,30 @@ struct BatchedVerifyTcMoePlan {
 /// with zero extra VRAM and zero lazy allocations, making it 100% CUDA-graph safe.
 #[inline]
 #[must_use]
+const fn batched_verify_router_tc_admits_with_policy(
+    scope_active: bool,
+    tc_dense_enabled: bool,
+    min_rows_override: Option<usize>,
+    rows: usize,
+    num_experts: u32,
+    hidden: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    batched_verify_router_tc_admits(
+        scope_active,
+        tc_dense_enabled,
+        min_rows_override,
+        rows,
+        num_experts,
+        hidden,
+    )
+}
+
+#[inline]
+#[must_use]
 const fn batched_verify_router_tc_admits(
     scope_active: bool,
     tc_dense_enabled: bool,
@@ -537,6 +561,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let _det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         anyhow::ensure!(
             matches!(rows, 4 | 5 | 9)
                 || (crate::layers::qwen4_hybrid_all_k()
@@ -644,13 +669,14 @@ impl MoeLayer {
         // bit-exact scalar GEMV path below.
         let use_rowpar = ops::w4a16_exact_rowpar_selected(self.w4a16_gemv_rows, num_experts);
         let ran_tc_router = !use_rowpar
-            && batched_verify_router_tc_admits(
+            && batched_verify_router_tc_admits_with_policy(
                 crate::layers::qwen4_hyper::batched_verify_tc_dense_scope_active(),
                 crate::layers::qwen4_hyper::batched_verify_tc_dense_enabled(),
                 crate::layers::qwen4_hyper::batched_verify_tc_dense_min_rows_override(),
                 rows,
                 num_experts,
                 h,
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
             )
             && super::qwen4_router_pipe::try_launch_batched_verify_router_gemm(
                 ctx.gpu,
@@ -1100,6 +1126,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<BatchedVerifyTcMoePlan>> {
+        if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+            return Ok(None);
+        }
         let policy = super::qwen4_prefill_compact::batched_verify_tc_moe_policy()?;
         let capturing = ctx.graph_capture || super::qwen4_moe_status::is_capturing(ctx.gpu, stream);
         let compact_active =
@@ -3334,6 +3363,32 @@ mod native_target_tile_tests {
         ));
         assert!(!batched_verify_router_tc_admits(
             true, true, None, 80, 512, 48
+        ));
+
+        use super::batched_verify_router_tc_admits_with_policy;
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert!(
+                !batched_verify_router_tc_admits_with_policy(
+                    true,
+                    true,
+                    None,
+                    m,
+                    512,
+                    2560,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                "router TC must stay disabled at M={m}"
+            );
+        }
+        assert!(batched_verify_router_tc_admits_with_policy(
+            true,
+            true,
+            None,
+            8,
+            512,
+            2560,
+            DeterministicBatchPolicy::Disabled,
         ));
     }
 }

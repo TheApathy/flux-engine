@@ -218,8 +218,9 @@ impl Qwen3AttentionLayer {
                 {
                     return Ok(route_telemetry.then_some(route));
                 }
-                if (crate::layers::qwen4_hyper::batched_verify_tc_dense_scope_active()
-                    || qwen4_c1_dense_attn_enabled())
+                if !crate::layers::deterministic_batch::deterministic_batch_enabled()
+                    && (crate::layers::qwen4_hyper::batched_verify_tc_dense_scope_active()
+                        || qwen4_c1_dense_attn_enabled())
                     && let Some(route) = self.try_qwen4_batched_dense_attention_rows(
                         raw_rows,
                         num_tokens,

@@ -831,14 +831,17 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
         let coalesced_enabled = crate::layers::qwen4_fast_proj::coalesced_nvfp4_dense_enabled();
         let direct_enabled = crate::layers::qwen4_fast_proj::direct_nvfp4_dense_enabled();
-        let Some(q_mode) = select_qkv_direct_q_mode(
+        let Some(q_mode) = select_qkv_direct_q_mode_with_policy(
             coalesced_enabled,
             direct_enabled,
             rows,
             h as usize,
             fp8_qkv_ready,
+            det_batch,
         ) else {
             return Ok(false);
         };
@@ -868,7 +871,7 @@ impl Qwen3AttentionLayer {
             .map(|(_, dual_kv)| dual_kv);
         let kv_span = (rows * extents.kv_bytes).next_multiple_of(16);
         let coalesced_kv_eligible = wide_dual_kv.is_none()
-            && qkv_direct_prefers_coalesced_kv(
+            && qkv_direct_prefers_coalesced_kv_with_policy(
                 coalesced_enabled,
                 rows,
                 h as usize,
@@ -878,6 +881,7 @@ impl Qwen3AttentionLayer {
                 extents.q_proj_bytes,
                 ctx.buffers.sizes().ssm_deinterleaved,
                 strided_copy_k.0 != 0,
+                det_batch,
             )
             && normed.0.is_multiple_of(16)
             && q_scratch.0.is_multiple_of(16)
@@ -1241,7 +1245,8 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if rows == 0
+        if crate::layers::deterministic_batch::deterministic_batch_enabled()
+            || rows == 0
             || rows > crate::layers::QWEN4_NATIVE_MAX_ROWS
             || self.o_dense_bf16.is_some()
             || self.o_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
@@ -1614,6 +1619,22 @@ enum QkvDirectQMode {
 
 #[inline]
 #[must_use]
+const fn select_qkv_direct_q_mode_with_policy(
+    coalesced_enabled: bool,
+    direct_enabled: bool,
+    rows: usize,
+    h: usize,
+    fp8_qkv_ready: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<QkvDirectQMode> {
+    if det_batch.is_enabled() {
+        return None;
+    }
+    select_qkv_direct_q_mode(coalesced_enabled, direct_enabled, rows, h, fp8_qkv_ready)
+}
+
+#[inline]
+#[must_use]
 const fn select_qkv_direct_q_mode(
     coalesced_enabled: bool,
     direct_enabled: bool,
@@ -1645,6 +1666,37 @@ const fn select_qkv_direct_q_mode(
 /// via single-launch coalesced NVFP4 W4A16 GEMMs (`try_coalesced_nvfp4_w4a16_gemm`)
 /// into the dead `q_scratch` arena + `strided_copy_rows`, eliminating 6–8 serial
 /// 32-row scalar `dual_kv` launches for `rows = 129..=256`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[must_use]
+const fn qkv_direct_prefers_coalesced_kv_with_policy(
+    coalesced_enabled: bool,
+    rows: usize,
+    h: usize,
+    kv_dim: usize,
+    kv_bytes: usize,
+    row_bytes: usize,
+    q_proj_bytes: usize,
+    scratch_bytes: usize,
+    has_strided_copy: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    qkv_direct_prefers_coalesced_kv(
+        coalesced_enabled,
+        rows,
+        h,
+        kv_dim,
+        kv_bytes,
+        row_bytes,
+        q_proj_bytes,
+        scratch_bytes,
+        has_strided_copy,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[must_use]
@@ -2472,5 +2524,52 @@ mod wide_exact_qkv_tests {
         for p in [src_dev, ref_dev, fused_dev] {
             let _ = gpu.free(p);
         }
+    }
+
+    #[test]
+    fn deterministic_batch_disables_qkv_direct_and_coalesced_kv_across_1_to_128() {
+        use super::{
+            QkvDirectQMode, qkv_direct_prefers_coalesced_kv_with_policy,
+            select_qkv_direct_q_mode_with_policy,
+        };
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(
+                select_qkv_direct_q_mode_with_policy(
+                    true,
+                    true,
+                    m,
+                    2_560,
+                    false,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                None,
+                "direct QKV must be disabled at M={m}"
+            );
+            assert!(!qkv_direct_prefers_coalesced_kv_with_policy(
+                true,
+                m,
+                2_560,
+                512,
+                1_024,
+                26_624,
+                24_576,
+                16 * 1024 * 1024,
+                true,
+                DeterministicBatchPolicy::Enabled,
+            ));
+        }
+        assert_eq!(
+            select_qkv_direct_q_mode_with_policy(
+                true,
+                false,
+                8,
+                2_560,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            Some(QkvDirectQMode::Coalesced)
+        );
     }
 }

@@ -1746,6 +1746,9 @@ pub(super) fn parse_gdn_h_fp16_enabled(raw: Option<&str>) -> bool {
 /// Process-constant gate for Tier-3 in-place per-head Scaled-FP16 `h_state`
 /// DRAM compression under `KEEP_LATE` (`ATLAS_QWEN4_GDN_H_FP16`, default ON).
 pub fn gdn_h_fp16_enabled() -> bool {
+    if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| {
         let raw = std::env::var(GDN_H_FP16_ENV).ok();
@@ -1766,6 +1769,9 @@ pub(super) fn parse_gdn_h_fp8_enabled(raw: Option<&str>) -> bool {
 /// Process-constant opt-in gate for in-place per-value-channel Scaled-FP8 E4M3
 /// `h_state` DRAM compression under `KEEP_LATE` (`ATLAS_QWEN4_GDN_H_FP8`, default OFF).
 pub fn gdn_h_fp8_enabled() -> bool {
+    if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| {
         let raw = std::env::var(GDN_H_FP8_ENV).ok();
@@ -1803,6 +1809,20 @@ pub(super) fn parse_gdn_split_v_policy(raw: Option<&str>) -> GdnSplitVPolicy {
 /// workloads on GPUs with `sm_count > 64` (saturating 188-SM SM120 / SM103
 /// with 192 CTAs instead of 48).
 #[must_use]
+pub(super) const fn resolve_gdn_split_v_enabled_with_policy(
+    policy: GdnSplitVPolicy,
+    sm_count: u32,
+    num_seqs: usize,
+    h_format: KeepLateHFormat,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    resolve_gdn_split_v_enabled(policy, sm_count, num_seqs, h_format)
+}
+
+#[must_use]
 pub(super) const fn resolve_gdn_split_v_enabled(
     policy: GdnSplitVPolicy,
     sm_count: u32,
@@ -1831,11 +1851,12 @@ fn gdn_split_v_policy() -> GdnSplitVPolicy {
 /// canonical FP32 single-sequence (`C = 1`) execution on the current GPU.
 #[must_use]
 pub fn qwen4_gdn_split_v_enabled_for_single_seq() -> bool {
-    resolve_gdn_split_v_enabled(
+    resolve_gdn_split_v_enabled_with_policy(
         gdn_split_v_policy(),
         atlas_core::device::active_sm_count(),
         1,
         KeepLateHFormat::Fp32,
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
     )
 }
 
@@ -1917,6 +1938,32 @@ impl KeepLateHFormatPlan {
             self.load_format
         }
     }
+}
+
+/// Policy-aware variant of [`plan_keep_late_h_format_ex`]:
+/// `ATLAS_DETERMINISTIC_BATCH=1` pins `h_state` to canonical FP32 across all
+/// cohort widths (`B=1..=128`), eliminating the `GDN_H_FP16_MIN_COHORT=2`
+/// `B=1` (FP32) vs `B>=2` (Scaled-FP16/FP8) numerical divergence.
+#[inline]
+#[must_use]
+pub(super) const fn plan_keep_late_h_format_ex_with_policy(
+    current: KeepLateHFormat,
+    h_fp16_enabled: bool,
+    h_fp8_enabled: bool,
+    cohort_seqs: usize,
+    base_flush_now: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> KeepLateHFormatPlan {
+    if det_batch.is_enabled() {
+        return plan_keep_late_h_format_ex(current, false, false, cohort_seqs, base_flush_now);
+    }
+    plan_keep_late_h_format_ex(
+        current,
+        h_fp16_enabled,
+        h_fp8_enabled,
+        cohort_seqs,
+        base_flush_now,
+    )
 }
 
 /// Resolve load/store `h_state` format and flush flag for one verify step,
@@ -3247,12 +3294,13 @@ impl Qwen3SsmLayer {
             gdn_keep_late_flush_period_for_cohort(cohort_seqs, ring_cap),
             ring_cap,
         );
-        let h_plan = plan_keep_late_h_format_ex(
+        let h_plan = plan_keep_late_h_format_ex_with_policy(
             entry.h_format,
             gdn_h_fp16_enabled(),
             gdn_h_fp8_enabled(),
             cohort_seqs,
             base_flush_now,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         );
         let write_base = (pending_base + pending_rows) % ring_cap;
         let bytes = keep_late_ctrl_le_bytes(
@@ -4535,5 +4583,79 @@ mod gdn_lazy_retain_lane_tests {
         assert!(!slot.needs_fp32_flush());
         slot.h_format = KeepLateHFormat::ScaledFp8;
         assert!(slot.needs_fp32_flush());
+    }
+
+    #[test]
+    fn deterministic_batch_pins_gdn_h_fp32_and_disables_split_v_across_1_to_128() {
+        use super::{
+            GdnSplitVPolicy, plan_keep_late_h_format_ex_with_policy,
+            resolve_gdn_split_v_enabled_with_policy,
+        };
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for c in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            let plan = plan_keep_late_h_format_ex_with_policy(
+                KeepLateHFormat::Fp32,
+                true,
+                true,
+                c,
+                false,
+                DeterministicBatchPolicy::Enabled,
+            );
+            assert_eq!(plan.load_format, KeepLateHFormat::Fp32);
+            assert_eq!(
+                plan.store_format,
+                KeepLateHFormat::Fp32,
+                "GDN h_state must stay FP32 at C={c}"
+            );
+            assert!(!plan.flush_now);
+            for sm in [48u32, 188u32] {
+                for pol in [GdnSplitVPolicy::Auto, GdnSplitVPolicy::Enabled] {
+                    assert!(
+                        !resolve_gdn_split_v_enabled_with_policy(
+                            pol,
+                            sm,
+                            c,
+                            KeepLateHFormat::Fp32,
+                            DeterministicBatchPolicy::Enabled,
+                        ),
+                        "GDN split-V must stay disabled at C={c} sm={sm}"
+                    );
+                }
+            }
+        }
+
+        // Baseline (Disabled) preserves B=1 FP32 vs B=8 Scaled-FP16 and SM120 split-V.
+        assert_eq!(
+            plan_keep_late_h_format_ex_with_policy(
+                KeepLateHFormat::Fp32,
+                true,
+                false,
+                1,
+                false,
+                DeterministicBatchPolicy::Disabled,
+            )
+            .store_format,
+            KeepLateHFormat::Fp32
+        );
+        assert_eq!(
+            plan_keep_late_h_format_ex_with_policy(
+                KeepLateHFormat::Fp32,
+                true,
+                false,
+                8,
+                false,
+                DeterministicBatchPolicy::Disabled,
+            )
+            .store_format,
+            KeepLateHFormat::ScaledFp16
+        );
+        assert!(resolve_gdn_split_v_enabled_with_policy(
+            GdnSplitVPolicy::Auto,
+            188,
+            1,
+            KeepLateHFormat::Fp32,
+            DeterministicBatchPolicy::Disabled,
+        ));
     }
 }

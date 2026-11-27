@@ -38,13 +38,14 @@ pub(crate) enum SmallBatchPrefillAction {
 }
 
 #[inline]
-pub(crate) const fn decide_small_batch_prefill(
+pub(crate) const fn decide_small_batch_prefill_with_policy(
     num_tokens: usize,
     frankenstein_decode_via_prefill: bool,
     prefill_native_or_r2_active: bool,
     ep_multi_gpu: bool,
     t_lanes_rows_available: bool,
     has_nvfp4_router: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
 ) -> SmallBatchPrefillAction {
     if prefill_native_or_r2_active {
         return SmallBatchPrefillAction::GroupedPrefill;
@@ -58,14 +59,36 @@ pub(crate) const fn decide_small_batch_prefill(
     if ep_multi_gpu {
         return SmallBatchPrefillAction::GroupedPrefill;
     }
-    if num_tokens >= 2
-        && is_small_batch_tokens(num_tokens)
-        && t_lanes_rows_available
-        && has_nvfp4_router
-    {
+    let within_exact_rows = if det_batch.is_enabled() {
+        num_tokens <= crate::layers::deterministic_batch::DETERMINISTIC_BATCH_MAX_ROWS
+    } else {
+        is_small_batch_tokens(num_tokens)
+    };
+    if num_tokens >= 2 && within_exact_rows && t_lanes_rows_available && has_nvfp4_router {
         return SmallBatchPrefillAction::ExactRows;
     }
     SmallBatchPrefillAction::GroupedPrefill
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[inline]
+pub(crate) const fn decide_small_batch_prefill(
+    num_tokens: usize,
+    frankenstein_decode_via_prefill: bool,
+    prefill_native_or_r2_active: bool,
+    ep_multi_gpu: bool,
+    t_lanes_rows_available: bool,
+    has_nvfp4_router: bool,
+) -> SmallBatchPrefillAction {
+    decide_small_batch_prefill_with_policy(
+        num_tokens,
+        frankenstein_decode_via_prefill,
+        prefill_native_or_r2_active,
+        ep_multi_gpu,
+        t_lanes_rows_available,
+        has_nvfp4_router,
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+    )
 }
 
 #[cfg(test)]
@@ -134,12 +157,42 @@ mod tests {
             );
         }
 
-        // M >= 17 always takes GroupedPrefill
+        // M >= 17 always takes GroupedPrefill under Disabled baseline
         for m in [17, 32, 256] {
             assert_eq!(
                 decide_small_batch_prefill(m, false, false, false, true, true),
                 SmallBatchPrefillAction::GroupedPrefill,
                 "M={m}"
+            );
+        }
+
+        // Under DeterministicBatchPolicy::Enabled, M=2..=128 stays on ExactRows (0-ULP to M=1).
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+        assert_eq!(
+            decide_small_batch_prefill_with_policy(
+                1,
+                false,
+                false,
+                false,
+                true,
+                true,
+                DeterministicBatchPolicy::Enabled,
+            ),
+            SmallBatchPrefillAction::ScalarDecodeM1
+        );
+        for m in [2usize, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(
+                decide_small_batch_prefill_with_policy(
+                    m,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                SmallBatchPrefillAction::ExactRows,
+                "deterministic batch must pin ExactRows at M={m}"
             );
         }
     }

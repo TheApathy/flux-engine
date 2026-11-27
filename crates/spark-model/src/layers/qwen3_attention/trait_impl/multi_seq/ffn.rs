@@ -53,6 +53,8 @@ impl Qwen3AttentionLayer {
             ..
         } = *c;
         let serial = crate::model::env_diag::DflashSerialControls::current();
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy()?.is_enabled();
         let force_serial_ffn = n > 1 && serial.ffn;
         let force_serial_norms = n > 1 && serial.layer_norms;
 
@@ -94,7 +96,7 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        let force_seq_ffn = self.mla.is_some() || force_serial_ffn;
+        let force_seq_ffn = self.mla.is_some() || force_serial_ffn || det_batch;
         if n == 3 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
             self.ms_post_norm(c, o_out, normed2)?;
@@ -157,12 +159,15 @@ impl Qwen3AttentionLayer {
                 crate::layers::FfnComponent::Dense(d) if d.can_forward_kgamma()
             );
             let wide_ready = self.ffn.wide_kgamma_ready(n as u32);
-            let ffn_chunks =
-                if can_kgamma && !force_serial_ffn && n >= crate::layers::TC_VERIFY_MIN_ROWS {
-                    plan_attn_multi_seq_ffn_chunks(n, wide_ready)
-                } else {
-                    Vec::new()
-                };
+            let ffn_chunks = if can_kgamma
+                && !force_serial_ffn
+                && !det_batch
+                && n >= crate::layers::TC_VERIFY_MIN_ROWS
+            {
+                plan_attn_multi_seq_ffn_chunks(n, wide_ready)
+            } else {
+                Vec::new()
+            };
             let try_kgamma = can_kgamma
                 && !ffn_chunks.is_empty()
                 && (wide_ready

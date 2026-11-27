@@ -93,12 +93,53 @@ fn raw_cublas_gemm_override() -> SmEnvOverride {
     *RAW.get_or_init(|| parse_sm_env_override(std::env::var("ATLAS_CUBLAS_GEMM").ok().as_deref()))
 }
 
+const fn resolve_ssm_proj_tc_for_sm_with_policy(
+    env_override: SmEnvOverride,
+    sm_count: u32,
+    rows: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    resolve_ssm_proj_tc_for_sm(env_override, sm_count, rows)
+}
+
 const fn resolve_ssm_proj_tc_for_sm(env_override: SmEnvOverride, sm_count: u32, rows: u32) -> bool {
     match env_override {
         SmEnvOverride::Disabled => false,
         SmEnvOverride::Enabled => true,
         SmEnvOverride::Auto => sm_count > 64 && rows >= 16,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn select_cross_seq_ba_route_with_policy(
+    total_rows: usize,
+    sm_count: u32,
+    cuda_available: bool,
+    cublas_override: SmEnvOverride,
+    has_compute_gdn_gates_multi_seq: bool,
+    has_ba_gates_prefill: bool,
+    has_ba_gates_batchn_exact: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> CrossSeqBaRoute {
+    if det_batch.is_enabled() {
+        return if has_ba_gates_batchn_exact {
+            CrossSeqBaRoute::ExactBatchnBaGates
+        } else {
+            CrossSeqBaRoute::SerialPerRow
+        };
+    }
+    select_cross_seq_ba_route(
+        total_rows,
+        sm_count,
+        cuda_available,
+        cublas_override,
+        has_compute_gdn_gates_multi_seq,
+        has_ba_gates_prefill,
+        has_ba_gates_batchn_exact,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,6 +171,43 @@ const fn select_cross_seq_ba_route(
         return CrossSeqBaRoute::PrefillFusedBaGates;
     }
     CrossSeqBaRoute::SerialPerRow
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn select_cross_seq_nvfp4_fallback_route_with_policy(
+    rows: u32,
+    n: u32,
+    sm_count: u32,
+    tc_enabled: bool,
+    has_transposed: bool,
+    splitk_splits: u32,
+    has_m32_n64_splitk: bool,
+    has_m32_n64: bool,
+    has_m128: bool,
+    has_t_n128: bool,
+    has_legacy_gemm: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> CrossSeqNvfp4ProjRoute {
+    if det_batch.is_enabled() {
+        return if rows >= 2 && rows <= crate::layers::QWEN4_NATIVE_MAX_ROWS as u32 {
+            CrossSeqNvfp4ProjRoute::ExactRows
+        } else {
+            CrossSeqNvfp4ProjRoute::SerialGemv
+        };
+    }
+    select_cross_seq_nvfp4_fallback_route(
+        rows,
+        n,
+        sm_count,
+        tc_enabled,
+        has_transposed,
+        splitk_splits,
+        has_m32_n64_splitk,
+        has_m32_n64,
+        has_m128,
+        has_t_n128,
+        has_legacy_gemm,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,6 +257,26 @@ const fn select_cross_seq_nvfp4_fallback_route(
     } else {
         CrossSeqNvfp4ProjRoute::SerialGemv
     }
+}
+
+const fn should_use_multi_seq_recurrent_with_policy(
+    num_seqs: usize,
+    k: usize,
+    gdn_seq_lazy: bool,
+    has_conv_multi: bool,
+    has_gdn_lazyfinal_multi: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    should_use_multi_seq_recurrent(
+        num_seqs,
+        k,
+        gdn_seq_lazy,
+        has_conv_multi,
+        has_gdn_lazyfinal_multi,
+    )
 }
 
 const fn should_use_multi_seq_recurrent(
@@ -257,15 +355,18 @@ impl Qwen3SsmLayer {
         label: &'static str,
         stream: u64,
     ) -> Result<()> {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let sm_count = atlas_core::device::active_sm_count();
         let tc_override = raw_ssm_proj_tc_override();
-        let tc_enabled = resolve_ssm_proj_tc_for_sm(tc_override, sm_count, rows);
+        let tc_enabled =
+            resolve_ssm_proj_tc_for_sm_with_policy(tc_override, sm_count, rows, det_batch);
 
         // SM120/SM103 (`sm_count > 64`) small/medium-M coalesced BF16xBF16 MMA
         // warp-split-K (`M <= 16`, or `M <= 64` when wide coalesced is enabled).
         // Zero extra VRAM, zero global split-K workspace, CUDA-graph safe.
         let sm120_max_m = crate::layers::dense_ffn::sm120_coalesced_max_m();
-        if rows >= 4
+        if !det_batch.is_enabled()
+            && rows >= 4
             && (rows as usize) <= sm120_max_m
             && tc_override != SmEnvOverride::Disabled
             && crate::layers::dense_ffn::try_coalesced_nvfp4_sm120_small_m(
@@ -285,7 +386,8 @@ impl Qwen3SsmLayer {
 
         // SM120/SM103 (`sm_count > 64`) native block-scaled cuBLASLt NVFP4 for
         // `M >= 24` (graph-capture aware via cached weight scales/workspaces).
-        if rows >= crate::layers::dense_ffn::CUBLASLT_NVFP4_MIN_M
+        if !det_batch.is_enabled()
+            && rows >= crate::layers::dense_ffn::CUBLASLT_NVFP4_MIN_M
             && tc_override != SmEnvOverride::Disabled
             && ops::try_cublaslt_nvfp4_multiseq_single(
                 gpu,
@@ -312,7 +414,7 @@ impl Qwen3SsmLayer {
         } else {
             None
         };
-        let route = select_cross_seq_nvfp4_fallback_route(
+        let route = select_cross_seq_nvfp4_fallback_route_with_policy(
             rows,
             n,
             sm_count,
@@ -326,6 +428,7 @@ impl Qwen3SsmLayer {
             self.w4a16_gemm_t_m128_k.0 != 0,
             self.w4a16_gemm_t_k.0 != 0,
             self.w4a16_gemm_k.0 != 0,
+            det_batch,
         );
         match route {
             CrossSeqNvfp4ProjRoute::TcM32N64SplitK => {
@@ -562,12 +665,13 @@ impl Qwen3SsmLayer {
         let gdn_nosnap = std::env::var("ATLAS_SSM_GDN_NOSNAP").ok().as_deref() == Some("1")
             && self.gdn_f32_sequence_nosnap_k.0 != 0;
         let gdn_seq_lazy = !gdn_nosnap && self.gdn_seq_lazy_engaged_inner(k);
-        if !should_use_multi_seq_recurrent(
+        if !should_use_multi_seq_recurrent_with_policy(
             num_seqs,
             k,
             gdn_seq_lazy,
             self.conv1d_l2norm_f32_sequence_multi_k.0 != 0,
             self.gdn_f32_sequence_lazyfinal_multi_k.0 != 0,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         ) {
             // Still ensure retain lanes exist outside capture for C < 4!
             if gdn_seq_lazy {
@@ -778,7 +882,8 @@ impl Qwen3SsmLayer {
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_beta_stride = nv * 2 * FP32;
         let sm_count = atlas_core::device::active_sm_count();
-        match select_cross_seq_ba_route(
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
+        match select_cross_seq_ba_route_with_policy(
             total_rows,
             sm_count,
             cfg!(feature = "cuda"),
@@ -786,6 +891,7 @@ impl Qwen3SsmLayer {
             self.compute_gdn_gates_multi_seq_k.0 != 0,
             self.ba_gates_prefill_k.0 != 0,
             self.ba_gates_batchn_exact_k.0 != 0,
+            det_batch,
         ) {
             CrossSeqBaRoute::CublasBf16AndGates => {
                 let ba_buf = ctx.buffers.ssm_ba();
@@ -883,12 +989,13 @@ impl Qwen3SsmLayer {
         let uniform_h_stride = h_inter_strides.iter().all(|&s| s == h_inter_strides[0]);
         let use_multi_seq = uniform_h_stride
             && ctx.ssm_multi_seq_ptr_table_override.is_some()
-            && should_use_multi_seq_recurrent(
+            && should_use_multi_seq_recurrent_with_policy(
                 num_seqs,
                 k,
                 gdn_seq_lazy,
                 self.conv1d_l2norm_f32_sequence_multi_k.0 != 0,
                 self.gdn_f32_sequence_lazyfinal_multi_k.0 != 0,
+                det_batch,
             );
 
         if use_multi_seq {
@@ -1286,6 +1393,99 @@ mod tests {
         assert!(!should_use_multi_seq_recurrent(4, 8, true, false, true));
         assert!(!should_use_multi_seq_recurrent(4, 8, true, true, false));
         assert!(!should_use_multi_seq_recurrent(4, 17, true, true, true));
+    }
+
+    #[test]
+    fn deterministic_batch_pins_cross_seq_dflash_ssm_across_1_to_128() {
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            for sm in [48u32, 188u32] {
+                assert!(!resolve_ssm_proj_tc_for_sm_with_policy(
+                    SmEnvOverride::Auto,
+                    sm,
+                    m as u32,
+                    DeterministicBatchPolicy::Enabled,
+                ));
+                assert!(!resolve_ssm_proj_tc_for_sm_with_policy(
+                    SmEnvOverride::Enabled,
+                    sm,
+                    m as u32,
+                    DeterministicBatchPolicy::Enabled,
+                ));
+                assert_eq!(
+                    select_cross_seq_ba_route_with_policy(
+                        m,
+                        sm,
+                        true,
+                        SmEnvOverride::Auto,
+                        true,
+                        true,
+                        true,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    CrossSeqBaRoute::ExactBatchnBaGates,
+                    "cross-seq BA route drifted at M={m} sm={sm}"
+                );
+                let expected_proj = if m == 1 {
+                    CrossSeqNvfp4ProjRoute::SerialGemv
+                } else {
+                    CrossSeqNvfp4ProjRoute::ExactRows
+                };
+                assert_eq!(
+                    select_cross_seq_nvfp4_fallback_route_with_policy(
+                        m as u32,
+                        2_560,
+                        sm,
+                        true,
+                        true,
+                        4,
+                        true,
+                        true,
+                        true,
+                        true,
+                        true,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    expected_proj,
+                    "cross-seq NVFP4 proj route drifted at M={m} sm={sm}"
+                );
+            }
+            assert!(
+                !should_use_multi_seq_recurrent_with_policy(
+                    m,
+                    8,
+                    true,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                "cross-seq multi-seq recurrent must stay disabled at C={m}"
+            );
+        }
+
+        // Baseline (Disabled) preserves wide-SM BA cuBLASLt at M>=32 and multi-seq recurrent at C>=4.
+        assert_eq!(
+            select_cross_seq_ba_route_with_policy(
+                32,
+                188,
+                true,
+                SmEnvOverride::Auto,
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            CrossSeqBaRoute::CublasBf16AndGates
+        );
+        assert!(should_use_multi_seq_recurrent_with_policy(
+            8,
+            8,
+            true,
+            true,
+            true,
+            DeterministicBatchPolicy::Disabled,
+        ));
     }
 
     #[test]

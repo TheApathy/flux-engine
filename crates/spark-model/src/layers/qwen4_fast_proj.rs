@@ -854,6 +854,46 @@ pub(crate) const fn select_coalesced_nvfp4_tile(m: usize, n: usize) -> Option<Co
     Some(CoalescedNvfp4Tile { n_tile, m_tile })
 }
 
+/// Fixed `M`-invariant, zero-Split-K coalesced NVFP4 tile used when
+/// `ATLAS_DETERMINISTIC_BATCH=1` is active across `m = 1..=256`.
+#[inline]
+#[must_use]
+const fn deterministic_coalesced_nvfp4_tile(
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Option<CoalescedNvfp4Tile> {
+    if m == 0 || m > COALESCED_NVFP4_MAX_ROWS || n == 0 || k == 0 {
+        return None;
+    }
+    let n_tile = if n <= 1024 {
+        CoalescedNvfp4NTile::N16
+    } else if n <= 4096 {
+        CoalescedNvfp4NTile::N32
+    } else {
+        CoalescedNvfp4NTile::N64
+    };
+    Some(CoalescedNvfp4Tile {
+        n_tile,
+        m_tile: CoalescedNvfp4MTile::M32,
+    })
+}
+
+/// Policy-aware variant of [`select_coalesced_nvfp4_tile_for_shape`].
+#[inline]
+#[must_use]
+pub(crate) const fn select_coalesced_nvfp4_tile_for_shape_with_policy(
+    m: usize,
+    n: usize,
+    k: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<CoalescedNvfp4Tile> {
+    if det_batch.is_enabled() {
+        return deterministic_coalesced_nvfp4_tile(m, n, k);
+    }
+    select_coalesced_nvfp4_tile_for_shape(m, n, k)
+}
+
 /// Select the empirical GB10 optimal `(CO_N, TILE_M)` (including intra-CTA
 /// Warp-Split-K tiers) for `[m, n, k]` (`m in 1..=256`, `n >= 1`, `k >= 1`).
 #[inline]
@@ -1113,6 +1153,23 @@ fn effective_coalesced_sm_count() -> u32 {
 ///   - `m in 33..=64`: `N32` (`M32`, `grid.y = 2`) -> `640..1024` CTAs on
 ///     `w4a16_gemm_coalesced_v2_n32_m32` (4 CTAs/SM, 2-stage K-prefetch),
 ///     degrading cleanly to `w4a16_gemm_coalesced_n32_m64` if v2 is absent.
+///
+/// Policy-aware SM-aware v2 coalesced NVFP4 tile selector for `[m, n, k]`.
+#[inline]
+#[must_use]
+pub(crate) const fn select_coalesced_nvfp4_tile_for_shape_v2_with_sms_and_policy(
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<CoalescedNvfp4Tile> {
+    if det_batch.is_enabled() {
+        return deterministic_coalesced_nvfp4_tile(m, n, k);
+    }
+    select_coalesced_nvfp4_tile_for_shape_v2_with_sms(m, n, k, sm_count)
+}
+
 #[inline]
 #[must_use]
 pub(crate) const fn select_coalesced_nvfp4_tile_for_shape_v2_with_sms(
@@ -1175,12 +1232,13 @@ pub(crate) const fn select_coalesced_nvfp4_tile_for_shape_v2_with_sms(
 #[inline]
 #[must_use]
 pub(crate) fn coalesced_nvfp4_dispatch_symbol(m: usize, n: usize, k: usize) -> &'static str {
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
     let use_v2 = coalesced_v2_enabled() && k.is_multiple_of(64);
     let sm_count = effective_coalesced_sm_count();
     let tile = if use_v2 {
-        select_coalesced_nvfp4_tile_for_shape_v2_with_sms(m, n, k, sm_count)
+        select_coalesced_nvfp4_tile_for_shape_v2_with_sms_and_policy(m, n, k, sm_count, det_batch)
     } else {
-        select_coalesced_nvfp4_tile_for_shape(m, n, k)
+        select_coalesced_nvfp4_tile_for_shape_with_policy(m, n, k, det_batch)
     };
     tile.map_or("w4a16_gemm_coalesced", |t| t.dispatch_symbol(use_v2))
 }
@@ -1211,6 +1269,19 @@ pub(crate) const COALESCED_NVFP4_NARROW_M_MAX: usize = COALESCED_NVFP4_MAX_ROWS;
 /// `n <= 1024`; smaller `m` stays on exact scalar GEMV).
 #[inline]
 #[must_use]
+pub(crate) const fn batched_verify_dense_proj_tc_admits_with_policy(
+    m: usize,
+    n: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    batched_verify_dense_proj_tc_admits(m, n)
+}
+
+#[inline]
+#[must_use]
 pub(crate) const fn batched_verify_dense_proj_tc_admits(m: usize, n: usize) -> bool {
     if n <= 1_024 {
         m >= COALESCED_NVFP4_NARROW_M_MIN
@@ -1219,12 +1290,44 @@ pub(crate) const fn batched_verify_dense_proj_tc_admits(m: usize, n: usize) -> b
     }
 }
 
+/// Policy-aware variant of [`coalesced_nvfp4_prefers_fp8_cached`].
+#[inline]
+#[must_use]
+pub(crate) const fn coalesced_nvfp4_prefers_fp8_cached_with_policy(
+    m: usize,
+    n: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    coalesced_nvfp4_prefers_fp8_cached(m, n)
+}
+
 /// Whether a batched-verify projection `[m, n]` prefers cached FP8 cuBLASLt
 /// over coalesced NVFP4 on GB10.
 #[inline]
 #[must_use]
 pub(crate) const fn coalesced_nvfp4_prefers_fp8_cached(m: usize, n: usize) -> bool {
     n <= COALESCED_NVFP4_NARROW_N_MAX && m > COALESCED_NVFP4_NARROW_M_MAX
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn coalesced_nvfp4_batched_verify_shape_eligible_with_policy(
+    scope_active: bool,
+    enabled: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    qg: Option<(usize, usize)>,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    coalesced_nvfp4_batched_verify_shape_eligible(scope_active, enabled, m, n, k, ldc, qg)
 }
 
 #[inline]
@@ -1691,6 +1794,25 @@ static NARROW_SPLITK_SCRATCH: NarrowGridSplitKScratchCache = NarrowGridSplitKScr
 /// and `grid_z = ceil(188 / 64) = 3` (`192` CTAs across all 188 SMs in 1 K-loop
 /// iteration instead of 64 CTAs over 2 iterations). GB10 (`<= 64` SMs) always
 /// returns `None`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[must_use]
+pub(crate) const fn select_narrow_grid_split_k_z_with_policy(
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: u32,
+    use_v2: bool,
+    has_kernel: bool,
+    has_scratch: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<u32> {
+    if det_batch.is_enabled() {
+        return None;
+    }
+    select_narrow_grid_split_k_z(m, n, k, sm_count, use_v2, has_kernel, has_scratch)
+}
+
 #[inline]
 #[must_use]
 pub(crate) const fn select_narrow_grid_split_k_z(
@@ -1787,6 +1909,7 @@ pub(crate) fn try_coalesced_nvfp4_w4a16_gemm(
     else {
         return Ok(false);
     };
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
     let use_v2 =
         coalesced_v2_enabled() && k.is_multiple_of(64) && weight.weight_scale.0.is_multiple_of(4);
     let sm_count = effective_coalesced_sm_count();
@@ -1800,8 +1923,9 @@ pub(crate) fn try_coalesced_nvfp4_w4a16_gemm(
             }
         });
         if let Some(scratch) = scratch
-            && let Some(grid_z) =
-                select_narrow_grid_split_k_z(m, n, k, sm_count, use_v2, true, true)
+            && let Some(grid_z) = select_narrow_grid_split_k_z_with_policy(
+                m, n, k, sm_count, use_v2, true, true, det_batch,
+            )
         {
             KernelLaunch::new(gpu, kernels.v2.n8_sk8_m32_grid_v2)
                 .grid([div_ceil(n_u32, 8), 1, grid_z])
@@ -1828,9 +1952,9 @@ pub(crate) fn try_coalesced_nvfp4_w4a16_gemm(
         }
     }
     let Some(preferred) = (if use_v2 {
-        select_coalesced_nvfp4_tile_for_shape_v2_with_sms(m, n, k, sm_count)
+        select_coalesced_nvfp4_tile_for_shape_v2_with_sms_and_policy(m, n, k, sm_count, det_batch)
     } else {
-        select_coalesced_nvfp4_tile_for_shape(m, n, k)
+        select_coalesced_nvfp4_tile_for_shape_with_policy(m, n, k, det_batch)
     }) else {
         return Ok(false);
     };
@@ -1953,6 +2077,24 @@ impl SharedExpertDownTile {
     }
 }
 
+/// Policy-aware variant of [`select_shared_expert_nvfp4_t_tiles`]: under
+/// `ATLAS_DETERMINISTIC_BATCH=1`, pins `(Sk4M16, M16)` identically across all
+/// `m in 2..=COALESCED_NVFP4_MAX_ROWS`.
+#[inline]
+#[must_use]
+pub(crate) const fn select_shared_expert_nvfp4_t_tiles_with_policy(
+    m: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<(SharedExpertGateUpTile, SharedExpertDownTile)> {
+    if m < 2 || m > COALESCED_NVFP4_MAX_ROWS {
+        return None;
+    }
+    if det_batch.is_enabled() {
+        return Some((SharedExpertGateUpTile::Sk4M16, SharedExpertDownTile::M16));
+    }
+    select_shared_expert_nvfp4_t_tiles(m)
+}
+
 /// Select the empirically optimal GB10 `(gate+up+SiLU, down)` transposed NVFP4
 /// tile pair for batched-decode shared expert (`m in 2..=256`).
 #[inline]
@@ -2028,10 +2170,11 @@ impl W4a16SharedFastV2Kernels {
     }
 
     #[inline]
-    const fn resolve(self, m: usize) -> Option<ResolvedSharedFastV2> {
-        let Some((pref_gu_tile, dn_tile)) = select_shared_expert_nvfp4_t_tiles(m) else {
-            return None;
-        };
+    fn resolve(self, m: usize) -> Option<ResolvedSharedFastV2> {
+        let (pref_gu_tile, dn_tile) = select_shared_expert_nvfp4_t_tiles_with_policy(
+            m,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        )?;
         let pref_gu_kernel = self.lookup_gateup(pref_gu_tile);
         let (gu_tile, gu_kernel) = if matches!(pref_gu_tile, SharedExpertGateUpTile::Sk2M64)
             && pref_gu_kernel.0 == 0
@@ -2267,6 +2410,46 @@ impl DirectNvfp4GemmRoute {
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[must_use]
+pub(crate) const fn select_direct_nvfp4_gemm_route_with_policy(
+    m: usize,
+    n: usize,
+    k: usize,
+    act_aligned_16: bool,
+    weight_aligned_16: bool,
+    out_aligned_16: bool,
+    has_pipe_m128n128: bool,
+    has_pipe: bool,
+    has_base: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<DirectNvfp4GemmRoute> {
+    if m == 0 || n == 0 || k == 0 || !k.is_multiple_of(16) {
+        return None;
+    }
+    if det_batch.is_enabled() {
+        return if has_pipe && k.is_multiple_of(32) && act_aligned_16 && weight_aligned_16 {
+            Some(DirectNvfp4GemmRoute::Pipe)
+        } else if has_base {
+            Some(DirectNvfp4GemmRoute::Base)
+        } else {
+            None
+        };
+    }
+    select_direct_nvfp4_gemm_route(
+        m,
+        n,
+        k,
+        act_aligned_16,
+        weight_aligned_16,
+        out_aligned_16,
+        has_pipe_m128n128,
+        has_pipe,
+        has_base,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[must_use]
 pub(crate) const fn select_direct_nvfp4_gemm_route(
     m: usize,
     n: usize,
@@ -2298,6 +2481,24 @@ pub(crate) const fn select_direct_nvfp4_gemm_route(
     } else {
         None
     }
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn direct_nvfp4_batched_verify_shape_eligible_with_policy(
+    scope_active: bool,
+    enabled: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    qg: Option<(usize, usize)>,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    direct_nvfp4_batched_verify_shape_eligible(scope_active, enabled, m, n, k, ldc, qg)
 }
 
 #[inline]
@@ -2395,7 +2596,7 @@ fn try_direct_nvfp4_w4a16_gemm(
     stream: u64,
 ) -> Result<bool> {
     let ks = w4a16_direct_kernels(gpu);
-    let Some(route) = select_direct_nvfp4_gemm_route(
+    let Some(route) = select_direct_nvfp4_gemm_route_with_policy(
         m,
         n,
         k,
@@ -2405,6 +2606,7 @@ fn try_direct_nvfp4_w4a16_gemm(
         ks.pipe_m128n128.0 != 0,
         ks.pipe.0 != 0,
         ks.base.0 != 0,
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
     ) else {
         return Ok(false);
     };
@@ -2484,6 +2686,7 @@ pub(crate) fn fp8_gemm_ex(
         );
     }
     clear_bypassed_fp8_shared_act();
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
     let scope_active = crate::layers::qwen4_hyper::batched_verify_tc_dense_scope_active();
     let nvfp4_mode = nvfp4::mode()?;
     if nvfp4_mode.is_enabled()
@@ -2491,7 +2694,16 @@ pub(crate) fn fp8_gemm_ex(
             || crate::layers::qwen4_prefill_native::fp8_lookup(weight, n, k, qg)?.is_none())
     {
         if has_prequant_fp8_act(act, m, k, stream) {
-            if nvfp4_mode.admits_call(m, n, k, ldc, qg, scope_active, nvfp4::verify_min_m()) {
+            if nvfp4_mode.admits_call_with_policy(
+                m,
+                n,
+                k,
+                ldc,
+                qg,
+                scope_active,
+                nvfp4::verify_min_m(),
+                det_batch,
+            ) {
                 let (_, ws, a8, _) = fp8_scratch(gpu, n, m, k)?;
                 if nvfp4::try_gemm_from_e4m3(
                     gpu,
@@ -2528,13 +2740,13 @@ pub(crate) fn fp8_gemm_ex(
         }
     }
     let capturing = spark_runtime::gpu_capture_region::active_capture_region().is_some();
-    let prefer_fp8_narrow = coalesced_nvfp4_prefers_fp8_cached(m, n)
+    let prefer_fp8_narrow = coalesced_nvfp4_prefers_fp8_cached_with_policy(m, n, det_batch)
         && (!capturing
             || (fp8_tensor_scales()
                 && has_cached_weight_tensor(weight, n, k, qg)
                 && fp8_scratch_ready_for_capture(n, m.max(resolve_fp8_pad_m(m, n)), k)));
     if !prefer_fp8_narrow
-        && coalesced_nvfp4_batched_verify_shape_eligible(
+        && coalesced_nvfp4_batched_verify_shape_eligible_with_policy(
             scope_active,
             coalesced_nvfp4_dense_enabled(),
             m,
@@ -2542,6 +2754,7 @@ pub(crate) fn fp8_gemm_ex(
             k,
             ldc,
             qg,
+            det_batch,
         )
         && try_coalesced_nvfp4_w4a16_gemm(gpu, act, weight, out, m, n, k, stream)?
     {
@@ -2559,7 +2772,7 @@ pub(crate) fn fp8_gemm_ex(
         });
         return Ok(());
     }
-    if direct_nvfp4_batched_verify_shape_eligible(
+    if direct_nvfp4_batched_verify_shape_eligible_with_policy(
         scope_active,
         direct_nvfp4_dense_enabled(),
         m,
@@ -2567,6 +2780,7 @@ pub(crate) fn fp8_gemm_ex(
         k,
         ldc,
         qg,
+        det_batch,
     ) && try_direct_nvfp4_w4a16_gemm(gpu, act, weight, out, m, n, k, stream)?
     {
         return Ok(());

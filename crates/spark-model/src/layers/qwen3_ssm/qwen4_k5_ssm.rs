@@ -115,6 +115,22 @@ pub(super) fn qwen4_exact_ssm_rows_route(
 /// parity when `ATLAS_QWEN4_C1_TC_VERIFY` is OFF (`0`/unset).
 #[inline]
 #[must_use]
+const fn ssm_k5_tc_coalesced_eligible_with_policy(
+    scope_active: bool,
+    coalesced_enabled: bool,
+    rows: usize,
+    n: usize,
+    k: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    ssm_k5_tc_coalesced_eligible(scope_active, coalesced_enabled, rows, n, k)
+}
+
+#[inline]
+#[must_use]
 const fn ssm_k5_tc_coalesced_eligible(
     scope_active: bool,
     coalesced_enabled: bool,
@@ -329,18 +345,25 @@ impl Qwen3SsmLayer {
         let deinterleaved = ctx.buffers.ssm_deinterleaved();
         let tc_scope = crate::layers::qwen4_hyper::batched_verify_tc_dense_scope_active();
         let coalesced_enabled = crate::layers::qwen4_fast_proj::coalesced_nvfp4_dense_enabled();
-        let qkvz_coalesced =
-            ssm_k5_tc_coalesced_eligible(tc_scope, coalesced_enabled, rows, qkvz_size, h)
-                && crate::layers::qwen4_fast_proj::try_coalesced_nvfp4_w4a16_gemm(
-                    ctx.gpu,
-                    input,
-                    qkvz,
-                    deinterleaved,
-                    rows,
-                    qkvz_size,
-                    h,
-                    stream,
-                )?;
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+        let qkvz_coalesced = ssm_k5_tc_coalesced_eligible_with_policy(
+            tc_scope,
+            coalesced_enabled,
+            rows,
+            qkvz_size,
+            h,
+            det_batch,
+        ) && crate::layers::qwen4_fast_proj::try_coalesced_nvfp4_w4a16_gemm(
+            ctx.gpu,
+            input,
+            qkvz,
+            deinterleaved,
+            rows,
+            qkvz_size,
+            h,
+            stream,
+        )?;
         if qkvz_coalesced {
             static QKVZ_COALESCED_LOGGED: std::sync::Once = std::sync::Once::new();
             QKVZ_COALESCED_LOGGED.call_once(|| {
@@ -949,18 +972,23 @@ impl Qwen3SsmLayer {
         }
 
         let output = ctx.buffers.moe_output();
-        let out_coalesced =
-            ssm_k5_tc_coalesced_eligible(tc_scope, coalesced_enabled, rows, h, value_dim)
-                && crate::layers::qwen4_fast_proj::try_coalesced_nvfp4_w4a16_gemm(
-                    ctx.gpu,
-                    normed,
-                    &self.ssm.out_proj,
-                    output,
-                    rows,
-                    h,
-                    value_dim,
-                    stream,
-                )?;
+        let out_coalesced = ssm_k5_tc_coalesced_eligible_with_policy(
+            tc_scope,
+            coalesced_enabled,
+            rows,
+            h,
+            value_dim,
+            det_batch,
+        ) && crate::layers::qwen4_fast_proj::try_coalesced_nvfp4_w4a16_gemm(
+            ctx.gpu,
+            normed,
+            &self.ssm.out_proj,
+            output,
+            rows,
+            h,
+            value_dim,
+            stream,
+        )?;
         if out_coalesced {
             static OUT_COALESCED_LOGGED: std::sync::Once = std::sync::Once::new();
             OUT_COALESCED_LOGGED.call_once(|| {
@@ -1005,10 +1033,41 @@ mod qwen4_k16_ssm_tests {
 
 #[cfg(test)]
 mod c1_tc_coalesced_tests {
-    use super::ssm_k5_tc_coalesced_eligible;
+    use super::{ssm_k5_tc_coalesced_eligible, ssm_k5_tc_coalesced_eligible_with_policy};
+    use crate::layers::deterministic_batch::DeterministicBatchPolicy;
     use crate::layers::qwen4_hyper::{
         BatchedVerifyTcDenseGuard, batched_verify_tc_dense_scope_active,
     };
+
+    #[test]
+    fn deterministic_batch_disables_ssm_k5_tc_coalesced_across_1_to_128() {
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert!(!ssm_k5_tc_coalesced_eligible_with_policy(
+                true,
+                true,
+                m,
+                16_384,
+                2_560,
+                DeterministicBatchPolicy::Enabled,
+            ));
+            assert!(!ssm_k5_tc_coalesced_eligible_with_policy(
+                true,
+                true,
+                m,
+                2_560,
+                6_144,
+                DeterministicBatchPolicy::Enabled,
+            ));
+        }
+        assert!(ssm_k5_tc_coalesced_eligible_with_policy(
+            true,
+            true,
+            8,
+            16_384,
+            2_560,
+            DeterministicBatchPolicy::Disabled,
+        ));
+    }
 
     #[test]
     fn c1_ssm_coalesced_tc_preserves_default_exact_and_admits_scoped_verify() {

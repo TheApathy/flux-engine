@@ -2335,10 +2335,11 @@ impl Qwen4PleLayer {
                 total_rows,
                 false,
             );
-        let proj_route = select_ple_cross_seq_proj_route(
+        let proj_route = select_ple_cross_seq_proj_route_with_policy(
             batched_projections_selected(),
             tc_dense_active,
             self.dense_gemv_batchn_tf_k.0 != 0,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         );
         let mut effective_prep_stream = match prep_stream {
             Some(ps) if ps != 0 && ps != stream && scratch.prep_done != 0 => ps,
@@ -2779,10 +2780,11 @@ impl Qwen4PleLayer {
                 rows,
                 false,
             );
-        select_ple_cross_seq_proj_route(
+        select_ple_cross_seq_proj_route_with_policy(
             batched_projections_selected(),
             tc_dense_active,
             self.dense_gemv_batchn_tf_k.0 != 0,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         )
     }
 
@@ -3394,6 +3396,18 @@ enum PleCrossSeqProjRoute {
     CublasBf16Gemm,
     BatchedGemvTf,
     PerRowGemv,
+}
+
+#[inline]
+#[must_use]
+const fn select_ple_cross_seq_proj_route_with_policy(
+    batched_proj: bool,
+    tc_dense_active: bool,
+    has_batchn_tf: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> PleCrossSeqProjRoute {
+    let effective_tc = !det_batch.is_enabled() && tc_dense_active;
+    select_ple_cross_seq_proj_route(batched_proj, effective_tc, has_batchn_tf)
 }
 
 #[inline]
@@ -4403,5 +4417,41 @@ mod tests {
             assert!(PLE_INLINE_SLOT_BYTES.is_multiple_of(16));
             assert!(PLE_UNIFIED_INLINE_SLOTS >= 2);
         }
+    }
+
+    #[test]
+    fn deterministic_batch_disables_ple_cublas_flip_across_1_to_128() {
+        use super::select_ple_cross_seq_proj_route_with_policy;
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for _m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(
+                select_ple_cross_seq_proj_route_with_policy(
+                    true,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                PleCrossSeqProjRoute::BatchedGemvTf
+            );
+            assert_eq!(
+                select_ple_cross_seq_proj_route_with_policy(
+                    true,
+                    true,
+                    false,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                PleCrossSeqProjRoute::PerRowGemv
+            );
+        }
+        assert_eq!(
+            select_ple_cross_seq_proj_route_with_policy(
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            PleCrossSeqProjRoute::CublasBf16Gemm
+        );
     }
 }

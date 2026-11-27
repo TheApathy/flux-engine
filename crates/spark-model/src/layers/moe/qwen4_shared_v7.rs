@@ -632,6 +632,19 @@ enum SharedOverlapPlan {
 }
 
 #[must_use]
+const fn select_shared_overlap_plan_with_policy(
+    full_overlap: bool,
+    sort_overlap: bool,
+    base_overlap: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> SharedOverlapPlan {
+    if det_batch.is_enabled() {
+        return SharedOverlapPlan::Serial;
+    }
+    select_shared_overlap_plan(full_overlap, sort_overlap, base_overlap)
+}
+
+#[must_use]
 const fn select_shared_overlap_plan(
     full_overlap: bool,
     sort_overlap: bool,
@@ -1245,6 +1258,23 @@ struct SharedV28LaunchPlan {
 }
 
 #[must_use]
+fn select_shared_v28_launch_plan_with_policy(
+    rows: usize,
+    m32_active: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> SharedV28LaunchPlan {
+    if det_batch.is_enabled() {
+        let items = rows.div_ceil(V7_TILE_M);
+        return SharedV28LaunchPlan {
+            tile: super::qwen4_compact_ops::V28OpTile::M64,
+            grid_gateup: (items * 5).clamp(1, abi::GRID as usize) as u32,
+            grid_down: (items * 10).clamp(1, abi::GRID as usize) as u32,
+        };
+    }
+    select_shared_v28_launch_plan(rows, m32_active)
+}
+
+#[must_use]
 fn select_shared_v28_launch_plan(rows: usize, m32_active: bool) -> SharedV28LaunchPlan {
     let items = rows.div_ceil(V7_TILE_M);
     if rows <= SHARED_V28_M32_MAX_ROWS && m32_active {
@@ -1275,9 +1305,10 @@ fn launch_direct_w4a8_gemms(
 ) -> Result<()> {
     let (grid_gateup, grid_down, block, gateup_k, gateup_smem, down_k, down_smem) =
         if p.wide.w4a8_tag == "v28" {
-            let plan = select_shared_v28_launch_plan(
+            let plan = select_shared_v28_launch_plan_with_policy(
                 p.rows,
                 super::qwen4_compact_ops::v28_m32_active_for_scope(),
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
             );
             match plan.tile {
                 super::qwen4_compact_ops::V28OpTile::M32 => {
@@ -1803,7 +1834,12 @@ impl MoeLayer {
                         arenas_disjoint,
                     })
             });
-            match select_shared_overlap_plan(full_overlap, sort_overlap, base_overlap_eligible) {
+            match select_shared_overlap_plan_with_policy(
+                full_overlap,
+                sort_overlap,
+                base_overlap_eligible,
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+            ) {
                 SharedOverlapPlan::FullAfterRouted => {
                     let ssm = ctx.buffers.ssm_deinterleaved();
                     let (pretranscode, act_base, use_gateup_2stage) = if let Some(pt) = pt_kernels {
@@ -3075,6 +3111,42 @@ mod tests {
         assert_eq!(
             select_shared_overlap_plan(false, false, false),
             SharedOverlapPlan::Serial
+        );
+    }
+
+    #[test]
+    fn deterministic_batch_pins_shared_v7_serial_and_m64_tile_across_1_to_128() {
+        use super::super::qwen4_compact_ops::V28OpTile;
+        use super::{
+            select_shared_overlap_plan_with_policy, select_shared_v28_launch_plan_with_policy,
+        };
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        assert_eq!(
+            select_shared_overlap_plan_with_policy(
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Enabled,
+            ),
+            SharedOverlapPlan::Serial
+        );
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            let plan = select_shared_v28_launch_plan_with_policy(
+                m,
+                true,
+                DeterministicBatchPolicy::Enabled,
+            );
+            assert_eq!(
+                plan.tile,
+                V28OpTile::M64,
+                "shared v28 tile must stay M-invariant at M={m}"
+            );
+        }
+        assert_eq!(
+            select_shared_v28_launch_plan_with_policy(8, true, DeterministicBatchPolicy::Disabled)
+                .tile,
+            V28OpTile::M32
         );
     }
 }

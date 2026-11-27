@@ -116,6 +116,23 @@ pub(crate) struct ThinSkEligibility {
 }
 
 impl ThinSkPolicy {
+    /// Whether `v33_thin_sk` should handle this dispatch under an explicit
+    /// deterministic-batch policy (`ATLAS_DETERMINISTIC_BATCH=1` disables
+    /// atomic work-stealing and `M`-dependent Split-K factors).
+    #[must_use]
+    pub(crate) const fn admits_for_sm_with_policy(
+        self,
+        e: ThinSkEligibility,
+        sm_count: u32,
+        max_rows: usize,
+        det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    ) -> bool {
+        if det_batch.is_enabled() {
+            return false;
+        }
+        self.admits_for_sm_with_max_rows(e, sm_count, max_rows)
+    }
+
     /// Whether `v33_thin_sk` should handle this dispatch on a GPU with `sm_count` SMs
     /// and crossover ceiling `max_rows` (used by [`Self::Auto`] and [`Self::On`]).
     #[must_use]
@@ -154,10 +171,11 @@ impl ThinSkPolicy {
     /// Whether `v33_thin_sk` should handle this dispatch on the active GPU.
     #[must_use]
     pub(crate) fn admits(self, e: ThinSkEligibility) -> bool {
-        self.admits_for_sm_with_max_rows(
+        self.admits_for_sm_with_policy(
             e,
             atlas_core::device::active_sm_count(),
             thin_sk_max_rows(),
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         )
     }
 }
@@ -943,6 +961,53 @@ mod tests {
         assert_eq!(thin_sk_persistent_grid(3200, 48), 288);
         assert_eq!(thin_sk_persistent_grid(400, 188), 400);
         assert_eq!(thin_sk_persistent_grid(0, 188), 1);
+    }
+
+    #[test]
+    fn deterministic_batch_disables_thin_sk_across_1_to_128() {
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            let elig = ThinSkEligibility {
+                rows: m,
+                w4a8_is_v28: true,
+                has_corrections: false,
+                v29_m256_active: false,
+                oracle_capture: false,
+                kernels_loaded: true,
+            };
+            for policy in [
+                ThinSkPolicy::Auto,
+                ThinSkPolicy::On,
+                ThinSkPolicy::All,
+                ThinSkPolicy::Force,
+            ] {
+                assert!(
+                    !policy.admits_for_sm_with_policy(
+                        elig,
+                        188,
+                        128,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    "thin_sk must stay disabled at M={m} for policy={policy:?}"
+                );
+            }
+        }
+
+        let elig_m16 = ThinSkEligibility {
+            rows: 16,
+            w4a8_is_v28: true,
+            has_corrections: false,
+            v29_m256_active: false,
+            oracle_capture: false,
+            kernels_loaded: true,
+        };
+        assert!(ThinSkPolicy::On.admits_for_sm_with_policy(
+            elig_m16,
+            188,
+            128,
+            DeterministicBatchPolicy::Disabled,
+        ));
     }
 
     #[cfg(feature = "cuda")]
