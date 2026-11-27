@@ -9,6 +9,8 @@
 
 #[path = "weight_map/cutlass_scale_layout.rs"]
 pub mod cutlass_scale_layout;
+#[path = "weight_map/dual_plane.rs"]
+pub mod dual_plane;
 #[path = "weight_map/expert.rs"]
 mod expert;
 #[path = "weight_map/flashinfer_ffn_admission.rs"]
@@ -56,6 +58,7 @@ pub mod w3_sidecar;
 #[path = "weight_map/tests.rs"]
 mod tests;
 
+pub use dual_plane::*;
 pub use expert::*;
 pub use loaders_fp8::*;
 pub use loaders_mtp::*;

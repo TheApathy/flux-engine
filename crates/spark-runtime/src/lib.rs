@@ -3,6 +3,7 @@
 #![deny(clippy::all)]
 
 pub mod alloc_receipt;
+pub mod autoematic;
 pub mod buffers;
 pub mod byte_resume;
 #[cfg(feature = "cuda")]

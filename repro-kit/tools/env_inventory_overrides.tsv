@@ -115,3 +115,10 @@ ATLAS_BITFP4_KV	NUMERICS	opt-in Blackwell SM120/SM121 BitDecoding-FP4 native FP4
 ATLAS_BITFP4_RAZER_KV	NUMERICS	opt-in 6-op SWAR RaZeR-KV ±5.0 remapping for BitDecoding-FP4 KV cache (layers/mod.rs)
 ATLAS_GATESIGHT_EVICT	NUMERICS	opt-in GateSight KV eviction mode (off/path_a/path_b), changes attention KV set when enabled
 ATLAS_GATESIGHT_RETENTION	NUMERICS	opt-in GateSight Zone-2 KV retention ratio, changes served output when eviction is enabled
+ATLAS_AUTOEMATIC_GATE_ENTROPY	NUMERICS	normalized top-K entropy threshold escalating NVFP4 layers to AutoFP6 (spark-runtime/src/autoematic.rs)
+ATLAS_AUTOEMATIC_LAYERS	NUMERICS	layer selection for +0.4 bpw AutoEMatic AutoFP6 sparse mantissa refinement (autoematic_sidecar.rs)
+ATLAS_AUTOEMATIC_SIDECAR	RESOURCE	canonical filesystem path to authenticated AutoEMatic sidecar file (autoematic_sidecar.rs)
+ATLAS_AUTOEMATIC_SIDECAR_SHA256	RESOURCE	expected SHA-256 digest authenticating AutoEMatic sidecar file (autoematic_sidecar.rs)
+ATLAS_AUTOEMATIC_SIDECAR_SIZE	RESOURCE	expected exact byte size authenticating AutoEMatic sidecar file (autoematic_sidecar.rs)
+ATLAS_DUAL_PLANE_NVFP4	NUMERICS	repacks BF16/FP8 weights into 8.5 bpw shared-scale DualPlaneNvfp4 (weight_map/dual_plane.rs)
+ATLAS_DUAL_PLANE_SELF_SPEC	ROUTE	opt-in W_hi DualPlaneNvfp4 self-speculation; target verify preserves DualPlaneNvfp4 output (speculative_self.rs)
