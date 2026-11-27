@@ -18,7 +18,8 @@ use super::cublaslt_proj::{
     clear_precomputed_proj_absmax, ensure_shared_merged_gate_up_out, nvfp4_weight_ready,
 };
 use super::e2m1_flashinfer::{
-    E2m1PrefillRoute, E2m1Scope, e2m1_kmajor_projection_shape, e2m1_prefill_route,
+    E2m1PrefillRoute, E2m1Scope, E2m1SelectedKernel, e2m1_kmajor_projection_shape,
+    e2m1_prefill_route, e2m1_selected_kernel,
 };
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 use super::e2m1_flashinfer::{
@@ -26,6 +27,7 @@ use super::e2m1_flashinfer::{
     flashinfer_ffn_activation_scale_extent, flashinfer_ffn_extent, flashinfer_ffn_prefill_route,
 };
 use super::layer::{DenseFfnLayer, FfnActivation};
+use super::policy::supports_warp_nvfp4_mma;
 #[cfg(feature = "cuda")]
 use super::policy::{
     FlashInferFfnAvailability, cublaslt_nvfp4_route_enabled, ffn_prefill_l2_strip_rows,
@@ -119,7 +121,36 @@ pub(crate) const fn evaluate_fused_rmsnorm_nvfp4_admission(
     }
 }
 
+/// Pure context guardrails shared by both fused prefill entry points.
+#[must_use]
+pub(crate) fn fused_prefill_context_guards_allow(
+    graph_capture: bool,
+    stream_capturing: bool,
+    use_fp32_residual: bool,
+    model_type: &str,
+    tp_world_size: usize,
+    has_bf16_weights: bool,
+) -> bool {
+    !graph_capture
+        && !stream_capturing
+        && !use_fp32_residual
+        && model_type != "gemma4"
+        && tp_world_size <= 1
+        && !has_bf16_weights
+}
+
 impl DenseFfnLayer {
+    fn fused_prefill_context_eligible(&self, ctx: &ForwardContext, stream: u64) -> bool {
+        fused_prefill_context_guards_allow(
+            ctx.graph_capture,
+            ctx.gpu.stream_is_capturing(stream),
+            ctx.config.use_fp32_residual(),
+            &ctx.config.model_type,
+            ctx.config.tp_world_size,
+            self.bf16_weights.is_some(),
+        )
+    }
+
     /// Launch `silu_mul_nvfp4_sm120` for either split `(gate, up)` or merged
     /// `[gate | up]` down-projection inputs. Fails closed if the fused kernel
     /// or SiLU activation contract is not satisfied.
@@ -300,6 +331,9 @@ impl DenseFfnLayer {
         if policy == FusedRmsNormNvfp4Policy::Disabled {
             return Ok(false);
         }
+        if !self.fused_prefill_context_eligible(ctx, stream) {
+            return Ok(false);
+        }
         let Ok(m) = u32::try_from(num_tokens) else {
             bail!("ATLAS_FUSED_RMSNORM_NVFP4=1 token count {num_tokens} exceeds u32");
         };
@@ -368,13 +402,7 @@ impl DenseFfnLayer {
         if policy == FusedRmsNormNvfp4Policy::Disabled {
             return Ok(false);
         }
-        if ctx.graph_capture
-            || ctx.gpu.stream_is_capturing(stream)
-            || ctx.config.use_fp32_residual()
-            || ctx.config.model_type == "gemma4"
-            || ctx.config.tp_world_size > 1
-            || self.bf16_weights.is_some()
-        {
+        if !self.fused_prefill_context_eligible(ctx, stream) {
             return Ok(false);
         }
         let Ok(m) = u32::try_from(num_tokens) else {
@@ -545,6 +573,20 @@ impl DenseFfnLayer {
 
         let merged_out = ctx.buffers.ffn_gate_up_bf16();
         let output = ctx.buffers.moe_output();
+        ensure!(
+            !merged_out.is_null()
+                && merged_out.0.is_multiple_of(16)
+                && !output.is_null()
+                && output.0.is_multiple_of(16),
+            "FlashInfer FFN output buffers must be non-null and 16-byte aligned"
+        );
+        let residual_total_elems = match norm_input {
+            FusedNormInput::Residual { .. } => Some(
+                m.checked_mul(h)
+                    .context("FlashInfer fused residual add element overflow")?,
+            ),
+            FusedNormInput::NonResidual { .. } => None,
+        };
         let merged_shape = FlashInferSm121Shape::new(
             u8::try_from(merged_plan.tactic).context("FlashInfer tactic exceeds u8")?,
             merged_plan.m,
@@ -657,10 +699,9 @@ impl DenseFfnLayer {
             },
             stream,
         )?;
-        if let FusedNormInput::Residual { hidden, .. } = norm_input {
-            let total_elems = m
-                .checked_mul(h)
-                .context("FlashInfer fused residual add element overflow")?;
+        if let (FusedNormInput::Residual { hidden, .. }, Some(total_elems)) =
+            (norm_input, residual_total_elems)
+        {
             ops::residual_add(
                 ctx.gpu,
                 self.residual_add_k,
@@ -906,13 +947,30 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // Defense-in-depth context guardrails so W4A4 fused norm can never
+        // bypass TP all-reduce, read FP32 residual buffers as BF16, or allocate
+        // scratch during CUDA graph capture.
+        if !self.fused_prefill_context_eligible(ctx, stream) {
+            return Ok(false);
+        }
+
         let e2m1_full = crate::layers::prefill_ffn_e2m1_enabled();
         let e2m1_kmajor = crate::layers::prefill_ffn_e2m1_kmajor_enabled();
+        let e2m1_kmajor_m256 = crate::layers::prefill_ffn_e2m1_kmajor_m256_enabled();
+        if e2m1_kmajor_m256 {
+            ensure!(
+                e2m1_kmajor,
+                "ATLAS_E2M1_KMAJOR_M256=1 requires ATLAS_E2M1_KMAJOR=1"
+            );
+        }
+        let selected_kernel = e2m1_selected_kernel(e2m1_kmajor, e2m1_kmajor_m256, m);
         let kmajor_ready = !e2m1_kmajor
             || (self.has_e2m1_kmajor_runtime()
                 && self.has_transposed_ffn()
                 && e2m1_kmajor_projection_shape(m, inter, h)
-                && e2m1_kmajor_projection_shape(m, h, inter));
+                && e2m1_kmajor_projection_shape(m, h, inter)
+                && (selected_kernel != E2m1SelectedKernel::KmajorM256
+                    || self.has_e2m1_kmajor_m256_runtime()));
         let route = e2m1_prefill_route(
             e2m1_full,
             false,
@@ -933,6 +991,14 @@ impl DenseFfnLayer {
             E2m1PrefillRoute::Complete(E2m1Scope::DownOnly) => return Ok(false),
         }
 
+        // Preflight every compute-capability, dimension, scale, pointer, and
+        // overflow invariant BEFORE issuing `prepare_rms_norm_residual_nvfp4_into`
+        // (which mutates `hidden += residual` in place on GPU).
+        ensure!(
+            supports_warp_nvfp4_mma(ctx.gpu.compute_capability()),
+            "warp-level SM120 NVFP4 MMA (cutlass_nvfp4_gemm.cu) is unsupported on {:?}; cannot run ATLAS_E2M1_GEMM=1 + ATLAS_FUSED_RMSNORM_NVFP4=1",
+            ctx.gpu.compute_capability()
+        );
         let has_required = match norm_input {
             FusedNormInput::NonResidual { .. } => {
                 self.fused_rmsnorm_nvfp4_k.has_rms_norm()
@@ -958,10 +1024,38 @@ impl DenseFfnLayer {
             FusedRmsNormNvfp4Admission::Incompatible(reason) => bail!("{reason}"),
             FusedRmsNormNvfp4Admission::Disabled => return Ok(false),
         }
+        let _ = ops::nvfp4_activation_extent(m, h, Nvfp4ScaleLayout::Linear)?;
+        let _ = ops::nvfp4_activation_extent(m, inter, Nvfp4ScaleLayout::Linear)?;
+        let residual_total_elems = match norm_input {
+            FusedNormInput::Residual { .. } => Some(
+                m.checked_mul(h)
+                    .context("W4A4 fused residual add element overflow")?,
+            ),
+            FusedNormInput::NonResidual { .. } => None,
+        };
 
         let scales = self
             .e2m1_checkpoint_scales
             .context("ATLAS_FUSED_RMSNORM_NVFP4=1 W4A4 requires static checkpoint scales")?;
+        ensure!(
+            scales.gate_up.is_finite()
+                && scales.gate_up > 0.0
+                && scales.down.is_finite()
+                && scales.down > 0.0,
+            "ATLAS_FUSED_RMSNORM_NVFP4=1 W4A4 requires finite positive static activation scales"
+        );
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+        let output = ctx.buffers.moe_output();
+        ensure!(
+            !gate_out.is_null()
+                && gate_out.0.is_multiple_of(16)
+                && !up_out.is_null()
+                && up_out.0.is_multiple_of(16)
+                && !output.is_null()
+                && output.0.is_multiple_of(16),
+            "ATLAS_FUSED_RMSNORM_NVFP4=1 W4A4 requires non-null 16-byte aligned gate/up/output buffers"
+        );
         let gate_weight = if e2m1_kmajor {
             self.gate_proj_t
                 .as_ref()
@@ -1020,9 +1114,6 @@ impl DenseFfnLayer {
                 )?,
         };
 
-        let gate_out = ctx.buffers.expert_gate_out();
-        let up_out = ctx.buffers.expert_up_out();
-        let output = ctx.buffers.moe_output();
         self.forward_e2m1_prepared(
             ctx,
             prepared.packed,
@@ -1075,10 +1166,9 @@ impl DenseFfnLayer {
             e2m1_kmajor,
             stream,
         )?;
-        if let FusedNormInput::Residual { hidden, .. } = norm_input {
-            let total_elems = m
-                .checked_mul(h)
-                .context("W4A4 fused residual add element overflow")?;
+        if let (FusedNormInput::Residual { hidden, .. }, Some(total_elems)) =
+            (norm_input, residual_total_elems)
+        {
             ops::residual_add(
                 ctx.gpu,
                 self.residual_add_k,
@@ -1185,6 +1275,55 @@ mod tests {
                 ..valid_input()
             }),
             FusedRmsNormNvfp4Admission::Admitted
+        );
+    }
+
+    #[test]
+    fn context_guards_reject_capture_fp32_residual_gemma4_tp_and_bf16() {
+        assert!(fused_prefill_context_guards_allow(
+            false, false, false, "qwen3_5", 1, false
+        ));
+        assert!(!fused_prefill_context_guards_allow(
+            true, false, false, "qwen3_5", 1, false
+        ));
+        assert!(!fused_prefill_context_guards_allow(
+            false, true, false, "qwen3_5", 1, false
+        ));
+        assert!(!fused_prefill_context_guards_allow(
+            false, false, true, "qwen3_5", 1, false
+        ));
+        assert!(!fused_prefill_context_guards_allow(
+            false, false, false, "gemma4", 1, false
+        ));
+        assert!(!fused_prefill_context_guards_allow(
+            false, false, false, "qwen3_5", 2, false
+        ));
+        assert!(!fused_prefill_context_guards_allow(
+            false, false, false, "qwen3_5", 1, true
+        ));
+    }
+
+    #[test]
+    fn w4a4_fused_preflight_order_checks_mma_m256_and_inter_before_gpu_mutation() {
+        let source = include_str!("fused_rmsnorm.rs");
+        let start = source
+            .find("fn try_w4a4_with_fused_norm(")
+            .expect("try_w4a4_with_fused_norm missing");
+        let body = &source[start..];
+
+        let ctx_guard = body.find("self.fused_prefill_context_eligible(").unwrap();
+        let m256_check = body.find("self.has_e2m1_kmajor_m256_runtime()").unwrap();
+        let warp_mma = body.find("supports_warp_nvfp4_mma(").unwrap();
+        let inter_extent = body
+            .find("ops::nvfp4_activation_extent(m, inter, Nvfp4ScaleLayout::Linear)")
+            .unwrap();
+        let residual_mutate = body.find("prepare_rms_norm_residual_nvfp4_into(").unwrap();
+        assert!(
+            ctx_guard < m256_check
+                && m256_check < warp_mma
+                && warp_mma < inter_extent
+                && inter_extent < residual_mutate,
+            "all W4A4 preflight invariants must run before in-place hidden += residual mutation"
         );
     }
 }
