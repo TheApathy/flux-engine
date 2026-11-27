@@ -281,6 +281,19 @@ pub(crate) async fn chat_completions_stream(
                 StreamEvent::Token(tok) => chunks_to_events(continuous_usage.observe_token(
                     dsv41::on_token(&mut st, &ctx, tok, dsv41_fence_stripper.as_mut()),
                 )),
+                StreamEvent::TokenBatch(toks) => {
+                    let token_count = toks.len();
+                    let mut chunks = ChunkVec::new();
+                    for tok in toks {
+                        chunks.extend(dsv41::on_token(
+                            &mut st,
+                            &ctx,
+                            tok,
+                            dsv41_fence_stripper.as_mut(),
+                        ));
+                    }
+                    chunks_to_events(continuous_usage.observe_token_batch(token_count, chunks))
+                }
                 StreamEvent::TokenWithLogprobs(tok, token_logprobs) => {
                     let chunks = dsv41::on_token(&mut st, &ctx, tok, dsv41_fence_stripper.as_mut());
                     let chunks = logprobs::attach_token_logprobs(
@@ -391,6 +404,11 @@ pub(crate) async fn chat_completions_stream(
                     &ctx,
                     tok,
                 )))
+            }
+            StreamEvent::TokenBatch(toks) => {
+                let token_count = toks.len();
+                let chunks = handle_token::handle_token_batch(&mut stream_state, &ctx, &toks);
+                chunks_to_events(continuous_usage.observe_token_batch(token_count, chunks))
             }
             StreamEvent::TokenWithLogprobs(tok, token_logprobs) => {
                 let chunks = handle_token::handle_token(&mut stream_state, &ctx, tok);

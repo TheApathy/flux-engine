@@ -3831,7 +3831,8 @@ impl TransformerModel {
         if self.dflash_capture_done_event == 0
             || self.dflash_hidden_save.is_none()
             || self.comm.as_ref().is_some_and(|c| c.rank() != 0)
-            || !crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+            || !(crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+                || crate::layers::dflash_head::async_propose::dflash_opt_branch0_enabled())
             || !crate::layers::dflash_head::async_propose::is_final_dflash_capture_layer(
                 layer_idx,
                 &self.dflash_capture_layers,
@@ -3862,7 +3863,8 @@ impl TransformerModel {
             || k == 0
             || self.dflash_capture_done_event == 0
             || self.comm.as_ref().is_some_and(|c| c.rank() != 0)
-            || !crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+            || !(crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+                || crate::layers::dflash_head::async_propose::dflash_opt_branch0_enabled())
         {
             return Ok(());
         }
@@ -3900,7 +3902,8 @@ impl TransformerModel {
     /// Zero-cost single-branch no-op when `ATLAS_DFLASH_EARLY_STAGE1` is OFF.
     pub(super) fn try_drain_dflash_early_stage1(&self) -> Result<()> {
         if self.dflash_capture_done_event == 0
-            || !crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+            || !(crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+                || crate::layers::dflash_head::async_propose::dflash_opt_branch0_enabled())
         {
             return Ok(());
         }

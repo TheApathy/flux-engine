@@ -22,6 +22,7 @@ mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
+mod defer_emit;
 mod deferred_prefill_tail;
 mod device_topk_route;
 mod device_topk_spec;

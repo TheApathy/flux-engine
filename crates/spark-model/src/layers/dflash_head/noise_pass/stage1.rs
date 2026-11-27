@@ -17,12 +17,12 @@ use super::lm_head_path::{LmHeadPath, resolve_lm_head_path};
 use super::policy::{
     CtxCacheInvalidationReason, CtxKvCacheRepr, DFLASH_SPLIT_KV_H128_MAX_SPLITS,
     DflashNoiseGraphKey, LmHeadNvfp4Mode, NoiseGraphRuntimeKey, REJECTION_SLOT_STRIDE,
-    STAGE1_GRAPH_MAX_ROWS, Stage2CtxAttnMode, all_layers_cover_old_fc_prefix,
-    dflash_noise_graph_enabled, dflash_split_kv_h128_workspace_bytes, dflash_stage1_graph_enabled,
-    lm_head_path_tag, noise_graph_stochastic_draft_sampling_active, noise_graph_swa_enabled,
-    plan_ctx_kv_cache_transition, plan_stage1_ring_append, resolve_c1_lm_head_nvfp4_mode,
-    resolve_dflash_split_kv_splits_for_sm, resolve_dflash2_selector_topk,
-    resolve_rejection_seq_staging, resolve_rejection_shortlist_k,
+    STAGE1_GRAPH_MAX_ROWS, Stage2CtxAttnMode, dflash_noise_graph_enabled,
+    dflash_split_kv_h128_workspace_bytes, dflash_stage1_graph_enabled, lm_head_path_tag,
+    min_layers_covered_old_fc_prefix, noise_graph_stochastic_draft_sampling_active,
+    noise_graph_swa_enabled, plan_ctx_kv_cache_transition, plan_stage1_ring_append,
+    resolve_c1_lm_head_nvfp4_mode, resolve_dflash_split_kv_splits_for_sm,
+    resolve_dflash2_selector_topk, resolve_rejection_seq_staging, resolve_rejection_shortlist_k,
     resolve_stage2_ctx_attn_mode_for_sm,
 };
 use crate::layer::ForwardContext;
@@ -150,11 +150,18 @@ impl BlockDiffusionDraftHead {
             && conv_ok
     }
 
-    /// Whether the 2-stage noise graph will keep all cached context KV rows
-    /// (`[needed_start .. needed_start + old_fc_count)`) in circular `PostRope`
-    /// representation so `scratch.fc_proj[0..old_fc_count)` is completely dead
-    /// and `forward_block` can skip copying `old_fc_count` rows from `ctx_fc_cache`.
-    pub(in super::super) fn noise_graph_can_skip_old_fc_copy(
+    /// Return the largest leading prefix count `skip <= old_fc_count` of
+    /// `[needed_start .. needed_start + old_fc_count)` that the 2-stage noise
+    /// graph already holds in circular `PostRope` K/V across every layer so
+    /// `forward_block` skips copying those rows from `ctx_fc_cache`.
+    ///
+    /// Handles both the standard steady-state case (`skip == old_fc_count`) and
+    /// the `ATLAS_DFLASH_EARLY_STAGE1=1` + `ATLAS_DFLASH_NOISE_GRAPH=1` interop
+    /// case where `ctx_fc_cache` already holds `[needed_start .. needed_start + eff_ctx)`
+    /// while `PostRope` K/V covers `[needed_start .. needed_start + eff_ctx - num_append)`:
+    /// instead of copying all `eff_ctx` rows (`16–32 MiB`), `forward_block` copies
+    /// only the `num_append` (`1..=8`) new rows into `scratch.fc_proj`.
+    pub(in super::super) fn noise_graph_skip_old_fc_prefix_count(
         &self,
         dstate: &DflashProposerState,
         policy: &super::super::proposal_policy::ProposalPolicy,
@@ -162,9 +169,9 @@ impl BlockDiffusionDraftHead {
         old_fc_count: usize,
         eff_ctx: usize,
         gamma_eff: usize,
-    ) -> bool {
+    ) -> usize {
         if !dflash_noise_graph_enabled() || old_fc_count == 0 || policy.denoise_steps != 1 {
-            return false;
+            return 0;
         }
         if !self.noise_graph_structural_ok(
             dstate,
@@ -178,21 +185,23 @@ impl BlockDiffusionDraftHead {
                 kprofile: false,
             },
         ) {
-            return false;
+            return 0;
         }
-        if dstate.ctx_kv_repr != Some(CtxKvCacheRepr::PostRope)
-            || !all_layers_cover_old_fc_prefix(
-                needed_start,
-                eff_ctx,
-                old_fc_count,
-                self.ctx_window,
-                &dstate.cache_k_start,
-                &dstate.cache_k_end,
-                &dstate.cache_v_start,
-                &dstate.cache_v_end,
-            )
-        {
-            return false;
+        if dstate.ctx_kv_repr != Some(CtxKvCacheRepr::PostRope) {
+            return 0;
+        }
+        let skip = min_layers_covered_old_fc_prefix(
+            needed_start,
+            eff_ctx,
+            old_fc_count,
+            self.ctx_window,
+            &dstate.cache_k_start,
+            &dstate.cache_k_end,
+            &dstate.cache_v_start,
+            &dstate.cache_v_end,
+        );
+        if skip == 0 {
+            return 0;
         }
         let head_state_arc = noise_graph_head_state(self as *const Self as usize);
         let has_linear_kernel = {
@@ -203,7 +212,7 @@ impl BlockDiffusionDraftHead {
         };
         let has_ring_h128_kernel =
             self.head_dim == 128 && self.kernels.split_ctx_h128_batched.0 != 0;
-        resolve_stage2_ctx_attn_mode_for_sm(
+        if resolve_stage2_ctx_attn_mode_for_sm(
             self.head_dim,
             needed_start,
             eff_ctx,
@@ -214,6 +223,11 @@ impl BlockDiffusionDraftHead {
             atlas_core::device::active_sm_count(),
         )
         .is_some()
+        {
+            skip
+        } else {
+            0
+        }
     }
 
     /// Attempt to run the 2-stage CUDA-graphed DFlash2 noise-block path when
@@ -569,6 +583,9 @@ impl BlockDiffusionDraftHead {
         // ── Stage 2: fixed-shape m_rows noise pass (CUDA graph replay/capture) ──
         if let Some(graph) = cached_graph {
             ctx.gpu.launch_graph(graph, stream)?;
+            super::super::async_propose::record_stage2_noise_graph_event(
+                super::super::async_propose::GraphExecKind::Hit,
+            );
         } else if stream != 0 {
             crate::layers::qwen4_fast_proj::warm_coalesced_nvfp4_kernels(ctx.gpu);
             let bf16_lm_head_fallback = (lm_head_path == LmHeadPath::Bf16
@@ -613,6 +630,9 @@ impl BlockDiffusionDraftHead {
                     state.insert_graph(ctx.gpu, runtime_key, graph);
                 }
                 ctx.gpu.launch_graph(graph, stream)?;
+                super::super::async_propose::record_stage2_noise_graph_event(
+                    super::super::async_propose::GraphExecKind::Capture,
+                );
             }
         } else {
             self.launch_stage2_noise_block(
@@ -1002,6 +1022,9 @@ impl BlockDiffusionDraftHead {
                 let layer_kv_stride = STAGE1_GRAPH_MAX_ROWS * kv_dim as usize * bf16;
                 let ran_graphed = if let Some(graph) = cached_s1 {
                     gpu.launch_graph(graph, stream)?;
+                    super::super::async_propose::record_stage1_graph_event(
+                        super::super::async_propose::GraphExecKind::Hit,
+                    );
                     true
                 } else {
                     crate::layers::qwen4_fast_proj::warm_coalesced_nvfp4_kernels(gpu);
@@ -1062,6 +1085,9 @@ impl BlockDiffusionDraftHead {
                                 state.stage1_graphs.insert((new_count, stream), graph);
                             }
                             gpu.launch_graph(graph, stream)?;
+                            super::super::async_propose::record_stage1_graph_event(
+                                super::super::async_propose::GraphExecKind::Capture,
+                            );
                             static S1_LOGGED: std::sync::Once = std::sync::Once::new();
                             S1_LOGGED.call_once(|| {
                                 tracing::info!(

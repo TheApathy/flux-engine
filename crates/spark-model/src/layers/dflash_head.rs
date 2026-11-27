@@ -2584,6 +2584,10 @@ pub struct BlockDiffusionDraftHead {
     /// `fc` + `hidden_norm` projection launched on `pstream` after the target's
     /// final capture layer.
     pub early_stage1_staged: Mutex<Option<async_propose::EarlyStage1Staged>>,
+    /// Optional optimistic branch-0 draft prefetch (`ATLAS_DFLASH_OPT_BRANCH0=1`)
+    /// staged into isolated `scratch.draft_tokens_dev_alt` without mutating
+    /// `dstate` before target verify confirms `(num_accepted, last_token)`.
+    pub opt_branch0_staged: Mutex<Option<async_propose::OptBranch0Staged>>,
     /// Dedicated non-blocking CUDA stream for async propose launches.
     /// Lazily created on first eligible launch; `0` = creation failed →
     /// async permanently disabled.
@@ -4221,6 +4225,7 @@ mod seq_buf_pool_tests {
             async_batched_inflight: Mutex::new(None),
             async_batch_slot_toggle: std::sync::atomic::AtomicU8::new(0),
             early_stage1_staged: Mutex::new(None),
+            opt_branch0_staged: Mutex::new(None),
             async_propose_stream: std::sync::OnceLock::new(),
             async_order_event: std::sync::atomic::AtomicU64::new(0),
             fused_event_armed: std::sync::atomic::AtomicBool::new(false),

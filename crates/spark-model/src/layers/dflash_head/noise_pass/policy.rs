@@ -413,9 +413,61 @@ pub(in super::super) fn plan_stage1_ring_append(
     })
 }
 
+/// Return the largest leading prefix count `skip <= old_fc_count` of
+/// `[needed_start .. needed_start + old_fc_count)` that EVERY layer's circular
+/// `PostRope` K/V cache already covers without rollback or range errors.
+///
+/// Rows `[0..skip)` of `scratch.fc_proj` are never read by Stage 1, allowing
+/// `forward_block` to skip copying `[needed_start .. needed_start + skip)` from
+/// `ctx_fc_cache` even when `ATLAS_DFLASH_EARLY_STAGE1=1` pre-populated the
+/// trailing `[skip .. old_fc_count)` rows in `ctx_fc_cache`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub(in super::super) fn min_layers_covered_old_fc_prefix(
+    needed_start: usize,
+    eff_ctx: usize,
+    old_fc_count: usize,
+    window: usize,
+    cache_k_start: &[usize],
+    cache_k_end: &[usize],
+    cache_v_start: &[usize],
+    cache_v_end: &[usize],
+) -> usize {
+    let num_layers = cache_k_start.len();
+    if num_layers == 0
+        || cache_k_end.len() != num_layers
+        || cache_v_start.len() != num_layers
+        || cache_v_end.len() != num_layers
+        || old_fc_count == 0
+        || old_fc_count > eff_ctx
+    {
+        return 0;
+    }
+    let mut min_covered = old_fc_count;
+    for l in 0..num_layers {
+        let Ok(plan) = plan_stage1_ring_append(
+            needed_start,
+            eff_ctx,
+            window,
+            cache_k_start[l],
+            cache_k_end[l],
+            cache_v_start[l],
+            cache_v_end[l],
+        ) else {
+            return 0;
+        };
+        min_covered = min_covered.min(plan.old_ctx_count);
+        if min_covered == 0 {
+            return 0;
+        }
+    }
+    min_covered
+}
+
 /// Whether every layer's circular `PostRope` K/V cache already covers at least
 /// `[needed_start .. needed_start + old_fc_count)` without rollback or range
 /// errors, guaranteeing `scratch.fc_proj[0..old_fc_count)` is never read by Stage 1.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub(in super::super) fn all_layers_cover_old_fc_prefix(
@@ -428,27 +480,23 @@ pub(in super::super) fn all_layers_cover_old_fc_prefix(
     cache_v_start: &[usize],
     cache_v_end: &[usize],
 ) -> bool {
-    let num_layers = cache_k_start.len();
-    if num_layers == 0
-        || cache_k_end.len() != num_layers
-        || cache_v_start.len() != num_layers
-        || cache_v_end.len() != num_layers
-        || old_fc_count > eff_ctx
-    {
-        return false;
+    if old_fc_count == 0 {
+        let num_layers = cache_k_start.len();
+        return num_layers > 0
+            && cache_k_end.len() == num_layers
+            && cache_v_start.len() == num_layers
+            && cache_v_end.len() == num_layers;
     }
-    (0..num_layers).all(|l| {
-        plan_stage1_ring_append(
-            needed_start,
-            eff_ctx,
-            window,
-            cache_k_start[l],
-            cache_k_end[l],
-            cache_v_start[l],
-            cache_v_end[l],
-        )
-        .is_ok_and(|plan| plan.old_ctx_count >= old_fc_count)
-    })
+    min_layers_covered_old_fc_prefix(
+        needed_start,
+        eff_ctx,
+        old_fc_count,
+        window,
+        cache_k_start,
+        cache_k_end,
+        cache_v_start,
+        cache_v_end,
+    ) == old_fc_count
 }
 
 /// Minimum `eff_ctx` for wide-SM DFlash2 Split-KV H=128 attention.

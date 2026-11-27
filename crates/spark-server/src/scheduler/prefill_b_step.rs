@@ -291,6 +291,7 @@ pub fn prefill_request(
         let prefix_hash = super::continuation::hash_token_incremental(req_prefix_hash, first);
         let mut a = ActiveSeq {
             stop_cause: None,
+            defer_emit: Default::default(),
             seq,
             session_hash: req_session_hash,
             prompt_prefix_hash: req_prefix_hash,
@@ -424,6 +425,7 @@ pub fn prefill_request(
     };
     let mut a = ActiveSeq {
         stop_cause: None,
+        defer_emit: Default::default(),
         seq,
         session_hash: req_session_hash,
         prompt_prefix_hash: req_prefix_hash,

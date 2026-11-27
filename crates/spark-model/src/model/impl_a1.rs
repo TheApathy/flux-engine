@@ -1027,7 +1027,8 @@ impl TransformerModel {
         let secondary_stream = gpu.create_stream()?;
         let secondary_event = gpu.create_event()?;
         let dflash_capture_done_event = if !dflash_capture_layers.is_empty()
-            && crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+            && (crate::layers::dflash_head::async_propose::dflash_early_stage1_enabled()
+                || crate::layers::dflash_head::async_propose::dflash_opt_branch0_enabled())
         {
             match gpu.create_event() {
                 Ok(ev) => ev,

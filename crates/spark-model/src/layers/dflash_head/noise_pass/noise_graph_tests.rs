@@ -1072,3 +1072,59 @@ fn bf16_proj_cublas_alignment_accepts_conv_selector_and_rejects_odd_or_misaligne
         2560
     ));
 }
+
+#[test]
+fn min_layers_covered_old_fc_prefix_skips_cached_kv_prefix_under_early_stage1_interop() {
+    use super::policy::{all_layers_cover_old_fc_prefix, min_layers_covered_old_fc_prefix};
+
+    // Steady-state EARLY_STAGE1 + NOISE_GRAPH + STAGE1_GRAPH interop:
+    // eff_ctx = 4096, EARLY_STAGE1 already populated all 4096 rows in ctx_fc_cache
+    // (old_fc_count = 4096), while PostRope KV across all 5 layers covers 4090 rows
+    // [100..4190). Only the 6 newly appended rows [4190..4196) need copying!
+    let k_start = [100usize; 5];
+    let k_end = [4190usize; 5];
+    let v_start = [100usize; 5];
+    let v_end = [4190usize; 5];
+    assert_eq!(
+        min_layers_covered_old_fc_prefix(100, 4096, 4096, 4096, &k_start, &k_end, &v_start, &v_end),
+        4090
+    );
+    assert!(!all_layers_cover_old_fc_prefix(
+        100, 4096, 4096, 4096, &k_start, &k_end, &v_start, &v_end
+    ));
+
+    // When one layer lags behind at 4088, every layer must receive rows from 4088 onward.
+    let mut k_end_lag = [4190usize; 5];
+    k_end_lag[3] = 4188;
+    assert_eq!(
+        min_layers_covered_old_fc_prefix(
+            100, 4096, 4096, 4096, &k_start, &k_end_lag, &v_start, &v_end
+        ),
+        4088
+    );
+
+    // Full coverage (standard non-early-stage1 steady state): skips all old_fc_count rows.
+    assert_eq!(
+        min_layers_covered_old_fc_prefix(100, 4096, 4090, 4096, &k_start, &k_end, &v_start, &v_end),
+        4090
+    );
+    assert!(all_layers_cover_old_fc_prefix(
+        100, 4096, 4090, 4096, &k_start, &k_end, &v_start, &v_end
+    ));
+
+    // Rollback safety (cache_k_end > needed_end) returns 0 so stale KV is never reused.
+    let k_end_rollback = [4200usize; 5];
+    assert_eq!(
+        min_layers_covered_old_fc_prefix(
+            100,
+            4096,
+            4096,
+            4096,
+            &k_start,
+            &k_end_rollback,
+            &v_start,
+            &v_end
+        ),
+        0
+    );
+}

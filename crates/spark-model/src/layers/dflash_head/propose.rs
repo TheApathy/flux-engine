@@ -92,8 +92,14 @@ impl BlockDiffusionDraftHead {
             .proposal_policy
             .get_or_init(super::proposal_policy::ProposalPolicy::from_env);
 
-        // Quiesce the single shared scratch before any host-only early return.
-        if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
+        // Quiesce stale single/batched/foreign-staged scratch before any host
+        // early return while preserving THIS sequence's freshly staged early
+        // Stage-1 and optimistic branch-0 handles so this propose can consume them.
+        if let Err(error) = self.resolve_stale_async_preserving_owner_staged(
+            ctx.gpu,
+            dstate,
+            super::async_propose::PreserveStagedMode::EarlyStage1AndOptBranch0,
+        ) {
             clear_proposal_outputs(dstate);
             return Err(error);
         }
@@ -125,6 +131,8 @@ impl BlockDiffusionDraftHead {
             }
         }
         if budget.flat == 0 {
+            self.disarm_fused_overlap_event();
+            self.drain_early_stage1_impl(ctx.gpu)?;
             clear_proposal_outputs(dstate);
             return Ok(Vec::new());
         }
@@ -203,7 +211,7 @@ impl BlockDiffusionDraftHead {
             *span_out = Some((ctx_len_before, num_append));
             Ok(())
         };
-        if !super::async_propose::dflash_async_enabled() {
+        if super::async_propose::should_flush_pending_ctx_eagerly() {
             flush_pending_ctx_on_default(&mut pending_ctx_base, &mut ctx_appended_span, dstate)?;
         }
 
@@ -810,6 +818,38 @@ impl BlockDiffusionDraftHead {
             // mean >= thresh (or warming up) ⇒ fall through to full-γ propose.
         }
 
+        // ── ATLAS_DFLASH_OPT_BRANCH0=1: optimistic branch-0 prefetch consume ──
+        // When an optimistic branch-0 prefetch was staged into isolated
+        // `scratch.draft_tokens_dev_alt` and target verify confirmed the exact
+        // `(num_accepted, last_token, budget)` assumptions, consume it directly
+        // without re-running `forward_block`. On miss/stale, drains `pstream`
+        // cleanly without mutating `dstate` and falls through to normal propose.
+        if super::async_propose::dflash_opt_branch0_enabled()
+            && !requires_sampled_q
+            && _grammar_bitmask.is_none()
+            && !portfolio_active
+            && !corroborate_on
+            && let Some(opt_drafts) = self.try_consume_opt_branch0(
+                ctx.gpu,
+                _stream,
+                dstate,
+                last_token,
+                position,
+                budget,
+                &mut pending_ctx_base,
+            )?
+        {
+            return Ok(opt_drafts);
+        }
+        // Unconditionally quiesce any unconsumed optimistic branch-0 prefetch
+        // before entering async or sync `forward_block` (e.g. when the consume
+        // gate above was bypassed due to sampled-q, grammar, portfolio,
+        // corroborate, or flag OFF) while preserving `early_stage1_staged`.
+        if let Err(error) = self.drain_opt_branch0_only(ctx.gpu) {
+            clear_proposal_outputs(dstate);
+            return Err(error);
+        }
+
         // ── ATLAS_DFLASH_ASYNC=1 (task #20): async propose‖commit-tail ──
         // Enqueue the drafter forward on the dedicated propose stream and
         // return a placeholder chain immediately; the real drafts are
@@ -834,7 +874,11 @@ impl BlockDiffusionDraftHead {
                 Ok(Some(placeholder)) => return Ok(placeholder),
                 Ok(None) => {
                     self.disarm_fused_overlap_event();
-                    if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
+                    if let Err(error) = self.resolve_stale_async_preserving_owner_staged(
+                        ctx.gpu,
+                        dstate,
+                        super::async_propose::PreserveStagedMode::EarlyStage1Only,
+                    ) {
                         clear_proposal_outputs(dstate);
                         return Err(error);
                     }

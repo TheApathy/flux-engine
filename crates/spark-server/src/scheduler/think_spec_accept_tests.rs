@@ -65,6 +65,7 @@ fn seq_state() -> SequenceState {
 fn think_seq() -> ActiveSeq {
     ActiveSeq {
         stop_cause: None,
+        defer_emit: Default::default(),
         seq: seq_state(),
         session_hash: 0,
         prompt_prefix_hash: 0,

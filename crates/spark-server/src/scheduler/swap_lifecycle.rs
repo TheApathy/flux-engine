@@ -281,6 +281,7 @@ fn restore_swapped_seq(
 
     ActiveSeq {
         stop_cause: None,
+        defer_emit: Default::default(),
         seq,
         session_hash: s.session_hash,
         prompt_prefix_hash: s.prompt_prefix_hash,

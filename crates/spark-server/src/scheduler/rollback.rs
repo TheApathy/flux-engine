@@ -396,6 +396,7 @@ pub(super) fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize)
     // 1+2. Truncate the generated-token buffer and rewind the
     //       attention-KV cursor (`seq.tokens` + `seq_len`).
     rewind_observable_buffers(a, keep_len);
+    a.defer_emit.invalidate_tool_call_positions();
 
     // 3. Restore the generation budget that the dropped tokens consumed
     //    (only content tokens decrement `remaining`, and

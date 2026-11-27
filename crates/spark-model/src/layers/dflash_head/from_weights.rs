@@ -644,7 +644,9 @@ impl BlockDiffusionDraftHead {
         let max_sel_rows = g.max(super::DFLASH_BATCH_MAX_SEL_ROWS);
         let topk_bytes = selector_topk_scratch_bytes(g);
         let batch_out_probs_bytes = batch_out_probs_scratch_bytes(g);
-        let early_stage1_fc_bytes = if super::async_propose::dflash_early_stage1_enabled() {
+        let early_stage1_fc_bytes = if super::async_propose::dflash_early_stage1_enabled()
+            || super::async_propose::dflash_opt_branch0_enabled()
+        {
             physical_verify_k.max(g + 1) * hidden_size * bf16
         } else {
             0
@@ -1675,6 +1677,7 @@ impl BlockDiffusionDraftHead {
             async_batched_inflight: Mutex::new(None),
             async_batch_slot_toggle: std::sync::atomic::AtomicU8::new(0),
             early_stage1_staged: Mutex::new(None),
+            opt_branch0_staged: Mutex::new(None),
             async_propose_stream: std::sync::OnceLock::new(),
             async_order_event: std::sync::atomic::AtomicU64::new(0),
             fused_event_armed: std::sync::atomic::AtomicBool::new(false),
