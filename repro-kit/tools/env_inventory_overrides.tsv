@@ -127,3 +127,4 @@ ATLAS_LM_HEAD_FUSED_ARGMAX	ROUTE	opt-in fused two-stage NVFP4 LM-head + online w
 ATLAS_DCOCO_SIDECAR	RESOURCE	canonical filesystem path to authenticated ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
 ATLAS_DCOCO_SIDECAR_SHA256	RESOURCE	expected SHA-256 digest authenticating ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
 ATLAS_DCOCO_SIDECAR_SIZE	RESOURCE	expected exact byte size authenticating ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
+ATLAS_LM_HEAD_INT8_BLOCK32	NUMERICS	opt-in native SM121 INT8 Block-32 BF16-scale (8.50 bpw) LM-head GEMM and fused online argmax (ops/lm_head_int8_block32.rs)
