@@ -1214,6 +1214,14 @@ pub fn step_verify_dflash(
 
     let production_pre_verify_len = a.seq.seq_len;
     let production_pre_verify_tokens = a.seq.tokens.len();
+    let _exact_gpu_accept_eligibility =
+        super::exact_gpu_accept::audit_single_seq_exact_gpu_accept_if_enabled(
+            a,
+            tokens.len(),
+            think,
+            model.decode_logits_fp32(),
+            spark_model::layers::ops::exact_spec_accept::exact_spec_gpu_accept_policy(),
+        );
     let rejection_policy = super::stochastic_verify_walk::spec_verify_policy()
         == super::stochastic_verify_walk::SpecVerifyPolicy::Rejection;
     if serial_oracle.is_none() && a.pending_tree_payload.is_none() {

@@ -338,6 +338,17 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "rms_norm_tensor_fp8_sm120",
         ),
     ),
+    (
+        "kernels/gb10/common/exact_spec_accept_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "exact_spec_accept_sparse_sm120",
+            "exact_spec_prefix_reduce_sm120",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(
