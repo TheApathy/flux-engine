@@ -219,6 +219,30 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "qwen4_conv1d_l2norm_bf16_prefill_v4_strip",
         ),
     ),
+    (
+        "kernels/gb10/common/autoematic_fp6_gemm.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "autoematic_fp6_gemm_sm120",
+            "autoematic_fp6_gemv_batch",
+        ),
+    ),
+    (
+        "kernels/gb10/common/dual_plane_nvfp4.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "repack_bf16_to_dual_plane_nvfp4",
+            "repack_fp8_blockscaled_to_dual_plane_nvfp4",
+            "dual_plane_nvfp4_verify_gemm_sm120",
+            "dual_plane_nvfp4_verify_gemv_batch",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(

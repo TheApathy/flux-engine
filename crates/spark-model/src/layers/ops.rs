@@ -31,6 +31,8 @@ mod fp8_moe_batch_b;
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[path = "ops/gdn_c143_sm121.rs"]
 pub mod gdn_c143_sm121;
+#[path = "ops/gemm_autoematic.rs"]
+mod gemm_autoematic;
 #[path = "ops/gemm_dense.rs"]
 mod gemm_dense;
 #[path = "ops/gemm_quant.rs"]
@@ -152,6 +154,7 @@ pub use embeddings::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
+pub use gemm_autoematic::*;
 pub use gemm_dense::*;
 pub use gemm_quant::*;
 pub use gemm_w3::*;

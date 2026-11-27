@@ -111,3 +111,10 @@ FLUX_QWEN4_TARGET_LMHEAD_MODE	NUMERICS	selects target lm_head precision (fp8/bf1
 ATLAS_DFLASH_HONOR_IS_CAUSAL	DEBUG	validated by cli_dflash_environment_rules.rs and pinned by built-in DFlash2 recipes
 ATLAS_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
 FLUX_TRUST_PROXY	RESOURCE	HTTP reverse-proxy header trust policy for rate limiting (rate_limiter.rs)
+ATLAS_AUTOEMATIC_GATE_ENTROPY	NUMERICS	normalized top-K entropy threshold escalating NVFP4 layers to AutoFP6 (spark-runtime/src/autoematic.rs)
+ATLAS_AUTOEMATIC_LAYERS	NUMERICS	layer selection for +0.4 bpw AutoEMatic AutoFP6 sparse mantissa refinement (autoematic_sidecar.rs)
+ATLAS_AUTOEMATIC_SIDECAR	RESOURCE	canonical filesystem path to authenticated AutoEMatic sidecar file (autoematic_sidecar.rs)
+ATLAS_AUTOEMATIC_SIDECAR_SHA256	RESOURCE	expected SHA-256 digest authenticating AutoEMatic sidecar file (autoematic_sidecar.rs)
+ATLAS_AUTOEMATIC_SIDECAR_SIZE	RESOURCE	expected exact byte size authenticating AutoEMatic sidecar file (autoematic_sidecar.rs)
+ATLAS_DUAL_PLANE_NVFP4	NUMERICS	repacks BF16/FP8 weights into 8.5 bpw shared-scale DualPlaneNvfp4 (weight_map/dual_plane.rs)
+ATLAS_DUAL_PLANE_SELF_SPEC	ROUTE	opt-in W_hi DualPlaneNvfp4 self-speculation; target verify preserves DualPlaneNvfp4 output (speculative_self.rs)

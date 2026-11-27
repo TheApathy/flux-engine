@@ -31,6 +31,7 @@ pub use admission::W3SidecarRequest;
 
 #[path = "w3_sidecar/digest.rs"]
 mod digest;
+pub(crate) use digest::sha256;
 
 #[path = "w3_sidecar/manifest.rs"]
 mod manifest;

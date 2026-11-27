@@ -36,6 +36,7 @@ pub mod qwen4_batch_policy;
 pub(crate) mod qwen4_native_selectors;
 pub(crate) mod source_pins;
 pub mod speculative;
+pub mod speculative_self;
 pub mod tp_shard;
 pub mod traits;
 pub mod vision_preprocess;
