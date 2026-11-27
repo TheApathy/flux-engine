@@ -278,6 +278,18 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "dual_plane_nvfp4_verify_gemv_batch",
         ),
     ),
+    (
+        "kernels/gb10/common/rms_norm_nvfp4_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "rms_norm_nvfp4_sm120",
+            "rms_norm_residual_nvfp4_sm120",
+            "silu_mul_nvfp4_sm120",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(

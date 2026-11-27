@@ -137,6 +137,8 @@ mod prefill_attn_main_b;
 mod prefill_attn_turbok;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
+#[path = "ops/rmsnorm_nvfp4.rs"]
+mod rmsnorm_nvfp4;
 #[path = "ops/sampling.rs"]
 mod sampling;
 #[path = "ops/sparsity.rs"]
@@ -226,6 +228,7 @@ pub use prefill_attn_main_a::*;
 pub use prefill_attn_main_b::*;
 pub use prefill_attn_turbok::*;
 pub use quant_dispatch::*;
+pub use rmsnorm_nvfp4::*;
 pub use sampling::*;
 pub use sparsity::*;
 pub use ssm_gdn_a::*;

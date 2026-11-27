@@ -891,18 +891,34 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<(DevicePtr, DevicePtr, f32)> {
         let (a_packed, a_scale, _) = self.ensure_e2m1_scratch(ctx.gpu, m as usize, k as usize)?;
-        ops::quantize_silu_mul_bf16_to_nvfp4(
-            ctx.gpu,
-            self.nvfp4_silu_quantize_k,
-            gate,
-            up,
-            a_packed,
-            a_scale,
-            checkpoint_scale2,
-            m,
-            k,
-            stream,
-        )?;
+        if ops::fused_rmsnorm_nvfp4_policy()? == ops::FusedRmsNormNvfp4Policy::Enabled {
+            self.launch_fused_silu_nvfp4(
+                ctx.gpu,
+                gate,
+                up,
+                a_packed,
+                a_scale,
+                checkpoint_scale2,
+                m,
+                k,
+                ops::SwiGluInputLayout::Split,
+                ops::Nvfp4ScaleLayout::Linear,
+                stream,
+            )?;
+        } else {
+            ops::quantize_silu_mul_bf16_to_nvfp4(
+                ctx.gpu,
+                self.nvfp4_silu_quantize_k,
+                gate,
+                up,
+                a_packed,
+                a_scale,
+                checkpoint_scale2,
+                m,
+                k,
+                stream,
+            )?;
+        }
         Ok((a_packed, a_scale, checkpoint_scale2))
     }
 
@@ -1365,6 +1381,7 @@ impl DenseFfnLayer {
             down_plan.k,
             1,
         )?;
+        let fused_rmsnorm_policy = ops::fused_rmsnorm_nvfp4_policy()?;
         let mut merged_launch =
             route
                 .library
@@ -1430,17 +1447,33 @@ impl DenseFfnLayer {
             },
             stream,
         )?;
-        ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
-            ctx.gpu,
-            route.quantize_merged_silu_atlas_128x4_k,
-            merged_out,
-            activation_fp4,
-            activation_scales,
-            f32::from_bits(route.down.input_scale_bits),
-            m,
-            inter,
-            stream,
-        )?;
+        if fused_rmsnorm_policy == ops::FusedRmsNormNvfp4Policy::Enabled {
+            self.launch_fused_silu_nvfp4(
+                ctx.gpu,
+                merged_out,
+                merged_out.offset((inter as usize) * 2),
+                activation_fp4,
+                activation_scales,
+                f32::from_bits(route.down.input_scale_bits),
+                m,
+                inter,
+                ops::SwiGluInputLayout::MergedGateUp,
+                ops::Nvfp4ScaleLayout::Swizzled128x4,
+                stream,
+            )?;
+        } else {
+            ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+                ctx.gpu,
+                route.quantize_merged_silu_atlas_128x4_k,
+                merged_out,
+                activation_fp4,
+                activation_scales,
+                f32::from_bits(route.down.input_scale_bits),
+                m,
+                inter,
+                stream,
+            )?;
+        }
 
         down_launch.launch_eager(
             FlashInferSm121Buffers {
