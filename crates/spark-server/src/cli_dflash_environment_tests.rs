@@ -213,7 +213,7 @@ fn the_selector_keeps_every_other_rule_strict() {
         ("ATLAS_DFLASH_PORTFOLIO", "1"),
         ("ATLAS_DFLASH_KEY_RETRIEVAL", "1"),
         ("ATLAS_DFLASH_PLD", "1"),
-        ("ATLAS_DFLASH_ASYNC", "1"),
+        ("ATLAS_DFLASH_BRANCH", "1"),
         ("ATLAS_DFLASH_RETR_WIDE", "15"),
         ("ATLAS_RETRIEVAL_HYBRID_MIN", "4"),
         ("ATLAS_RETRIEVAL_LMAX", "32"),
@@ -242,4 +242,22 @@ fn the_selector_is_irrelevant_when_dflash_is_off() {
         (name == "ATLAS_DFLASH_LOOKUP").then(|| "bogus".to_string())
     })
     .expect("a non-DFlash target (Flash-Next) never reads the selector");
+}
+
+#[test]
+fn v12_opt_in_dflash_controls_admit_zero_or_one_and_fail_closed_otherwise() {
+    for name in [
+        "ATLAS_DFLASH_ASYNC",
+        "ATLAS_DFLASH_DENSE_PCUM",
+        "ATLAS_DFLASH_EARLY_STAGE1",
+        "ATLAS_DFLASH_ECHO",
+        "ATLAS_DFLASH_ECHO_GAMMA7",
+        "ATLAS_DFLASH_NGRAM_BONUS",
+        "ATLAS_DFLASH_SPEC_CYCLE_V2",
+    ] {
+        validate_one(name, "0").unwrap_or_else(|e| panic!("{name}=0: {e}"));
+        validate_one(name, "1").unwrap_or_else(|e| panic!("{name}=1: {e}"));
+        let err = validate_one(name, "2").expect_err("non-binary value must fail closed");
+        assert!(err.contains(name), "{name}=2: {err}");
+    }
 }
