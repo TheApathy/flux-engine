@@ -297,6 +297,7 @@ fn build_active_seq_from_prefill(
     });
     ActiveSeq {
         stop_cause: None,
+        defer_emit: Default::default(),
         seq: p.seq,
         session_hash: p.session_hash,
         prompt_prefix_hash,

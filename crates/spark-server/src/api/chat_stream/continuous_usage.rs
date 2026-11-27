@@ -48,12 +48,23 @@ impl ContinuousUsageTracker {
 
     pub(super) fn observe_token(
         &mut self,
+        chunks: Vec<ChatCompletionChunk>,
+    ) -> Vec<ChatCompletionChunk> {
+        self.observe_token_batch(1, chunks)
+    }
+
+    /// Advance cumulative usage by `token_count` committed tokens from a
+    /// coalesced `StreamEvent::TokenBatch`, stamping the updated count on every
+    /// choice chunk (or synthesizing one progress chunk when empty).
+    pub(super) fn observe_token_batch(
+        &mut self,
+        token_count: usize,
         mut chunks: Vec<ChatCompletionChunk>,
     ) -> Vec<ChatCompletionChunk> {
-        if !self.enabled {
+        if !self.enabled || token_count == 0 {
             return chunks;
         }
-        self.completion_tokens = self.completion_tokens.saturating_add(1);
+        self.completion_tokens = self.completion_tokens.saturating_add(token_count);
         if chunks.is_empty() {
             chunks.push(ChatCompletionChunk::progress_chunk(&self.model, &self.id));
         }

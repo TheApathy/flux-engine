@@ -269,6 +269,10 @@ pub struct InferenceResponse {
 /// Events sent during streaming generation.
 pub enum StreamEvent {
     Token(u32),
+    /// Multiple contiguous plain tokens emitted in one speculative verify step
+    /// (`ATLAS_DFLASH_DEFER_EMIT=1`). Decoded in a single `incremental_decode`
+    /// pass (with automatic per-token fallback on incomplete trailing UTF-8).
+    TokenBatch(Vec<u32>),
     /// Token with logprobs data (when top_logprobs is requested).
     TokenWithLogprobs(u32, TokenLogprobs),
     /// One committed completion token intentionally has no text/token delta

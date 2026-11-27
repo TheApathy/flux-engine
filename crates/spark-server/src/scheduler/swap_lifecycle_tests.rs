@@ -72,6 +72,7 @@ pub(super) fn active_seq(committed_probe: bool) -> Fixture {
     (
         ActiveSeq {
             stop_cause: None,
+            defer_emit: Default::default(),
             seq: seq_state(),
             session_hash: 55,
             prompt_prefix_hash: 55,

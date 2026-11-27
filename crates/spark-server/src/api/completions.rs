@@ -884,6 +884,102 @@ pub(super) async fn completions_stream(
                     ));
                 }
             }
+            StreamEvent::TokenBatch(toks) => {
+                if stop_triggered || toks.is_empty() {
+                    return futures::stream::iter(events);
+                }
+                let len_before = all_toks.len();
+                let prefix_before = detok_prefix_offset;
+                let read_before = detok_read_offset;
+                all_toks.extend_from_slice(&toks);
+                let batch_delta = match state.tokenizer.incremental_decode(
+                    &all_toks,
+                    &mut detok_prefix_offset,
+                    &mut detok_read_offset,
+                ) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "completion batched incremental tokenizer decode failed; deferring to Done"
+                        );
+                        String::new()
+                    }
+                };
+                if !batch_delta.is_empty() {
+                    emitted += batch_delta.len();
+                    let (safe, matched) = super::chat_stream::filter_stop_delta(
+                        &mut stop_holdback,
+                        &batch_delta,
+                        &stop_strings,
+                    );
+                    if matched {
+                        crate::openai::record_shared_intervention(
+                            intervention_ledger.as_ref(),
+                            "completion_stop_sequence",
+                            "stop_stream",
+                        );
+                        stop_triggered = true;
+                        cancel_guard.cancel();
+                    }
+                    if !safe.is_empty() {
+                        let chunk = CompletionChunk::text_chunk(&model, &id, safe);
+                        let json = serde_json::to_string(&chunk).unwrap_or_default();
+                        events.push(Ok::<_, std::convert::Infallible>(
+                            Event::default().data(json),
+                        ));
+                    }
+                } else if toks.len() > 1 {
+                    all_toks.truncate(len_before);
+                    detok_prefix_offset = prefix_before;
+                    detok_read_offset = read_before;
+                    for tok in toks {
+                        if stop_triggered {
+                            break;
+                        }
+                        all_toks.push(tok);
+                        let delta = match state.tokenizer.incremental_decode(
+                            &all_toks,
+                            &mut detok_prefix_offset,
+                            &mut detok_read_offset,
+                        ) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                tracing::warn!(
+                                    ?error,
+                                    "completion incremental tokenizer decode failed; deferring to Done"
+                                );
+                                String::new()
+                            }
+                        };
+                        if delta.is_empty() {
+                            continue;
+                        }
+                        emitted += delta.len();
+                        let (safe, matched) = super::chat_stream::filter_stop_delta(
+                            &mut stop_holdback,
+                            &delta,
+                            &stop_strings,
+                        );
+                        if matched {
+                            crate::openai::record_shared_intervention(
+                                intervention_ledger.as_ref(),
+                                "completion_stop_sequence",
+                                "stop_stream",
+                            );
+                            stop_triggered = true;
+                            cancel_guard.cancel();
+                        }
+                        if !safe.is_empty() {
+                            let chunk = CompletionChunk::text_chunk(&model, &id, safe);
+                            let json = serde_json::to_string(&chunk).unwrap_or_default();
+                            events.push(Ok::<_, std::convert::Infallible>(
+                                Event::default().data(json),
+                            ));
+                        }
+                    }
+                }
+            }
             StreamEvent::CompletionProgress
             | StreamEvent::CompletionProgressWithLogprobs(_)
             | StreamEvent::ThinkingDone => {}

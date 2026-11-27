@@ -155,6 +155,9 @@ pub(super) fn finish_sequence_with_cache(
     a: &mut ActiveSeq,
     cache_sequence: bool,
 ) {
+    // Flush any deferred streaming events before terminal `StreamEvent::Done`
+    // so tokens accepted on a terminal verify step are never lost or reordered.
+    flush_deferred_emit(a);
     // SPEC_CYCLE_V2 is C=1-only and keeps an allocation-free thread-local
     // identity across cycles.  Retire it at every request boundary, including
     // client cancellation after a fully recorded cycle; otherwise a later
@@ -286,6 +289,7 @@ pub(super) fn finish_sequence_with_cache(
 
 /// Send error to client and free GPU resources.
 pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
+    flush_deferred_emit(a);
     spec_timing::retire_request();
     super::adaptive_depth::retire_seq(a.depth_controller_key());
     super::verify_dflash_step::prune_branch_audit_stash(a.session_hash);

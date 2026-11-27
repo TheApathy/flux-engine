@@ -185,7 +185,9 @@ mod bounded_stream_send {
         assert_eq!(first_a.matches("blocking_send(").count(), 0);
         assert_eq!(first_b.matches("blocking_send(").count(), 0);
         assert_eq!(promote.matches("blocking_send(").count(), 0);
-        assert_eq!(emit.matches("stream_send_bounded(tx, ").count(), 4);
+        assert_eq!(emit.matches("stream_send_bounded(tx, ").count(), 2);
+        assert_eq!(emit.matches("publish_stream_event(a, ").count(), 4);
+        assert_eq!(emit.matches("try_send(").count(), 1);
         assert_eq!(serial.matches("stream_send_bounded(tx, event").count(), 1);
         assert_eq!(lifecycle.matches("stream_send_bounded(tx, ").count(), 2);
         assert!(lifecycle.contains("stream_send_bounded(\n                tx,"));
@@ -375,5 +377,73 @@ mod request_timeout {
     fn timeout_reason_names_the_cause() {
         assert_eq!(TimeoutReason::Stall.as_str(), "stall");
         assert_eq!(TimeoutReason::TotalDeadline.as_str(), "total_deadline");
+    }
+}
+
+#[cfg(test)]
+mod defer_emit_integration_tests {
+    use super::*;
+    use crate::scheduler::test_fixtures::active_seq;
+
+    #[test]
+    fn deferred_emit_buffers_during_accept_and_flushes_coalesced_token_batch() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut a = active_seq(ResponseSink::Streaming(tx), 0);
+        a.max_output_tokens = 32;
+        a.remaining = 32;
+        a.defer_emit.begin();
+
+        for tok in [10u32, 11, 12, 13, 14] {
+            assert!(emit_token_for_verify(&mut a, tok, None));
+        }
+        assert!(!a.finished);
+        // Zero channel wakeups occurred while deferral was armed (prior to commit+propose).
+        assert!(rx.try_recv().is_err());
+
+        flush_deferred_emit(&mut a);
+        assert!(!a.defer_emit.is_active());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamEvent::TokenBatch(batch)) if batch == vec![10, 11, 12, 13, 14]
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn deferred_emit_retires_immediately_when_receiver_closes() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        drop(rx);
+        let mut a = active_seq(ResponseSink::Streaming(tx), 0);
+        a.defer_emit.begin();
+        assert!(!publish_stream_event(&mut a, StreamEvent::Token(7), "test"));
+        assert!(a.finished);
+    }
+
+    #[test]
+    fn tracked_fuzzy_repetition_outside_tool_matches_full_rposition_scan() {
+        let mut a = active_seq(ResponseSink::Blocking(None), 0);
+        a.tool_call_start_token = Some(900);
+        a.tool_call_end_token = Some(901);
+
+        // Repeat a 20-token block 5 times (100 >= 90 tokens) inside a tool call -> suppressed by both.
+        a.output_tokens.push(900);
+        for _ in 0..5 {
+            a.output_tokens.extend(10..30);
+        }
+        assert_eq!(
+            fuzzy_repetition_outside_tool_tracked(&mut a),
+            fuzzy_repetition_outside_tool(&a)
+        );
+        assert!(fuzzy_repetition_outside_tool_tracked(&mut a).is_none());
+
+        // Close the tool call and repeat a 20-token block 5 times outside -> detected identically by both.
+        a.output_tokens.push(901);
+        for _ in 0..5 {
+            a.output_tokens.extend(40..60);
+        }
+        let tracked = fuzzy_repetition_outside_tool_tracked(&mut a);
+        let reference = fuzzy_repetition_outside_tool(&a);
+        assert_eq!(tracked, reference);
+        assert!(tracked.is_some());
     }
 }

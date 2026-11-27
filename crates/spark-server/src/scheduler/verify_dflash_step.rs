@@ -1406,6 +1406,9 @@ pub fn step_verify_dflash(
     // commit_verify_state_async so the commit knows tree mode was active
     // and routes through the partial-accept (intermediate→h_state) path.
     a.last_token_time = Instant::now();
+    if super::defer_emit::dflash_defer_emit_enabled() {
+        a.defer_emit.begin();
+    }
 
     // ATLAS_DFLASH_FUSED=1: record the propose-ordering event NOW, before
     // commit kernels are enqueued. The drafter reads dflash_hidden_save
@@ -1874,6 +1877,7 @@ pub fn step_verify_dflash(
                 tracing::error!("EP-result abort rollback failed: {rollback_error:#}");
             }
             model.clear_ddtree_parent_ids();
+            flush_deferred_emit(a);
             fail_speculative_step(a, "verify EP result broadcast", &e);
             return;
         }
@@ -1886,6 +1890,7 @@ pub fn step_verify_dflash(
                 tracing::error!("EP-policy abort rollback failed: {rollback_error:#}");
             }
             model.clear_ddtree_parent_ids();
+            flush_deferred_emit(a);
             return;
         }
     }
@@ -2007,6 +2012,7 @@ pub fn step_verify_dflash(
                 record_settled(a, k_verify, num_accepted, t.consumed_rows, true);
             }
             model.clear_ddtree_parent_ids();
+            flush_deferred_emit(a);
             if let Some(record) =
                 spec_cycle.terminal(spec_phase, num_accepted, a.output_tokens.len())
             {
@@ -2055,6 +2061,7 @@ pub fn step_verify_dflash(
                     record_settled(a, k_verify, num_accepted, consumed_rows, true);
                 }
                 model.clear_ddtree_parent_ids();
+                flush_deferred_emit(a);
                 if let Some(record) =
                     spec_cycle.terminal(spec_phase, num_accepted, a.output_tokens.len())
                 {
@@ -2117,6 +2124,7 @@ pub fn step_verify_dflash(
                     record_settled(a, k_verify, num_accepted, consumed_rows, true);
                 }
                 model.clear_ddtree_parent_ids();
+                flush_deferred_emit(a);
                 if let Some(record) =
                     spec_cycle.terminal(spec_phase, num_accepted, a.output_tokens.len())
                 {
@@ -2324,6 +2332,7 @@ pub fn step_verify_dflash(
             tracing::error!("commit-error abort rollback failed: {rollback_error:#}");
         }
         model.clear_ddtree_parent_ids();
+        flush_deferred_emit(a);
         fail_speculative_step(a, "verify commit", &e);
         return;
     }
@@ -2331,12 +2340,14 @@ pub fn step_verify_dflash(
         let Some(evidence) = fixture_evidence.take() else {
             tracing::error!("K16 acceptance fixture lacks its armed evidence guard");
             model.clear_ddtree_parent_ids();
+            flush_deferred_emit(a);
             a.finished = true;
             return;
         };
         if let Err(error) = fixture.finish(evidence, num_accepted, pre_verify_len, &tokens) {
             tracing::error!("K16 acceptance fixture commit receipt failed: {error:#}");
             model.clear_ddtree_parent_ids();
+            flush_deferred_emit(a);
             a.finished = true;
             return;
         }
@@ -2350,6 +2361,7 @@ pub fn step_verify_dflash(
         tracing::info!(
             "DFLASH_K5_COMMIT_PARITY_TERMINAL schema=1 production_commit_preserved=true reproposal_skipped=true"
         );
+        flush_deferred_emit(a);
         a.finished = true;
         return;
     }
@@ -2376,6 +2388,7 @@ pub fn step_verify_dflash(
         && let Err(e) = model.compact_verify_kv(&a.seq, path, pre_verify_len)
     {
         tracing::error!("compact_verify_kv (dflash tree-fork): {e:#}");
+        flush_deferred_emit(a);
         fail_speculative_step(a, "verify tree KV compaction", &e);
         return;
     }
@@ -2387,6 +2400,7 @@ pub fn step_verify_dflash(
         // snapshot captures the committed prefix, not the rejected tail.
         if let Err(e) = model.sync_secondary() {
             tracing::error!("sync_secondary before SSM boundary snapshot (dflash): {e:#}");
+            flush_deferred_emit(a);
             fail_speculative_step(a, "verify think-end snapshot sync", &e);
             return;
         }
@@ -2428,6 +2442,7 @@ pub fn step_verify_dflash(
         // the proposer a known-stale hidden row—the exact corruption this path
         // exists to prevent. Preserve DFlash's prior log-and-continue behavior.
         if !proposer_is_dflash {
+            flush_deferred_emit(a);
             return;
         }
     }
@@ -2686,6 +2701,9 @@ pub fn step_verify_dflash(
     // upcoming verify window `[a.last_token, ...a.pending_drafts]` paired with
     // `a.seq.tokens` before the next verify step's Layer 0 begins.
     super::verify_qwen4_batched_step::warm_ple_draft_ahead_for_seq(model, a);
+    // ATLAS_DFLASH_DEFER_EMIT=1: dispatch coalesced SSE TokenBatch events NOW,
+    // strictly after GPU commit + async propose have already been enqueued.
+    flush_deferred_emit(a);
     let spec_phase = spec_cycle.finalize(spec_phase);
     if let Some(record) = spec_cycle.complete(spec_phase, num_accepted, a.output_tokens.len()) {
         tracing::info!("{record}");

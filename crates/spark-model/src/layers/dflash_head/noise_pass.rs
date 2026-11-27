@@ -35,10 +35,10 @@ pub(super) use graph_state::{
 pub(crate) use policy::CtxKvCacheRepr;
 pub(super) use policy::{
     LM_HEAD_PATH_TAG_BF16, LmHeadNvfp4Mode, REJECTION_SLOT_STRIDE, dflash_noise_graph_enabled,
-    dflash_split_kv_h128_workspace_bytes, noise_graph_attn_kgamma_disable_o,
-    noise_graph_swa_enabled, resolve_dflash_split_kv_splits_for_sm, resolve_dflash2_selector_topk,
-    resolve_lm_head_path_tag, resolve_rejection_seq_staging, resolve_rejection_shortlist_k,
-    validate_selector_shortlist,
+    dflash_split_kv_h128_workspace_bytes, dflash_stage1_graph_enabled,
+    noise_graph_attn_kgamma_disable_o, noise_graph_swa_enabled,
+    resolve_dflash_split_kv_splits_for_sm, resolve_dflash2_selector_topk, resolve_lm_head_path_tag,
+    resolve_rejection_seq_staging, resolve_rejection_shortlist_k, validate_selector_shortlist,
 };
 
 #[cfg(test)]

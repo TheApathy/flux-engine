@@ -87,12 +87,11 @@ pub(super) fn maybe_implicit_close_thinking_on_eos(
 /// usage nor logprobs. Blocking responses recover the same boundary from the
 /// scheduler's content-token count at finalization.
 pub(super) fn publish_thinking_done(a: &mut ActiveSeq) {
-    let ResponseSink::Streaming(tx) = &a.sink else {
+    if !matches!(a.sink, ResponseSink::Streaming(_)) {
         return;
-    };
-    if !stream_send_bounded(tx, StreamEvent::ThinkingDone, "thinking_done") {
+    }
+    if !publish_stream_event(a, StreamEvent::ThinkingDone, "thinking_done") {
         tracing::debug!("stream dropped or stalled before hidden thinking boundary");
-        a.finished = true;
     }
 }
 
@@ -187,6 +186,54 @@ pub(super) fn retire_if_budget_exhausted(a: &mut ActiveSeq, context: &str) -> bo
     true
 }
 
+/// Deliver one streaming event immediately (default), or queue it inside
+/// `a.defer_emit` when `ATLAS_DFLASH_DEFER_EMIT=1` is armed for the active
+/// verify step. Retires `a.finished = true` immediately when the receiver has
+/// already closed so commit/propose work is never wasted on a dead stream.
+pub(super) fn publish_stream_event(a: &mut ActiveSeq, event: StreamEvent, context: &str) -> bool {
+    if !matches!(a.sink, ResponseSink::Streaming(_)) {
+        return true;
+    }
+    if a.defer_emit.is_active() {
+        if a.sink.is_closed() {
+            tracing::debug!(context, "Streaming receiver dropped, finishing seq");
+            a.finished = true;
+            return false;
+        }
+        a.defer_emit.push_event(event);
+        return true;
+    }
+    let ResponseSink::Streaming(tx) = &a.sink else {
+        return true;
+    };
+    if !stream_send_bounded(tx, event, context) {
+        a.finished = true;
+        return false;
+    }
+    true
+}
+
+/// Flush any queued deferred SSE events (`ATLAS_DFLASH_DEFER_EMIT=1`) in exact
+/// FIFO order and disarm deferral. No-op when deferral is inactive and empty.
+pub(super) fn flush_deferred_emit(a: &mut ActiveSeq) {
+    if !a.defer_emit.has_pending() {
+        return;
+    }
+    let events = a.defer_emit.drain_events();
+    if events.is_empty() {
+        return;
+    }
+    let ResponseSink::Streaming(tx) = &a.sink else {
+        return;
+    };
+    for event in events {
+        if !stream_send_bounded(tx, event, "deferred_emit_flush") {
+            a.finished = true;
+            break;
+        }
+    }
+}
+
 /// Publish one committed scheduler token which must never enter either text
 /// decoder. This is used for structural/terminal tokens and for suppressed
 /// reasoning. The event still carries requested logprobs and advances opt-in
@@ -196,13 +243,11 @@ pub(super) fn publish_hidden_committed_token(
     logprobs: &Option<crate::api::TokenLogprobs>,
     context: &str,
 ) {
-    let ResponseSink::Streaming(tx) = &a.sink else {
+    if !matches!(a.sink, ResponseSink::Streaming(_)) {
         return;
-    };
-    let event = committed_token_event(0, logprobs, true);
-    if !stream_send_bounded(tx, event, context) {
-        a.finished = true;
     }
+    let event = committed_token_event(0, logprobs, true);
+    let _ = publish_stream_event(a, event, context);
 }
 
 /// Advance the sampler's tool-body phase after committing one content token.
@@ -264,15 +309,13 @@ pub(super) fn commit_tool_call_close(a: &mut ActiveSeq, tok: u32, was_inside_thi
         a.post_think_gate_steps = mtp_gate::advance_entry_counter(a.post_think_gate_steps);
     }
 
-    if let ResponseSink::Streaming(ref tx) = a.sink {
+    if matches!(a.sink, ResponseSink::Streaming(_)) {
         let event = if let Some(lp) = a.logprobs_data.last().cloned() {
             StreamEvent::TokenWithLogprobs(tok, lp)
         } else {
             StreamEvent::Token(tok)
         };
-        if !stream_send_bounded(tx, event, "tool_call_end") {
-            a.finished = true;
-        }
+        let _ = publish_stream_event(a, event, "tool_call_end");
     }
 
     // A stop-after-first grammar (required/specific tool_choice, or
@@ -324,11 +367,37 @@ pub(super) fn fuzzy_repetition_outside_tool(a: &ActiveSeq) -> Option<(usize, usi
     }
 }
 
+/// O(1) amortized variant of [`fuzzy_repetition_outside_tool`] that tracks the
+/// latest `<tool_call>` / `</tool_call>` positions incrementally in
+/// `a.defer_emit` instead of running two O(N) reverse scans per token.
+pub(super) fn fuzzy_repetition_outside_tool_tracked(
+    a: &mut ActiveSeq,
+) -> Option<(usize, usize, usize)> {
+    if a.inside_thinking {
+        return None;
+    }
+    let (last_tc_start, last_tc_end) = a.defer_emit.sync_tool_call_positions(
+        &a.output_tokens,
+        a.tool_call_start_token,
+        a.tool_call_end_token,
+    );
+    let inside_tool_call = match (last_tc_start, last_tc_end) {
+        (Some(start), Some(end)) => start > end,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if inside_tool_call {
+        None
+    } else {
+        detect_fuzzy_repetition(&a.output_tokens)
+    }
+}
+
 /// Stop speculative emission on a fuzzy tail-loop. The serial path can roll
 /// back to a per-token SSM snapshot; a multi-token verify batch cannot safely
 /// do that after commit, so its parity behavior is the conservative hard stop.
 pub(super) fn apply_speculative_fuzzy_stop(a: &mut ActiveSeq) -> bool {
-    let Some((pattern_len, mis_a, mis_b)) = fuzzy_repetition_outside_tool(a) else {
+    let Some((pattern_len, mis_a, mis_b)) = fuzzy_repetition_outside_tool_tracked(a) else {
         return false;
     };
     record_watchdog_stop(a, "fuzzy_repeat_watchdog");
@@ -528,8 +597,13 @@ fn emit_token_with_policies(
     loop_watchdog_enabled: bool,
     catastrophic_loop_watchdog_enabled: bool,
 ) -> bool {
-    let stall_s = crate::api::request_contract::stall_timeout_s();
-    let stall = (stall_s > 0).then(|| std::time::Duration::from_secs(stall_s));
+    let (now, stall) = if a.defer_emit.is_active() {
+        a.defer_emit.step_clock()
+    } else {
+        let stall_s = crate::api::request_contract::stall_timeout_s();
+        let stall = (stall_s > 0).then(|| std::time::Duration::from_secs(stall_s));
+        (Instant::now(), stall)
+    };
     emit_token_with_policies_at(
         a,
         tok,
@@ -537,7 +611,7 @@ fn emit_token_with_policies(
         honor_eos_inside_thinking,
         loop_watchdog_enabled,
         catastrophic_loop_watchdog_enabled,
-        Instant::now(),
+        now,
         stall,
     )
 }
@@ -943,12 +1017,11 @@ fn emit_token_inner(
     let suppress_stream = (a.inside_thinking
         || (was_inside_thinking && a.think_end_token == Some(tok)))
         && !a.enable_thinking;
-    if let ResponseSink::Streaming(ref tx) = a.sink {
+    if matches!(a.sink, ResponseSink::Streaming(_)) {
         let event = committed_token_event(tok, &current_logprobs, suppress_stream);
         // The channel is the burst buffer. A full or closed consumer retires
         // this sequence immediately instead of parking the sole scheduler.
-        if !stream_send_bounded(tx, event, "spec_emit") {
-            a.finished = true;
+        if !publish_stream_event(a, event, "spec_emit") {
             return true;
         }
     }

@@ -234,6 +234,146 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
     // Counted HERE, as it is produced, so the dashboard's tok/s is a live
     // rate rather than one spike at completion.
     crate::metrics::DECODED_TOKENS_TOTAL.inc();
+    handle_token_inner(state, ctx, tok)
+}
+
+/// Process a batch of contiguous plain tokens emitted from one speculative
+/// verify step (`ATLAS_DFLASH_DEFER_EMIT=1`).
+///
+/// Decodes each same-phase run (reasoning or content) in ONE
+/// `incremental_decode` call instead of `k` calls, producing a single SSE
+/// chunk per phase run while preserving byte-identical output, stop-string
+/// truncation, `</think>` boundaries, and UTF-8 multi-byte boundaries (falling
+/// back automatically to per-token decoding when a batch ends mid-codepoint or
+/// when `FLUX_AGENT_GUARDS=1` is active).
+pub(super) fn handle_token_batch(
+    state: &mut StreamState,
+    ctx: &StreamCtx,
+    toks: &[u32],
+) -> ChunkVec {
+    if toks.is_empty() {
+        return Vec::new();
+    }
+    crate::metrics::DECODED_TOKENS_TOTAL.inc_by(toks.len() as u64);
+    if state.stop_string_triggered {
+        return Vec::new();
+    }
+    let mut sse_events: ChunkVec = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < toks.len() && !state.stop_string_triggered {
+        if !state.thinking_done {
+            if let Some(end_id) = ctx.state.think_end_token_id
+                && let Some(rel) = toks[cursor..].iter().position(|&t| t == end_id)
+            {
+                let before_end = &toks[cursor..cursor + rel];
+                if !before_end.is_empty() {
+                    sse_events.extend(handle_thinking_slice(state, ctx, before_end));
+                }
+                if !state.stop_string_triggered {
+                    sse_events.extend(handle_thinking_done(state, ctx));
+                }
+                cursor += rel + 1;
+                continue;
+            }
+            sse_events.extend(handle_thinking_slice(state, ctx, &toks[cursor..]));
+            break;
+        }
+        sse_events.extend(handle_content_slice(state, ctx, &toks[cursor..]));
+        break;
+    }
+    sse_events
+}
+
+fn handle_thinking_slice(state: &mut StreamState, ctx: &StreamCtx, sub: &[u32]) -> ChunkVec {
+    if sub.is_empty() {
+        return Vec::new();
+    }
+    if !ctx.enable_thinking {
+        state.all_toks.extend_from_slice(sub);
+        return Vec::new();
+    }
+    if sub.len() == 1 || ctx.agent_guards || crate::api::chat_phases::agent_guards_enabled() {
+        let mut out = ChunkVec::new();
+        for &tok in sub {
+            out.extend(handle_token_inner(state, ctx, tok));
+        }
+        return out;
+    }
+    let len_before = state.all_toks.len();
+    let prefix_before = state.detok_prefix_offset;
+    let read_before = state.detok_read_offset;
+    state.all_toks.extend_from_slice(sub);
+    let stable = incremental_text(state, ctx);
+    if stable.is_empty() {
+        // Trailing incomplete UTF-8 or empty special token: roll back and run
+        // per-token so any complete leading tokens emit immediately at exact
+        // UTF-8 boundaries.
+        state.all_toks.truncate(len_before);
+        state.detok_prefix_offset = prefix_before;
+        state.detok_read_offset = read_before;
+        let mut out = ChunkVec::new();
+        for &tok in sub {
+            out.extend(handle_token_inner(state, ctx, tok));
+        }
+        return out;
+    }
+    state.decoded_text.push_str(&stable);
+    let stable_end = state.decoded_text.len();
+    if stable_end <= state.emitted {
+        return Vec::new();
+    }
+    let delta = state.decoded_text[state.emitted..stable_end].to_string();
+    state.emitted = stable_end;
+    if delta.is_empty() {
+        return Vec::new();
+    }
+    let cleaned = sanitize_reasoning_delta(state, &ctx.leak_markers, delta);
+    if has_wire_bytes(&cleaned) {
+        vec![ChatCompletionChunk::reasoning_chunk(
+            &ctx.model, &ctx.id, cleaned,
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn handle_content_slice(state: &mut StreamState, ctx: &StreamCtx, sub: &[u32]) -> ChunkVec {
+    if sub.is_empty() || state.stop_string_triggered {
+        return Vec::new();
+    }
+    if sub.len() == 1 || ctx.agent_guards {
+        let mut out = ChunkVec::new();
+        for &tok in sub {
+            out.extend(handle_token_inner(state, ctx, tok));
+        }
+        return out;
+    }
+    let len_before = state.all_toks.len();
+    let prefix_before = state.detok_prefix_offset;
+    let read_before = state.detok_read_offset;
+    state.all_toks.extend_from_slice(sub);
+    let stable = incremental_text(state, ctx);
+    if stable.is_empty() {
+        state.all_toks.truncate(len_before);
+        state.detok_prefix_offset = prefix_before;
+        state.detok_read_offset = read_before;
+        let mut out = ChunkVec::new();
+        for &tok in sub {
+            out.extend(handle_token_inner(state, ctx, tok));
+        }
+        return out;
+    }
+    state.decoded_text.push_str(&stable);
+    let stable_end = state.decoded_text.len();
+    if stable_end <= state.emitted {
+        return Vec::new();
+    }
+    let delta = state.decoded_text[state.emitted..stable_end].to_string();
+    state.emitted = stable_end;
+    route_content_delta(state, ctx, delta)
+}
+
+fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> ChunkVec {
     let mut sse_events: ChunkVec = Vec::new();
     if state.stop_string_triggered {
         return sse_events;
@@ -789,5 +929,300 @@ mod stop_prefix_tests {
         let done = include_str!("handle_done.rs");
         assert!(done.contains("std::mem::take(&mut state.stop_holdback)"));
         assert!(done.contains("det.process(&incomplete_prefix)"));
+    }
+}
+
+#[cfg(test)]
+mod token_batch_parity_tests {
+    use super::{flush_terminal_decode, handle_token, handle_token_batch};
+    use crate::AppState;
+    use crate::api::chat_stream::continuous_usage::ContinuousUsageTracker;
+    use crate::api::chat_stream::ctx::StreamCtx;
+    use crate::api::chat_stream::state::StreamState;
+    use crate::api::failures::F39FailureCache;
+    use crate::openai::ChatCompletionChunk;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    // ByteLevel BPE fixture with ASCII tokens, a 4-byte UTF-8 emoji ("🚀" = F0 9F 9A 80)
+    // split across individual byte tokens, a `</think>` delimiter token, and a split stop string.
+    const TOK_HELLO: u32 = 1;
+    const TOK_SPACE_WORLD: u32 = 2;
+    const TOK_BANG: u32 = 3;
+    const TOK_EMOJI_0: u32 = 4; // 0xF0 -> ByteLevel char 'ð' (U+00F0)
+    const TOK_EMOJI_1: u32 = 5; // 0x9F -> ByteLevel char 'Ÿ' (U+0178? ByteLevel maps 0x9F -> U+013D; wait: use WordLevel + ByteFallback decoder!)
+    const TOK_EMOJI_2: u32 = 6;
+    const TOK_EMOJI_3: u32 = 7;
+    const TOK_THINK_END: u32 = 8;
+    const TOK_THINK_A: u32 = 9;
+    const TOK_THINK_B: u32 = 10;
+    const TOK_STOP_A: u32 = 11;
+    const TOK_STOP_B: u32 = 12;
+    const TOK_AFTER: u32 = 13;
+
+    fn make_byte_fallback_ctx(enable_thinking: bool, stop_strings: Vec<String>) -> StreamCtx {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vocab = [
+            "[UNK]", "hello", " world", "!", "<0xF0>", "<0x9F>", "<0x9A>", "<0x80>", "</think>",
+            "step1", " step2", "<ST", "OP>", "tail",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, tok)| (tok.to_string(), id as u32))
+        .collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".into())
+            .build()
+            .expect("wordlevel model");
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.with_decoder(Some(tokenizers::decoders::sequence::Sequence::new(vec![
+            tokenizers::DecoderWrapper::ByteFallback(
+                tokenizers::decoders::byte_fallback::ByteFallback::default(),
+            ),
+            tokenizers::DecoderWrapper::Fuse(tokenizers::decoders::fuse::Fuse::default()),
+        ])));
+        tok.save(dir.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{{ messages }}"}"#,
+        )
+        .expect("write tokenizer_config");
+        let chat_tok = crate::tokenizer::ChatTokenizer::from_model_dir(
+            dir.path(),
+            0,
+            enable_thinking,
+            "batch-parity-fixture",
+            None,
+        )
+        .expect("load tokenizer");
+        assert_eq!(
+            chat_tok
+                .decode(&[TOK_EMOJI_0, TOK_EMOJI_1, TOK_EMOJI_2, TOK_EMOJI_3])
+                .expect("decode rocket"),
+            "🚀"
+        );
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(4);
+        let app_state = Arc::new(AppState {
+            tokenizer: chat_tok,
+            model_name: "batch-parity-fixture".into(),
+            max_seq_len: 128,
+            max_batch_size: 1,
+            serving: serde_json::Value::Null,
+            yarn_context: false,
+            request_tx,
+            vision_config: None,
+            dsv41: false,
+            dsv41_vision: None,
+            default_temperature: 0.0,
+            default_top_k: 0,
+            default_top_p: 1.0,
+            default_top_n_sigma: 0.0,
+            default_min_p: 0.0,
+            tool_call_parser: None,
+            reasoning_parser: None,
+            think_end_token_id: Some(TOK_THINK_END),
+            think_start_token_id: None,
+            tool_max_tokens: 16,
+            default_max_tokens: None,
+            sampling_presets: Default::default(),
+            tool_call_start_token_id: None,
+            auto_compact_threshold: None,
+            model_ready: Arc::new(AtomicBool::new(true)),
+            request_timeout: 0,
+            effective_context: 0,
+            behavior: Default::default(),
+            disable_thinking: false,
+            disable_simhash_watchdog: true,
+            default_chat_template_kwargs: None,
+            runtime: crate::runtime_settings::RuntimeSettings::for_tests(128),
+            response_store: crate::response_store::ResponseStore::with_config(
+                4,
+                Duration::from_secs(60),
+            ),
+            rate_limiter: crate::rate_limiter::RateLimiter::with_config(
+                crate::rate_limiter::RateLimitConfig {
+                    rpm: 0,
+                    tpm: 0,
+                    burst_rpm: 0,
+                    burst_tpm: 0,
+                },
+            ),
+            conversation_store: crate::conversation_store::ConversationStore::with_config(
+                4,
+                Duration::from_secs(60),
+            ),
+            dump_writer: None,
+            auth: None,
+        });
+        StreamCtx {
+            state: app_state,
+            model: "batch-parity-fixture".into(),
+            id: "chatcmpl-batch-test".into(),
+            prompt_len: 4,
+            min_tokens: 0,
+            ignore_eos: false,
+            enable_thinking,
+            tool_defs_for_backfill: Vec::new(),
+            native_tool_defs: None,
+            cwd_for_normalize: None,
+            stop_strings,
+            leak_markers: crate::tool_parser::LeakMarkers::EMPTY,
+            max_tool_calls_per_response: 8,
+            agent_guards: false,
+            allow_parallel_tool_calls: true,
+            req_stream_include_usage: true,
+            req_return_token_ids: false,
+            req_ctx: None,
+            dump_seq: None,
+            f44_cache: F39FailureCache::default(),
+            f44_cache_active: false,
+            intervention_ledger: None,
+            rendered_prompt_evidence: None,
+            contract_warnings: Vec::new(),
+            active_guard: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn collect_text(chunks: &[ChatCompletionChunk]) -> (String, String) {
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for chunk in chunks {
+            let val = serde_json::to_value(chunk).expect("serialize chunk");
+            if let Some(delta) = val["choices"]
+                .as_array()
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("delta"))
+            {
+                if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                    reasoning.push_str(r);
+                }
+                if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                    content.push_str(c);
+                }
+            }
+        }
+        (reasoning, content)
+    }
+
+    fn run_per_token_vs_batched(
+        enable_thinking: bool,
+        stop_strings: Vec<String>,
+        batches: &[&[u32]],
+    ) -> (usize, usize) {
+        let ctx = make_byte_fallback_ctx(enable_thinking, stop_strings);
+        let mut seq_state = StreamState::new(
+            false,
+            enable_thinking,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let mut batch_state = StreamState::new(
+            false,
+            enable_thinking,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let mut seq_usage =
+            ContinuousUsageTracker::new(true, true, ctx.prompt_len, &ctx.model, &ctx.id);
+        let mut batch_usage =
+            ContinuousUsageTracker::new(true, true, ctx.prompt_len, &ctx.model, &ctx.id);
+
+        let mut seq_chunks = Vec::new();
+        let mut batch_chunks = Vec::new();
+        let mut total_tokens = 0usize;
+        for batch in batches {
+            total_tokens += batch.len();
+            for &tok in *batch {
+                let c = handle_token(&mut seq_state, &ctx, tok);
+                seq_chunks.extend(seq_usage.observe_token(c));
+            }
+            let c = handle_token_batch(&mut batch_state, &ctx, batch);
+            batch_chunks.extend(batch_usage.observe_token_batch(batch.len(), c));
+        }
+        seq_chunks.extend(flush_terminal_decode(&mut seq_state, &ctx));
+        batch_chunks.extend(flush_terminal_decode(&mut batch_state, &ctx));
+
+        let seq_text = collect_text(&seq_chunks);
+        let batch_text = collect_text(&batch_chunks);
+        assert_eq!(
+            batch_text, seq_text,
+            "batched SSE output must be byte-identical to per-token output"
+        );
+        assert_eq!(
+            batch_state.stop_string_triggered,
+            seq_state.stop_string_triggered
+        );
+        assert_eq!(batch_state.stop_reason, seq_state.stop_reason);
+
+        // Verify ContinuousUsageTracker reaches exact completion_tokens parity on both paths.
+        let seq_last_usage = seq_chunks
+            .iter()
+            .rev()
+            .find_map(|c| c.usage.as_ref().map(|u| u.completion_tokens));
+        let batch_last_usage = batch_chunks
+            .iter()
+            .rev()
+            .find_map(|c| c.usage.as_ref().map(|u| u.completion_tokens));
+        assert_eq!(seq_last_usage, Some(total_tokens));
+        assert_eq!(batch_last_usage, Some(total_tokens));
+
+        (seq_chunks.len(), batch_chunks.len())
+    }
+
+    #[test]
+    fn batched_plain_ascii_matches_per_token_and_coalesces_to_one_chunk() {
+        let (seq_n, batch_n) = run_per_token_vs_batched(
+            false,
+            Vec::new(),
+            &[&[TOK_HELLO, TOK_SPACE_WORLD, TOK_BANG]],
+        );
+        assert_eq!(seq_n, 3);
+        assert_eq!(
+            batch_n, 1,
+            "3 plain ASCII tokens should coalesce to 1 SSE chunk"
+        );
+    }
+
+    #[test]
+    fn batched_multibyte_utf8_split_and_complete_matches_per_token() {
+        // Split mid-codepoint across batches AND complete 4-byte emoji inside one batch.
+        run_per_token_vs_batched(
+            false,
+            Vec::new(),
+            &[
+                &[TOK_HELLO, TOK_EMOJI_0, TOK_EMOJI_1],
+                &[TOK_EMOJI_2, TOK_EMOJI_3, TOK_BANG],
+                &[TOK_EMOJI_0, TOK_EMOJI_1, TOK_EMOJI_2, TOK_EMOJI_3],
+            ],
+        );
+    }
+
+    #[test]
+    fn batched_mid_batch_think_end_matches_per_token_for_thinking_on_and_off() {
+        for enable_thinking in [true, false] {
+            run_per_token_vs_batched(
+                enable_thinking,
+                Vec::new(),
+                &[&[
+                    TOK_THINK_A,
+                    TOK_THINK_B,
+                    TOK_THINK_END,
+                    TOK_HELLO,
+                    TOK_SPACE_WORLD,
+                ]],
+            );
+        }
+    }
+
+    #[test]
+    fn batched_mid_batch_stop_string_truncates_byte_identically_to_per_token() {
+        run_per_token_vs_batched(
+            false,
+            vec!["<STOP>".to_string()],
+            &[&[TOK_HELLO, TOK_STOP_A, TOK_STOP_B, TOK_AFTER]],
+        );
     }
 }

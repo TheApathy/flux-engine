@@ -331,6 +331,9 @@ pub(super) struct ActiveSeq {
     /// token or its token budget. A set cause reports `finish_reason: "stop"`
     /// plus `flux_stop_reason`; `"length"` stays reserved for exhaustion.
     pub stop_cause: Option<&'static str>,
+    /// Opt-in deferred SSE emission buffer (`ATLAS_DFLASH_DEFER_EMIT=1`) and
+    /// O(1) incremental tool-tag position cache.
+    pub defer_emit: super::defer_emit::DeferredEmitState,
 }
 
 impl ActiveSeq {

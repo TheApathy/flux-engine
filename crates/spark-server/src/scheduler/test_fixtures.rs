@@ -36,6 +36,7 @@ pub(super) fn active_seq_with_ssm_ring(
     seq.slot_idx = slot;
     ActiveSeq {
         stop_cause: None,
+        defer_emit: Default::default(),
         seq,
         session_hash: 0,
         prompt_prefix_hash: 0,

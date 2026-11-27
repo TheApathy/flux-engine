@@ -97,6 +97,34 @@ pub fn dflash_early_stage1_enabled() -> bool {
     })
 }
 
+/// Opt-in environment selector for optimistic branch-0 draft prefetch staged
+/// in isolated `scratch.draft_tokens_dev_alt` (`ATLAS_DFLASH_OPT_BRANCH0=1`,
+/// strict `"0"` / `"1"`, default OFF).
+pub const DFLASH_OPT_BRANCH0_ENV: &str = "ATLAS_DFLASH_OPT_BRANCH0";
+
+/// Parse `ATLAS_DFLASH_OPT_BRANCH0`: exact `"1"` (trimmed) enables; default OFF.
+#[inline]
+#[must_use]
+pub fn parse_dflash_opt_branch0_enabled(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+/// Cached gate for `ATLAS_DFLASH_OPT_BRANCH0=1` (default OFF).
+#[must_use]
+pub fn dflash_opt_branch0_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| match std::env::var(DFLASH_OPT_BRANCH0_ENV) {
+        Ok(val) => parse_dflash_opt_branch0_enabled(Some(&val)),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "{DFLASH_OPT_BRANCH0_ENV} contains non-UTF-8 bytes; failing closed to OFF"
+            );
+            false
+        }
+    })
+}
+
 thread_local! {
     static SINGLE_SEQ_ASYNC_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -413,6 +441,105 @@ pub struct EarlyStage1Staged {
     pub stream: u64,
 }
 
+/// Metadata for an optimistic branch-0 draft prefetch staged into isolated
+/// `scratch.draft_tokens_dev_alt` (`ATLAS_DFLASH_OPT_BRANCH0=1`).
+///
+/// Never mutates `dstate.ctx_*` or `dstate.cache_*` before target verify
+/// confirms `(actual_num_accepted, actual_last_token)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptBranch0Staged {
+    pub owner: usize,
+    pub ctx_len_before: usize,
+    pub assumed_num_accepted: usize,
+    pub assumed_last_token: u32,
+    pub budget: DflashDraftBudget,
+    pub stream: u64,
+    pub noise_graph_engaged: bool,
+    pub stage1_graph_engaged: bool,
+}
+
+/// Resolution of a staged optimistic branch-0 prefetch against the confirmed
+/// target verify outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptBranch0Resolution {
+    /// Confirmed target state matches all staged assumptions: consume
+    /// `draft_tokens_dev_alt` directly (0-ULP bit-exact, zero extra forward).
+    ExactHit,
+    /// Same sequence and `ctx_len_before`, but target confirmed a different
+    /// `(num_accepted, last_token)` or budget: drain `stream` cleanly without
+    /// mutating `dstate`, preserve any staged `early_stage1_fc`, and fall back
+    /// to standard propose.
+    PartialCtxMiss {
+        assumed_num_accepted: usize,
+        actual_num_accepted: usize,
+        assumed_last_token: u32,
+        actual_last_token: u32,
+    },
+    /// Foreign sequence or stale `ctx_len_before`: drain `stream` and discard.
+    StaleDiscard,
+}
+
+/// Pure decision function resolving an [`OptBranch0Staged`] handle against the
+/// confirmed verify outcome `(owner, ctx_len_before, actual_num_accepted, actual_last_token, budget)`.
+#[inline]
+#[must_use]
+pub fn resolve_opt_branch0(
+    staged: &OptBranch0Staged,
+    owner: usize,
+    ctx_len_before: usize,
+    actual_num_accepted: usize,
+    actual_last_token: u32,
+    budget: DflashDraftBudget,
+) -> OptBranch0Resolution {
+    if staged.owner != owner || staged.ctx_len_before != ctx_len_before {
+        return OptBranch0Resolution::StaleDiscard;
+    }
+    if staged.assumed_num_accepted == actual_num_accepted
+        && staged.assumed_last_token == actual_last_token
+        && staged.budget == budget
+    {
+        OptBranch0Resolution::ExactHit
+    } else {
+        OptBranch0Resolution::PartialCtxMiss {
+            assumed_num_accepted: staged.assumed_num_accepted,
+            actual_num_accepted,
+            assumed_last_token: staged.assumed_last_token,
+            actual_last_token,
+        }
+    }
+}
+
+/// Which owner-matching staged handles to preserve across stale-inflight
+/// cleanup at the entry or sync-fallback seam of `propose_drafts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreserveStagedMode {
+    EarlyStage1Only,
+    EarlyStage1AndOptBranch0,
+}
+
+/// Whether a Stage-1 or Stage-2 CUDA graph invocation replayed a cached graph
+/// (`Hit`) or captured a new one (`Capture`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GraphExecKind {
+    Hit,
+    Capture,
+}
+
+/// Process-wide telemetry snapshot for `ATLAS_DFLASH_OPT_BRANCH0=1` and
+/// Stage-1 / Stage-2 noise-graph interop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OptBranch0TelemetrySnapshot {
+    pub launches: u64,
+    pub exact_hits: u64,
+    pub partial_misses: u64,
+    pub discards: u64,
+    pub stage1_graph_hits: u64,
+    pub stage1_graph_captures: u64,
+    pub stage2_noise_graph_hits: u64,
+    pub stage2_noise_graph_captures: u64,
+    pub old_fc_copy_rows_skipped: u64,
+}
+
 /// Stable identity for a proposer state (Box contents don't move).
 pub fn dstate_id(dstate: &DflashProposerState) -> usize {
     dstate as *const DflashProposerState as usize
@@ -428,10 +555,96 @@ fn validate_async_collection(
     launched.validate_flat_width(launched.flat)
 }
 
-// ── Telemetry (fire / collect / discard counters, logged periodically) ──
+// ── Telemetry (fire / collect / discard + Opt-Branch0 + Noise-Graph counters) ──
 static ASYNC_FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ASYNC_COLLECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ASYNC_DISCARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static OPT_BRANCH0_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPT_BRANCH0_EXACT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPT_BRANCH0_PARTIAL_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static OPT_BRANCH0_DISCARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NOISE_GRAPH_STAGE1_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NOISE_GRAPH_STAGE1_CAPTURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NOISE_GRAPH_STAGE2_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NOISE_GRAPH_STAGE2_CAPTURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NOISE_GRAPH_OLD_FC_SKIP_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record one Stage-1 KV CUDA graph replay (`Hit`) or capture (`Capture`).
+#[inline]
+pub(super) fn record_stage1_graph_event(kind: GraphExecKind) {
+    match kind {
+        GraphExecKind::Hit => {
+            NOISE_GRAPH_STAGE1_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        GraphExecKind::Capture => {
+            NOISE_GRAPH_STAGE1_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Record one Stage-2 noise-block CUDA graph replay (`Hit`) or capture (`Capture`).
+#[inline]
+pub(super) fn record_stage2_noise_graph_event(kind: GraphExecKind) {
+    match kind {
+        GraphExecKind::Hit => {
+            NOISE_GRAPH_STAGE2_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        GraphExecKind::Capture => {
+            NOISE_GRAPH_STAGE2_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Record how many redundant `ctx_fc_cache -> scratch.fc_proj` D2D rows were
+/// skipped because all layers already held `PostRope` K/V coverage.
+#[inline]
+pub(super) fn record_old_fc_copy_rows_skipped(rows: usize) {
+    if rows > 0 {
+        NOISE_GRAPH_OLD_FC_SKIP_ROWS.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the current process-wide Opt-Branch0 and Noise-Graph/Stage-1-Graph
+/// telemetry counters.
+#[must_use]
+pub fn opt_branch0_telemetry_snapshot() -> OptBranch0TelemetrySnapshot {
+    use std::sync::atomic::Ordering::Relaxed;
+    OptBranch0TelemetrySnapshot {
+        launches: OPT_BRANCH0_LAUNCHES.load(Relaxed),
+        exact_hits: OPT_BRANCH0_EXACT_HITS.load(Relaxed),
+        partial_misses: OPT_BRANCH0_PARTIAL_MISSES.load(Relaxed),
+        discards: OPT_BRANCH0_DISCARDS.load(Relaxed),
+        stage1_graph_hits: NOISE_GRAPH_STAGE1_HITS.load(Relaxed),
+        stage1_graph_captures: NOISE_GRAPH_STAGE1_CAPTURES.load(Relaxed),
+        stage2_noise_graph_hits: NOISE_GRAPH_STAGE2_HITS.load(Relaxed),
+        stage2_noise_graph_captures: NOISE_GRAPH_STAGE2_CAPTURES.load(Relaxed),
+        old_fc_copy_rows_skipped: NOISE_GRAPH_OLD_FC_SKIP_ROWS.load(Relaxed),
+    }
+}
+
+fn log_opt_branch0_telemetry() {
+    let snap = opt_branch0_telemetry_snapshot();
+    let total = snap.exact_hits + snap.partial_misses + snap.discards;
+    if total > 0 && total.is_multiple_of(256) {
+        tracing::info!(
+            launches = snap.launches,
+            exact_hits = snap.exact_hits,
+            partial_misses = snap.partial_misses,
+            discards = snap.discards,
+            stage1_graph_hits = snap.stage1_graph_hits,
+            stage1_graph_captures = snap.stage1_graph_captures,
+            stage2_noise_graph_hits = snap.stage2_noise_graph_hits,
+            stage2_noise_graph_captures = snap.stage2_noise_graph_captures,
+            old_fc_copy_rows_skipped = snap.old_fc_copy_rows_skipped,
+            "DFLASH_OPT_BRANCH0 telemetry"
+        );
+    }
+}
 
 fn log_telemetry() {
     let f = ASYNC_FIRES.load(std::sync::atomic::Ordering::Relaxed);
@@ -621,7 +834,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         use crate::layers::ops;
 
-        if !dflash_early_stage1_enabled()
+        if !(dflash_early_stage1_enabled() || dflash_opt_branch0_enabled())
             || self.scratch.early_stage1_fc.is_null()
             || dflash_hidden_save.is_null()
             || capture_done_event == 0
@@ -816,16 +1029,282 @@ impl BlockDiffusionDraftHead {
     }
 
     /// Synchronize and discard any unconsumed early-started Stage-1 (`fc` +
-    /// `hidden_norm`) launch without disturbing `async_inflight` or
-    /// `async_batched_inflight`.
+    /// `hidden_norm`) or optimistic branch-0 prefetch launch without disturbing
+    /// `async_inflight` or `async_batched_inflight`.
     ///
     /// Called before any target forward overwrites `dflash_hidden_save`, on
     /// Phase 3 verify readback errors, and on host-preempted `propose_drafts`
     /// early returns (Echo / PLD / Retrieval / Recycle / accept-fallback) so
-    /// `pstream` can never suffer a cross-stream WAR race on `dflash_hidden_save`.
+    /// `pstream` can never suffer a cross-stream WAR race on `dflash_hidden_save`
+    /// or `draft_tokens_dev_alt`.
     pub(crate) fn drain_early_stage1_impl(&self, gpu: &dyn GpuBackend) -> Result<()> {
-        if let Some(early) = self.early_stage1_staged.lock().take() {
-            gpu.synchronize(early.stream)?;
+        let taken_early = self.early_stage1_staged.lock().take();
+        let taken_opt = self.opt_branch0_staged.lock().take();
+        let mut synced_stream: Option<u64> = None;
+        let mut sync_once = |stream: u64| -> Result<()> {
+            if synced_stream == Some(stream) {
+                return Ok(());
+            }
+            gpu.synchronize(stream)?;
+            synced_stream = Some(stream);
+            Ok(())
+        };
+        if let Some(early) = taken_early {
+            sync_once(early.stream)?;
+        }
+        if let Some(opt) = taken_opt {
+            sync_once(opt.stream)?;
+            OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log_opt_branch0_telemetry();
+        }
+        Ok(())
+    }
+
+    /// Stage an optimistic branch-0 draft prefetch (`ATLAS_DFLASH_OPT_BRANCH0=1`)
+    /// from a device draft buffer into the isolated `scratch.draft_tokens_dev_alt`
+    /// slot on `pstream`, ordered strictly after `capture_done_event`.
+    ///
+    /// Never mutates `dstate.ctx_*`, `dstate.cache_*`, or the primary
+    /// `scratch.draft_tokens_dev` slot before target verify confirms
+    /// `(actual_num_accepted, actual_last_token)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_opt_branch0_from_device_slot(
+        &self,
+        gpu: &dyn GpuBackend,
+        src_drafts_dev: DevicePtr,
+        capture_done_event: u64,
+        dstate: &DflashProposerState,
+        assumed_num_accepted: usize,
+        assumed_last_token: u32,
+        budget: DflashDraftBudget,
+    ) -> Result<bool> {
+        if !dflash_opt_branch0_enabled() {
+            return Ok(false);
+        }
+        self.stage_opt_branch0_from_device_slot_inner(
+            gpu,
+            src_drafts_dev,
+            capture_done_event,
+            dstate,
+            assumed_num_accepted,
+            assumed_last_token,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_opt_branch0_from_device_slot_inner(
+        &self,
+        gpu: &dyn GpuBackend,
+        src_drafts_dev: DevicePtr,
+        capture_done_event: u64,
+        dstate: &DflashProposerState,
+        assumed_num_accepted: usize,
+        assumed_last_token: u32,
+        budget: DflashDraftBudget,
+    ) -> Result<bool> {
+        if single_seq_async_suppressed()
+            || self.scratch.draft_tokens_dev_alt.is_null()
+            || src_drafts_dev.is_null()
+            || capture_done_event == 0
+            || budget.flat == 0
+        {
+            return Ok(false);
+        }
+        budget.validate_flat_width(budget.flat)?;
+        let copy_bytes = budget
+            .flat
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| anyhow::anyhow!("DFlash opt-branch0 draft byte count overflow"))?;
+        // Never alias an active single-seq or batched async launch that owns
+        // scratch/draft_tokens_dev_alt.
+        if self.async_inflight.lock().is_some() || self.async_batched_inflight.lock().is_some() {
+            return Ok(false);
+        }
+        // Drain any stale prior opt-branch0 prefetch before overwriting alt slot.
+        if let Some(prev) = self.opt_branch0_staged.lock().take() {
+            gpu.synchronize(prev.stream)?;
+            OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let pstream = self.propose_stream_lazy(gpu);
+        if pstream == 0 {
+            return Ok(false);
+        }
+        gpu.stream_wait_event(pstream, capture_done_event)?;
+        if let Err(error) = gpu.copy_d2d_async(
+            src_drafts_dev,
+            self.scratch.draft_tokens_dev_alt,
+            copy_bytes,
+            pstream,
+        ) {
+            let _ = gpu.synchronize(pstream);
+            return Err(error);
+        }
+        *self.opt_branch0_staged.lock() = Some(OptBranch0Staged {
+            owner: dstate_id(dstate),
+            ctx_len_before: dstate.ctx_len,
+            assumed_num_accepted,
+            assumed_last_token,
+            budget,
+            stream: pstream,
+            noise_graph_engaged: super::noise_pass::dflash_noise_graph_enabled(),
+            stage1_graph_engaged: super::noise_pass::dflash_stage1_graph_enabled(),
+        });
+        OPT_BRANCH0_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log_opt_branch0_telemetry();
+        Ok(true)
+    }
+
+    /// Attempt to consume a staged optimistic branch-0 draft prefetch against
+    /// the confirmed target verify outcome.
+    ///
+    /// - `ExactHit`: synchronizes `staged.stream`, reads `budget.flat` tokens
+    ///   from isolated `draft_tokens_dev_alt`, commits confirmed target context
+    ///   captures (and any staged early Stage-1 `fc` rows) in lockstep on
+    ///   `default_stream`, and returns `Ok(Some(drafts))`.
+    /// - `PartialCtxMiss` / `StaleDiscard`: synchronizes `staged.stream` to
+    ///   prevent cross-stream WAR races, leaves `dstate` and `early_stage1_staged`
+    ///   untouched, and returns `Ok(None)` so standard propose runs cleanly.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_consume_opt_branch0(
+        &self,
+        gpu: &dyn GpuBackend,
+        default_stream: u64,
+        dstate: &mut DflashProposerState,
+        actual_last_token: u32,
+        position: usize,
+        budget: DflashDraftBudget,
+        pending_ctx_base: &mut Option<DevicePtr>,
+    ) -> Result<Option<Vec<u32>>> {
+        let Some(staged) = self.opt_branch0_staged.lock().take() else {
+            return Ok(None);
+        };
+        let resolution = resolve_opt_branch0(
+            &staged,
+            dstate_id(dstate),
+            dstate.ctx_len,
+            dstate.last_num_accepted,
+            actual_last_token,
+            budget,
+        );
+        match resolution {
+            OptBranch0Resolution::ExactHit => {
+                staged.budget.validate_flat_width(staged.budget.flat)?;
+                let host_bytes = staged
+                    .budget
+                    .flat
+                    .checked_mul(size_of::<u32>())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DFlash opt-branch0 host readback byte count overflow")
+                    })?;
+                if self.scratch.draft_tokens_dev_alt.is_null() {
+                    gpu.synchronize(staged.stream)?;
+                    OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log_opt_branch0_telemetry();
+                    return Ok(None);
+                }
+                if let Err(error) = gpu.synchronize(staged.stream) {
+                    clear_proposal_outputs(dstate);
+                    return Err(error);
+                }
+                let host_buf = &mut dstate.draft_output_pinned.as_mut_slice()[..host_bytes];
+                if let Err(error) = gpu.copy_d2h(self.scratch.draft_tokens_dev_alt, host_buf) {
+                    clear_proposal_outputs(dstate);
+                    return Err(error);
+                }
+                let drafts =
+                    super::proposal_inputs::decode_token_ids(host_buf, staged.budget.flat)?;
+                self.disarm_fused_overlap_event();
+                if let Some(base) = pending_ctx_base.take() {
+                    let ctx_len_before = dstate.ctx_len;
+                    let num_append = dstate.append_pending_ctx_captures(
+                        gpu,
+                        base,
+                        position,
+                        self.physical_verify_k,
+                        default_stream,
+                    )?;
+                    self.try_commit_early_stage1_fc(
+                        gpu,
+                        dstate,
+                        ctx_len_before,
+                        num_append,
+                        default_stream,
+                    )?;
+                } else {
+                    self.drain_early_stage1_impl(gpu)?;
+                }
+                dstate.async_placeholder = false;
+                dstate.last_num_drafted = drafts.len();
+                dstate.first_propose_done = true;
+                dstate.pending_tree_payload = None;
+                OPT_BRANCH0_EXACT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log_opt_branch0_telemetry();
+                Ok(Some(finalize_proposal(
+                    dstate,
+                    staged.budget,
+                    drafts,
+                    false,
+                )))
+            }
+            OptBranch0Resolution::PartialCtxMiss { .. } => {
+                gpu.synchronize(staged.stream)?;
+                OPT_BRANCH0_PARTIAL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log_opt_branch0_telemetry();
+                Ok(None)
+            }
+            OptBranch0Resolution::StaleDiscard => {
+                gpu.synchronize(staged.stream)?;
+                OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log_opt_branch0_telemetry();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Quiesce any stale async inflight handles at `propose_drafts` entry or
+    /// sync fallback while preserving `dstate`'s own staged `early_stage1_staged`
+    /// (and optionally `opt_branch0_staged`) so THIS propose step can consume
+    /// them. On any GPU sync error, drains preserved handles before returning.
+    pub(super) fn resolve_stale_async_preserving_owner_staged(
+        &self,
+        gpu: &dyn GpuBackend,
+        dstate: &mut DflashProposerState,
+        mode: PreserveStagedMode,
+    ) -> Result<()> {
+        let owner = dstate_id(dstate);
+        let preserved_early = {
+            let mut guard = self.early_stage1_staged.lock();
+            if guard.as_ref().is_some_and(|e| e.owner == owner) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        let preserved_opt = if mode == PreserveStagedMode::EarlyStage1AndOptBranch0 {
+            let mut guard = self.opt_branch0_staged.lock();
+            if guard.as_ref().is_some_and(|o| o.owner == owner) {
+                guard.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Err(error) = self.resolve_async_inflight_impl(gpu, Some(dstate)) {
+            if let Some(e) = preserved_early {
+                let _ = gpu.synchronize(e.stream);
+            }
+            if let Some(o) = preserved_opt {
+                let _ = gpu.synchronize(o.stream);
+            }
+            return Err(error);
+        }
+        if let Some(e) = preserved_early {
+            *self.early_stage1_staged.lock() = Some(e);
+        }
+        if let Some(o) = preserved_opt {
+            *self.opt_branch0_staged.lock() = Some(o);
         }
         Ok(())
     }
@@ -859,10 +1338,10 @@ impl BlockDiffusionDraftHead {
     }
 
     /// Resolve (sync + discard) any in-flight async propose (single-seq,
-    /// cross-seq batched, or early-started Stage-1). Called before any new
-    /// launch touches shared scratch, and from `free_sequence` before the
-    /// per-seq ctx buffers are freed. Also clears an orphaned placeholder
-    /// flag on `dstate` when provided.
+    /// cross-seq batched, early-started Stage-1, or optimistic branch-0).
+    /// Called before any new launch touches shared scratch, and from
+    /// `free_sequence` before the per-seq ctx buffers are freed. Also clears an
+    /// orphaned placeholder flag on `dstate` when provided.
     pub(crate) fn resolve_async_inflight_impl(
         &self,
         gpu: &dyn GpuBackend,
@@ -871,6 +1350,7 @@ impl BlockDiffusionDraftHead {
         let taken_single = self.async_inflight.lock().take();
         let taken_batch = self.async_batched_inflight.lock().take();
         let taken_early = self.early_stage1_staged.lock().take();
+        let taken_opt = self.opt_branch0_staged.lock().take();
         let mut synced_stream: Option<u64> = None;
 
         let mut sync_once = |stream: u64| -> Result<()> {
@@ -918,6 +1398,16 @@ impl BlockDiffusionDraftHead {
                 clear_proposal_outputs(ds);
             }
             return Err(error);
+        }
+        if let Some(opt) = taken_opt {
+            if let Err(error) = sync_once(opt.stream) {
+                if let Some(ds) = dstate.as_deref_mut() {
+                    clear_proposal_outputs(ds);
+                }
+                return Err(error);
+            }
+            OPT_BRANCH0_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log_opt_branch0_telemetry();
         }
         if let Some(ds) = dstate {
             ds.async_placeholder = false;
@@ -2382,5 +2872,323 @@ mod tests {
             assert!(single_seq_async_suppressed());
         }
         assert!(!single_seq_async_suppressed());
+    }
+
+    #[test]
+    fn opt_branch0_env_parser_defaults_off_and_accepts_only_exact_one() {
+        assert!(!parse_dflash_opt_branch0_enabled(None));
+        assert!(!parse_dflash_opt_branch0_enabled(Some("")));
+        assert!(!parse_dflash_opt_branch0_enabled(Some("0")));
+        assert!(!parse_dflash_opt_branch0_enabled(Some("true")));
+        assert!(!parse_dflash_opt_branch0_enabled(Some("2")));
+        assert!(parse_dflash_opt_branch0_enabled(Some("1")));
+        assert!(parse_dflash_opt_branch0_enabled(Some(" 1\n")));
+    }
+
+    #[test]
+    fn resolve_opt_branch0_distinguishes_exact_hit_partial_miss_and_stale_discard() {
+        let budget = DflashDraftBudget::new(4, 7, 8).unwrap();
+        let other_budget = DflashDraftBudget::new(2, 7, 8).unwrap();
+        let staged = OptBranch0Staged {
+            owner: 0x1000,
+            ctx_len_before: 12,
+            assumed_num_accepted: 0,
+            assumed_last_token: 42,
+            budget,
+            stream: 0xAA,
+            noise_graph_engaged: true,
+            stage1_graph_engaged: true,
+        };
+        assert_eq!(
+            resolve_opt_branch0(&staged, 0x1000, 12, 0, 42, budget),
+            OptBranch0Resolution::ExactHit
+        );
+        assert_eq!(
+            resolve_opt_branch0(&staged, 0x1000, 12, 2, 42, budget),
+            OptBranch0Resolution::PartialCtxMiss {
+                assumed_num_accepted: 0,
+                actual_num_accepted: 2,
+                assumed_last_token: 42,
+                actual_last_token: 42,
+            }
+        );
+        assert_eq!(
+            resolve_opt_branch0(&staged, 0x1000, 12, 0, 99, budget),
+            OptBranch0Resolution::PartialCtxMiss {
+                assumed_num_accepted: 0,
+                actual_num_accepted: 0,
+                assumed_last_token: 42,
+                actual_last_token: 99,
+            }
+        );
+        assert_eq!(
+            resolve_opt_branch0(&staged, 0x1000, 12, 0, 42, other_budget),
+            OptBranch0Resolution::PartialCtxMiss {
+                assumed_num_accepted: 0,
+                actual_num_accepted: 0,
+                assumed_last_token: 42,
+                actual_last_token: 42,
+            }
+        );
+        assert_eq!(
+            resolve_opt_branch0(&staged, 0x2000, 12, 0, 42, budget),
+            OptBranch0Resolution::StaleDiscard
+        );
+        assert_eq!(
+            resolve_opt_branch0(&staged, 0x1000, 13, 0, 42, budget),
+            OptBranch0Resolution::StaleDiscard
+        );
+    }
+
+    #[test]
+    fn opt_branch0_exact_hit_reads_isolated_alt_slot_and_commits_ctx_lockstep() {
+        let gpu = RecordingAsyncGpu::new();
+        let (head, mut states, save_buf) = make_test_head_and_states(&gpu, 1);
+        let pstream = head.propose_stream_lazy(&gpu);
+        let budget = DflashDraftBudget::new(3, 7, 8).unwrap();
+
+        // Populate distinct values in primary vs isolated alt device slots.
+        let pri_bytes: Vec<u8> = [900u32, 901, 902]
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect();
+        let alt_bytes: Vec<u8> = [301u32, 302, 303]
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect();
+        gpu.copy_h2d(&pri_bytes, head.scratch.draft_tokens_dev)
+            .unwrap();
+        gpu.copy_h2d(&alt_bytes, head.scratch.draft_tokens_dev_alt)
+            .unwrap();
+        // Stage early Stage-1 fc row 0 so ExactHit commits it in lockstep too.
+        let row_bytes = head.hidden_size * 2;
+        let fc_marker = vec![0x5Au8; row_bytes];
+        gpu.copy_h2d(&fc_marker, head.scratch.early_stage1_fc)
+            .unwrap();
+
+        let d0 = as_dstate_mut(states[0].as_mut());
+        d0.draft_budget = Some(budget);
+        d0.ctx_len = 0;
+        d0.last_num_accepted = 0;
+        let owner0 = dstate_id(d0);
+        // Gate OFF by default: public entry point is a zero-op without touching GPU.
+        let src_dev = gpu.alloc(12).unwrap();
+        gpu.copy_h2d(&alt_bytes, src_dev).unwrap();
+        gpu.take_ops();
+        assert!(
+            !head
+                .stage_opt_branch0_from_device_slot(&gpu, src_dev, 0x77, d0, 0, 77, budget)
+                .unwrap()
+        );
+        assert!(gpu.take_ops().is_empty());
+
+        // Staging via inner path orders pstream after capture_done_event and copies
+        // into isolated draft_tokens_dev_alt without mutating dstate.
+        let before = opt_branch0_telemetry_snapshot();
+        assert!(
+            head.stage_opt_branch0_from_device_slot_inner(&gpu, src_dev, 0x77, d0, 0, 77, budget)
+                .unwrap()
+        );
+        assert_eq!(d0.ctx_len, 0);
+        assert_eq!(d0.cache_fc_end, 0);
+        assert_eq!(
+            gpu.take_ops(),
+            vec![
+                RecordedGpuOp::StreamWaitEvent {
+                    stream: pstream,
+                    event: 0x77,
+                },
+                RecordedGpuOp::CopyD2dAsync {
+                    src: src_dev.0,
+                    dst: head.scratch.draft_tokens_dev_alt.0,
+                    bytes: 12,
+                    stream: pstream,
+                },
+            ]
+        );
+        *head.early_stage1_staged.lock() = Some(EarlyStage1Staged {
+            owner: owner0,
+            start_pos: 0,
+            num_rows: 4,
+            stream: pstream,
+        });
+        gpu.take_ops();
+
+        let mut pending = Some(save_buf);
+        let consumed = head
+            .try_consume_opt_branch0(&gpu, gpu.default_stream(), d0, 77, 1, budget, &mut pending)
+            .unwrap();
+        assert_eq!(consumed, Some(vec![301, 302, 303]));
+        assert!(pending.is_none());
+        assert_eq!(d0.ctx_len, 1);
+        assert_eq!(d0.cache_fc_start, 0);
+        assert_eq!(d0.cache_fc_end, 1);
+        assert_eq!(d0.last_num_drafted, 3);
+        assert!(d0.first_propose_done);
+        assert!(head.opt_branch0_staged.lock().is_none());
+        assert!(head.early_stage1_staged.lock().is_none());
+
+        let ops = gpu.take_ops();
+        assert!(ops.contains(&RecordedGpuOp::Sync { stream: pstream }));
+        assert!(ops.contains(&RecordedGpuOp::CopyD2h {
+            src: head.scratch.draft_tokens_dev_alt.0,
+            bytes: 12,
+        }));
+        let after = opt_branch0_telemetry_snapshot();
+        assert!(after.launches > before.launches);
+        assert!(after.exact_hits > before.exact_hits);
+
+        gpu.free(src_dev).unwrap();
+        head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn opt_branch0_partial_miss_syncs_without_mutating_dstate_and_preserves_early_stage1() {
+        let gpu = RecordingAsyncGpu::new();
+        let (head, mut states, save_buf) = make_test_head_and_states(&gpu, 1);
+        let pstream = head.propose_stream_lazy(&gpu);
+        let budget = DflashDraftBudget::new(3, 7, 8).unwrap();
+
+        let d0 = as_dstate_mut(states[0].as_mut());
+        d0.draft_budget = Some(budget);
+        d0.ctx_len = 0;
+        d0.last_num_accepted = 2; // target accepted 2, branch-0 assumed 0
+        let owner0 = dstate_id(d0);
+        *head.early_stage1_staged.lock() = Some(EarlyStage1Staged {
+            owner: owner0,
+            start_pos: 0,
+            num_rows: 4,
+            stream: pstream,
+        });
+        *head.opt_branch0_staged.lock() = Some(OptBranch0Staged {
+            owner: owner0,
+            ctx_len_before: 0,
+            assumed_num_accepted: 0,
+            assumed_last_token: 77,
+            budget,
+            stream: pstream,
+            noise_graph_engaged: true,
+            stage1_graph_engaged: false,
+        });
+        let before = opt_branch0_telemetry_snapshot();
+        gpu.take_ops();
+
+        let mut pending = Some(save_buf);
+        let consumed = head
+            .try_consume_opt_branch0(&gpu, gpu.default_stream(), d0, 77, 3, budget, &mut pending)
+            .unwrap();
+        assert_eq!(consumed, None);
+        // Pending capture and dstate remain untouched; early_stage1_staged stays intact for normal propose.
+        assert_eq!(pending, Some(save_buf));
+        assert_eq!(d0.ctx_len, 0);
+        assert_eq!(d0.cache_fc_end, 0);
+        assert!(head.opt_branch0_staged.lock().is_none());
+        assert!(head.early_stage1_staged.lock().is_some());
+        assert_eq!(
+            gpu.take_ops(),
+            vec![RecordedGpuOp::Sync { stream: pstream }]
+        );
+        let after = opt_branch0_telemetry_snapshot();
+        assert!(after.partial_misses > before.partial_misses);
+
+        head.resolve_async_inflight_impl(&gpu, None).unwrap();
+        head.release_rejection_resources(&gpu);
+    }
+
+    #[test]
+    fn opt_branch0_drain_deduplicates_stream_sync_and_preserve_owner_staged_guards_entry() {
+        let gpu = RecordingAsyncGpu::new();
+        let (head, mut states, _save_buf) = make_test_head_and_states(&gpu, 2);
+        let pstream = head.propose_stream_lazy(&gpu);
+        let budget = DflashDraftBudget::new(2, 7, 8).unwrap();
+        let owner0 = dstate_id(as_dstate_ref(states[0].as_ref()));
+        let owner1 = dstate_id(as_dstate_ref(states[1].as_ref()));
+
+        // Both early_stage1_staged and opt_branch0_staged share pstream:
+        // drain_early_stage1_impl must sync pstream ONCE and clear both.
+        *head.early_stage1_staged.lock() = Some(EarlyStage1Staged {
+            owner: owner0,
+            start_pos: 0,
+            num_rows: 4,
+            stream: pstream,
+        });
+        *head.opt_branch0_staged.lock() = Some(OptBranch0Staged {
+            owner: owner0,
+            ctx_len_before: 0,
+            assumed_num_accepted: 0,
+            assumed_last_token: 11,
+            budget,
+            stream: pstream,
+            noise_graph_engaged: true,
+            stage1_graph_engaged: true,
+        });
+        let before = opt_branch0_telemetry_snapshot();
+        gpu.take_ops();
+
+        head.drain_early_stage1_impl(&gpu).unwrap();
+        assert_eq!(
+            gpu.take_ops(),
+            vec![RecordedGpuOp::Sync { stream: pstream }]
+        );
+        assert!(head.early_stage1_staged.lock().is_none());
+        assert!(head.opt_branch0_staged.lock().is_none());
+        assert!(opt_branch0_telemetry_snapshot().discards > before.discards);
+
+        // At propose_drafts entry for owner0, preserve owner0's staged handles
+        // while still draining a stale single-seq async_inflight from owner1.
+        *head.async_inflight.lock() = Some(AsyncInflight {
+            owner: owner1,
+            budget,
+            stream: pstream,
+            ddtree: None,
+        });
+        *head.early_stage1_staged.lock() = Some(EarlyStage1Staged {
+            owner: owner0,
+            start_pos: 0,
+            num_rows: 4,
+            stream: pstream,
+        });
+        *head.opt_branch0_staged.lock() = Some(OptBranch0Staged {
+            owner: owner0,
+            ctx_len_before: 0,
+            assumed_num_accepted: 0,
+            assumed_last_token: 12,
+            budget,
+            stream: pstream,
+            noise_graph_engaged: false,
+            stage1_graph_engaged: true,
+        });
+        gpu.take_ops();
+
+        head.resolve_stale_async_preserving_owner_staged(
+            &gpu,
+            as_dstate_mut(states[0].as_mut()),
+            PreserveStagedMode::EarlyStage1AndOptBranch0,
+        )
+        .unwrap();
+        assert!(head.async_inflight.lock().is_none());
+        assert!(head.early_stage1_staged.lock().is_some());
+        assert!(head.opt_branch0_staged.lock().is_some());
+        assert_eq!(
+            gpu.take_ops(),
+            vec![RecordedGpuOp::Sync { stream: pstream }]
+        );
+
+        // Verify Stage-1 / Stage-2 noise-graph & skipped-row telemetry counters.
+        let t0 = opt_branch0_telemetry_snapshot();
+        record_stage1_graph_event(GraphExecKind::Capture);
+        record_stage1_graph_event(GraphExecKind::Hit);
+        record_stage2_noise_graph_event(GraphExecKind::Capture);
+        record_stage2_noise_graph_event(GraphExecKind::Hit);
+        record_old_fc_copy_rows_skipped(4090);
+        let t1 = opt_branch0_telemetry_snapshot();
+        assert!(t1.stage1_graph_captures > t0.stage1_graph_captures);
+        assert!(t1.stage1_graph_hits > t0.stage1_graph_hits);
+        assert!(t1.stage2_noise_graph_captures > t0.stage2_noise_graph_captures);
+        assert!(t1.stage2_noise_graph_hits > t0.stage2_noise_graph_hits);
+        assert!(t1.old_fc_copy_rows_skipped >= t0.old_fc_copy_rows_skipped + 4090);
+
+        head.resolve_async_inflight_impl(&gpu, None).unwrap();
+        head.release_rejection_resources(&gpu);
     }
 }

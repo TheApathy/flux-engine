@@ -60,6 +60,7 @@ fn active_seq(sink: ResponseSink, last_token: u32) -> ActiveSeq {
     let now = std::time::Instant::now();
     ActiveSeq {
         stop_cause: None,
+        defer_emit: Default::default(),
         seq: model_support::seq_state(),
         session_hash: 0,
         prompt_prefix_hash: 0,

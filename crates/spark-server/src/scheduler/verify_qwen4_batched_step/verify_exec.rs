@@ -141,6 +141,12 @@ pub(in super::super) fn step_verify_qwen4_batched(
         abort_cohort(model, active, cohort, "batched verify cohort begin", &error);
         return true;
     }
+    let defer_emit_active = crate::scheduler::defer_emit::dflash_defer_emit_enabled();
+    if defer_emit_active {
+        for &idx in cohort {
+            active[idx].defer_emit.begin();
+        }
+    }
     let mut propose_idxs = Vec::with_capacity(cohort.len());
     for (idxs, tokens_per_seq) in frames.iter().zip(&windows) {
         match verify_frame(model, active, idxs, tokens_per_seq, cohort.len(), think) {
@@ -198,6 +204,11 @@ pub(in super::super) fn step_verify_qwen4_batched(
             "QWEN4_BATCHED_K5 draft frame"
         );
     }
+    if defer_emit_active {
+        for &idx in cohort {
+            flush_deferred_emit(&mut active[idx]);
+        }
+    }
     true
 }
 
@@ -236,6 +247,7 @@ fn abort_cohort(
     // The model restores host extent only for uncommitted owner states. A
     // committed, published or retired lane must never be rewound here.
     for &idx in cohort {
+        flush_deferred_emit(&mut active[idx]);
         crate::scheduler::stochastic_verify_walk::invalidate_seq_rejection_q(&active[idx]);
         fail_speculative_step(&mut active[idx], stage, &error);
     }

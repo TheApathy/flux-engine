@@ -443,29 +443,37 @@ impl BlockDiffusionDraftHead {
                 new_fc_count,
             );
 
-            let skip_old_fc_copy = old_fc_count > 0
-                && !kprofile
-                && self.noise_graph_can_skip_old_fc_copy(
+            let skip_old_fc_prefix = if old_fc_count > 0 && !kprofile {
+                self.noise_graph_skip_old_fc_prefix_count(
                     dstate,
                     policy,
                     needed_start,
                     old_fc_count,
                     eff_ctx,
                     gamma_eff,
-                );
-            if skip_old_fc_copy {
-                pos_suffix_only = Some((old_fc_count, new_fc_count));
+                )
+            } else {
+                0
+            };
+            if skip_old_fc_prefix > 0 {
+                pos_suffix_only = Some((skip_old_fc_prefix, eff_ctx - skip_old_fc_prefix));
+                super::async_propose::record_old_fc_copy_rows_skipped(skip_old_fc_prefix);
             }
-            if old_fc_count > 0 && !skip_old_fc_copy {
+            if old_fc_count > skip_old_fc_prefix {
+                let copy_start = needed_start + skip_old_fc_prefix;
+                let dst_offset = skip_old_fc_prefix
+                    .checked_mul(self.hidden_size)
+                    .and_then(|elems| elems.checked_mul(bf16))
+                    .ok_or_else(|| anyhow::anyhow!("DFlash fc_proj suffix offset overflow"))?;
                 self.cache_copy_range(
                     gpu,
                     dstate.ctx_fc_cache,
                     dstate.cache_fc_start,
                     dstate.cache_fc_end,
                     self.ctx_window,
-                    needed_start,
+                    copy_start,
                     old_fc_end,
-                    self.scratch.fc_proj,
+                    self.scratch.fc_proj.offset(dst_offset),
                     self.hidden_size * bf16,
                     stream,
                 )?;
