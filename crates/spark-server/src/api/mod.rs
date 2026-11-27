@@ -45,6 +45,7 @@ pub mod failures;
 pub mod flux_ui;
 pub mod inference_impl;
 pub mod inference_types;
+pub mod kv_prefetch;
 pub mod misc_handlers;
 pub mod ollama;
 pub(crate) mod request_contract;
@@ -88,6 +89,7 @@ pub use inference_types::{
     GrammarSpec, InferenceRequest, InferenceResponse, ResponseFormatConstraint, StreamEvent,
     TokenLogprobs,
 };
+pub use kv_prefetch::{kv_cache_prefetch, kv_cache_prefetch_status};
 #[allow(unused_imports)]
 pub use misc_handlers::{
     DetokenizeRequest, cancel_response, detokenize, health, health_live, metrics_handler, tokenize,

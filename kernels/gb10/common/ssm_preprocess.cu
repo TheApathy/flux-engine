@@ -16,6 +16,7 @@
 //   total QKVZ = 16*768 = 12288
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 // ============================================================
 // Deinterleave QKVZ projection output
@@ -517,7 +518,8 @@ extern "C" __global__ void __launch_bounds__(256, 3) dense_gemv_ba_gates_batchn(
 // Grid: (ceil(N/4), M_tokens, 1)  Block: (256, 1, 1)
 // blockIdx.x = which group of 4 BA outputs (0..N/4-1)
 // blockIdx.y = token index (0..M-1)
-extern "C" __global__ void dense_gemm_ba_gates_prefill(
+template <bool GATESIGHT>
+__device__ __forceinline__ void dense_gemm_ba_gates_prefill_body(
     const __nv_bfloat16* __restrict__ A,         // [M, K_stride] activations
     const __nv_bfloat16* __restrict__ B,         // [N, K] BA weight (row-major)
     const float* __restrict__ A_log,     // [nv] learned A_log parameter
@@ -529,7 +531,8 @@ extern "C" __global__ void dense_gemm_ba_gates_prefill(
     unsigned int K_stride,        // BF16 elements per token in A (= K for dense)
     unsigned int gate_stride,     // FP32 elements per token in gate_out (= 2*nv)
     unsigned int nv,              // num_v_heads (32)
-    unsigned int vheads_per_group // 2
+    unsigned int vheads_per_group, // 2
+    __half* __restrict__ gatesight_out // optional [M, nv, 3] FP16: (beta, g, ||v||_2)
 ) {
     const unsigned int threads_per_out = 256 / 4;  // 64 (2 warps per output)
     const unsigned int local_out = threadIdx.x / threads_per_out;  // 0..3
@@ -591,7 +594,14 @@ extern "C" __global__ void dense_gemm_ba_gates_prefill(
         if (within_group < vheads_per_group) {
             // Beta element: sigmoid(b_raw) → stored at offset nv
             unsigned int vh = group * vheads_per_group + within_group;
-            gate_tok[nv + vh] = 1.0f / (1.0f + __expf(-result));
+            float beta = 1.0f / (1.0f + __expf(-result));
+            gate_tok[nv + vh] = beta;
+            if constexpr (GATESIGHT) {
+                if (gatesight_out != nullptr) {
+                    gatesight_out[((unsigned long long)token * nv + vh) * 3ull + 0ull] =
+                        __float2half_rn(beta);
+                }
+            }
         } else {
             // Alpha (gate) element: exp(-exp(A_log) * softplus(alpha + dt_bias))
             unsigned int vh = group * vheads_per_group + (within_group - vheads_per_group);
@@ -599,9 +609,58 @@ extern "C" __global__ void dense_gemm_ba_gates_prefill(
             float dt_b = dt_bias[vh];
             float A_val = __expf(fminf(a_log_val, 20.0f));
             float dt = __logf(1.0f + __expf(fminf(result + dt_b, 20.0f)));
-            gate_tok[vh] = __expf(-A_val * dt);
+            float g = -A_val * dt;
+            gate_tok[vh] = __expf(g);
+            if constexpr (GATESIGHT) {
+                if (gatesight_out != nullptr) {
+                    gatesight_out[((unsigned long long)token * nv + vh) * 3ull + 1ull] =
+                        __float2half_rn(g);
+                }
+            }
         }
     }
+}
+
+extern "C" __global__ void dense_gemm_ba_gates_prefill(
+    const __nv_bfloat16* __restrict__ A,         // [M, K_stride] activations
+    const __nv_bfloat16* __restrict__ B,         // [N, K] BA weight (row-major)
+    const float* __restrict__ A_log,     // [nv] learned A_log parameter
+    const float* __restrict__ dt_bias,   // [nv] learned dt_bias parameter
+    float* __restrict__ gate_out,                 // [M, gate_stride] FP32 output
+    unsigned int M,               // num_tokens
+    unsigned int N,               // 64 = ssm_ba_size
+    unsigned int K,               // 2048 = hidden_size
+    unsigned int K_stride,        // BF16 elements per token in A (= K for dense)
+    unsigned int gate_stride,     // FP32 elements per token in gate_out (= 2*nv)
+    unsigned int nv,              // num_v_heads (32)
+    unsigned int vheads_per_group // 2
+) {
+    dense_gemm_ba_gates_prefill_body<false>(
+        A, B, A_log, dt_bias, gate_out, M, N, K, K_stride, gate_stride, nv,
+        vheads_per_group, nullptr);
+}
+
+// Opt-in GateSight twin: captures in-register (beta, log_decay g) into
+// `gatesight_out` ([M, nv, 3] FP16, slots 0 and 1; slot 2 written by conv1d)
+// with zero extra DRAM reads. Guarded on `gatesight_out != nullptr`.
+extern "C" __global__ void dense_gemm_ba_gates_prefill_gatesight(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ gate_out,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int K_stride,
+    unsigned int gate_stride,
+    unsigned int nv,
+    unsigned int vheads_per_group,
+    __half* __restrict__ gatesight_out
+) {
+    dense_gemm_ba_gates_prefill_body<true>(
+        A, B, A_log, dt_bias, gate_out, M, N, K, K_stride, gate_stride, nv,
+        vheads_per_group, gatesight_out);
 }
 
 // ============================================================
@@ -614,7 +673,8 @@ extern "C" __global__ void dense_gemm_ba_gates_prefill(
 //
 // Grid: (num_tokens, 1, 1)  Block: (num_v_heads, 1, 1)
 // blockIdx.x = token index. (num_v_heads=32 fits in a single warp)
-extern "C" __global__ void compute_gdn_gates(
+template <bool GATESIGHT>
+__device__ __forceinline__ void compute_gdn_gates_body(
     const __nv_bfloat16* __restrict__ ba_interleaved, // [num_tokens, num_groups * group_dim_ba]
     const float* __restrict__ A_log,          // [num_v_heads]
     const float* __restrict__ dt_bias,        // [num_v_heads]
@@ -623,8 +683,10 @@ extern "C" __global__ void compute_gdn_gates(
     unsigned int num_v_heads,      // 32
     unsigned int num_groups,       // 16
     unsigned int vheads_per_group, // 2
-    unsigned int ba_stride         // elements between tokens in ba_interleaved
+    unsigned int ba_stride,        // elements between tokens in ba_interleaved
+    __half* __restrict__ gatesight_out // optional [num_tokens, num_v_heads, 3] FP16
 ) {
+    (void)num_groups;
     unsigned int token = blockIdx.x;
     unsigned int vh = threadIdx.x;
     if (vh >= num_v_heads) return;
@@ -654,5 +716,50 @@ extern "C" __global__ void compute_gdn_gates(
     gate_tok[vh] = __expf(g);  // multiplicative decay in (0, 1)
 
     // Beta: sigmoid(b)
-    beta_tok[vh] = 1.0f / (1.0f + __expf(-b_raw));
+    float beta = 1.0f / (1.0f + __expf(-b_raw));
+    beta_tok[vh] = beta;
+
+    if constexpr (GATESIGHT) {
+        if (gatesight_out != nullptr) {
+            const unsigned long long base =
+                ((unsigned long long)token * num_v_heads + vh) * 3ull;
+            gatesight_out[base + 0ull] = __float2half_rn(beta);
+            gatesight_out[base + 1ull] = __float2half_rn(g);
+        }
+    }
+}
+
+extern "C" __global__ void compute_gdn_gates(
+    const __nv_bfloat16* __restrict__ ba_interleaved, // [num_tokens, num_groups * group_dim_ba]
+    const float* __restrict__ A_log,          // [num_v_heads]
+    const float* __restrict__ dt_bias,        // [num_v_heads]
+    float* __restrict__ gate_out,                      // [num_tokens, num_v_heads] decay factor, strided by 2 * num_v_heads
+    float* __restrict__ beta_out,                      // [num_tokens, num_v_heads] write gate, strided by 2 * num_v_heads
+    unsigned int num_v_heads,      // 32
+    unsigned int num_groups,       // 16
+    unsigned int vheads_per_group, // 2
+    unsigned int ba_stride         // elements between tokens in ba_interleaved
+) {
+    compute_gdn_gates_body<false>(
+        ba_interleaved, A_log, dt_bias, gate_out, beta_out, num_v_heads,
+        num_groups, vheads_per_group, ba_stride, nullptr);
+}
+
+// Opt-in GateSight twin: captures in-register (beta, log_decay g) into
+// `gatesight_out` ([num_tokens, num_v_heads, 3] FP16, slots 0 and 1).
+extern "C" __global__ void compute_gdn_gates_gatesight(
+    const __nv_bfloat16* __restrict__ ba_interleaved,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ gate_out,
+    float* __restrict__ beta_out,
+    unsigned int num_v_heads,
+    unsigned int num_groups,
+    unsigned int vheads_per_group,
+    unsigned int ba_stride,
+    __half* __restrict__ gatesight_out
+) {
+    compute_gdn_gates_body<true>(
+        ba_interleaved, A_log, dt_bias, gate_out, beta_out, num_v_heads,
+        num_groups, vheads_per_group, ba_stride, gatesight_out);
 }

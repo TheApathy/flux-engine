@@ -5,6 +5,9 @@
 //! `block_size` granularity; each node holds one physical KV block index.
 
 use std::collections::HashMap;
+use std::time::Instant;
+
+use crate::prefix_cache::ProtectionClass;
 
 type NodeId = usize;
 
@@ -67,6 +70,10 @@ pub(super) struct RadixNode {
     /// `false` on insert and is set only when the owner of `block_idx` calls
     /// [`RadixTreeInner::mark_blocks_qsa_populated`].
     qsa_populated: bool,
+    /// TripleKV eviction protection tier (`Cached` < `Backup` < active `Prefetched`).
+    /// Defaults to [`ProtectionClass::Cached`], preserving exact legacy LRU order
+    /// when no nodes are tagged.
+    protection: ProtectionClass,
 }
 
 fn block_overlaps_noncausal_span(
@@ -163,6 +170,7 @@ impl RadixTreeInner {
             min_commit_blocks: 0,
             has_noncausal: false,
             qsa_populated: true,
+            protection: ProtectionClass::Cached,
         };
         Self {
             nodes: vec![root],
@@ -364,6 +372,12 @@ impl RadixTreeInner {
                 for node_id in matched_nodes {
                     self.nodes[node_id].ref_count += 1;
                     self.nodes[node_id].last_access = access;
+                    if matches!(
+                        self.nodes[node_id].protection,
+                        ProtectionClass::Prefetched { .. }
+                    ) {
+                        self.nodes[node_id].protection = ProtectionClass::Cached;
+                    }
                 }
             }
             return (matched_blocks, matched_disk, matched_tokens);
@@ -411,10 +425,22 @@ impl RadixTreeInner {
             for node_id in matched_nodes {
                 self.nodes[node_id].ref_count += 1;
                 self.nodes[node_id].last_access = access;
+                if matches!(
+                    self.nodes[node_id].protection,
+                    ProtectionClass::Prefetched { .. }
+                ) {
+                    self.nodes[node_id].protection = ProtectionClass::Cached;
+                }
             }
             if let Some((child_id, suffix_key)) = subblock_child {
                 self.nodes[child_id].ref_count += 1;
                 self.nodes[child_id].last_access = access;
+                if matches!(
+                    self.nodes[child_id].protection,
+                    ProtectionClass::Prefetched { .. }
+                ) {
+                    self.nodes[child_id].protection = ProtectionClass::Cached;
+                }
                 self.subblock_pins
                     .entry((current, suffix_key))
                     .or_default()
@@ -468,11 +494,82 @@ impl RadixTreeInner {
             if let Some(&child) = self.nodes[current].children.get(chunk) {
                 self.nodes[child].ref_count += 1;
                 self.nodes[child].last_access = access;
+                if matches!(
+                    self.nodes[child].protection,
+                    ProtectionClass::Prefetched { .. }
+                ) {
+                    self.nodes[child].protection = ProtectionClass::Cached;
+                }
                 current = child;
             } else {
                 break;
             }
         }
+    }
+
+    /// Tag all live full-block nodes matching `tokens` with TripleKV `class`.
+    /// Returns the number of nodes tagged along the matched prefix.
+    pub(super) fn set_prefix_protection(
+        &mut self,
+        tokens: &[u32],
+        block_size: usize,
+        class: ProtectionClass,
+    ) -> usize {
+        if block_size == 0 {
+            return 0;
+        }
+        let mut current = self.root;
+        let mut parent_ctx_hash: u64 = 0;
+        let mut tagged = 0usize;
+        let num_full_blocks = tokens.len() / block_size;
+        for i in 0..num_full_blocks {
+            let chunk = &tokens[i * block_size..(i + 1) * block_size];
+            let expected_hash = context_hash_combine(parent_ctx_hash, chunk);
+            match self.nodes[current].children.get(chunk) {
+                Some(&child)
+                    if self.nodes[child].context_hash == expected_hash
+                        && self.nodes[child].ref_count > 0 =>
+                {
+                    self.nodes[child].protection = class;
+                    tagged += 1;
+                    parent_ctx_hash = expected_hash;
+                    current = child;
+                }
+                _ => break,
+            }
+        }
+        tagged
+    }
+
+    /// Return the [`ProtectionClass`] of each live full-block node matching `tokens`.
+    pub(super) fn prefix_protection(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+    ) -> Vec<ProtectionClass> {
+        if block_size == 0 {
+            return Vec::new();
+        }
+        let mut current = self.root;
+        let mut parent_ctx_hash: u64 = 0;
+        let mut classes = Vec::new();
+        let num_full_blocks = tokens.len() / block_size;
+        for i in 0..num_full_blocks {
+            let chunk = &tokens[i * block_size..(i + 1) * block_size];
+            let expected_hash = context_hash_combine(parent_ctx_hash, chunk);
+            match self.nodes[current].children.get(chunk) {
+                Some(&child)
+                    if self.nodes[child].context_hash == expected_hash
+                        && self.nodes[child].ref_count > 0 =>
+                {
+                    classes.push(self.nodes[child].protection);
+                    parent_ctx_hash = expected_hash;
+                    current = child;
+                }
+                _ => break,
+            }
+        }
+        classes
     }
 
     /// Decrement ref_count on all nodes along the matched path (including any
@@ -817,6 +914,7 @@ impl RadixTreeInner {
                     min_commit_blocks: min_commit,
                     has_noncausal,
                     qsa_populated: false,
+                    protection: ProtectionClass::Cached,
                 };
                 let child_id = self.alloc_node(node);
                 self.nodes[current]
@@ -877,7 +975,14 @@ impl RadixTreeInner {
     /// disk-block IDs (Phase 6.1.e). When HSS isn't in use, `u32::MAX`
     /// sentinels are filtered out by the public-trait wrapper into
     /// `EvictedBlocks::disk_block_ids`.
-    pub(super) fn evict(&mut self, num_blocks: usize) -> (Vec<u32>, Vec<u32>) {
+    /// Evict up to `num_blocks` cached blocks evaluated at monotonic instant `now`.
+    ///
+    /// Leaf victim selection follows TripleKV's 3-queue protection priority:
+    /// `Cached` (incl. expired `Prefetched`) -> `Backup` -> active `Prefetched`,
+    /// with strict LRU (`last_access` ascending) within each protection tier.
+    /// When all nodes remain in the default `Cached` tier, behavior is identical
+    /// to legacy LRU.
+    pub(super) fn evict_at(&mut self, num_blocks: usize, now: Instant) -> (Vec<u32>, Vec<u32>) {
         let mut freed_phys = Vec::new();
         let mut freed_disk = Vec::new();
         if num_blocks == 0 {
@@ -901,7 +1006,7 @@ impl RadixTreeInner {
                 break;
             }
 
-            let mut best: Option<(NodeId, u64)> = None;
+            let mut best: Option<(NodeId, u8, u64)> = None;
             for (id, node) in self.nodes.iter().enumerate() {
                 if id == self.root {
                     continue;
@@ -911,10 +1016,13 @@ impl RadixTreeInner {
                     && node.children.is_empty()
                     && node.block_idx != u32::MAX
                 {
+                    let tier = node.protection.eviction_priority(now);
                     match best {
-                        None => best = Some((id, node.last_access)),
-                        Some((_, best_access)) if node.last_access < best_access => {
-                            best = Some((id, node.last_access));
+                        None => best = Some((id, tier, node.last_access)),
+                        Some((_, best_tier, best_access))
+                            if (tier, node.last_access) < (best_tier, best_access) =>
+                        {
+                            best = Some((id, tier, node.last_access));
                         }
                         _ => {}
                     }
@@ -922,7 +1030,7 @@ impl RadixTreeInner {
             }
 
             match best {
-                Some((node_id, _)) => {
+                Some((node_id, _, _)) => {
                     let block = self.nodes[node_id].block_idx;
                     let disk = self.nodes[node_id].disk_block_id;
                     freed_phys.push(block);
@@ -959,6 +1067,7 @@ impl RadixTreeInner {
                     self.nodes[node_id].partial_suffix = None;
                     self.nodes[node_id].partial_suffix_refs = 0;
                     self.nodes[node_id].qsa_populated = false;
+                    self.nodes[node_id].protection = ProtectionClass::Cached;
                     self.free_nodes.push(node_id);
                 }
                 None => break,
