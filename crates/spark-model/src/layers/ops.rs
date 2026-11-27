@@ -103,6 +103,8 @@ mod kv_cache_fp8k;
 mod kv_cache_turbok;
 #[path = "ops/lm_head_argmax.rs"]
 pub mod lm_head_argmax;
+#[path = "ops/lm_head_int8_block32.rs"]
+pub mod lm_head_int8_block32;
 #[path = "ops/moe_down_act.rs"]
 mod moe_down_act;
 #[path = "ops/moe_expert.rs"]
@@ -221,6 +223,7 @@ pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
 pub use lm_head_argmax::*;
+pub use lm_head_int8_block32::*;
 pub use moe_down_act::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;

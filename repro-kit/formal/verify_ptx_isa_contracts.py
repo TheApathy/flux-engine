@@ -360,6 +360,19 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "reduce_w4a4_sk3_bf16_sm120",
         ),
     ),
+    (
+        "kernels/gb10/common/lm_head_int8_block32_argmax_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "lm_head_int8_block32_gemm_sm120",
+            "lm_head_int8_block32_argmax_stage1_sm120",
+            "lm_head_int8_block32_argmax_stage2_sm120",
+            "quantize_bf16_to_int8_block32_sm120",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(

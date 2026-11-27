@@ -198,6 +198,12 @@ impl Drop for TransformerModel {
         self.clear_model_slot_tracking();
         self.clear_ssm_norm_cached_slot();
         self.clear_serial_batch_suppress();
+        crate::layers::ops::release_cached_lm_head_int8_block32_weight(
+            self.gpu.as_ref(),
+            self.lm_head_weight.weight,
+            self.config.vocab_size as u32,
+            self.config.hidden_size as u32,
+        );
 
         // Everything above is graphs, vision buffers and events — the small
         // set of GPU allocations this Drop impl already knew how to name.

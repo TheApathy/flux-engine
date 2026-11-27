@@ -1250,6 +1250,190 @@ impl TransformerModel {
         Ok(logits)
     }
 
+    /// Opt-in (`ATLAS_LM_HEAD_INT8_BLOCK32=1`, default OFF) two-stage fused
+    /// `INT8 Block-32 BF16-Scale (8.50 bpw)` LM-head + online warp/block argmax.
+    fn try_lm_head_int8_block32_fused_argmax(
+        &self,
+        hidden: DevicePtr,
+        out_tokens: DevicePtr,
+        rows: u32,
+        vocab: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        let policy = ops::LmHeadInt8Block32Policy::from_env()?;
+        if policy == ops::LmHeadInt8Block32Policy::Disabled {
+            return Ok(false);
+        }
+        let h = self.config.hidden_size as u32;
+        let full_vocab = self.config.vocab_size as u32;
+        if self.use_fp32_logits
+            || self.logit_softcap_kernel.0 != 0
+            || self.config.final_logit_softcapping != 0.0
+            || !self.config.final_logit_softcapping.is_finite()
+            || self.lm_head_weight.weight.is_null()
+            || !self.lm_head_weight.weight.0.is_multiple_of(2)
+            || rows == 0
+            || rows > ops::LM_HEAD_INT8_ARGMAX_MAX_M
+            || vocab == 0
+            || vocab > full_vocab
+            || h < ops::LM_HEAD_INT8_BLOCK_SIZE
+            || !h.is_multiple_of(ops::LM_HEAD_INT8_BLOCK_SIZE)
+            || hidden.is_null()
+            || !hidden.0.is_multiple_of(16)
+            || out_tokens.is_null()
+            || !out_tokens.0.is_multiple_of(4)
+        {
+            return Ok(false);
+        }
+        let kernels = ops::cached_lm_head_int8_block32_kernels(self.gpu.as_ref());
+        if !kernels.argmax_ready() {
+            return Ok(false);
+        }
+        let Ok(plan) = ops::plan_lm_head_int8_block32_argmax(rows, vocab, h) else {
+            return Ok(false);
+        };
+        let scratch = self.buffers.logits();
+        let scratch_bytes = self.buffers.sizes().logits;
+        if scratch.is_null()
+            || !scratch.0.is_multiple_of(4)
+            || scratch_bytes < plan.total_scratch_bytes
+        {
+            return Ok(false);
+        }
+        let capturing = spark_runtime::gpu_capture_region::active_capture_region().is_some()
+            || self.gpu.stream_is_capturing(stream);
+        let alloc_policy = if capturing {
+            ops::Int8WeightAllocPolicy::CaptureNoAlloc
+        } else {
+            ops::Int8WeightAllocPolicy::AllowAlloc
+        };
+        let Some(dev_weight) = ops::ensure_cached_lm_head_int8_block32_weight(
+            self.gpu.as_ref(),
+            kernels.quantize,
+            self.lm_head_weight.weight,
+            full_vocab,
+            h,
+            stream,
+            alloc_policy,
+        )?
+        else {
+            return Ok(false);
+        };
+        ops::lm_head_int8_block32_fused_argmax(
+            self.gpu.as_ref(),
+            kernels,
+            &plan,
+            hidden,
+            &dev_weight,
+            scratch,
+            scratch_bytes,
+            out_tokens,
+            stream,
+        )?;
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                target: "atlas::lm_head",
+                rows = plan.rows,
+                vocab = plan.vocab,
+                hidden = plan.hidden,
+                num_v_tiles = plan.num_v_tiles,
+                scratch_bytes = plan.total_scratch_bytes,
+                "ENGAGED ATLAS_LM_HEAD_INT8_BLOCK32: fused INT8 Block-32 BF16-scale LM-head + online argmax"
+            );
+        });
+        Ok(true)
+    }
+
+    /// Opt-in (`ATLAS_LM_HEAD_INT8_BLOCK32=1`, default OFF) full BF16 logit
+    /// GEMM (`M = 1..=64`) using `INT8 Block-32 BF16-Scale (8.50 bpw)` weights.
+    fn try_lm_head_int8_block32_logits(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: u32,
+        vocab: u32,
+        h: u32,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        let policy = ops::LmHeadInt8Block32Policy::from_env()?;
+        if policy == ops::LmHeadInt8Block32Policy::Disabled {
+            return Ok(None);
+        }
+        let full_vocab = self.config.vocab_size as u32;
+        let logits = self.buffers.logits();
+        if self.use_fp32_logits
+            || self.lm_head_weight.weight.is_null()
+            || !self.lm_head_weight.weight.0.is_multiple_of(2)
+            || num_tokens == 0
+            || num_tokens > ops::LM_HEAD_INT8_GEMM_MAX_M
+            || vocab == 0
+            || vocab > full_vocab
+            || h < ops::LM_HEAD_INT8_BLOCK_SIZE
+            || !h.is_multiple_of(ops::LM_HEAD_INT8_BLOCK_SIZE)
+            || hidden.is_null()
+            || !hidden.0.is_multiple_of(16)
+            || logits.is_null()
+            || !logits.0.is_multiple_of(2)
+        {
+            return Ok(None);
+        }
+        let kernels = ops::cached_lm_head_int8_block32_kernels(self.gpu.as_ref());
+        if !kernels.gemm_ready() {
+            return Ok(None);
+        }
+        let Ok(plan) = ops::plan_lm_head_int8_block32_gemm(num_tokens, vocab, h) else {
+            return Ok(None);
+        };
+        let logits_bytes = self.buffers.sizes().logits;
+        if logits_bytes < plan.c_bytes {
+            return Ok(None);
+        }
+        let capturing = spark_runtime::gpu_capture_region::active_capture_region().is_some()
+            || self.gpu.stream_is_capturing(stream);
+        let alloc_policy = if capturing {
+            ops::Int8WeightAllocPolicy::CaptureNoAlloc
+        } else {
+            ops::Int8WeightAllocPolicy::AllowAlloc
+        };
+        let Some(dev_weight) = ops::ensure_cached_lm_head_int8_block32_weight(
+            self.gpu.as_ref(),
+            kernels.quantize,
+            self.lm_head_weight.weight,
+            full_vocab,
+            h,
+            stream,
+            alloc_policy,
+        )?
+        else {
+            return Ok(None);
+        };
+        ops::lm_head_int8_block32_gemm_sm120(
+            self.gpu.as_ref(),
+            kernels.gemm,
+            &plan,
+            hidden,
+            &dev_weight,
+            logits,
+            logits_bytes,
+            stream,
+        )?;
+        if self.logit_softcap_kernel.0 != 0 {
+            let cap = self.config.final_logit_softcapping;
+            self.apply_logit_softcap(logits, num_tokens * vocab, cap, stream)?;
+        }
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                target: "atlas::lm_head",
+                rows = plan.rows,
+                vocab = plan.vocab,
+                hidden = plan.hidden,
+                "ENGAGED ATLAS_LM_HEAD_INT8_BLOCK32: full BF16 logit GEMM"
+            );
+        });
+        Ok(Some(logits))
+    }
+
     /// Opt-in fused two-stage NVFP4 LM-head + online warp/block argmax
     /// (`ATLAS_LM_HEAD_FUSED_ARGMAX=1`, default OFF).
     ///
@@ -1267,6 +1451,9 @@ impl TransformerModel {
         vocab: u32,
         stream: u64,
     ) -> Result<bool> {
+        if self.try_lm_head_int8_block32_fused_argmax(hidden, out_tokens, rows, vocab, stream)? {
+            return Ok(true);
+        }
         let policy = ops::FusedLmHeadArgmaxPolicy::from_env()?;
         if policy == ops::FusedLmHeadArgmaxPolicy::Disabled {
             return Ok(false);
@@ -1371,6 +1558,11 @@ impl TransformerModel {
         // `verify_lmhead_vocab()` returns the full vocab when truncation is
         // disabled (`ATLAS_TARGET_LMHEAD_VOCAB` unset / 0 / ≥ vocab).
         let v = self.verify_lmhead_vocab();
+        if let Some(logits) =
+            self.try_lm_head_int8_block32_logits(hidden, num_tokens, v, h, stream)?
+        {
+            return Ok(logits);
+        }
         if self.use_target_fp8_lm_head() {
             return self.lm_head_fp8_rows(hidden, num_tokens, v, h, stream);
         }
@@ -1699,6 +1891,11 @@ impl TransformerModel {
         );
         let h = self.config.hidden_size as u32;
         let v = self.verify_lmhead_vocab();
+        if let Some(logits) =
+            self.try_lm_head_int8_block32_logits(hidden, num_tokens, v, h, stream)?
+        {
+            return Ok(logits);
+        }
         if self.use_target_fp8_lm_head() {
             return self.lm_head_fp8_rows(hidden, num_tokens, v, h, stream);
         }
@@ -1836,6 +2033,12 @@ impl TransformerModel {
         } else {
             (self.buffers.logits(), false)
         };
+        if !fp32
+            && let Some(int8_logits) =
+                self.try_lm_head_int8_block32_logits(hidden, 1, v, h, stream)?
+        {
+            return Ok(int8_logits);
+        }
         if !fp32 && self.use_target_fp8_lm_head() {
             return self.lm_head_fp8_rows(hidden, 1, v, h, stream);
         }
@@ -2015,6 +2218,13 @@ impl TransformerModel {
         num_tokens: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let h = self.config.hidden_size as u32;
+        let v = self.verify_lmhead_vocab();
+        if let Some(logits) =
+            self.try_lm_head_int8_block32_logits(hidden, num_tokens, v, h, stream)?
+        {
+            return Ok(logits);
+        }
         if self.use_target_fp8_lm_head() {
             anyhow::ensure!(
                 (1..=crate::layers::QWEN4_NATIVE_MAX_ROWS as u32).contains(&num_tokens),
