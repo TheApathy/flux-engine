@@ -230,14 +230,18 @@ pub fn plan_lm_head_int8_block32_weight(rows: u32, cols: u32) -> Result<Int8Bloc
     })
 }
 
-/// Validated launch geometry and buffer extents for full BF16 logit GEMM.
+/// Validated launch geometry and buffer extents for single-CTA (`grid_y == 1`)
+/// full BF16 logit GEMM (`M in 1..=64`, `m_blocks = ceil(M/16) in 1..=4`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LmHeadInt8Block32GemmPlan {
     pub rows: u32,
     pub vocab: u32,
     pub hidden: u32,
     pub grid_x: u32,
+    /// Always `1` (`grid.y == 1` for all `M <= 64`) so each `int8` weight &
+    /// BF16 scale is read ONCE across all `m_blocks` strips.
     pub grid_y: u32,
+    pub m_blocks: u32,
     pub a_bytes: usize,
     pub c_bytes: usize,
     pub weight_plan: Int8Block32WeightPlan,
@@ -271,7 +275,8 @@ pub fn plan_lm_head_int8_block32_gemm(
         vocab,
         hidden,
         grid_x: div_ceil(vocab, LM_HEAD_INT8_GEMM_N_TILE),
-        grid_y: div_ceil(rows, LM_HEAD_INT8_GEMM_M_TILE),
+        grid_y: 1,
+        m_blocks: div_ceil(rows, LM_HEAD_INT8_GEMM_M_TILE),
         a_bytes,
         c_bytes,
         weight_plan,
@@ -731,10 +736,102 @@ pub fn ensure_cached_lm_head_int8_block32_weight(
     Ok(Some(entry))
 }
 
-/// Launch `lm_head_int8_block32_gemm_sm120` (full BF16 logit GEMM for
-/// `M in 1..=64`, `K % 32 == 0`, arbitrary `N`).
+/// Eagerly quantize a BF16 LM-head weight `[vocab, hidden]` into an owned
+/// [`Int8Block32DeviceWeight`] on GPU (called at model load time before
+/// `QWEN4_RELEASE_*_UNUSED` reclaims the BF16 slab).
 ///
-/// Grid: `(ceil(N / 64), ceil(M / 16), 1)`  Block: `(128, 1, 1)`
+/// Returns `Ok(None)` if the `quantize_bf16_to_int8_block32_sm120` kernel
+/// symbol is unavailable. On any allocation, launch, or synchronization error,
+/// frees all newly allocated buffers before returning `Err` (zero leak).
+///
+/// # Errors
+/// Propagates shape/pointer validation, allocation, launch, or sync errors.
+pub fn quantize_lm_head_bf16_to_int8_block32_owned(
+    gpu: &dyn GpuBackend,
+    src_bf16: DevicePtr,
+    vocab: u32,
+    hidden: u32,
+    stream: u64,
+) -> Result<Option<Int8Block32DeviceWeight>> {
+    let plan = plan_lm_head_int8_block32_weight(vocab, hidden)?;
+    ensure!(
+        !src_bf16.is_null() && src_bf16.0.is_multiple_of(2),
+        "quantize_lm_head_bf16_to_int8_block32_owned: src_bf16 must be non-null and 2B-aligned"
+    );
+    let kernels = cached_lm_head_int8_block32_kernels(gpu);
+    if !kernels.quantize_ready() {
+        tracing::warn!(
+            target: "atlas::lm_head",
+            module = LM_HEAD_INT8_BLOCK32_MODULE,
+            "quantize_bf16_to_int8_block32_sm120 unavailable; skipping eager INT8 Block-32 LM-head quantization"
+        );
+        return Ok(None);
+    }
+    quantize_lm_head_bf16_to_int8_block32_owned_with_kernel(
+        gpu,
+        kernels.quantize,
+        src_bf16,
+        plan,
+        stream,
+    )
+    .map(Some)
+}
+
+fn quantize_lm_head_bf16_to_int8_block32_owned_with_kernel(
+    gpu: &dyn GpuBackend,
+    quantize_kernel: KernelHandle,
+    src_bf16: DevicePtr,
+    plan: Int8Block32WeightPlan,
+    stream: u64,
+) -> Result<Int8Block32DeviceWeight> {
+    let w_i8 = gpu.alloc(plan.weight_bytes)?;
+    let scales_bf16 = match gpu.alloc(plan.scales_bytes) {
+        Ok(ptr) => ptr,
+        Err(err) => {
+            let _ = gpu.free(w_i8);
+            return Err(err);
+        }
+    };
+    if let Err(err) = quantize_bf16_to_int8_block32_sm120(
+        gpu,
+        quantize_kernel,
+        src_bf16,
+        w_i8,
+        scales_bf16,
+        plan.rows,
+        plan.cols,
+        stream,
+    )
+    .and_then(|()| gpu.synchronize(stream))
+    {
+        let _ = gpu.free(w_i8);
+        let _ = gpu.free(scales_bf16);
+        return Err(err);
+    }
+    Ok(Int8Block32DeviceWeight {
+        w_i8,
+        scales_bf16,
+        rows: plan.rows,
+        cols: plan.cols,
+        weight_bytes: plan.weight_bytes,
+        scales_bytes: plan.scales_bytes,
+    })
+}
+
+/// Free both device allocations owned by an [`Int8Block32DeviceWeight`].
+pub fn free_lm_head_int8_block32_weight(gpu: &dyn GpuBackend, weight: Int8Block32DeviceWeight) {
+    if !weight.w_i8.is_null() {
+        let _ = gpu.free(weight.w_i8);
+    }
+    if !weight.scales_bf16.is_null() {
+        let _ = gpu.free(weight.scales_bf16);
+    }
+}
+
+/// Launch `lm_head_int8_block32_gemm_sm120` (single-CTA full BF16 logit GEMM
+/// for `M in 1..=64`, `K % 32 == 0`, arbitrary `N`).
+///
+/// Grid: `(ceil(N / 64), 1, 1)`  Block: `(128, 1, 1)`
 ///
 /// # Errors
 /// Fails closed before launch on invalid handle, dimensions, alignment,
@@ -1459,17 +1556,39 @@ mod tests {
     }
 
     #[test]
-    fn verify_width_invariance_m1_m8_m16_and_non_tile_vocab_bit_exact() {
-        // Test BOTH odd-block K=96 (K % 64 == 32) and even-block K=128 with non-tile V=277.
+    fn verify_width_invariance_m1_m8_m16_m32_m64_and_non_tile_vocab_bit_exact() {
+        // Single-CTA grid.y == 1 across ALL M <= 64 (reads weights ONCE for M=1..=64).
+        for &(m, expected_mb) in &[(1u32, 1u32), (8, 1), (16, 1), (32, 2), (48, 3), (64, 4)] {
+            let p = plan_lm_head_int8_block32_gemm(m, 248_077, 2560).unwrap();
+            assert_eq!(p.grid_y, 1, "expected single-CTA grid_y=1 at M={m}");
+            assert_eq!(p.m_blocks, expected_mb);
+        }
+
+        // Test BOTH odd-block K=96 (K % 64 == 32) and even-block K=128 with non-tile V=277
+        // across M in {1, 8, 16, 32, 48, 64} for 0-ULP batch-invariance.
         for &(v, k) in &[(277usize, 96usize), (277usize, 128usize)] {
             let w_bf16 = synthetic_gaussian_bf16(v * k, 0.04, 0x1010_2020 + k as u64);
             let w_q = quantize_bf16_weight_to_int8_block32(&w_bf16, v, k).unwrap();
-            let a_16 = synthetic_gaussian_bf16(16 * k, 1.2, 0x3030_4040 + k as u64);
+            let a_64 = synthetic_gaussian_bf16(64 * k, 1.2, 0x3030_4040 + k as u64);
 
-            let logits_m16 = lm_head_int8_block32_gemm_cpu(&a_16, &w_q, 16, v, k).unwrap();
-            let argmax_m16 = lm_head_int8_block32_fused_argmax_cpu(&a_16, &w_q, 16, v, k).unwrap();
+            let logits_m64 = lm_head_int8_block32_gemm_cpu(&a_64, &w_q, 64, v, k).unwrap();
+            let logits_m32_0 =
+                lm_head_int8_block32_gemm_cpu(&a_64[..32 * k], &w_q, 32, v, k).unwrap();
+            let logits_m32_1 =
+                lm_head_int8_block32_gemm_cpu(&a_64[32 * k..], &w_q, 32, v, k).unwrap();
+            assert_eq!(logits_m32_0.as_slice(), &logits_m64[..32 * v]);
+            assert_eq!(logits_m32_1.as_slice(), &logits_m64[32 * v..]);
 
-            // M=1 row-by-row MUST match M=16 bit-for-bit (0 ULP) in BOTH logits and argmax.
+            let logits_m48 =
+                lm_head_int8_block32_gemm_cpu(&a_64[..48 * k], &w_q, 48, v, k).unwrap();
+            assert_eq!(logits_m48.as_slice(), &logits_m64[..48 * v]);
+
+            let a_16 = &a_64[..16 * k];
+            let logits_m16 = lm_head_int8_block32_gemm_cpu(a_16, &w_q, 16, v, k).unwrap();
+            let argmax_m16 = lm_head_int8_block32_fused_argmax_cpu(a_16, &w_q, 16, v, k).unwrap();
+            assert_eq!(logits_m16.as_slice(), &logits_m64[..16 * v]);
+
+            // M=1 row-by-row MUST match M=16 and M=64 bit-for-bit (0 ULP).
             for r in 0..16 {
                 let a_row = &a_16[r * k..(r + 1) * k];
                 let logits_m1 = lm_head_int8_block32_gemm_cpu(a_row, &w_q, 1, v, k).unwrap();
@@ -1477,8 +1596,8 @@ mod tests {
                     lm_head_int8_block32_fused_argmax_cpu(a_row, &w_q, 1, v, k).unwrap();
                 assert_eq!(
                     logits_m1.as_slice(),
-                    &logits_m16[r * v..(r + 1) * v],
-                    "M=1 vs M=16 BF16 logit drift at row {r} (V={v}, K={k})"
+                    &logits_m64[r * v..(r + 1) * v],
+                    "M=1 vs M=64 BF16 logit drift at row {r} (V={v}, K={k})"
                 );
                 assert_eq!(
                     argmax_m1[0], argmax_m16[r],
@@ -1486,16 +1605,69 @@ mod tests {
                 );
             }
 
-            // M=8 halves MUST match M=16 bit-for-bit (0 ULP).
+            // M=8 halves MUST match M=16 and M=64 bit-for-bit (0 ULP).
             for half in 0..2 {
                 let r0 = half * 8;
                 let a_8 = &a_16[r0 * k..(r0 + 8) * k];
                 let logits_m8 = lm_head_int8_block32_gemm_cpu(a_8, &w_q, 8, v, k).unwrap();
                 let argmax_m8 = lm_head_int8_block32_fused_argmax_cpu(a_8, &w_q, 8, v, k).unwrap();
-                assert_eq!(logits_m8.as_slice(), &logits_m16[r0 * v..(r0 + 8) * v]);
+                assert_eq!(logits_m8.as_slice(), &logits_m64[r0 * v..(r0 + 8) * v]);
                 assert_eq!(argmax_m8.as_slice(), &argmax_m16[r0..r0 + 8]);
             }
         }
+    }
+
+    #[test]
+    fn eager_owned_weight_quantize_and_free_has_zero_leaks_on_success_and_error() {
+        let gpu = MockGpuBackend::new();
+        let src = DevicePtr(0x7_0000_0000);
+        let plan = plan_lm_head_int8_block32_weight(128, 64).unwrap();
+
+        // 1. Second alloc failure frees first buffer cleanly (0 leaks).
+        gpu.fail_alloc_after(1);
+        assert!(
+            quantize_lm_head_bf16_to_int8_block32_owned_with_kernel(
+                &gpu,
+                KernelHandle(4),
+                src,
+                plan,
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(gpu.alloc_count(), 0);
+        assert_eq!(gpu.invalid_free_count(), 0);
+
+        // 2. Null kernel handle frees both buffers cleanly (0 leaks).
+        assert!(
+            quantize_lm_head_bf16_to_int8_block32_owned_with_kernel(
+                &gpu,
+                KernelHandle(0),
+                src,
+                plan,
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(gpu.alloc_count(), 0);
+        assert_eq!(gpu.invalid_free_count(), 0);
+
+        // 3. Successful eager quantization owns 2 buffers; free releases both cleanly.
+        let owned = quantize_lm_head_bf16_to_int8_block32_owned_with_kernel(
+            &gpu,
+            KernelHandle(4),
+            src,
+            plan,
+            0,
+        )
+        .unwrap();
+        assert_eq!(gpu.alloc_count(), 2);
+        assert_eq!(gpu.launch_count(), 1);
+        assert_eq!(owned.rows, 128);
+        assert_eq!(owned.cols, 64);
+        free_lm_head_int8_block32_weight(&gpu, owned);
+        assert_eq!(gpu.alloc_count(), 0);
+        assert_eq!(gpu.invalid_free_count(), 0);
     }
 
     #[test]

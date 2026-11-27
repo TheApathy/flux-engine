@@ -1098,6 +1098,78 @@ pub fn build_model(
         None
     };
 
+    // Eagerly quantize `lm_head.weight` (BF16) -> `INT8 Block-32 BF16-Scale`
+    // (`8.50 bpw`) BEFORE `QWEN4_RELEASE_*_UNUSED` / memlean reclaims the
+    // `~1.21 GiB` BF16 slab below. Default OFF (`ATLAS_LM_HEAD_INT8_BLOCK32`
+    // unset/`0`) allocates zero VRAM and skips all kernel probes.
+    struct OwnedInt8LmHeadGuard {
+        gpu: Arc<dyn GpuBackend>,
+        weight: Option<crate::layers::ops::Int8Block32DeviceWeight>,
+    }
+    impl OwnedInt8LmHeadGuard {
+        fn into_inner(mut self) -> Option<crate::layers::ops::Int8Block32DeviceWeight> {
+            self.weight.take()
+        }
+    }
+    impl Drop for OwnedInt8LmHeadGuard {
+        fn drop(&mut self) {
+            if let Some(w) = self.weight.take() {
+                crate::layers::ops::free_lm_head_int8_block32_weight(self.gpu.as_ref(), w);
+            }
+        }
+    }
+    let lm_head_int8_block32 = if crate::layers::ops::LmHeadInt8Block32Policy::from_env()?
+        == crate::layers::ops::LmHeadInt8Block32Policy::Enabled
+        && config.pp_rank == 0
+        && !lm_head.weight.is_null()
+        && lm_head.weight.0.is_multiple_of(2)
+        && config.vocab_size > 0
+        && config.hidden_size >= crate::layers::ops::LM_HEAD_INT8_BLOCK_SIZE as usize
+        && config
+            .hidden_size
+            .is_multiple_of(crate::layers::ops::LM_HEAD_INT8_BLOCK_SIZE as usize)
+    {
+        let plan = crate::layers::ops::plan_lm_head_int8_block32_weight(
+            config.vocab_size as u32,
+            config.hidden_size as u32,
+        )?;
+        let requested = plan.weight_bytes + plan.scales_bytes;
+        let maybe_w = startup_ledger::measure(
+            "lm-head-int8-block32",
+            format!(
+                "vocab {} x hidden {} INT8 block-32 BF16-scale (8.50 bpw)",
+                config.vocab_size, config.hidden_size
+            ),
+            Some(requested),
+            || {
+                crate::layers::ops::quantize_lm_head_bf16_to_int8_block32_owned(
+                    gpu.as_ref(),
+                    lm_head.weight,
+                    config.vocab_size as u32,
+                    config.hidden_size as u32,
+                    stream,
+                )
+            },
+        )?;
+        if let Some(w) = maybe_w {
+            tracing::info!(
+                target: "atlas::lm_head",
+                vocab = w.rows,
+                hidden = w.cols,
+                weight_mib = (w.weight_bytes + w.scales_bytes) >> 20,
+                "LM_HEAD_INT8_BLOCK32_EAGER_QUANTIZED"
+            );
+            Some(OwnedInt8LmHeadGuard {
+                gpu: Arc::clone(&gpu),
+                weight: Some(w),
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let is_head_rank = config.tp_rank == 0 && config.ep_rank == 0 && config.pp_rank == 0;
     let qwen4_mtp_layout = if use_native_mtp && config.is_qwen4_exp() && is_head_rank {
         crate::weight_loader::qwen4_mtp::classify_qwen4_mtp_store(store, &config)?
@@ -1808,6 +1880,11 @@ pub fn build_model(
     model.initialize_qwen4_ple_prefill(max_batch_tokens)?;
     if let Some(fp8) = lm_head_fp8 {
         model.set_lm_head_fp8(fp8);
+    }
+    if let Some(int8_guard) = lm_head_int8_block32
+        && let Some(int8_w) = int8_guard.into_inner()
+    {
+        model.set_lm_head_int8_block32(int8_w);
     }
     drop(model_state_receipt);
     startup_ledger::record(

@@ -1266,6 +1266,7 @@ impl TransformerModel {
             qwen4_ple_prefetch: Mutex::new(HashMap::new()),
             lm_head_weight,
             lm_head_fp8: None,
+            lm_head_int8_block32: None,
             lm_head_nvfp4,
             lm_head_nvfp4_t,
             layers,
@@ -1409,6 +1410,14 @@ impl TransformerModel {
     /// model factory.
     pub(crate) fn set_lm_head_fp8(&mut self, weight: crate::weight_map::Fp8DenseWeight) {
         self.lm_head_fp8 = Some(weight);
+    }
+
+    /// Attach the owned `INT8 Block-32 BF16-Scale (8.50 bpw)` target `lm_head`
+    /// weight eagerly quantized at model load time.
+    pub(crate) fn set_lm_head_int8_block32(&mut self, weight: ops::Int8Block32DeviceWeight) {
+        if let Some(prev) = self.lm_head_int8_block32.replace(weight) {
+            ops::free_lm_head_int8_block32_weight(self.gpu.as_ref(), prev);
+        }
     }
 }
 

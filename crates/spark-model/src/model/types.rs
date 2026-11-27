@@ -181,6 +181,10 @@ pub struct TransformerModel {
         Mutex<HashMap<usize, crate::layers::qwen4_ple::PleChunkPrefetch>>,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_fp8: Option<crate::weight_map::Fp8DenseWeight>,
+    /// Owned `INT8 Block-32 BF16-Scale (8.50 bpw)` target `lm_head` weight
+    /// eagerly quantized at model load when `ATLAS_LM_HEAD_INT8_BLOCK32=1`
+    /// (before `QWEN4_RELEASE_*_UNUSED` frees BF16 `lm_head.weight`).
+    pub(super) lm_head_int8_block32: Option<ops::Int8Block32DeviceWeight>,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// Transposed NVFP4 lm_head shared with the DFlash drafter propose path.
     /// Target verification uses the exact row-major family instead. Built at
