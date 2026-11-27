@@ -302,14 +302,17 @@ pub(in super::super) fn propose_next_batch(
                 Ok(all_drafts) => {
                     for (&(idx, seq_drafts), mut drafts) in chunk.iter().zip(all_drafts) {
                         let a = &mut active[idx];
+                        let is_async_placeholder = model.dflash_seq_has_async_placeholder(&a.seq);
                         if drafts.len() > seq_drafts {
                             drafts.truncate(seq_drafts);
-                            crate::scheduler::stochastic_verify_walk::truncate_seq_rejection_q(
-                                a,
-                                drafts.len(),
-                            );
+                            if !is_async_placeholder {
+                                crate::scheduler::stochastic_verify_walk::truncate_seq_rejection_q(
+                                    a,
+                                    drafts.len(),
+                                );
+                            }
                         }
-                        if !drafts.is_empty() {
+                        if !is_async_placeholder && !drafts.is_empty() {
                             let before_splice = drafts.clone();
                             cfg_jf_splice_drafts(a, &mut drafts);
                             crate::scheduler::think_budget_nudge::splice_forced_drafts(
@@ -329,7 +332,7 @@ pub(in super::super) fn propose_next_batch(
                             tracing::error!("install proposal (batched native MTP): {error:#}");
                             continue;
                         }
-                        if !use_upward_rejection_pcum {
+                        if !is_async_placeholder && !use_upward_rejection_pcum {
                             apply_dflash_pcum_truncation_for_cohort(
                                 a,
                                 model.proposer_is_dflash(),
@@ -358,19 +361,89 @@ pub(in super::super) fn propose_next_batch(
             }
         }
     }
-    if use_upward_rejection_pcum {
-        apply_dflash_pcum_and_upward_bucket_quantize_cohort(
-            active,
-            propose_idxs,
-            model.proposer_is_dflash(),
-        );
-    } else if model.proposer_is_dflash() && ragged {
-        quantize_dflash_ragged_drafts_to_graph_bucket(active, propose_idxs);
+    let sync_propose_idxs: Vec<usize> = propose_idxs
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            active
+                .get(idx)
+                .is_some_and(|a| !model.dflash_seq_has_async_placeholder(&a.seq))
+        })
+        .collect();
+    if !sync_propose_idxs.is_empty() {
+        if use_upward_rejection_pcum {
+            apply_dflash_pcum_and_upward_bucket_quantize_cohort(
+                active,
+                &sync_propose_idxs,
+                model.proposer_is_dflash(),
+            );
+        } else if model.proposer_is_dflash() && ragged {
+            quantize_dflash_ragged_drafts_to_graph_bucket(active, &sync_propose_idxs);
+        }
+        if sync_propose_idxs.len() < 2 {
+            warm_ple_draft_ahead_for_seqs(model, active, &sync_propose_idxs);
+        } else {
+            warm_ple_verify_prefetch_for_seqs(model, active, &sync_propose_idxs, ragged);
+        }
     }
-    if propose_idxs.len() < 2 {
-        warm_ple_draft_ahead_for_seqs(model, active, propose_idxs);
+}
+
+/// Apply post-proposal splicing, `p_cum` truncation, and ragged verify-graph
+/// bucket quantization to freshly collected asynchronous DFlash drafts at the
+/// start of the next scheduler step (deferred from launch time while the
+/// placeholder chain was in flight).
+pub(in super::super) fn finalize_collected_async_dflash_drafts(
+    model: &dyn Model,
+    active: &mut [ActiveSeq],
+    collected_idxs: &[usize],
+) {
+    if collected_idxs.is_empty() || !model.proposer_is_dflash() {
+        return;
+    }
+    let vocab_size = model.vocab_size();
+    for &idx in collected_idxs {
+        let Some(a) = active.get_mut(idx) else {
+            continue;
+        };
+        if a.finished || a.pending_drafts.is_empty() || a.pending_tree_payload.is_some() {
+            continue;
+        }
+        let before_splice = a.pending_drafts.clone();
+        let mut drafts = std::mem::take(&mut a.pending_drafts);
+        cfg_jf_splice_drafts(a, &mut drafts);
+        crate::scheduler::think_budget_nudge::splice_forced_drafts(a, &mut drafts);
+        splice_grammar_drafts(a, &mut drafts, vocab_size);
+        let after_splice = drafts.clone();
+        a.pending_drafts = drafts;
+        crate::scheduler::stochastic_verify_walk::truncate_seq_rejection_q_after_splice(
+            a,
+            &before_splice,
+            &after_splice,
+        );
+    }
+    let ragged = batched_ragged_enabled() && !model.is_ep();
+    let has_stochastic_lane = collected_idxs.iter().any(|&idx| {
+        active
+            .get(idx)
+            .is_some_and(|a| !a.finished && a.temperature.is_finite() && a.temperature > 0.0)
+    });
+    let use_upward_rejection_pcum = ragged
+        && collected_idxs.len() >= 2
+        && has_stochastic_lane
+        && crate::scheduler::stochastic_verify_walk::spec_verify_policy()
+            == crate::scheduler::stochastic_verify_walk::SpecVerifyPolicy::Rejection;
+    if use_upward_rejection_pcum {
+        apply_dflash_pcum_and_upward_bucket_quantize_cohort(active, collected_idxs, true);
     } else {
-        warm_ple_verify_prefetch_for_seqs(model, active, propose_idxs, ragged);
+        let cohort_size = collected_idxs.len();
+        for &idx in collected_idxs {
+            if let Some(a) = active.get_mut(idx) {
+                apply_dflash_pcum_truncation_for_cohort(a, true, cohort_size);
+            }
+        }
+        if ragged && cohort_size >= 2 {
+            quantize_dflash_ragged_drafts_to_graph_bucket(active, collected_idxs);
+        }
     }
 }
 

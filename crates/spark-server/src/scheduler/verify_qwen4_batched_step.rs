@@ -60,7 +60,9 @@ pub(super) use planning::{
     DraftDepthPolicy, clamp_pending_drafts_to_model_max_seq_len, harmonize_cohort_widths,
     plan_for_cohort,
 };
-pub(super) use propose::{propose_next_batch, warm_ple_draft_ahead_for_seq};
+pub(super) use propose::{
+    finalize_collected_async_dflash_drafts, propose_next_batch, warm_ple_draft_ahead_for_seq,
+};
 pub(super) use verify_exec::{batch_sequences_mut, step_verify_qwen4_batched};
 
 #[cfg(test)]

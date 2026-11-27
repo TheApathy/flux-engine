@@ -683,6 +683,7 @@ struct BatchedNoiseGraphKey {
     lm_vocab: u32,
     lm_head_path_tag: u8,
     split_kv_splits: u8,
+    output_slot: u8,
     logits_out_ptr: u64,
     meta_dev_ptr: u64,
     stream: u64,
@@ -1508,8 +1509,6 @@ impl BlockDiffusionDraftHead {
             || self.markov.is_some()
             || self.dspine.is_some()
             || self.w4a4_shadow.is_some()
-            || super::async_propose::dflash_async_enabled()
-            || self.async_inflight.lock().is_some()
             || super::kernel_profile_enabled()
         {
             return Ok(None);
@@ -1734,7 +1733,13 @@ impl BlockDiffusionDraftHead {
             ));
         }
 
-        // All guards passed — downcast mutably and run Stage 1 + Stage 2.
+        // All guards passed — resolve any stale in-flight single/batched async
+        // handle before mutating shared scratch, then downcast mutably and run
+        // Stage 1 + Stage 2 (asynchronously on `pstream` with alternating
+        // double-buffered output scratch when `ATLAS_DFLASH_ASYNC=1` is active
+        // and eligible, or synchronously on `stream` otherwise).
+        self.resolve_async_inflight_impl(ctx.gpu, None)?;
+
         let mut dstates: Vec<&mut DflashProposerState> = Vec::with_capacity(b);
         for state in states.iter_mut() {
             let dstate = state
@@ -1762,16 +1767,23 @@ impl BlockDiffusionDraftHead {
         match exec {
             Ok(drafts) => Ok(Some(drafts)),
             Err(error) => {
-                // Drain `stream` before returning so any async H2D from
-                // `stage1_meta_pinned` / `meta_pinned` finishes before the
-                // caller can reuse or drop the pinned staging slabs.
+                // Drain both default and propose streams before returning so any
+                // async H2D from `stage1_meta_pinned` / `meta_pinned` finishes
+                // before the caller can reuse or drop the pinned staging slabs.
                 let _ = ctx.gpu.synchronize(stream);
+                if let Some(&pstream) = self.async_propose_stream.get()
+                    && pstream != 0
+                    && pstream != stream
+                {
+                    let _ = ctx.gpu.synchronize(pstream);
+                }
                 for dstate in dstates {
                     invalidate_dstate_ctx_kv_ranges(dstate);
                     dstate.cache_fc_start = 0;
                     dstate.cache_fc_end = 0;
                     dstate.last_draft_probs.clear();
                     dstate.pending_draft_probs_gamma = 0;
+                    dstate.async_placeholder = false;
                     dstate.invalidate_rejection_q();
                     super::draft_budget::clear_proposal_outputs(dstate);
                 }
@@ -1930,6 +1942,36 @@ impl BlockDiffusionDraftHead {
                 | BatchedSelectorMode::ProbabilisticRejection { .. }
         );
 
+        // Select execution stream and double-buffered output slot.
+        // When `ATLAS_DFLASH_ASYNC=1` is active and eligible (and secondary
+        // scratch slots are allocated), run Stage 1 + Stage 2 on `pstream`
+        // writing to alternating `Primary`/`Secondary` output buffers and defer
+        // sync + D2H to `collect_async_drafts` at the top of the next step.
+        let async_batch_slot = if super::async_propose::dflash_async_enabled()
+            && super::async_propose::async_batched_launch_eligible(
+                super::async_propose::AsyncEnvEligibility::cached(),
+                self.markov.is_some(),
+            )
+            && !self.scratch.draft_tokens_dev_alt.is_null()
+            && (!writes_out_probs || !self.scratch.batch_out_probs_alt.is_null())
+        {
+            let pstream = self.propose_stream_lazy(gpu);
+            if pstream != 0 {
+                self.order_pstream_for_batched_launch(gpu, stream, pstream)?;
+                Some((pstream, self.next_async_batch_slot()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (exec_stream, output_slot) = match async_batch_slot {
+            Some((pstream, slot)) => (pstream, slot),
+            None => (stream, super::async_propose::AsyncScratchSlot::Primary),
+        };
+        let draft_tokens_out = self.scratch.draft_tokens_dev_for_slot(output_slot);
+        let batch_out_probs_out = self.scratch.batch_out_probs_for_slot(output_slot);
+
         // ── Stage 1: Batched incremental PostRope context append ──
         for (s, plan) in plans.iter().enumerate() {
             if plan.invalidate_prev {
@@ -1947,7 +1989,7 @@ impl BlockDiffusionDraftHead {
                 policy.prefill_pipe,
                 dstates,
                 gpu,
-                stream,
+                exec_stream,
             )?;
         }
         for (s, plan) in plans.iter().enumerate() {
@@ -1989,7 +2031,7 @@ impl BlockDiffusionDraftHead {
         //    rotating pinned host staging via ONE coalesced H2D copy into the
         //    persistent contiguous `meta_dev` slab (zero per-step Vec
         //    allocations, zero stream sync), and check the Stage-2 graph cache.
-        let graph_enabled = dflash_noise_graph_enabled() && stream != 0;
+        let graph_enabled = dflash_noise_graph_enabled() && exec_stream != 0;
         let max_row_layout = DraftRowLayout::for_family(self.checkpoint_family, self.gamma);
         let n_attn_scratch = max_row_layout.query_rows + self.ctx_window;
         let max_sel_rows = self.gamma.max(DFLASH_BATCH_MAX_SEL_ROWS);
@@ -2068,7 +2110,7 @@ impl BlockDiffusionDraftHead {
                 |l, s| dstates[s].ctx_v_cache[l].0,
                 (use_gumbel_selector || rejection_mode).then_some(&staged_specs_buf[..padded_b]),
                 rejection_mode.then_some(&q_row_bases_buf[..padded_b]),
-                stream,
+                exec_stream,
             )?;
             let split_kv_plan = if desired_split_kv > 1
                 && let Some((split_kernel, reduce_kernel)) =
@@ -2106,9 +2148,10 @@ impl BlockDiffusionDraftHead {
                 lm_vocab: lm_stride as u32,
                 lm_head_path_tag: lm_head_tag,
                 split_kv_splits: split_kv_plan.map_or(1u8, |p| p.num_splits as u8),
+                output_slot: output_slot.as_u8(),
                 logits_out_ptr: logits_out.0,
                 meta_dev_ptr: ptrs.base.0,
-                stream,
+                stream: exec_stream,
             };
             let cached = if graph_enabled {
                 cache.graphs.get(&key).copied()
@@ -2135,7 +2178,7 @@ impl BlockDiffusionDraftHead {
         //      noise graph is enabled and stream != 0, with fail-closed
         //      rollback to eager execution on capture error.
         if let Some(graph) = cached_graph {
-            gpu.launch_graph(graph, stream)?;
+            gpu.launch_graph(graph, exec_stream)?;
         } else if graph_enabled {
             crate::layers::qwen4_fast_proj::warm_coalesced_nvfp4_kernels(gpu);
             let bf16_lm_head_fallback = (lm_head_tag == LM_HEAD_PATH_TAG_BF16
@@ -2149,7 +2192,7 @@ impl BlockDiffusionDraftHead {
                 kv_dim,
                 inter,
                 bf16_lm_head_fallback,
-                stream,
+                exec_stream,
             )?;
             self.prewarm_batched_stage2_nvfp4(
                 gpu,
@@ -2158,10 +2201,10 @@ impl BlockDiffusionDraftHead {
                 q_dim,
                 kv_dim,
                 inter,
-                stream,
+                exec_stream,
             )?;
             let captured = (|| -> Result<GraphHandle> {
-                let capture = NoiseGraphCaptureGuard::begin(gpu, stream)?;
+                let capture = NoiseGraphCaptureGuard::begin(gpu, exec_stream)?;
                 self.launch_batched_stage2_body(
                     meta_ptrs,
                     padded_b,
@@ -2177,12 +2220,14 @@ impl BlockDiffusionDraftHead {
                     inv_sqrt_d,
                     lm_stride,
                     logits_out,
+                    draft_tokens_out,
+                    batch_out_probs_out,
                     policy.lm_head_nvfp4,
                     shortlist_k,
                     selector_mode,
                     split_kv_plan,
                     gpu,
-                    stream,
+                    exec_stream,
                 )?;
                 capture.end()
             })();
@@ -2191,7 +2236,7 @@ impl BlockDiffusionDraftHead {
                     self.batched_noise_graph
                         .lock()
                         .insert_graph(gpu, graph_key, graph);
-                    gpu.launch_graph(graph, stream)?;
+                    gpu.launch_graph(graph, exec_stream)?;
                     static BATCHED_GRAPH_RECEIPT: std::sync::Once = std::sync::Once::new();
                     BATCHED_GRAPH_RECEIPT.call_once(|| {
                         tracing::info!(
@@ -2209,7 +2254,7 @@ impl BlockDiffusionDraftHead {
                 Ok(_) => {
                     // Mock/no-op capture backends execute kernels directly inside
                     // `begin_capture`..`end_capture` and return `GraphHandle(0)`,
-                    // so Stage 2 has already run once on `stream`.
+                    // so Stage 2 has already run once on `exec_stream`.
                 }
                 Err(capture_err) => {
                     static CAPTURE_FAIL_WARN: std::sync::Once = std::sync::Once::new();
@@ -2238,12 +2283,14 @@ impl BlockDiffusionDraftHead {
                         inv_sqrt_d,
                         lm_stride,
                         logits_out,
+                        draft_tokens_out,
+                        batch_out_probs_out,
                         policy.lm_head_nvfp4,
                         shortlist_k,
                         selector_mode,
                         split_kv_plan,
                         gpu,
-                        stream,
+                        exec_stream,
                     )?;
                 }
             }
@@ -2263,12 +2310,14 @@ impl BlockDiffusionDraftHead {
                 inv_sqrt_d,
                 lm_stride,
                 logits_out,
+                draft_tokens_out,
+                batch_out_probs_out,
                 policy.lm_head_nvfp4,
                 shortlist_k,
                 selector_mode,
                 split_kv_plan,
                 gpu,
-                stream,
+                exec_stream,
             )?;
         }
 
@@ -2284,6 +2333,40 @@ impl BlockDiffusionDraftHead {
             });
         }
 
+        // Async batched overlap (`ATLAS_DFLASH_ASYNC=1`): defer stream sync +
+        // D2H readback to the top of the next scheduler step, registering the
+        // cohort under `AsyncBatchedInflight` with double-buffered output slot
+        // `output_slot` and returning lossless MASK placeholder chains now.
+        if let Some((pstream, slot)) = async_batch_slot {
+            let mut owners = Vec::with_capacity(b);
+            let mut results = Vec::with_capacity(b);
+            for dstate in dstates.iter_mut() {
+                owners.push(super::async_propose::dstate_id(dstate));
+                dstate.draft_budget = Some(budget);
+                dstate.last_num_drafted = gamma_eff;
+                dstate.first_propose_done = true;
+                dstate.pending_tree_payload = None;
+                dstate.pending_sampled_proposal = None;
+                dstate.active_sampling_request = None;
+                dstate.async_placeholder = true;
+                dstate.last_draft_probs.clear();
+                dstate.pending_draft_probs_gamma = 0;
+                dstate.invalidate_rejection_q();
+                results.push(super::async_propose::placeholder_drafts(gamma_eff, mask_id));
+            }
+            self.register_async_batched_inflight(
+                slot,
+                owners,
+                budget,
+                gamma_eff,
+                pstream,
+                writes_out_probs,
+                rejection_mode,
+                valid_q_records[..b].to_vec(),
+            );
+            return Ok(results);
+        }
+
         // 9. Single stream-ordered sync + D2H readback of draft tokens (and
         //    optional `batch_out_probs` via `copy_d2h_pair_on_stream`, avoiding
         //    a redundant second stream synchronization) using stack buffers
@@ -2293,17 +2376,17 @@ impl BlockDiffusionDraftHead {
         let mut probs_host_buf = [0u8; BATCHED_MAX_NOISE_ROWS * size_of::<f32>()];
         if writes_out_probs {
             gpu.copy_d2h_pair_on_stream(
-                self.scratch.draft_tokens_dev,
+                draft_tokens_out,
                 &mut tok_host_buf[..out_bytes],
-                self.scratch.batch_out_probs,
+                batch_out_probs_out,
                 &mut probs_host_buf[..out_bytes],
-                stream,
+                exec_stream,
             )?;
         } else {
             gpu.copy_d2h_on_stream(
-                self.scratch.draft_tokens_dev,
+                draft_tokens_out,
                 &mut tok_host_buf[..out_bytes],
-                stream,
+                exec_stream,
             )?;
         }
         let flat_tokens =
@@ -2544,6 +2627,8 @@ impl BlockDiffusionDraftHead {
         inv_sqrt_d: f32,
         lm_stride: usize,
         logits_out: DevicePtr,
+        draft_tokens_out: DevicePtr,
+        batch_out_probs_out: DevicePtr,
         lm_head_nvfp4: bool,
         shortlist_k: usize,
         selector_mode: BatchedSelectorMode,
@@ -2782,8 +2867,8 @@ impl BlockDiffusionDraftHead {
                         self.scratch.selector_hidden,
                         sel.predecessor_codebook.weight,
                         sel.successor_codebook.weight,
-                        self.scratch.draft_tokens_dev,
-                        self.scratch.batch_out_probs,
+                        draft_tokens_out,
+                        batch_out_probs_out,
                         self.scratch.shared_q_ids,
                         self.scratch.shared_q_probs,
                         Some(meta_ptrs.q_row_bases),
@@ -2811,8 +2896,8 @@ impl BlockDiffusionDraftHead {
                         self.scratch.selector_hidden,
                         sel.predecessor_codebook.weight,
                         sel.successor_codebook.weight,
-                        self.scratch.draft_tokens_dev,
-                        self.scratch.batch_out_probs,
+                        draft_tokens_out,
+                        batch_out_probs_out,
                         meta_ptrs.batch_anchor_ids,
                         meta_ptrs.batch_gumbel_seeds,
                         meta_ptrs.batch_gumbel_step0_pos,
@@ -2836,7 +2921,7 @@ impl BlockDiffusionDraftHead {
                         self.scratch.selector_hidden,
                         sel.predecessor_codebook.weight,
                         sel.successor_codebook.weight,
-                        self.scratch.draft_tokens_dev,
+                        draft_tokens_out,
                         meta_ptrs.batch_anchor_ids,
                         meta_ptrs.batch_gumbel_seeds,
                         meta_ptrs.batch_gumbel_step0_pos,
@@ -2861,7 +2946,7 @@ impl BlockDiffusionDraftHead {
                         self.scratch.selector_hidden,
                         sel.predecessor_codebook.weight,
                         sel.successor_codebook.weight,
-                        self.scratch.draft_tokens_dev,
+                        draft_tokens_out,
                         meta_ptrs.batch_anchor_ids,
                         gamma_eff as i32,
                         sel.rank as i32,
@@ -2875,7 +2960,7 @@ impl BlockDiffusionDraftHead {
                 gpu,
                 self.kernels.argmax_rows,
                 logits_out,
-                self.scratch.draft_tokens_dev,
+                draft_tokens_out,
                 lm_stride as u32,
                 lm_stride as u32,
                 m_out as u32,
@@ -2888,7 +2973,7 @@ impl BlockDiffusionDraftHead {
                     gpu,
                     self.kernels.argmax,
                     logits_out.offset(i * logit_row_bytes),
-                    self.scratch.draft_tokens_dev.offset(i * size_of::<u32>()),
+                    draft_tokens_out.offset(i * size_of::<u32>()),
                     lm_stride as u32,
                     stream,
                 )?;
@@ -4535,6 +4620,7 @@ mod tests {
             lm_vocab: 248_320,
             lm_head_path_tag: 2,
             split_kv_splits: 1,
+            output_slot: 0,
             logits_out_ptr: 0x1000_0000,
             meta_dev_ptr: 0x3000_0000,
             stream: 7,
@@ -4592,6 +4678,10 @@ mod tests {
             },
             BatchedNoiseGraphKey {
                 split_kv_splits: 4,
+                ..base
+            },
+            BatchedNoiseGraphKey {
+                output_slot: 1,
                 ..base
             },
             BatchedNoiseGraphKey {
@@ -4760,6 +4850,7 @@ mod tests {
             lm_vocab: 248_320,
             lm_head_path_tag: 2,
             split_kv_splits: 1,
+            output_slot: 0,
             logits_out_ptr: 0x1000,
             meta_dev_ptr: 0x3000,
             stream: 7,

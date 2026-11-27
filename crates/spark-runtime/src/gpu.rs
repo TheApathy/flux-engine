@@ -35,6 +35,17 @@ pub struct KernelHandle(pub u64);
 #[derive(Debug, Clone, Copy)]
 pub struct GraphHandle(pub u64);
 
+/// How an event record interacts with CUDA graph capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventRecordMode {
+    /// Standard stream-ordered event record (`cuEventRecord`).
+    Default,
+    /// External event record node inside an active CUDA graph capture
+    /// (`cuEventRecordWithFlags(..., CU_EVENT_RECORD_EXTERNAL)`), so an
+    /// external non-captured stream can wait on this signal across replays.
+    ExternalInGraph,
+}
+
 /// Typed kernel argument, used by `launch_typed`.
 ///
 /// CUDA's `cuLaunchKernel` is type-blind — every arg is `void*` and the
@@ -718,6 +729,21 @@ pub trait GpuBackend: Send + Sync {
     /// Record an event on a stream (marks a point in the stream's work).
     fn record_event(&self, _event: u64, _stream: u64) -> Result<()> {
         Ok(())
+    }
+
+    /// Record an event on a stream using the requested capture mode.
+    ///
+    /// [`EventRecordMode::ExternalInGraph`] must only be passed while `stream`
+    /// is actively capturing a CUDA graph; outside capture use
+    /// [`EventRecordMode::Default`]. Backends without external-event graph
+    /// support delegate to [`Self::record_event`].
+    fn record_event_with_mode(
+        &self,
+        event: u64,
+        stream: u64,
+        _mode: EventRecordMode,
+    ) -> Result<()> {
+        self.record_event(event, stream)
     }
 
     /// Make a stream wait for an event (GPU-side sync, CPU does not block).

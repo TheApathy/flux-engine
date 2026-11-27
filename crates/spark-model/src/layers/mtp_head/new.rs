@@ -292,6 +292,7 @@ impl MtpHead {
             sigmoid_gate_mul_k: gpu.kernel("residual_add", "sigmoid_gate_mul")?,
             bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            argmax_prob_k: crate::layers::try_kernel(gpu, "argmax", "argmax_prob_bf16"),
             embed_from_argmax_k: gpu.kernel("embed_from_argmax", "embed_from_argmax")?,
             draft_token_id_dev: gpu.alloc(4)?,
             dense_gemv_k,
@@ -482,6 +483,7 @@ impl MtpHead {
             sigmoid_gate_mul_k: gpu.kernel("residual_add", "sigmoid_gate_mul")?,
             bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            argmax_prob_k: crate::layers::try_kernel(gpu, "argmax", "argmax_prob_bf16"),
             embed_from_argmax_k: gpu.kernel("embed_from_argmax", "embed_from_argmax")?,
             draft_token_id_dev: gpu.alloc(4)?,
             // moe_silu_mul is the same kernel for dense fused silu*up — it

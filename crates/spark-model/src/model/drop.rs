@@ -164,6 +164,15 @@ impl Drop for TransformerModel {
             );
         }
 
+        if self.dflash_capture_done_event != 0
+            && let Err(error) = self.gpu.destroy_event(self.dflash_capture_done_event)
+        {
+            tracing::error!(
+                "TransformerModel::drop: destroy_event({}) (dflash_capture_done) failed: {error:#}",
+                self.dflash_capture_done_event
+            );
+        }
+
         if let Some(&event) = self.slot_zero_event.get()
             && let Err(error) = self.gpu.destroy_event(event)
         {

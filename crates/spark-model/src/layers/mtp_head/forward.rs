@@ -762,6 +762,9 @@ impl MtpHead {
     /// - Chains intermediate steps `0..num_drafts - 2` on the GPU via `embed_from_argmax`
     ///   directly into `embed_out` (`ctx.buffers.ssm_qkvz()`) with zero intermediate D2H syncs.
     /// - Performs a single D2H readback on the final step `step == num_drafts - 1`.
+    /// - Under opt-in `ATLAS_MTP_DLOOP=1` on dense targets (`!is_moe`, `C <= 2`), reads back
+    ///   Stage-1 softmax probabilities and extends by Stage 2 (`K = 5 -> K = 9`) when
+    ///   `c_1 = sum ln(p_i) >= -0.5`. Strictly fail-closed on MoE targets.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn propose_chain(
         &self,
@@ -774,6 +777,119 @@ impl MtpHead {
         stream: u64,
         draft_embed_target: Option<DevicePtr>,
     ) -> Result<Vec<u32>> {
+        use crate::layers::mtp_dloop;
+
+        let dloop_enabled = mtp_dloop::mtp_dloop_enabled();
+        let topology = if self.is_dense_mlp {
+            mtp_dloop::TargetFfnTopology::from_num_experts(ctx.config.num_experts)
+        } else {
+            mtp_dloop::TargetFfnTopology::Moe {
+                num_experts: ctx.config.num_experts.max(2),
+            }
+        };
+        let cohort_ctx = mtp_dloop::active_cohort_context();
+        let dloop_precheck = if dloop_enabled && draft_embed_target.is_none() {
+            match cohort_ctx {
+                Some(cohort) => {
+                    mtp_dloop::precheck_stage1_admission(&mtp_dloop::MtpDloopStage1PrecheckInput {
+                        enabled: true,
+                        topology,
+                        live_seqs: cohort.live_seqs,
+                        stage1_drafts: num_drafts,
+                        max_verify_k: cohort.max_verify_k,
+                    })
+                }
+                None => Err(mtp_dloop::MtpDloopRefusal::ConcurrencyTooHigh {
+                    live_seqs: 0,
+                    max_concurrency: mtp_dloop::MTP_DLOOP_MAX_CONCURRENCY,
+                }),
+            }
+        } else {
+            Err(mtp_dloop::MtpDloopRefusal::Disabled)
+        };
+        if let Err(mtp_dloop::MtpDloopRefusal::MoeTargetRefused { num_experts }) = dloop_precheck {
+            static MOE_REFUSED_LOGGED: std::sync::Once = std::sync::Once::new();
+            MOE_REFUSED_LOGGED.call_once(|| {
+                tracing::info!(
+                    num_experts,
+                    "MTP_DLOOP_REFUSED reason=moe_target (ATLAS_MTP_DLOOP=1 is dense-only)"
+                );
+            });
+        }
+        let want_stage1_probs = dloop_precheck.is_ok() && self.argmax_prob_k.0 != 0;
+
+        let (mut drafts, stage1_probs) = self.propose_chain_segment(
+            last_token,
+            target_hidden,
+            position,
+            num_drafts,
+            state,
+            ctx,
+            stream,
+            draft_embed_target,
+            want_stage1_probs,
+        )?;
+
+        if want_stage1_probs
+            && let Some(cohort) = cohort_ctx
+            && let Some(&stage1_last_token) = drafts.last()
+        {
+            let decision = mtp_dloop::evaluate_stage2_extension(&mtp_dloop::MtpDloopInput {
+                enabled: dloop_enabled,
+                topology,
+                live_seqs: cohort.live_seqs,
+                stage1_drafts: num_drafts,
+                max_verify_k: cohort.max_verify_k,
+                stage1_probs: &stage1_probs,
+                threshold: mtp_dloop::mtp_dloop_thresh(),
+            });
+            if let mtp_dloop::MtpDloopDecision::ExtendStage2 {
+                extra_drafts,
+                total_drafts,
+            } = decision
+            {
+                static DLOOP_ENGAGED: std::sync::Once = std::sync::Once::new();
+                DLOOP_ENGAGED.call_once(|| {
+                    tracing::info!(
+                        stage1_drafts = num_drafts,
+                        extra_drafts,
+                        total_drafts,
+                        live_seqs = cohort.live_seqs,
+                        threshold = mtp_dloop::mtp_dloop_thresh(),
+                        "MTP_DLOOP_STAGE2_ENGAGED"
+                    );
+                });
+                let (stage2_drafts, _) = self.propose_chain_segment(
+                    stage1_last_token,
+                    ctx.buffers.hidden_states(),
+                    position + num_drafts,
+                    extra_drafts,
+                    state,
+                    ctx,
+                    stream,
+                    None,
+                    false,
+                )?;
+                drafts.extend_from_slice(&stage2_drafts);
+            }
+        }
+
+        Ok(drafts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propose_chain_segment(
+        &self,
+        last_token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+        draft_embed_target: Option<DevicePtr>,
+        capture_probs: bool,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
         let h = ctx.config.hidden_size as u32;
         let nq = ctx.config.num_attention_heads as u32;
         let nkv = ctx.config.num_key_value_heads as u32;
@@ -831,6 +947,8 @@ impl MtpHead {
         )?;
 
         let argmax_base = ctx.buffers.scratch();
+        let prob_base = ctx.buffers.scratch().offset(256);
+        let emit_probs = capture_probs && self.argmax_prob_k.0 != 0 && num_drafts <= 64;
         let embed_out = ctx.buffers.ssm_qkvz();
         let mut current_hidden = target_hidden;
 
@@ -838,6 +956,7 @@ impl MtpHead {
             let is_last_step = step + 1 == num_drafts;
             let meta_base = meta_base_all.offset(step * step_meta_stride);
             let out_ptr = argmax_base.offset(step * 4);
+            let prob_ptr = prob_base.offset(step * 4);
 
             // 1. Embed token (step 0 copies from host-known last_token; steps 1..num_drafts-1
             //    already had their embedding gathered into `embed_out` by the previous step's
@@ -1136,7 +1255,18 @@ impl MtpHead {
                 stream,
             )?;
 
-            ops::argmax_bf16(ctx.gpu, self.argmax_k, logits, out_ptr, v, stream)?;
+            if emit_probs {
+                spark_runtime::kernel_args::KernelLaunch::new(ctx.gpu, self.argmax_prob_k)
+                    .grid([1, 1, 1])
+                    .block([1024, 1, 1])
+                    .arg_ptr(logits)
+                    .arg_ptr(out_ptr)
+                    .arg_ptr(prob_ptr)
+                    .arg_u32(v)
+                    .launch(stream)?;
+            } else {
+                ops::argmax_bf16(ctx.gpu, self.argmax_k, logits, out_ptr, v, stream)?;
+            }
 
             if !is_last_step {
                 // Chain token embedding directly on GPU into `embed_out` for `step + 1`
@@ -1176,8 +1306,24 @@ impl MtpHead {
             num_drafts
         };
         let mut bytes = vec![0u8; read_count * 4];
+        let mut probs = Vec::new();
         if read_count > 0 {
-            ctx.gpu.copy_d2h(argmax_base, &mut bytes)?;
+            if emit_probs {
+                let mut pbytes = vec![0u8; read_count * 4];
+                ctx.gpu.copy_d2h_pair_on_stream(
+                    argmax_base,
+                    &mut bytes,
+                    prob_base,
+                    &mut pbytes,
+                    stream,
+                )?;
+                probs = pbytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+            } else {
+                ctx.gpu.copy_d2h(argmax_base, &mut bytes)?;
+            }
         }
         let mut drafts: Vec<u32> = bytes
             .chunks_exact(4)
@@ -1186,6 +1332,6 @@ impl MtpHead {
         if draft_embed_target.is_some() {
             drafts.push(0u32);
         }
-        Ok(drafts)
+        Ok((drafts, probs))
     }
 }

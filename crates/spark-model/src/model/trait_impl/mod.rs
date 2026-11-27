@@ -1089,6 +1089,27 @@ impl Model for TransformerModel {
         proposer.arm_propose_overlap(self.gpu.as_ref(), self.gpu.default_stream())
     }
 
+    fn dflash_seq_has_async_placeholder(&self, seq: &SequenceState) -> bool {
+        seq.proposer_state
+            .as_ref()
+            .and_then(|s| {
+                s.as_any()
+                    .downcast_ref::<crate::layers::DflashProposerState>()
+            })
+            .is_some_and(|ds| ds.async_placeholder)
+    }
+
+    fn mtp_dloop_max_verify_k(&self) -> usize {
+        if self.config.num_experts > 1 {
+            return 0;
+        }
+        if self.ssm_pool.num_ssm_layers > 0 {
+            self.ssm_pool.num_intermediates.saturating_sub(1)
+        } else {
+            self.buffers.max_batch_tokens()
+        }
+    }
+
     fn dflash_stash_recycle(
         &self,
         seq: &mut SequenceState,

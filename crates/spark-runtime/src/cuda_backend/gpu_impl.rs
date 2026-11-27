@@ -34,7 +34,7 @@ use cudarc::driver::LaunchConfig;
 
 use super::{
     AtlasCudaBackend, cuCtxGetDevice, cuCtxSetCurrent, cuDeviceGraphMemTrim, cuEventCreate,
-    cuEventDestroy_v2, cuEventRecord, cuGraphDestroy, cuGraphExecDestroy,
+    cuEventDestroy_v2, cuEventRecord, cuEventRecordWithFlags, cuGraphDestroy, cuGraphExecDestroy,
     cuGraphInstantiateWithFlags, cuGraphLaunch, cuMemAlloc_v2, cuMemAllocHost_v2,
     cuMemAllocManaged, cuMemFree_v2, cuMemFreeHost, cuMemGetAddressRange_v2, cuMemGetInfo_v2,
     cuMemcpyDtoDAsync_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyHtoDAsync_v2, cuMemsetD8Async,
@@ -1049,6 +1049,29 @@ impl GpuBackend for AtlasCudaBackend {
             bail!("cuEventRecord failed: status {status}");
         }
         Ok(())
+    }
+
+    fn record_event_with_mode(
+        &self,
+        event: u64,
+        stream: u64,
+        mode: crate::gpu::EventRecordMode,
+    ) -> Result<()> {
+        match mode {
+            crate::gpu::EventRecordMode::Default => self.record_event(event, stream),
+            crate::gpu::EventRecordMode::ExternalInGraph => {
+                const CU_EVENT_RECORD_EXTERNAL: u32 = 0x1;
+                // SAFETY: `event` and `stream` are valid handles on the active CUDA
+                // context, and the caller guarantees `stream` is currently capturing a
+                // CUDA graph (required by CUDA driver API for CU_EVENT_RECORD_EXTERNAL).
+                let status =
+                    unsafe { cuEventRecordWithFlags(event, stream, CU_EVENT_RECORD_EXTERNAL) };
+                if status != 0 {
+                    bail!("cuEventRecordWithFlags(EXTERNAL) failed: status {status}");
+                }
+                Ok(())
+            }
+        }
     }
 
     fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {

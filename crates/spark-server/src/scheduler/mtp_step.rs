@@ -729,6 +729,10 @@ pub fn step_mtp(
     // narrower drafts at higher concurrency. Lossless; unset keeps
     // `num_drafts` unchanged.
     let live_seqs = active.iter().filter(|a| !a.finished).count();
+    let _mtp_dloop_guard = spark_model::layers::mtp_dloop::MtpDloopCohortGuard::enter(
+        live_seqs,
+        model.mtp_dloop_max_verify_k(),
+    );
     let any_sampled = active.iter().any(|a| !a.finished && a.temperature > 0.0);
     verify_qwen4_batched_step::set_step_cohort_sampled(any_sampled);
     let depth_policy = verify_qwen4_batched_step::DraftDepthPolicy::for_cohort(
@@ -741,7 +745,8 @@ pub fn step_mtp(
     // `<tool_call>`). DFlash drafts and the K=γ verify argmax bypass the
     // XGrammar bitmask, so a grammar-active sequence must run the bootstrap
     // path below, where `sample_token_with_grammar` enforces it.
-    for a in active.iter_mut() {
+    let mut collected_async_idxs: Vec<usize> = Vec::new();
+    for (idx, a) in active.iter_mut().enumerate() {
         // ATLAS_DFLASH_ASYNC (task #20): the previous step's propose was
         // ENQUEUED on a second CUDA stream and returned a placeholder chain;
         // its drafter kernels overlapped the SSM commit tail + step-tail CPU
@@ -761,8 +766,12 @@ pub fn step_mtp(
                     // after `run_mtp_propose_multi`, which on the async path
                     // clears `dstate.pending_tree_payload` — so that later drain
                     // returns `None` and does not overwrite the tree set here.
+                    let had_drafts = !drafts.is_empty();
                     install_collected(model, a, Ok(drafts))
                         .expect("an infallible collected proposal cannot fail");
+                    if had_drafts {
+                        collected_async_idxs.push(idx);
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -828,6 +837,13 @@ pub fn step_mtp(
             &a.pending_drafts,
             &mut a.pending_tree_payload,
             &mut a.pending_dflash_sampled_proposal,
+        );
+    }
+    if !collected_async_idxs.is_empty() && model.proposer_is_dflash() {
+        verify_qwen4_batched_step::finalize_collected_async_dflash_drafts(
+            model,
+            active,
+            &collected_async_idxs,
         );
     }
 

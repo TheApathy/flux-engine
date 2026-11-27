@@ -2692,13 +2692,15 @@ pub fn step_verify_dflash(
     }
 }
 
-/// Whether DFlash2 `p_cum` confidence truncation should run for `a`.
+/// Whether DFlash2 `p_cum` confidence truncation should run for `a` inside a
+/// cohort of `cohort_size` sequences.
 ///
 /// Disabled by default on dense (non-MoE) targets so full `K` acceptance and
-/// fixed-width verify CUDA graphs are preserved; stays enabled on MoE targets
-/// and whenever `ATLAS_QWEN4_DFLASH_PCUM_THRESH` explicitly sets a positive
-/// threshold.
-pub(super) fn dflash_pcum_enabled_for_seq(a: &ActiveSeq) -> bool {
+/// fixed-width verify CUDA graphs are preserved; opt-in `ATLAS_DFLASH_DENSE_PCUM=1`
+/// enables dense 27B truncation at `cohort_size >= 4` or inside `<think>` blocks.
+/// MoE targets and explicit `ATLAS_QWEN4_DFLASH_PCUM_THRESH` overrides preserve
+/// their established behavior.
+pub(super) fn dflash_pcum_enabled_for_seq_in_cohort(a: &ActiveSeq, cohort_size: usize) -> bool {
     let target_is_moe = a
         .seq
         .proposer_state
@@ -2708,7 +2710,16 @@ pub(super) fn dflash_pcum_enabled_for_seq(a: &ActiveSeq) -> bool {
                 .downcast_ref::<spark_model::layers::dflash_head::DflashProposerState>()
         })
         .and_then(spark_model::layers::dflash_head::DflashProposerState::target_is_moe);
-    spark_model::layers::dflash_head::dflash_pcum_enabled_for_target_env(target_is_moe)
+    spark_model::layers::dflash_head::dflash_pcum_enabled_for_target_context_env(
+        target_is_moe,
+        cohort_size,
+        a.inside_thinking,
+    )
+}
+
+/// Whether DFlash2 `p_cum` confidence truncation should run for single-sequence `a`.
+pub(super) fn dflash_pcum_enabled_for_seq(a: &ActiveSeq) -> bool {
+    dflash_pcum_enabled_for_seq_in_cohort(a, 1)
 }
 
 /// Whether any DFlash TREE draft method is active (BRANCH / CATERPILLAR /

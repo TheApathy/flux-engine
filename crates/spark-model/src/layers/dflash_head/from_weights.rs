@@ -635,6 +635,11 @@ impl BlockDiffusionDraftHead {
         let max_sel_rows = g.max(super::DFLASH_BATCH_MAX_SEL_ROWS);
         let topk_bytes = selector_topk_scratch_bytes(g);
         let batch_out_probs_bytes = batch_out_probs_scratch_bytes(g);
+        let early_stage1_fc_bytes = if super::async_propose::dflash_early_stage1_enabled() {
+            physical_verify_k.max(g + 1) * hidden_size * bf16
+        } else {
+            0
+        };
         let scratch = DflashScratch {
             stream_buf: alloc_tx.alloc(n_attn * hidden_size * bf16)?,
             norm_buf: alloc_tx.alloc(n_attn * hidden_size * bf16)?,
@@ -648,6 +653,7 @@ impl BlockDiffusionDraftHead {
             fc_proj: alloc_tx.adopt(gpu.alloc(ctx_window * hidden_size * bf16)?),
             logits: alloc_tx.alloc(logits_layout.allocation_bytes())?,
             draft_tokens_dev: alloc_tx.alloc(n_attn.max(max_sel_rows) * 4)?,
+            draft_tokens_dev_alt: alloc_tx.alloc(n_attn.max(max_sel_rows) * 4)?,
             position_ids: alloc_tx.alloc(n_attn * 4)?,
             // DDTree M4B v2 / DFlash2 selector top-K scratch. Sized for
             // `max(γ, 128)` rows × `DFLASH2_GUMBEL_SHORTLIST_K` (32) so both
@@ -759,6 +765,12 @@ impl BlockDiffusionDraftHead {
             batch_gumbel_top_ps: alloc_tx.alloc(super::DFLASH_BATCH_MAX_SEQS * size_of::<f32>())?,
             batch_gumbel_min_ps: alloc_tx.alloc(super::DFLASH_BATCH_MAX_SEQS * size_of::<f32>())?,
             batch_out_probs: alloc_tx.alloc(batch_out_probs_bytes)?,
+            batch_out_probs_alt: alloc_tx.alloc(batch_out_probs_bytes)?,
+            early_stage1_fc: if early_stage1_fc_bytes > 0 {
+                alloc_tx.alloc(early_stage1_fc_bytes)?
+            } else {
+                DevicePtr::NULL
+            },
             q_row_bases: alloc_tx.alloc(super::DFLASH_BATCH_MAX_SEQS * size_of::<u32>())?,
             shared_q_ids: DevicePtr::NULL,
             shared_q_probs: DevicePtr::NULL,
@@ -796,6 +808,7 @@ impl BlockDiffusionDraftHead {
                 super::DFLASH_BATCH_MAX_SEQS * size_of::<f32>(),
             ),
             (scratch.batch_out_probs, batch_out_probs_bytes),
+            (scratch.batch_out_probs_alt, batch_out_probs_bytes),
             (
                 scratch.q_row_bases,
                 super::DFLASH_BATCH_MAX_SEQS * size_of::<u32>(),
@@ -1620,6 +1633,9 @@ impl BlockDiffusionDraftHead {
             proposal_policy: std::sync::OnceLock::new(),
             quant: quantization,
             async_inflight: Mutex::new(None),
+            async_batched_inflight: Mutex::new(None),
+            async_batch_slot_toggle: std::sync::atomic::AtomicU8::new(0),
+            early_stage1_staged: Mutex::new(None),
             async_propose_stream: std::sync::OnceLock::new(),
             async_order_event: std::sync::atomic::AtomicU64::new(0),
             fused_event_armed: std::sync::atomic::AtomicBool::new(false),

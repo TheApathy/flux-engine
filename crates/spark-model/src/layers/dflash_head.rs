@@ -622,6 +622,10 @@ pub struct DflashScratch {
     pub fc_proj: DevicePtr,
     pub logits: DevicePtr,
     pub draft_tokens_dev: DevicePtr,
+    /// Secondary double-buffered draft token output slot for consecutive
+    /// overlapping async batched (`C >= 2`) proposals (zero aliasing with
+    /// `draft_tokens_dev`).
+    pub draft_tokens_dev_alt: DevicePtr,
     /// `[ctx_window + γ]` i32 positions. First ctx_window are
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
@@ -742,6 +746,14 @@ pub struct DflashScratch {
     /// `dflash2_selector_walk_gumbel_batched_k32` (at least `64 * 8 = 512` f32s = 2048 B,
     /// shared by C=1 and batched C=2..64).
     pub batch_out_probs: DevicePtr,
+    /// Secondary double-buffered draft probability output slot paired with
+    /// `draft_tokens_dev_alt` for consecutive overlapping async batched proposals.
+    pub batch_out_probs_alt: DevicePtr,
+    /// Opt-in (`ATLAS_DFLASH_EARLY_STAGE1=1`) isolated staging slab
+    /// `[physical_verify_k, hidden_size]` BF16 for early-started Stage-1
+    /// `fc` + `hidden_norm` projections computed on `pstream` after Layer 61 / 45
+    /// completes. `DevicePtr::NULL` when the flag is OFF.
+    pub early_stage1_fc: DevicePtr,
     /// Fixed-capacity (`[DFLASH_BATCH_MAX_SEQS]` u32 = 256 B) per-sequence
     /// base row indices (`slot_idx * 8`) into the shared `(q_cand_ids, q_probs)`
     /// GPU buffer for `dflash2_selector_walk_probabilistic_batched`.
@@ -756,6 +768,34 @@ pub struct DflashScratch {
     pub shared_q_row_cap: usize,
     /// Candidate stride of `shared_q_ids` / `shared_q_probs` (20 when bound).
     pub shared_q_stride: usize,
+}
+
+impl DflashScratch {
+    /// Select the primary or secondary double-buffered draft-token output device pointer.
+    #[inline]
+    #[must_use]
+    pub const fn draft_tokens_dev_for_slot(
+        &self,
+        slot: async_propose::AsyncScratchSlot,
+    ) -> DevicePtr {
+        match slot {
+            async_propose::AsyncScratchSlot::Primary => self.draft_tokens_dev,
+            async_propose::AsyncScratchSlot::Secondary => self.draft_tokens_dev_alt,
+        }
+    }
+
+    /// Select the primary or secondary double-buffered draft-probability output device pointer.
+    #[inline]
+    #[must_use]
+    pub const fn batch_out_probs_for_slot(
+        &self,
+        slot: async_propose::AsyncScratchSlot,
+    ) -> DevicePtr {
+        match slot {
+            async_propose::AsyncScratchSlot::Primary => self.batch_out_probs,
+            async_propose::AsyncScratchSlot::Secondary => self.batch_out_probs_alt,
+        }
+    }
 }
 
 /// Drafter-side weight precision.
@@ -2522,6 +2562,16 @@ pub struct BlockDiffusionDraftHead {
     /// single scratch buffer set. `None` when idle / flag off. See
     /// `async_propose.rs` for the shared-scratch discipline.
     pub async_inflight: Mutex<Option<async_propose::AsyncInflight>>,
+    /// At most one in-flight async batched (`C >= 2`) propose using alternating
+    /// double-buffered output scratch slots (`Primary` / `Secondary`) so
+    /// consecutive launches never alias.
+    pub async_batched_inflight: Mutex<Option<async_propose::AsyncBatchedInflight>>,
+    /// Alternating slot counter (`0` / `1`) toggled per async batched launch.
+    pub async_batch_slot_toggle: std::sync::atomic::AtomicU8,
+    /// Optional staged early-start Stage-1 (`ATLAS_DFLASH_EARLY_STAGE1=1`)
+    /// `fc` + `hidden_norm` projection launched on `pstream` after the target's
+    /// final capture layer.
+    pub early_stage1_staged: Mutex<Option<async_propose::EarlyStage1Staged>>,
     /// Dedicated non-blocking CUDA stream for async propose launches.
     /// Lazily created on first eligible launch; `0` = creation failed →
     /// async permanently disabled.
@@ -2726,6 +2776,38 @@ impl Drop for BlockDiffusionDraftHead {
     }
 }
 
+/// Opt-in dense-target `p_cum` policy (`ATLAS_DFLASH_DENSE_PCUM=1`, default OFF):
+/// preserves full fixed-width `K` on dense `C = 1` non-thinking steps while
+/// engaging `p_cum` confidence truncation on dense cohorts `C >= 4` or inside
+/// `<think>` reasoning blocks.
+pub const DFLASH_DENSE_PCUM_ENV: &str = "ATLAS_DFLASH_DENSE_PCUM";
+
+/// Minimum dense cohort concurrency admitted by `ATLAS_DFLASH_DENSE_PCUM=1`.
+pub const DFLASH_DENSE_PCUM_MIN_COHORT: usize = 4;
+
+/// Parse `ATLAS_DFLASH_DENSE_PCUM`: exact `"1"` (trimmed) opts in; default OFF.
+#[inline]
+#[must_use]
+pub fn parse_dflash_dense_pcum_opt_in(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+/// Process-lifetime cached gate for `ATLAS_DFLASH_DENSE_PCUM=1` (default OFF).
+#[must_use]
+pub fn dflash_dense_pcum_opt_in() -> bool {
+    let read_live = || std::env::var(DFLASH_DENSE_PCUM_ENV).ok();
+    #[cfg(not(test))]
+    let raw = {
+        static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        RAW.get_or_init(read_live).as_deref()
+    };
+    #[cfg(test)]
+    let raw_owned = read_live();
+    #[cfg(test)]
+    let raw = raw_owned.as_deref();
+    parse_dflash_dense_pcum_opt_in(raw)
+}
+
 /// Whether DFlash2 `p_cum` confidence truncation (and its `batch_out_probs`
 /// D2H readback) should engage for a target model.
 ///
@@ -2746,6 +2828,55 @@ pub fn dflash_pcum_enabled_for_target(target_is_moe: Option<bool>, raw_env: Opti
     !matches!(target_is_moe, Some(false))
 }
 
+/// Context-aware DFlash2 `p_cum` policy supporting opt-in dense 27B truncation
+/// at `cohort_size >= 4` or `inside_thinking` (`ATLAS_DFLASH_DENSE_PCUM=1`)
+/// while keeping dense `C = 1` non-thinking default behavior byte-identical.
+#[must_use]
+pub fn dflash_pcum_enabled_for_target_context(
+    target_is_moe: Option<bool>,
+    cohort_size: usize,
+    inside_thinking: bool,
+    dense_opt_in: bool,
+    explicit_thresh_env: Option<&str>,
+) -> bool {
+    if let Some(trimmed) = explicit_thresh_env.map(str::trim).filter(|s| !s.is_empty())
+        && let Ok(tau) = trimmed.parse::<f32>()
+        && tau.is_finite()
+    {
+        return tau > 0.0;
+    }
+    if !matches!(target_is_moe, Some(false)) {
+        return true;
+    }
+    dense_opt_in && (cohort_size >= DFLASH_DENSE_PCUM_MIN_COHORT || inside_thinking)
+}
+
+/// Runtime wrapper over [`dflash_pcum_enabled_for_target_context`].
+#[must_use]
+pub fn dflash_pcum_enabled_for_target_context_env(
+    target_is_moe: Option<bool>,
+    cohort_size: usize,
+    inside_thinking: bool,
+) -> bool {
+    let read_live = || std::env::var("ATLAS_QWEN4_DFLASH_PCUM_THRESH").ok();
+    #[cfg(not(test))]
+    let raw = {
+        static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        RAW.get_or_init(read_live).as_deref()
+    };
+    #[cfg(test)]
+    let raw_owned = read_live();
+    #[cfg(test)]
+    let raw = raw_owned.as_deref();
+    dflash_pcum_enabled_for_target_context(
+        target_is_moe,
+        cohort_size,
+        inside_thinking,
+        dflash_dense_pcum_opt_in(),
+        raw,
+    )
+}
+
 /// Runtime wrapper over [`dflash_pcum_enabled_for_target`] reading
 /// `ATLAS_QWEN4_DFLASH_PCUM_THRESH`.
 #[must_use]
@@ -2761,6 +2892,14 @@ pub fn dflash_pcum_enabled_for_target_env(target_is_moe: Option<bool>) -> bool {
     #[cfg(test)]
     let raw = raw_owned.as_deref();
     dflash_pcum_enabled_for_target(target_is_moe, raw)
+}
+
+/// True when `batch_out_probs` should be read back alongside draft tokens so
+/// either MoE/explicit `p_cum` or opt-in `ATLAS_DFLASH_DENSE_PCUM=1` can inspect them.
+#[must_use]
+pub fn dflash_pcum_probs_readback_enabled(target_is_moe: Option<bool>) -> bool {
+    dflash_pcum_enabled_for_target_env(target_is_moe)
+        || (matches!(target_is_moe, Some(false)) && dflash_dense_pcum_opt_in())
 }
 
 /// Read `count` little-endian `f32` draft probabilities from `dev_ptr` into
@@ -3393,7 +3532,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                     } else if dstate.pending_tree_payload.is_none()
                         && !dstate.last_draft_probs.is_empty()
                         && dstate.last_draft_probs.len() >= finalized.len()
-                        && dflash_pcum_enabled_for_target_env(self.target_is_moe)
+                        && dflash_pcum_probs_readback_enabled(self.target_is_moe)
                     {
                         // Already packed into `copy_d2h_pair_on_stream` alongside
                         // `draft_tokens_dev` in `forward_block.rs` (zero extra D2H sync).
@@ -3402,7 +3541,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                         && probs_gamma > 0
                         && finalized.len() <= probs_gamma
                         && !self.scratch.batch_out_probs.is_null()
-                        && dflash_pcum_enabled_for_target_env(self.target_is_moe)
+                        && dflash_pcum_probs_readback_enabled(self.target_is_moe)
                     {
                         read_draft_probs_into(
                             ctx.gpu,
@@ -3580,10 +3719,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
             Ok(Some(drafts)) if !drafts.is_empty() && dstate.pending_tree_payload.is_none() => {
                 let probs_gamma = dstate.pending_draft_probs_gamma;
                 dstate.pending_draft_probs_gamma = 0;
-                if probs_gamma > 0
+                if !dstate.last_draft_probs.is_empty() {
+                    // Batched async collection already materialized `last_draft_probs`
+                    // from the double-buffered slot alongside `drafts`.
+                    dstate.last_draft_probs.truncate(drafts.len());
+                } else if probs_gamma > 0
                     && drafts.len() <= probs_gamma
                     && !self.scratch.batch_out_probs.is_null()
-                    && dflash_pcum_enabled_for_target_env(self.target_is_moe)
+                    && dflash_pcum_probs_readback_enabled(self.target_is_moe)
                 {
                     read_draft_probs_into(
                         gpu,
@@ -3621,6 +3764,28 @@ impl DraftProposer for BlockDiffusionDraftHead {
 
     fn arm_propose_overlap(&self, gpu: &dyn GpuBackend, default_stream: u64) -> Result<()> {
         BlockDiffusionDraftHead::arm_propose_overlap(self, gpu, default_stream)
+    }
+
+    fn launch_dflash_early_stage1(
+        &self,
+        gpu: &dyn GpuBackend,
+        dflash_hidden_save: DevicePtr,
+        num_rows: usize,
+        start_pos: usize,
+        capture_done_event: u64,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
+        let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() else {
+            return Ok(());
+        };
+        self.launch_early_stage1_from_capture_event(
+            gpu,
+            dflash_hidden_save,
+            num_rows,
+            start_pos,
+            capture_done_event,
+            dstate,
+        )
     }
 
     fn sync_target_config(
@@ -3875,7 +4040,7 @@ mod seq_buf_pool_tests {
         }
     }
 
-    fn test_draft_head(num_layers: usize) -> Box<BlockDiffusionDraftHead> {
+    pub(super) fn test_draft_head(num_layers: usize) -> Box<BlockDiffusionDraftHead> {
         let k0 = KernelHandle(0);
         let p0 = DevicePtr::NULL;
         let w0 = DenseWeight { weight: p0 };
@@ -3934,6 +4099,7 @@ mod seq_buf_pool_tests {
             fc_proj: p0,
             logits: p0,
             draft_tokens_dev: p0,
+            draft_tokens_dev_alt: p0,
             position_ids: p0,
             topk_tokens_dev: p0,
             topk_logits_dev: p0,
@@ -3963,6 +4129,8 @@ mod seq_buf_pool_tests {
             batch_gumbel_top_ps: p0,
             batch_gumbel_min_ps: p0,
             batch_out_probs: p0,
+            batch_out_probs_alt: p0,
+            early_stage1_fc: p0,
             q_row_bases: p0,
             shared_q_ids: p0,
             shared_q_probs: p0,
@@ -4020,6 +4188,9 @@ mod seq_buf_pool_tests {
             proposal_policy: std::sync::OnceLock::new(),
             quant: DflashQuantization::Bf16,
             async_inflight: Mutex::new(None),
+            async_batched_inflight: Mutex::new(None),
+            async_batch_slot_toggle: std::sync::atomic::AtomicU8::new(0),
+            early_stage1_staged: Mutex::new(None),
             async_propose_stream: std::sync::OnceLock::new(),
             async_order_event: std::sync::atomic::AtomicU64::new(0),
             fused_event_armed: std::sync::atomic::AtomicBool::new(false),
