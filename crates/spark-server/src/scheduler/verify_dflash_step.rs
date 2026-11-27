@@ -1218,6 +1218,8 @@ pub fn step_verify_dflash(
         super::exact_gpu_accept::audit_single_seq_exact_gpu_accept_if_enabled(
             a,
             tokens.len(),
+            think,
+            model.decode_logits_fp32(),
             spark_model::layers::ops::exact_spec_accept::exact_spec_gpu_accept_policy(),
         );
     let rejection_policy = super::stochastic_verify_walk::spec_verify_policy()

@@ -38,7 +38,7 @@ pub const EXACT_SPEC_PREFIX_REDUCE_ENTRY: &str = "exact_spec_prefix_reduce_sm120
 
 /// Environment variable opting into hardened on-GPU exact speculative acceptance.
 ///
-/// Unset, empty, or `"0"` keeps the baseline path byte-identical (default OFF).
+/// Unset or `"0"` keeps the baseline path byte-identical (default OFF).
 pub const SPEC_EXACT_GPU_ACCEPT_ENV: &str = "ATLAS_SPEC_EXACT_GPU_ACCEPT";
 
 /// Maximum sparse draft support width `K` per draft row.
@@ -72,7 +72,7 @@ const PHILOX_W32_1: u32 = 0xBB67_AE85;
 pub enum ExactSpecGpuAcceptEnvError {
     /// Environment value is not valid UTF-8.
     NonUtf8,
-    /// Environment value is neither unset/empty nor strictly `"0"` / `"1"`.
+    /// Environment value is present but neither strictly `"0"` nor `"1"`.
     InvalidValue(String),
 }
 
@@ -104,9 +104,9 @@ pub enum ExactSpecGpuAcceptPolicy {
 
 /// Strictly parse an optional OS string for `ATLAS_SPEC_EXACT_GPU_ACCEPT`.
 ///
-/// - `None`, `""`, or `"0"` -> `Ok(Disabled)`.
+/// - `None` or `"0"` -> `Ok(Disabled)`.
 /// - `"1"` -> `Ok(Enabled)`.
-/// - Non-UTF-8 or any other value -> `Err(...)` (fail closed).
+/// - Empty `""`, non-UTF-8, or any other value -> `Err(...)` (strict `ZERO_OR_ONE`, fail closed).
 pub fn parse_exact_spec_gpu_accept_os(
     raw: Option<&OsStr>,
 ) -> std::result::Result<ExactSpecGpuAcceptPolicy, ExactSpecGpuAcceptEnvError> {
@@ -115,7 +115,7 @@ pub fn parse_exact_spec_gpu_accept_os(
     };
     let utf8 = os_val.to_str().ok_or(ExactSpecGpuAcceptEnvError::NonUtf8)?;
     match utf8 {
-        "" | "0" => Ok(ExactSpecGpuAcceptPolicy::Disabled),
+        "0" => Ok(ExactSpecGpuAcceptPolicy::Disabled),
         "1" => Ok(ExactSpecGpuAcceptPolicy::Enabled),
         other => Err(ExactSpecGpuAcceptEnvError::InvalidValue(other.to_owned())),
     }
@@ -1588,10 +1588,6 @@ mod tests {
             ExactSpecGpuAcceptPolicy::Disabled
         );
         assert_eq!(
-            parse_exact_spec_gpu_accept_os(Some(OsStr::new(""))).unwrap(),
-            ExactSpecGpuAcceptPolicy::Disabled
-        );
-        assert_eq!(
             parse_exact_spec_gpu_accept_os(Some(OsStr::new("0"))).unwrap(),
             ExactSpecGpuAcceptPolicy::Disabled
         );
@@ -1599,7 +1595,7 @@ mod tests {
             parse_exact_spec_gpu_accept_os(Some(OsStr::new("1"))).unwrap(),
             ExactSpecGpuAcceptPolicy::Enabled
         );
-        for bad in [" 1 ", "true", "on", "2", "-1", "yes"] {
+        for bad in ["", " ", " 1 ", "true", "on", "2", "-1", "yes"] {
             assert_eq!(
                 parse_exact_spec_gpu_accept_os(Some(OsStr::new(bad))),
                 Err(ExactSpecGpuAcceptEnvError::InvalidValue(bad.to_owned())),

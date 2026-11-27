@@ -13,6 +13,7 @@ use spark_model::layers::ops::exact_spec_accept::{
     EXACT_SPEC_MAX_WIDTH, ExactSpecGpuAcceptPolicy, ExactSpecSlotGuard, validate_slot_guards_host,
 };
 
+use super::think_spec_accept::ThinkSpecCtx;
 use super::types::ActiveSeq;
 
 /// Fail-closed scheduler admission decision for `exact_spec_accept_sm120`.
@@ -22,27 +23,32 @@ pub(super) enum ExactGpuAcceptEligibility {
     Eligible,
     /// `ATLAS_SPEC_EXACT_GPU_ACCEPT` is disabled (default OFF).
     Disabled,
-    /// Sampling parameters are greedy, non-finite, or include unsupported
-    /// truncation filters (`top_k`, `top_p`, `top_n_sigma`, `min_p`).
+    /// Sampling parameters are greedy, non-finite, missing a Philox seed, or
+    /// include unsupported truncation filters (`top_k`, `top_p`, `top_n_sigma`,
+    /// `min_p`).
     UnsupportedSampling,
     /// Verify window width `W` is outside `1..=16`.
     UnsupportedWidth,
-    /// Sequence carries unsupported modifiers (repetition/DRY/LZ penalties,
-    /// logit bias, grammar, logprobs, DDTree payload, min-tokens, tool masks,
-    /// or is already finished).
+    /// Sequence or runtime carries unsupported modifiers (windowed penalties,
+    /// repetition/DRY/LZ penalties, logit bias, grammar, logprobs, DDTree
+    /// payload, min-tokens, think/tool/nudge/adaptive/dsv41/receipt policies,
+    /// FP32 decode logits, or is already finished).
     UnsupportedModifiers,
 }
 
 /// Evaluate whether `a` is eligible for hardened on-GPU exact acceptance over a
 /// verify window of width `verify_width` under `policy`.
 ///
-/// Strictly fail-closed: admits only finite positive-temperature sampling whose
-/// exact target distribution is fully captured by `exact_spec_accept_sparse_sm120`
-/// (temperature scaling plus prefix-aware presence & frequency penalties).
+/// Strictly fail-closed: admits only finite positive-temperature, explicitly
+/// seeded BF16-logit sampling whose exact target distribution is fully captured
+/// by `exact_spec_accept_sparse_sm120` (temperature scaling plus full-history
+/// prefix-aware presence & frequency penalties).
 #[must_use]
 pub(super) fn evaluate_exact_gpu_accept_eligibility(
     a: &ActiveSeq,
     verify_width: usize,
+    think: &ThinkSpecCtx<'_>,
+    logits_fp32: bool,
     policy: ExactSpecGpuAcceptPolicy,
 ) -> ExactGpuAcceptEligibility {
     if policy != ExactSpecGpuAcceptPolicy::Enabled {
@@ -57,15 +63,32 @@ pub(super) fn evaluate_exact_gpu_accept_eligibility(
         || !a.frequency_penalty.is_finite()
         || a.top_k != 0
         || !a.top_p.is_finite()
-        || a.top_p < 1.0
+        || a.top_p != 1.0
         || !a.top_n_sigma.is_finite()
-        || a.top_n_sigma > 0.0
+        || a.top_n_sigma != 0.0
         || !a.min_p.is_finite()
-        || a.min_p > 0.0
+        || a.min_p != 0.0
+        || a.seed.is_none()
     {
         return ExactGpuAcceptEligibility::UnsupportedSampling;
     }
-    if a.finished
+    let windowed_history_penalty = (a.presence_penalty != 0.0 || a.frequency_penalty != 0.0)
+        && a.repetition_penalty_window != 0;
+    if logits_fp32
+        || windowed_history_penalty
+        || a.inside_thinking
+        || a.think_ended
+        || a.think_just_ended
+        || a.force_end_thinking
+        || a.budget_nudge.is_some()
+        || super::think_nudge::forced_token(a).is_some()
+        || super::think_budget_nudge::forced_token(a).is_some()
+        || think.adaptive_sampling
+        || super::decode_logits_seq::logits_fnv_requires_row()
+        || super::logits_row_receipt::enabled()
+        || crate::dsv41::serving()
+        || crate::dsv41::repetition::active()
+        || a.finished
         || !a.repetition_penalty.is_finite()
         || a.repetition_penalty != 1.0
         || !a.lz_penalty.is_finite()
@@ -88,8 +111,12 @@ pub(super) fn evaluate_exact_gpu_accept_eligibility(
 /// Construct the physical slot ownership guard for `a` before launching
 /// `exact_spec_prefix_reduce_sm120`.
 ///
+/// Consumed exclusively by callers holding real pool generations and refcounts
+/// (never fabricated by diagnostic hooks).
+///
 /// # Errors
 /// Fails closed if `a.seq.slot_idx` exceeds `u32::MAX`.
+#[allow(dead_code)]
 pub(super) fn build_slot_guard(
     a: &ActiveSeq,
     slot_generation: u64,
@@ -109,9 +136,12 @@ pub(super) fn build_slot_guard(
 /// Validate that every sequence in a batch holds an exclusive (`refcount == 1`),
 /// generation-matched, pairwise-distinct physical slot before zero-host-sync commit.
 ///
+/// Consumed exclusively by callers supplying real pool generations and refcounts.
+///
 /// # Errors
 /// Returns an error identifying the first lane that violated `Generation` or
 /// `sharing <= 1`.
+#[allow(dead_code)]
 pub(super) fn validate_batch_slot_guards(guards: &[ExactSpecSlotGuard]) -> Result<()> {
     ensure!(!guards.is_empty(), "empty exact GPU accept batch");
     let statuses = validate_slot_guards_host(guards);
@@ -133,19 +163,17 @@ pub(super) fn validate_batch_slot_guards(guards: &[ExactSpecSlotGuard]) -> Resul
 pub(super) fn audit_single_seq_exact_gpu_accept_if_enabled(
     a: &ActiveSeq,
     verify_width: usize,
+    think: &ThinkSpecCtx<'_>,
+    logits_fp32: bool,
     policy: ExactSpecGpuAcceptPolicy,
 ) -> ExactGpuAcceptEligibility {
-    let eligibility = evaluate_exact_gpu_accept_eligibility(a, verify_width, policy);
+    let eligibility =
+        evaluate_exact_gpu_accept_eligibility(a, verify_width, think, logits_fp32, policy);
     if policy == ExactSpecGpuAcceptPolicy::Enabled {
-        let slot_guard = build_slot_guard(a, 1, 1, 1);
-        let guard_ok = slot_guard
-            .as_ref()
-            .is_ok_and(|g| validate_batch_slot_guards(&[*g]).is_ok());
         tracing::debug!(
             slot_idx = a.seq.slot_idx,
             verify_width,
             ?eligibility,
-            guard_ok,
             "ATLAS_SPEC_EXACT_GPU_ACCEPT single-seq verify admission audit"
         );
     }
@@ -154,6 +182,8 @@ pub(super) fn audit_single_seq_exact_gpu_accept_if_enabled(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use spark_model::layers::ops::exact_spec_accept::{
         CpuExactSpecRowInput, CpuExactSpecRowKind, EXACT_SPEC_INVALID_TOKEN, ExactGpuAcceptOutcome,
         ExactSpecStatus, cpu_exact_spec_accept_sparse_row, cpu_exact_spec_prefix_reduce,
@@ -162,7 +192,18 @@ mod tests {
 
     use super::*;
     use crate::scheduler::test_fixtures;
+    use crate::scheduler::think_budget_nudge::BudgetNudge;
     use crate::scheduler::types::ResponseSink;
+
+    fn neutral_think_ctx() -> ThinkSpecCtx<'static> {
+        ThinkSpecCtx {
+            enabled: true,
+            code_fence_token: None,
+            reflection_suppress_ids: &[],
+            adaptive_sampling: false,
+            honor_eos_inside_thinking: None,
+        }
+    }
 
     fn sampled_active_seq(slot: usize) -> ActiveSeq {
         let (tx, _rx) = tokio::sync::oneshot::channel();
@@ -170,28 +211,38 @@ mod tests {
         a.temperature = 0.8;
         a.presence_penalty = 0.25;
         a.frequency_penalty = 0.1;
+        a.repetition_penalty_window = 0;
+        a.think_ended = false;
+        a.seed = Some(0xCAFE_BABE_0000_0001);
         a
     }
 
     #[test]
     fn admission_defaults_off_and_rejects_every_unsupported_modifier() {
+        let think = neutral_think_ctx();
         let base = sampled_active_seq(0);
         assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&base, 8, ExactSpecGpuAcceptPolicy::Disabled),
+            evaluate_exact_gpu_accept_eligibility(
+                &base,
+                8,
+                &think,
+                false,
+                ExactSpecGpuAcceptPolicy::Disabled
+            ),
             ExactGpuAcceptEligibility::Disabled
         );
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&base, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::Eligible
-        );
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&base, 1, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::Eligible
-        );
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&base, 16, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::Eligible
-        );
+        for w in [1_usize, 8, 16] {
+            assert_eq!(
+                evaluate_exact_gpu_accept_eligibility(
+                    &base,
+                    w,
+                    &think,
+                    false,
+                    ExactSpecGpuAcceptPolicy::Enabled
+                ),
+                ExactGpuAcceptEligibility::Eligible
+            );
+        }
 
         // Width outside 1..=16.
         for bad_w in [0_usize, 17, 32] {
@@ -199,75 +250,139 @@ mod tests {
                 evaluate_exact_gpu_accept_eligibility(
                     &base,
                     bad_w,
+                    &think,
+                    false,
                     ExactSpecGpuAcceptPolicy::Enabled
                 ),
                 ExactGpuAcceptEligibility::UnsupportedWidth
             );
         }
 
-        // Greedy / invalid temp / top_k / top_p / min_p / top_n_sigma.
-        let mut s = sampled_active_seq(0);
-        s.temperature = 0.0;
+        // Sampling disqualifiers: greedy, non-finite, top_k, top_p != 1.0,
+        // top_n_sigma != 0.0, min_p != 0.0, missing Philox seed.
+        for mutate in [
+            (|s: &mut ActiveSeq| s.temperature = 0.0) as fn(&mut ActiveSeq),
+            |s| s.temperature = f32::NAN,
+            |s| s.top_k = 40,
+            |s| s.top_p = 0.95,
+            |s| s.top_p = 1.5,
+            |s| s.top_n_sigma = 1.0,
+            |s| s.top_n_sigma = -0.5,
+            |s| s.min_p = 0.05,
+            |s| s.min_p = -0.1,
+            |s| s.seed = None,
+        ] {
+            let mut s = sampled_active_seq(0);
+            mutate(&mut s);
+            assert_eq!(
+                evaluate_exact_gpu_accept_eligibility(
+                    &s,
+                    8,
+                    &think,
+                    false,
+                    ExactSpecGpuAcceptPolicy::Enabled
+                ),
+                ExactGpuAcceptEligibility::UnsupportedSampling
+            );
+        }
+
+        // Windowed presence/frequency penalties must fail closed while
+        // neutral zero penalties with a non-zero window remain eligible.
+        let mut win_pres = sampled_active_seq(0);
+        win_pres.frequency_penalty = 0.0;
+        win_pres.repetition_penalty_window = 64;
         assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&s, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedSampling
+            evaluate_exact_gpu_accept_eligibility(
+                &win_pres,
+                8,
+                &think,
+                false,
+                ExactSpecGpuAcceptPolicy::Enabled
+            ),
+            ExactGpuAcceptEligibility::UnsupportedModifiers
         );
-        s.temperature = 0.8;
-        s.top_k = 40;
+        let mut win_freq = sampled_active_seq(0);
+        win_freq.presence_penalty = 0.0;
+        win_freq.repetition_penalty_window = 64;
         assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&s, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedSampling
+            evaluate_exact_gpu_accept_eligibility(
+                &win_freq,
+                8,
+                &think,
+                false,
+                ExactSpecGpuAcceptPolicy::Enabled
+            ),
+            ExactGpuAcceptEligibility::UnsupportedModifiers
         );
-        s.top_k = 0;
-        s.top_p = 0.95;
+        let mut win_zero_pen = sampled_active_seq(0);
+        win_zero_pen.presence_penalty = 0.0;
+        win_zero_pen.frequency_penalty = 0.0;
+        win_zero_pen.repetition_penalty_window = 64;
         assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&s, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedSampling
-        );
-        s.top_p = 1.0;
-        s.min_p = 0.05;
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&s, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedSampling
+            evaluate_exact_gpu_accept_eligibility(
+                &win_zero_pen,
+                8,
+                &think,
+                false,
+                ExactSpecGpuAcceptPolicy::Enabled
+            ),
+            ExactGpuAcceptEligibility::Eligible
         );
 
-        // Repetition / DRY / LZ penalties, logit_bias, logprobs, finished.
-        let mut m = sampled_active_seq(0);
-        m.repetition_penalty = 1.1;
+        // FP32 decode logits and adaptive sampling must fail closed.
         assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&m, 8, ExactSpecGpuAcceptPolicy::Enabled),
+            evaluate_exact_gpu_accept_eligibility(
+                &base,
+                8,
+                &think,
+                true,
+                ExactSpecGpuAcceptPolicy::Enabled
+            ),
             ExactGpuAcceptEligibility::UnsupportedModifiers
         );
-        m.repetition_penalty = 1.0;
-        m.dry_multiplier = 0.5;
+        let mut adaptive_think = neutral_think_ctx();
+        adaptive_think.adaptive_sampling = true;
         assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&m, 8, ExactSpecGpuAcceptPolicy::Enabled),
+            evaluate_exact_gpu_accept_eligibility(
+                &base,
+                8,
+                &adaptive_think,
+                false,
+                ExactSpecGpuAcceptPolicy::Enabled
+            ),
             ExactGpuAcceptEligibility::UnsupportedModifiers
         );
-        m.dry_multiplier = 0.0;
-        m.lz_penalty = 0.2;
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&m, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedModifiers
-        );
-        m.lz_penalty = 0.0;
-        m.logit_bias.push((42, -5.0));
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&m, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedModifiers
-        );
-        m.logit_bias.clear();
-        m.top_logprobs = Some(5);
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&m, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedModifiers
-        );
-        m.top_logprobs = None;
-        m.finished = true;
-        assert_eq!(
-            evaluate_exact_gpu_accept_eligibility(&m, 8, ExactSpecGpuAcceptPolicy::Enabled),
-            ExactGpuAcceptEligibility::UnsupportedModifiers
-        );
+
+        // Think / nudge / penalty / bias / logprobs / tool / min-token / finished modifiers.
+        for mutate in [
+            (|m: &mut ActiveSeq| m.inside_thinking = true) as fn(&mut ActiveSeq),
+            |m| m.think_ended = true,
+            |m| m.think_just_ended = true,
+            |m| m.force_end_thinking = true,
+            |m| m.budget_nudge = BudgetNudge::plan(Some(Arc::from([10_u32, 11])), 1, 100),
+            |m| m.repetition_penalty = 1.1,
+            |m| m.dry_multiplier = 0.5,
+            |m| m.lz_penalty = 0.2,
+            |m| m.logit_bias.push((42, -5.0)),
+            |m| m.top_logprobs = Some(5),
+            |m| m.suppress_tool_call = true,
+            |m| m.require_tool_call = true,
+            |m| m.min_tokens = m.output_tokens.len() + 1,
+            |m| m.finished = true,
+        ] {
+            let mut m = sampled_active_seq(0);
+            mutate(&mut m);
+            assert_eq!(
+                evaluate_exact_gpu_accept_eligibility(
+                    &m,
+                    8,
+                    &think,
+                    false,
+                    ExactSpecGpuAcceptPolicy::Enabled
+                ),
+                ExactGpuAcceptEligibility::UnsupportedModifiers
+            );
+        }
     }
 
     #[test]
@@ -345,9 +460,16 @@ mod tests {
 
     #[test]
     fn scheduler_end_to_end_oracle_roundtrip_matches_interpret_outcome() {
+        let think = neutral_think_ctx();
         let a = sampled_active_seq(1);
         assert_eq!(
-            audit_single_seq_exact_gpu_accept_if_enabled(&a, 2, ExactSpecGpuAcceptPolicy::Enabled),
+            audit_single_seq_exact_gpu_accept_if_enabled(
+                &a,
+                2,
+                &think,
+                false,
+                ExactSpecGpuAcceptPolicy::Enabled
+            ),
             ExactGpuAcceptEligibility::Eligible
         );
         let guard = build_slot_guard(&a, 7, 7, 1).unwrap();
@@ -364,7 +486,7 @@ mod tests {
             },
             prefix_tokens: &[],
             pre_verify_counts: None,
-            seed: 12345,
+            seed: a.seed.unwrap(),
             abs_pos: 50,
             temperature: a.temperature,
             presence_penalty: a.presence_penalty,
@@ -375,7 +497,7 @@ mod tests {
             kind: CpuExactSpecRowKind::Bonus,
             prefix_tokens: &[1],
             pre_verify_counts: None,
-            seed: 12345,
+            seed: a.seed.unwrap(),
             abs_pos: 51,
             temperature: a.temperature,
             presence_penalty: a.presence_penalty,
