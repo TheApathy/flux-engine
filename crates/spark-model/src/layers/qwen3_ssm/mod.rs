@@ -301,6 +301,12 @@ pub struct Qwen3SsmLayer {
     /// `ATLAS_QWEN4_GDN_KEEP_LATE` is active. Lazily allocated on first engaged
     /// dispatch (or pre-allocated outside CUDA graph capture).
     gdn_lazy_retain: std::sync::OnceLock<GdnLazyRetainPool>,
+    /// Optional SM120/SM121 1D GDN correction-record verify & device-driven
+    /// cross-layer replay commit kernels (`ATLAS_GDN_1D_REPLAY=1`, default OFF).
+    gdn_1d_replay_k: ops::GdnCorrectionReplayKernels,
+    /// Lazy per-layer 1D correction-record arena (`delta`, `k`, `decay`),
+    /// `63.75x`-`95.4x` smaller than 2D `h_state_intermediates`.
+    gdn_1d_replay_arena: std::sync::Mutex<Option<gdn_1d_replay::Gdn1dReplayArena>>,
     ba_gates_k: KernelHandle,
     residual_add_k: KernelHandle,
     l2_norm_k: KernelHandle,
@@ -555,6 +561,7 @@ mod exact_projection;
 mod exact_projection_tests;
 #[cfg(test)]
 mod flashinfer_prefill_tests;
+pub mod gdn_1d_replay;
 mod init;
 #[cfg(test)]
 mod prefill_gdn_gatecache_tests;
@@ -1255,6 +1262,18 @@ impl TransformerLayer for Qwen3SsmLayer {
         // A lane past the count this buffer was built with has no retain
         // storage; the commit then fails closed ("retention buffer missing").
         (lane < pool.lanes).then(|| pool.retain_active_ptr(lane))
+    }
+
+    fn gdn_1d_replay_commit_desc(&self) -> Result<Option<ops::GdnCommitSlotDesc>> {
+        self.try_current_gdn_1d_commit_desc()
+    }
+
+    fn gdn_1d_replay_invalidate_generation(&self) -> Result<()> {
+        self.invalidate_gdn_1d_replay_generation()
+    }
+
+    fn gdn_1d_replay_commit_kernel(&self) -> KernelHandle {
+        self.gdn_1d_replay_k.commit_replay_1d
     }
 
     fn gdn_keep_late_supported(&self) -> bool {

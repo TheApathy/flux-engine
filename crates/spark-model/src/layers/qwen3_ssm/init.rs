@@ -387,6 +387,8 @@ impl Qwen3SsmLayer {
             gdn_fused_split_done_stride,
             gdn_fused_split_done,
             gdn_lazy_retain: std::sync::OnceLock::new(),
+            gdn_1d_replay_k: ops::GdnCorrectionReplayKernels::load_optional(gpu),
+            gdn_1d_replay_arena: std::sync::Mutex::new(None),
             ba_gates_k: gpu.kernel("ssm_preprocess", "dense_gemv_ba_gates")?,
             residual_add_k: if config.use_fp32_residual() {
                 gpu.kernel("norm", "f32_residual_add")
