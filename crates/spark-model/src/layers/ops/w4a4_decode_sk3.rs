@@ -7,10 +7,12 @@
 //! CUDA entrypoints live in `kernels/gb10/common/w4a4_decode_roofline_sm120.cu`
 //! (auto-discovered by `atlas-kernels` under module `"w4a4_decode_roofline_sm120"`):
 //! - `w4a4_gemm_m16_sk3_sm120`: native Blackwell `m16n8k64.scale_vec::4X`
-//!   NVFP4xNVFP4 decode GEMM (`M_TILE=16, N_TILE=64, K_STEP=64`, 2-stage
-//!   register pipeline, `LDG.E.EF.128` weights, `LDG.E.128.CONSTANT` activations,
-//!   3-op branchless SWAR E2M1 `-0.0 -> +0.0` canonicalization, exact scalar
-//!   fallback on `sm_103a`, zero `atomicAdd`).
+//!   register-direct NVFP4xNVFP4 decode GEMM (`M_TILE=16, N_TILE=64,
+//!   K_SUPER=128` + `K=64` tail, `0 B` SMEM, `0` `__syncthreads()`, static
+//!   3-stage register ring, 4x4 intra-quad `SHFL.BFLY` transpose,
+//!   `LDG.E.EF.128` weights, L1-cached `L2::evict_first` weight scales,
+//!   `LDG.E.128.CONSTANT` activations, 3-op branchless SWAR E2M1 `-0.0 -> +0.0`
+//!   canonicalization, exact scalar fallback on `sm_103a`, zero `atomicAdd`).
 //! - `reduce_w4a4_sk3_bf16_sm120`: fixed ascending-order (`s = 0..split_k-1`)
 //!   FP32 workspace reduction + `scale2_ab` multiply + explicit inline PTX
 //!   `cvt.rn.bf16.f32`.
@@ -1616,7 +1618,10 @@ mod tests {
         assert!(cu.contains("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."));
         assert!(cu.contains("m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3"));
         assert!(cu.contains("ld.global.cs.L2::cache_hint.v4.u32"));
+        assert!(cu.contains("ld.global.nc.L2::cache_hint.u32"));
         assert!(cu.contains("ld.global.nc.v4.u32"));
+        assert!(cu.contains("w4sk_quad_transpose_4x4"));
+        assert!(cu.contains("__shfl_xor_sync"));
         assert!(cu.contains("cvt.rn.bf16.f32"));
         assert!(cu.contains("0x77777777u"));
         // Check zero actual atomicAdd instructions in executable code (ignore comments).
@@ -1626,6 +1631,609 @@ mod tests {
                 !code.contains("atomicAdd"),
                 "non-deterministic atomicAdd found in CUDA kernel: {line}"
             );
+        }
+        // Register-direct SM120+ path must use ZERO __shared__ arrays and ZERO __syncthreads().
+        let sm120_fn = cu
+            .split("void w4a4_gemm_m16_sk3_sm120(")
+            .nth(1)
+            .expect("w4a4_gemm_m16_sk3_sm120 body");
+        let sm120_branch = sm120_fn
+            .split("#if __CUDA_ARCH__ >= 1200")
+            .nth(1)
+            .expect("SM120+ branch")
+            .split("#else")
+            .next()
+            .expect("SM120+ branch before #else");
+        for line in sm120_branch.lines() {
+            let code = line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("__shared__"),
+                "SM120+ register-direct path must not allocate SMEM: {line}"
+            );
+            assert!(
+                !code.contains("__syncthreads"),
+                "SM120+ register-direct path must not call __syncthreads: {line}"
+            );
+        }
+    }
+
+    /// Exact 4-lane Rust mirror of `w4sk_quad_transpose_4x4` in
+    /// `kernels/gb10/common/w4a4_decode_roofline_sm120.cu`.
+    fn sim_quad_transpose_4x4(v: [[u32; 4]; 4]) -> [[u32; 4]; 4] {
+        let mut e0 = [0u32; 4];
+        let mut e1 = [0u32; 4];
+        let mut k0 = [0u32; 4];
+        let mut k1 = [0u32; 4];
+        for tid in 0..4 {
+            let p1 = (tid & 1) != 0;
+            e0[tid] = if p1 { v[tid][0] } else { v[tid][1] };
+            e1[tid] = if p1 { v[tid][2] } else { v[tid][3] };
+            k0[tid] = if p1 { v[tid][1] } else { v[tid][0] };
+            k1[tid] = if p1 { v[tid][3] } else { v[tid][2] };
+        }
+        let mut t00 = [0u32; 4];
+        let mut t10 = [0u32; 4];
+        let mut t01 = [0u32; 4];
+        let mut t11 = [0u32; 4];
+        for tid in 0..4 {
+            let p1 = (tid & 1) != 0;
+            let r0 = e0[tid ^ 1];
+            let r1 = e1[tid ^ 1];
+            t00[tid] = if p1 { r0 } else { k0[tid] };
+            t10[tid] = if p1 { k0[tid] } else { r0 };
+            t01[tid] = if p1 { r1 } else { k1[tid] };
+            t11[tid] = if p1 { k1[tid] } else { r1 };
+        }
+        let mut s0 = [0u32; 4];
+        let mut s1 = [0u32; 4];
+        for tid in 0..4 {
+            let p2 = (tid & 2) != 0;
+            s0[tid] = if p2 { t00[tid] } else { t01[tid] };
+            s1[tid] = if p2 { t10[tid] } else { t11[tid] };
+        }
+        let mut out = [[0u32; 4]; 4];
+        for tid in 0..4 {
+            let p2 = (tid & 2) != 0;
+            let q0 = s0[tid ^ 2];
+            let q1 = s1[tid ^ 2];
+            out[tid][0] = if p2 { q0 } else { t00[tid] };
+            out[tid][1] = if p2 { q1 } else { t10[tid] };
+            out[tid][2] = if p2 { t01[tid] } else { q0 };
+            out[tid][3] = if p2 { t11[tid] } else { q1 };
+        }
+        out
+    }
+
+    #[test]
+    fn quad_transpose_4x4_and_k64_tail_are_bit_exact() {
+        // Full K_SUPER = 128 (64 bytes = 16 u32 words per row across 4 lanes).
+        let mut row = [0u32; 16];
+        for (i, slot) in row.iter_mut().enumerate() {
+            *slot = 0xA500_0000u32 ^ ((i as u32) * 0x0101_0101u32) ^ ((i as u32) << 12);
+        }
+        let mut v_full = [[0u32; 4]; 4];
+        for tid in 0..4 {
+            v_full[tid].copy_from_slice(&row[tid * 4..tid * 4 + 4]);
+        }
+        let tr = sim_quad_transpose_4x4(v_full);
+        for tid in 0..4 {
+            assert_eq!(tr[tid][0], row[tid], "k0 lo word mismatch at tid={tid}");
+            assert_eq!(tr[tid][1], row[4 + tid], "k0 hi word mismatch at tid={tid}");
+            assert_eq!(tr[tid][2], row[8 + tid], "k1 lo word mismatch at tid={tid}");
+            assert_eq!(
+                tr[tid][3],
+                row[12 + tid],
+                "k1 hi word mismatch at tid={tid}"
+            );
+        }
+
+        // K = 64 odd-tile tail (only tid < 2 loads 16B each; tid >= 2 supplies 0).
+        let mut v_tail = [[0u32; 4]; 4];
+        for tid in 0..2 {
+            v_tail[tid].copy_from_slice(&row[tid * 4..tid * 4 + 4]);
+        }
+        let tr_tail = sim_quad_transpose_4x4(v_tail);
+        for tid in 0..4 {
+            assert_eq!(
+                tr_tail[tid][0], row[tid],
+                "tail lo word mismatch at tid={tid}"
+            );
+            assert_eq!(
+                tr_tail[tid][1],
+                row[4 + tid],
+                "tail hi word mismatch at tid={tid}"
+            );
+            assert_eq!(
+                tr_tail[tid][2], 0u32,
+                "tail unused c2 must be 0 at tid={tid}"
+            );
+            assert_eq!(
+                tr_tail[tid][3], 0u32,
+                "tail unused c3 must be 0 at tid={tid}"
+            );
+        }
+    }
+
+    /// Exact 32-lane warp-level simulator of the register-direct v2 SM120+ kernel
+    /// (`w4a4_gemm_m16_sk3_sm120`): mirrors the static 3-stage ring, `row8_stride`,
+    /// `B_scale`/`A_scale` quad-packed loads + shuffles, `has_hi_rows`,
+    /// `w4sk_quad_transpose_4x4`, SWAR `-0.0 -> +0.0`, and `K=64` odd-tile tail,
+    /// with strict slice bounds checking on every simulated global load.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn sim_v2_regdirect_stage1(
+        a_packed: &[u8],
+        a_scale: &[u8],
+        b_packed: &[u8],
+        b_scale: &[u8],
+        m: u32,
+        n: u32,
+        k: u32,
+        split_k: u32,
+    ) -> Vec<f32> {
+        let half_k = (k / 2) as usize;
+        let num_groups = (k / 16) as usize;
+        let row8_stride = half_k * 8;
+        let num_k_tiles = k / 64;
+        let mut ws = vec![0.0f32; (split_k * m * n) as usize];
+
+        let read_u4 = |buf: &[u8], off: usize| -> [u32; 4] {
+            let mut out = [0u32; 4];
+            for (i, slot) in out.iter_mut().enumerate() {
+                let p = off + i * 4;
+                *slot = u32::from_le_bytes(buf[p..p + 4].try_into().expect("in-bounds u4"));
+            }
+            out
+        };
+        let read_u32 = |buf: &[u8], off: usize| -> u32 {
+            u32::from_le_bytes(buf[off..off + 4].try_into().expect("in-bounds u32"))
+        };
+        let canon_u4 = |v: [u32; 4]| -> [u32; 4] {
+            [
+                canon_e2m1_u32_cpu(v[0]),
+                canon_e2m1_u32_cpu(v[1]),
+                canon_e2m1_u32_cpu(v[2]),
+                canon_e2m1_u32_cpu(v[3]),
+            ]
+        };
+        // Exact m16n8k64.scale_vec::4X accumulator over one warp's (a0..a3, b0..b1, sfa, sfb).
+        let mma_m16n8k64_warp = |acc: &mut [[f32; 4]; 32],
+                                 a0: &[u32; 32],
+                                 a1: &[u32; 32],
+                                 a2: &[u32; 32],
+                                 a3: &[u32; 32],
+                                 b0: &[u32; 32],
+                                 b1: &[u32; 32],
+                                 sfa: &[u32; 32],
+                                 sfb: &[u32; 32]| {
+            for r in 0..16usize {
+                let g_a = r & 7;
+                let hi_a = (r >> 3) != 0;
+                // Reconstruct the 64-K row from the 4 lanes of quad g_a:
+                let mut a_words = [0u32; 8];
+                for tid in 0..4 {
+                    let lane = g_a * 4 + tid;
+                    a_words[tid] = if hi_a { a1[lane] } else { a0[lane] };
+                    a_words[4 + tid] = if hi_a { a3[lane] } else { a2[lane] };
+                }
+                let sfa_lane = g_a * 4 + usize::from(hi_a);
+                let as_w = sfa[sfa_lane];
+                // Verify hardware contract: both even (tid=0,2) or odd (tid=1,3) lanes carry identical sfa.
+                assert_eq!(sfa[sfa_lane], sfa[sfa_lane + 2]);
+
+                for c in 0..8usize {
+                    let mut b_words = [0u32; 8];
+                    for tid in 0..4 {
+                        let lane = c * 4 + tid;
+                        b_words[tid] = b0[lane];
+                        b_words[4 + tid] = b1[lane];
+                    }
+                    let bs_w = sfb[c * 4];
+                    for tid in 1..4 {
+                        assert_eq!(sfb[c * 4 + tid], bs_w);
+                    }
+                    let mut tile_sum = 0.0f32;
+                    for grp in 0..4 {
+                        let sa = e4m3_byte_to_f32(((as_w >> (grp * 8)) & 0x7F) as u8);
+                        let sb = e4m3_byte_to_f32(((bs_w >> (grp * 8)) & 0x7F) as u8);
+                        let mut g_dot = 0.0f32;
+                        for wi in 0..2 {
+                            let aw = a_words[grp * 2 + wi];
+                            let bw = b_words[grp * 2 + wi];
+                            for nib in 0..8 {
+                                let an = ((aw >> (nib * 4)) & 0xF) as usize;
+                                let bn = ((bw >> (nib * 4)) & 0xF) as usize;
+                                g_dot += DUAL_PLANE_E2M1_LUT[an] * DUAL_PLANE_E2M1_LUT[bn];
+                            }
+                        }
+                        tile_sum += g_dot * (sa * sb);
+                    }
+                    // Store into the MMA output lane `(group_id=r&7, tid=c>>1, reg=(hi_a<<1)|(c&1))`.
+                    let out_lane = (r & 7) * 4 + (c >> 1);
+                    let out_reg = (usize::from(hi_a) << 1) | (c & 1);
+                    acc[out_lane][out_reg] += tile_sum;
+                }
+            }
+        };
+
+        #[derive(Clone, Copy, Default)]
+        struct WarpStage {
+            b0: [[u32; 4]; 32],
+            b1: [[u32; 4]; 32],
+            bs: [u32; 32],
+        }
+
+        let n_tiles = div_ceil(n, 64);
+        for sk in 0..split_k {
+            let tile_begin = (sk * num_k_tiles) / split_k;
+            let tile_end = ((sk + 1) * num_k_tiles) / split_k;
+            let k_begin = tile_begin * 64;
+            let slice_tiles = tile_end - tile_begin;
+            let num_super = slice_tiles >> 1;
+            let has_tail = (slice_tiles & 1) != 0;
+            let has_hi_rows = m > 8;
+
+            for bx in 0..n_tiles {
+                let cta_n = bx * 64;
+                for warp_id in 0..4u32 {
+                    let warp_n = cta_n + warp_id * 16;
+                    let mut b0_off = [0usize; 32];
+                    let mut bs_off = [0usize; 32];
+                    let mut a0_off = [0usize; 32];
+                    let mut as_off = [0usize; 32];
+                    let mut b0_valid = [false; 32];
+                    let mut b1_valid = [false; 32];
+                    let mut bs_valid = [false; 32];
+                    let mut a0_valid = [false; 32];
+                    let mut a1_valid = [false; 32];
+                    let mut as_valid = [false; 32];
+
+                    for lane in 0..32usize {
+                        let group_id = (lane >> 2) as u32;
+                        let tid = (lane & 3) as u32;
+                        let b0_gn = warp_n + group_id;
+                        let b1_gn = b0_gn + 8;
+                        let bs_gn = warp_n + ((tid >> 1) << 3) + group_id;
+                        let fr0 = group_id;
+                        let fr1 = group_id + 8;
+                        let as_row = group_id + ((tid & 1) << 3);
+
+                        b0_valid[lane] = b0_gn < n;
+                        b1_valid[lane] = b1_gn < n;
+                        bs_valid[lane] = bs_gn < n;
+                        a0_valid[lane] = fr0 < m;
+                        a1_valid[lane] = fr1 < m;
+                        as_valid[lane] = as_row < m;
+
+                        let k0_byte = (k_begin as usize >> 1) + ((tid as usize) << 4);
+                        let g0_base = k_begin as usize >> 4;
+                        if b0_valid[lane] {
+                            b0_off[lane] = b0_gn as usize * half_k + k0_byte;
+                        }
+                        if bs_valid[lane] {
+                            bs_off[lane] =
+                                bs_gn as usize * num_groups + g0_base + (((tid & 1) as usize) << 2);
+                        }
+                        if a0_valid[lane] {
+                            a0_off[lane] = fr0 as usize * half_k + k0_byte;
+                        }
+                        if as_valid[lane] {
+                            as_off[lane] = as_row as usize * num_groups
+                                + g0_base
+                                + (((tid & 2) as usize) << 1);
+                        }
+                    }
+
+                    let load_b_super =
+                        |b0_o: &mut [usize; 32], bs_o: &mut [usize; 32]| -> WarpStage {
+                            let mut st = WarpStage::default();
+                            for lane in 0..32 {
+                                if b0_valid[lane] {
+                                    st.b0[lane] = read_u4(b_packed, b0_o[lane]);
+                                }
+                                if b1_valid[lane] {
+                                    st.b1[lane] = read_u4(b_packed, b0_o[lane] + row8_stride);
+                                }
+                                if bs_valid[lane] {
+                                    st.bs[lane] = read_u32(b_scale, bs_o[lane]);
+                                }
+                                b0_o[lane] += 64;
+                                bs_o[lane] += 8;
+                            }
+                            st
+                        };
+
+                    let load_b_tail = |b0_o: &[usize; 32], bs_o: &[usize; 32]| -> WarpStage {
+                        let mut st = WarpStage::default();
+                        for lane in 0..32 {
+                            let p1 = (lane & 1) != 0;
+                            let p2 = (lane & 2) != 0;
+                            if b0_valid[lane] && !p2 {
+                                st.b0[lane] = read_u4(b_packed, b0_o[lane]);
+                            }
+                            if b1_valid[lane] && !p2 {
+                                st.b1[lane] = read_u4(b_packed, b0_o[lane] + row8_stride);
+                            }
+                            if bs_valid[lane] && !p1 {
+                                st.bs[lane] = read_u32(b_scale, bs_o[lane]);
+                            }
+                        }
+                        st
+                    };
+
+                    let mut acc0 = [[0.0f32; 4]; 32];
+                    let mut acc1 = [[0.0f32; 4]; 32];
+
+                    let transpose_warp =
+                        |raw: &[[u32; 4]; 32]| -> ([u32; 32], [u32; 32], [u32; 32], [u32; 32]) {
+                            let mut c0 = [0u32; 32];
+                            let mut c1 = [0u32; 32];
+                            let mut c2 = [0u32; 32];
+                            let mut c3 = [0u32; 32];
+                            for g in 0..8 {
+                                let mut q = [[0u32; 4]; 4];
+                                for t in 0..4 {
+                                    q[t] = canon_u4(raw[g * 4 + t]);
+                                }
+                                let tr = sim_quad_transpose_4x4(q);
+                                for t in 0..4 {
+                                    let l = g * 4 + t;
+                                    c0[l] = tr[t][0];
+                                    c1[l] = tr[t][1];
+                                    c2[l] = tr[t][2];
+                                    c3[l] = tr[t][3];
+                                }
+                            }
+                            (c0, c1, c2, c3)
+                        };
+
+                    let compute_super =
+                        |st: &WarpStage,
+                         a0_o: &mut [usize; 32],
+                         as_o: &mut [usize; 32],
+                         a0_acc: &mut [[f32; 4]; 32],
+                         a1_acc: &mut [[f32; 4]; 32]| {
+                            let mut ra0 = [[0u32; 4]; 32];
+                            let mut ra1 = [[0u32; 4]; 32];
+                            let mut ras = [0u32; 32];
+                            for lane in 0..32 {
+                                if a0_valid[lane] {
+                                    ra0[lane] = read_u4(a_packed, a0_o[lane]);
+                                }
+                                if as_valid[lane] {
+                                    ras[lane] = read_u32(a_scale, as_o[lane]) & 0x7F7F_7F7F;
+                                }
+                                if has_hi_rows && a1_valid[lane] {
+                                    ra1[lane] = read_u4(a_packed, a0_o[lane] + row8_stride);
+                                }
+                                a0_o[lane] += 64;
+                                as_o[lane] += 8;
+                            }
+                            let (a0_k0, a2_k0, a0_k1, a2_k1) = transpose_warp(&ra0);
+                            let (a1_k0, a3_k0, a1_k1, a3_k1) = if has_hi_rows {
+                                transpose_warp(&ra1)
+                            } else {
+                                ([0; 32], [0; 32], [0; 32], [0; 32])
+                            };
+                            let mut sfa_k0 = [0u32; 32];
+                            let mut sfa_k1 = [0u32; 32];
+                            for lane in 0..32 {
+                                let p2 = (lane & 2) != 0;
+                                let peer = ras[lane ^ 2];
+                                sfa_k0[lane] = if p2 { peer } else { ras[lane] };
+                                sfa_k1[lane] = if p2 { ras[lane] } else { peer };
+                            }
+                            let (b0_k0, b1_k0, b0_k1, b1_k1) = transpose_warp(&st.b0);
+                            let mut sfb0_k0 = [0u32; 32];
+                            let mut sfb0_k1 = [0u32; 32];
+                            let mut sfb1_k0 = [0u32; 32];
+                            let mut sfb1_k1 = [0u32; 32];
+                            for lane in 0..32 {
+                                let q0 = lane & !3;
+                                sfb0_k0[lane] = st.bs[q0] & 0x7F7F_7F7F;
+                                sfb0_k1[lane] = st.bs[q0 + 1] & 0x7F7F_7F7F;
+                                sfb1_k0[lane] = st.bs[q0 + 2] & 0x7F7F_7F7F;
+                                sfb1_k1[lane] = st.bs[q0 + 3] & 0x7F7F_7F7F;
+                            }
+                            mma_m16n8k64_warp(
+                                a0_acc, &a0_k0, &a1_k0, &a2_k0, &a3_k0, &b0_k0, &b1_k0, &sfa_k0,
+                                &sfb0_k0,
+                            );
+                            mma_m16n8k64_warp(
+                                a0_acc, &a0_k1, &a1_k1, &a2_k1, &a3_k1, &b0_k1, &b1_k1, &sfa_k1,
+                                &sfb0_k1,
+                            );
+                            let (b0_k0, b1_k0, b0_k1, b1_k1) = transpose_warp(&st.b1);
+                            mma_m16n8k64_warp(
+                                a1_acc, &a0_k0, &a1_k0, &a2_k0, &a3_k0, &b0_k0, &b1_k0, &sfa_k0,
+                                &sfb1_k0,
+                            );
+                            mma_m16n8k64_warp(
+                                a1_acc, &a0_k1, &a1_k1, &a2_k1, &a3_k1, &b0_k1, &b1_k1, &sfa_k1,
+                                &sfb1_k1,
+                            );
+                        };
+
+                    let compute_tail =
+                        |st: &WarpStage,
+                         a0_o: &[usize; 32],
+                         as_o: &[usize; 32],
+                         a0_acc: &mut [[f32; 4]; 32],
+                         a1_acc: &mut [[f32; 4]; 32]| {
+                            let mut ra0 = [[0u32; 4]; 32];
+                            let mut ra1 = [[0u32; 4]; 32];
+                            let mut ras = [0u32; 32];
+                            for lane in 0..32 {
+                                let p2 = (lane & 2) != 0;
+                                if a0_valid[lane] && !p2 {
+                                    ra0[lane] = read_u4(a_packed, a0_o[lane]);
+                                }
+                                if as_valid[lane] && !p2 {
+                                    ras[lane] = read_u32(a_scale, as_o[lane]) & 0x7F7F_7F7F;
+                                }
+                                if has_hi_rows && a1_valid[lane] && !p2 {
+                                    ra1[lane] = read_u4(a_packed, a0_o[lane] + row8_stride);
+                                }
+                            }
+                            let (a0_k0, a2_k0, _, _) = transpose_warp(&ra0);
+                            let (a1_k0, a3_k0, _, _) = if has_hi_rows {
+                                transpose_warp(&ra1)
+                            } else {
+                                ([0; 32], [0; 32], [0; 32], [0; 32])
+                            };
+                            let mut sfa = [0u32; 32];
+                            for lane in 0..32 {
+                                let p2 = (lane & 2) != 0;
+                                sfa[lane] = if p2 { ras[lane ^ 2] } else { ras[lane] };
+                            }
+                            let (b0_k0, b1_k0, _, _) = transpose_warp(&st.b0);
+                            let mut sfb0 = [0u32; 32];
+                            let mut sfb1 = [0u32; 32];
+                            for lane in 0..32 {
+                                let q0 = lane & !3;
+                                sfb0[lane] = st.bs[q0] & 0x7F7F_7F7F;
+                                sfb1[lane] = st.bs[q0 + 2] & 0x7F7F_7F7F;
+                            }
+                            mma_m16n8k64_warp(
+                                a0_acc, &a0_k0, &a1_k0, &a2_k0, &a3_k0, &b0_k0, &b1_k0, &sfa, &sfb0,
+                            );
+                            let (b0_k0, b1_k0, _, _) = transpose_warp(&st.b1);
+                            mma_m16n8k64_warp(
+                                a1_acc, &a0_k0, &a1_k0, &a2_k0, &a3_k0, &b0_k0, &b1_k0, &sfa, &sfb1,
+                            );
+                        };
+
+                    // Mirror exact static 3-stage ring + 0..2 cleanup + odd-tile tail.
+                    if num_super >= 2 {
+                        let mut s0 = load_b_super(&mut b0_off, &mut bs_off);
+                        let mut s1 = load_b_super(&mut b0_off, &mut bs_off);
+                        let mut it = 2u32;
+                        while it + 3 <= num_super {
+                            let s2 = load_b_super(&mut b0_off, &mut bs_off);
+                            compute_super(&s0, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            s0 = load_b_super(&mut b0_off, &mut bs_off);
+                            compute_super(&s1, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            s1 = load_b_super(&mut b0_off, &mut bs_off);
+                            compute_super(&s2, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            it += 3;
+                        }
+                        while it < num_super {
+                            let s2 = load_b_super(&mut b0_off, &mut bs_off);
+                            compute_super(&s0, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            s0 = s1;
+                            s1 = s2;
+                            it += 1;
+                        }
+                        if has_tail {
+                            let stail = load_b_tail(&b0_off, &bs_off);
+                            compute_super(&s0, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            compute_super(&s1, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            compute_tail(&stail, &a0_off, &as_off, &mut acc0, &mut acc1);
+                        } else {
+                            compute_super(&s0, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            compute_super(&s1, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                        }
+                    } else if num_super == 1 {
+                        let s0 = load_b_super(&mut b0_off, &mut bs_off);
+                        if has_tail {
+                            let stail = load_b_tail(&b0_off, &bs_off);
+                            compute_super(&s0, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                            compute_tail(&stail, &a0_off, &as_off, &mut acc0, &mut acc1);
+                        } else {
+                            compute_super(&s0, &mut a0_off, &mut as_off, &mut acc0, &mut acc1);
+                        }
+                    } else if has_tail {
+                        let stail = load_b_tail(&b0_off, &bs_off);
+                        compute_tail(&stail, &a0_off, &as_off, &mut acc0, &mut acc1);
+                    }
+
+                    let ws_base = (sk * m * n) as usize;
+                    for (nt, acc) in [&acc0, &acc1].into_iter().enumerate() {
+                        for (lane, regs) in acc.iter().enumerate() {
+                            let group_id = (lane >> 2) as u32;
+                            let tid = (lane & 3) as u32;
+                            let r0 = group_id;
+                            let r1 = group_id + 8;
+                            let c0 = warp_n + (nt as u32) * 8 + tid * 2;
+                            let c1 = c0 + 1;
+                            if r0 < m && c0 < n {
+                                ws[ws_base + (r0 * n + c0) as usize] = regs[0];
+                            }
+                            if r0 < m && c1 < n {
+                                ws[ws_base + (r0 * n + c1) as usize] = regs[1];
+                            }
+                            if r1 < m && c0 < n {
+                                ws[ws_base + (r1 * n + c0) as usize] = regs[2];
+                            }
+                            if r1 < m && c1 < n {
+                                ws[ws_base + (r1 * n + c1) as usize] = regs[3];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ws
+    }
+
+    #[test]
+    fn v2_regdirect_3stage_ring_and_tails_match_cpu_reference_bit_for_bit() {
+        // Exhaustively exercise every ring branch (`slice_tiles = 0,1,2,3,4,5,6,7,8,9,10,11`),
+        // odd/even tile_begin, M<=8 vs M>8 (`has_hi_rows`), non-multiple-of-64 N, and split_k.
+        let cases: &[(u32, u32, u32, u32)] = &[
+            (1, 1, 64, 1),    // slice_tiles = 1 (num_super=0, tail=true)
+            (1, 7, 192, 3),   // split_k=3 -> 1 tail tile per slice (odd+even tile_begin)
+            (8, 16, 128, 1),  // num_super=1, tail=false, has_hi_rows=false
+            (9, 17, 192, 1),  // num_super=1, tail=true,  has_hi_rows=true
+            (4, 63, 256, 1),  // num_super=2, tail=false
+            (13, 64, 320, 1), // num_super=2, tail=true
+            (16, 65, 384, 1), // num_super=3, rem=1, tail=false
+            (16, 70, 448, 1), // num_super=3, rem=1, tail=true
+            (8, 131, 512, 1), // num_super=4, rem=2, tail=false
+            (16, 64, 576, 1), // num_super=4, rem=2, tail=true
+            (16, 64, 640, 1), // num_super=5, ring=1 trip, rem=0, tail=false
+            (16, 64, 704, 1), // num_super=5, ring=1 trip, rem=0, tail=true
+            (1, 64, 704, 3),  // split_k=3 -> slices 3, 4, 4 (odd+even tile_begin)
+            (8, 64, 704, 3),  // W=8 invariance vs W=1 & W=16
+            (16, 64, 704, 3), // W=16 full M tile
+            (16, 128, 768, 3),
+        ];
+        for &(m, n, k, split_k) in cases {
+            let (ap, asc) = synthetic_nvfp4_matrix(
+                m as usize,
+                k as usize,
+                0x1111_0001u64 ^ u64::from(m * 31 + k),
+            );
+            let (bp, bsc) = synthetic_nvfp4_matrix(
+                n as usize,
+                k as usize,
+                0x2222_0007u64 ^ u64::from(n * 17 + split_k),
+            );
+            let ref_ws = w4a4_gemm_m16_sk3_cpu(&ap, &asc, &bp, &bsc, m, n, k, split_k)
+                .expect("cpu ref stage1");
+            let sim_ws = sim_v2_regdirect_stage1(&ap, &asc, &bp, &bsc, m, n, k, split_k);
+            assert_eq!(
+                ref_ws.len(),
+                sim_ws.len(),
+                "len mismatch for m={m} n={n} k={k} sk={split_k}"
+            );
+            for (idx, (r, s)) in ref_ws.iter().zip(sim_ws.iter()).enumerate() {
+                assert_eq!(
+                    r.to_bits(),
+                    s.to_bits(),
+                    "0-ULP mismatch at idx={idx} for m={m} n={n} k={k} sk={split_k}: ref={r} sim={s}"
+                );
+            }
+        }
+        // Also prove empty K-slices (`slice_tiles == 0`, e.g. kernel launched with K=64, split_k=3)
+        // safely write 0.0 for empty slices and match split_k=1 on the non-empty slice.
+        let (ap, asc) = synthetic_nvfp4_matrix(4, 64, 0xABCD_1234);
+        let (bp, bsc) = synthetic_nvfp4_matrix(17, 64, 0xDCBA_4321);
+        let ref_sk1 = w4a4_gemm_m16_sk3_cpu(&ap, &asc, &bp, &bsc, 4, 17, 64, 1).unwrap();
+        let sim_empty = sim_v2_regdirect_stage1(&ap, &asc, &bp, &bsc, 4, 17, 64, 3);
+        let plane = 4 * 17;
+        assert!(sim_empty[..2 * plane].iter().all(|&v| v.to_bits() == 0));
+        for (r, s) in ref_sk1.iter().zip(sim_empty[2 * plane..].iter()) {
+            assert_eq!(r.to_bits(), s.to_bits());
         }
     }
 }
