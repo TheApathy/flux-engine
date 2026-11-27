@@ -719,7 +719,11 @@ impl Qwen3SsmLayer {
         // out-of-bounds panic instead of an actionable error. Common cause: an
         // EP=2 worker started without `--speculative --mtp-quantization` to
         // mirror the head node.
-        if ssm_state.h_state_intermediates.len() < num_tokens
+        let gdn_1d_replay_policy = ops::gdn_1d_replay_policy()?;
+        let gdn_1d_replay_on_exact_seq = gdn_1d_replay_policy == ops::Gdn1dReplayPolicy::Enabled
+            && !force_serial_recurrent
+            && exact_flat_route == ExactFlatSsmRoute::ExactSequence;
+        if (!gdn_1d_replay_on_exact_seq && ssm_state.h_state_intermediates.len() < num_tokens)
             || ssm_state.conv_state_intermediates.len() < num_tokens
         {
             anyhow::bail!(
@@ -821,12 +825,38 @@ impl Qwen3SsmLayer {
                 conv_bytes,
                 "conv",
             )?;
-            let h_inter = contiguous_intermediate_base(
-                &ssm_state.h_state_intermediates,
-                num_tokens,
-                h_bytes,
-                "H",
-            )?;
+            let h_inter = if gdn_1d_replay_on_exact_seq {
+                DevicePtr::NULL
+            } else {
+                contiguous_intermediate_base(
+                    &ssm_state.h_state_intermediates,
+                    num_tokens,
+                    h_bytes,
+                    "H",
+                )?
+            };
+            let gdn_1d_verify_args = gdn_1d_replay::ExactSequenceGdn1dVerifyArgs {
+                h_state: ssm_state.h_state,
+                h_is_f16: ssm_state.h_is_f16,
+                conv_f32,
+                gdn_f32,
+                gates_buf,
+                live_tokens: num_tokens as u32,
+                max_tokens: max_k.max(num_tokens) as u32,
+                nk: nk as u32,
+                nv: nv as u32,
+                kd: kd as u32,
+                vd: vd as u32,
+                key_dim,
+                qkvz_size: qkvz_size as u32,
+                graph_capture: ctx.graph_capture,
+                has_tree_parent_ids: ctx.ddtree_parent_ids_dev.is_some(),
+            };
+            if gdn_1d_replay_on_exact_seq {
+                // Fail closed BEFORE mutating conv_state on GPU if kernels,
+                // geometry, state format, or graph-capture preconditions fail.
+                self.preflight_gdn_1d_replay_exact_sequence(ctx.gpu, &gdn_1d_verify_args, stream)?;
+            }
             crate::kprof!(ctx.gpu, stream, "ssm_conv_fp32_seq", {
                 ops::conv1d_update_l2norm_f32_sequence(
                     ctx.gpu,
@@ -849,140 +879,57 @@ impl Qwen3SsmLayer {
                 )?;
                 anyhow::Result::<()>::Ok(())
             })?;
-            crate::kprof!(ctx.gpu, stream, "ssm_gdn_fp32_seq", {
-                // Register-resident H variant (identical single-accumulator FP32
-                // order; H cached in registers across the token loop instead of
-                // 3 global re-reads/token). Bit-exact by construction.
-                // SPEED PROBE: ATLAS_SSM_GDN_NOSNAP=1 routes to a twin with the
-                // per-token snapshot writes removed. Those are 89% of this
-                // kernel's H traffic and impl_b2.rs reads exactly ONE of the 16
-                // (index num_accepted). The probe measures the ceiling of
-                // removing them; it INVALIDATES rollback, so output is wrong.
-                // Measure only — the exact fix recomputes on commit.
-                let nosnap = gdn_nosnap;
-                // LAZY-COMMIT dispatch (ATLAS_SSM_GDN_LAZY=1): run the
-                // lazyfinal kernel — no per-token snapshots (58.6% of this
-                // kernel at k=16), final H into inter[num_tokens-1], h_state
-                // left at step-initial for the commit replay. The async commit
-                // mirrors this decision via gdn_seq_lazy_engaged_inner, so the
-                // predicate MUST stay pure in num_tokens + env + handles.
-                let lazy = gdn_seq_lazy;
-                if lazy && direct_retain.is_none() {
-                    // Fallback when BA/conv ran into shared arena buffers
-                    // (e.g. force_serial_ba diagnostic): copy into retain now.
-                    let retain = self.gdn_lazy_retain_current(ctx.gpu, qkvz_size, nv)?;
-                    ctx.gpu.copy_d2d_async(
-                        conv_f32,
-                        retain,
-                        num_tokens * qkvz_size * fp32,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2d_async(
-                        gates_buf,
-                        retain.offset(max_k * qkvz_size * fp32),
-                        num_tokens * nv * 2 * fp32,
-                        stream,
-                    )?;
-                }
-                let persistent = !nosnap
-                    && !lazy
-                    && self.gdn_f32_sequence_persistent_k.0 != 0
-                    && super::qwen4_cross_seq_verify::ssm_gdn_seq_persistent_enabled();
-                if nosnap {
-                    // Same ABI as the plain sequence kernel — it simply skips
-                    // the snapshot stores. h_inter is passed and left untouched.
-                    ops::gdn_decode_f32_sequence(
-                        ctx.gpu,
-                        self.gdn_f32_sequence_nosnap_k,
-                        ssm_state.h_state,
-                        conv_f32,
-                        conv_f32.offset(key_dim * fp32),
-                        conv_f32.offset(key_dim * 2 * fp32),
-                        gates_buf,
-                        gates_buf.offset(nv * fp32),
-                        gdn_f32,
-                        h_inter,
-                        num_tokens as u32,
-                        nk as u32,
-                        nv as u32,
-                        kd as u32,
-                        vd as u32,
-                        qkvz_size as u32,
-                        qkvz_size as u32,
-                        (nv * 2) as u32,
-                        qkvz_size as u32,
-                        (h_bytes / fp32) as u32,
-                        stream,
-                    )?;
-                } else if lazy {
-                    // Same ABI + extern-shared layout as the persistent kernel.
-                    let lazy_inter_stride = if ssm_state.h_state_checkpoint.is_none() {
-                        0u32
-                    } else {
-                        (h_bytes / fp32) as u32
-                    };
-                    if super::qwen4_gdn_split_v_enabled_for_single_seq()
-                        && kd == 128
-                        && vd == 128
-                        && self.gdn_f32_sequence_lazyfinal_splitv4_k.0 != 0
-                    {
-                        ops::gdn_decode_f32_sequence_persistent_splitv4(
-                            ctx.gpu,
-                            self.gdn_f32_sequence_lazyfinal_splitv4_k,
-                            ssm_state.h_state,
+            let gdn_1d_verify_outcome = if gdn_1d_replay_on_exact_seq {
+                self.try_gdn_1d_replay_verify_exact_sequence(ctx.gpu, &gdn_1d_verify_args, stream)?
+            } else {
+                gdn_1d_replay::Gdn1dReplayVerifyOutcome::Disabled
+            };
+            if gdn_1d_verify_outcome == gdn_1d_replay::Gdn1dReplayVerifyOutcome::Disabled {
+                crate::kprof!(ctx.gpu, stream, "ssm_gdn_fp32_seq", {
+                    // Register-resident H variant (identical single-accumulator FP32
+                    // order; H cached in registers across the token loop instead of
+                    // 3 global re-reads/token). Bit-exact by construction.
+                    // SPEED PROBE: ATLAS_SSM_GDN_NOSNAP=1 routes to a twin with the
+                    // per-token snapshot writes removed. Those are 89% of this
+                    // kernel's H traffic and impl_b2.rs reads exactly ONE of the 16
+                    // (index num_accepted). The probe measures the ceiling of
+                    // removing them; it INVALIDATES rollback, so output is wrong.
+                    // Measure only — the exact fix recomputes on commit.
+                    let nosnap = gdn_nosnap;
+                    // LAZY-COMMIT dispatch (ATLAS_SSM_GDN_LAZY=1): run the
+                    // lazyfinal kernel — no per-token snapshots (58.6% of this
+                    // kernel at k=16), final H into inter[num_tokens-1], h_state
+                    // left at step-initial for the commit replay. The async commit
+                    // mirrors this decision via gdn_seq_lazy_engaged_inner, so the
+                    // predicate MUST stay pure in num_tokens + env + handles.
+                    let lazy = gdn_seq_lazy;
+                    if lazy && direct_retain.is_none() {
+                        // Fallback when BA/conv ran into shared arena buffers
+                        // (e.g. force_serial_ba diagnostic): copy into retain now.
+                        let retain = self.gdn_lazy_retain_current(ctx.gpu, qkvz_size, nv)?;
+                        ctx.gpu.copy_d2d_async(
                             conv_f32,
-                            conv_f32.offset(key_dim * fp32),
-                            conv_f32.offset(key_dim * fp32 * 2),
-                            gates_buf,
-                            gates_buf.offset(nv * fp32),
-                            gdn_f32,
-                            h_inter,
-                            num_tokens as u32,
-                            nk as u32,
-                            nv as u32,
-                            kd as u32,
-                            vd as u32,
-                            qkvz_size as u32,
-                            qkvz_size as u32,
-                            (nv * 2) as u32,
-                            qkvz_size as u32,
-                            lazy_inter_stride,
+                            retain,
+                            num_tokens * qkvz_size * fp32,
                             stream,
                         )?;
-                    } else {
-                        ops::gdn_decode_f32_sequence_persistent(
-                            ctx.gpu,
-                            self.gdn_f32_sequence_lazyfinal_k,
-                            ssm_state.h_state,
-                            conv_f32,
-                            conv_f32.offset(key_dim * fp32),
-                            conv_f32.offset(key_dim * fp32 * 2),
+                        ctx.gpu.copy_d2d_async(
                             gates_buf,
-                            gates_buf.offset(nv * fp32),
-                            gdn_f32,
-                            h_inter,
-                            num_tokens as u32,
-                            nk as u32,
-                            nv as u32,
-                            kd as u32,
-                            vd as u32,
-                            qkvz_size as u32,
-                            qkvz_size as u32,
-                            (nv * 2) as u32,
-                            qkvz_size as u32,
-                            lazy_inter_stride,
+                            retain.offset(max_k * qkvz_size * fp32),
+                            num_tokens * nv * 2 * fp32,
                             stream,
                         )?;
                     }
-                } else if persistent {
-                    if super::qwen4_gdn_split_v_enabled_for_single_seq()
-                        && kd == 128
-                        && vd == 128
-                        && self.gdn_f32_sequence_persistent_splitv4_k.0 != 0
-                    {
-                        ops::gdn_decode_f32_sequence_persistent_splitv4(
+                    let persistent = !nosnap
+                        && !lazy
+                        && self.gdn_f32_sequence_persistent_k.0 != 0
+                        && super::qwen4_cross_seq_verify::ssm_gdn_seq_persistent_enabled();
+                    if nosnap {
+                        // Same ABI as the plain sequence kernel — it simply skips
+                        // the snapshot stores. h_inter is passed and left untouched.
+                        ops::gdn_decode_f32_sequence(
                             ctx.gpu,
-                            self.gdn_f32_sequence_persistent_splitv4_k,
+                            self.gdn_f32_sequence_nosnap_k,
                             ssm_state.h_state,
                             conv_f32,
                             conv_f32.offset(key_dim * fp32),
@@ -1003,10 +950,124 @@ impl Qwen3SsmLayer {
                             (h_bytes / fp32) as u32,
                             stream,
                         )?;
+                    } else if lazy {
+                        // Same ABI + extern-shared layout as the persistent kernel.
+                        let lazy_inter_stride = if ssm_state.h_state_checkpoint.is_none() {
+                            0u32
+                        } else {
+                            (h_bytes / fp32) as u32
+                        };
+                        if super::qwen4_gdn_split_v_enabled_for_single_seq()
+                            && kd == 128
+                            && vd == 128
+                            && self.gdn_f32_sequence_lazyfinal_splitv4_k.0 != 0
+                        {
+                            ops::gdn_decode_f32_sequence_persistent_splitv4(
+                                ctx.gpu,
+                                self.gdn_f32_sequence_lazyfinal_splitv4_k,
+                                ssm_state.h_state,
+                                conv_f32,
+                                conv_f32.offset(key_dim * fp32),
+                                conv_f32.offset(key_dim * fp32 * 2),
+                                gates_buf,
+                                gates_buf.offset(nv * fp32),
+                                gdn_f32,
+                                h_inter,
+                                num_tokens as u32,
+                                nk as u32,
+                                nv as u32,
+                                kd as u32,
+                                vd as u32,
+                                qkvz_size as u32,
+                                qkvz_size as u32,
+                                (nv * 2) as u32,
+                                qkvz_size as u32,
+                                lazy_inter_stride,
+                                stream,
+                            )?;
+                        } else {
+                            ops::gdn_decode_f32_sequence_persistent(
+                                ctx.gpu,
+                                self.gdn_f32_sequence_lazyfinal_k,
+                                ssm_state.h_state,
+                                conv_f32,
+                                conv_f32.offset(key_dim * fp32),
+                                conv_f32.offset(key_dim * fp32 * 2),
+                                gates_buf,
+                                gates_buf.offset(nv * fp32),
+                                gdn_f32,
+                                h_inter,
+                                num_tokens as u32,
+                                nk as u32,
+                                nv as u32,
+                                kd as u32,
+                                vd as u32,
+                                qkvz_size as u32,
+                                qkvz_size as u32,
+                                (nv * 2) as u32,
+                                qkvz_size as u32,
+                                lazy_inter_stride,
+                                stream,
+                            )?;
+                        }
+                    } else if persistent {
+                        if super::qwen4_gdn_split_v_enabled_for_single_seq()
+                            && kd == 128
+                            && vd == 128
+                            && self.gdn_f32_sequence_persistent_splitv4_k.0 != 0
+                        {
+                            ops::gdn_decode_f32_sequence_persistent_splitv4(
+                                ctx.gpu,
+                                self.gdn_f32_sequence_persistent_splitv4_k,
+                                ssm_state.h_state,
+                                conv_f32,
+                                conv_f32.offset(key_dim * fp32),
+                                conv_f32.offset(key_dim * 2 * fp32),
+                                gates_buf,
+                                gates_buf.offset(nv * fp32),
+                                gdn_f32,
+                                h_inter,
+                                num_tokens as u32,
+                                nk as u32,
+                                nv as u32,
+                                kd as u32,
+                                vd as u32,
+                                qkvz_size as u32,
+                                qkvz_size as u32,
+                                (nv * 2) as u32,
+                                qkvz_size as u32,
+                                (h_bytes / fp32) as u32,
+                                stream,
+                            )?;
+                        } else {
+                            ops::gdn_decode_f32_sequence_persistent(
+                                ctx.gpu,
+                                self.gdn_f32_sequence_persistent_k,
+                                ssm_state.h_state,
+                                conv_f32,
+                                conv_f32.offset(key_dim * fp32),
+                                conv_f32.offset(key_dim * 2 * fp32),
+                                gates_buf,
+                                gates_buf.offset(nv * fp32),
+                                gdn_f32,
+                                h_inter,
+                                num_tokens as u32,
+                                nk as u32,
+                                nv as u32,
+                                kd as u32,
+                                vd as u32,
+                                qkvz_size as u32,
+                                qkvz_size as u32,
+                                (nv * 2) as u32,
+                                qkvz_size as u32,
+                                (h_bytes / fp32) as u32,
+                                stream,
+                            )?;
+                        }
                     } else {
-                        ops::gdn_decode_f32_sequence_persistent(
+                        ops::gdn_decode_f32_sequence(
                             ctx.gpu,
-                            self.gdn_f32_sequence_persistent_k,
+                            self.gdn_f32_sequence_k,
                             ssm_state.h_state,
                             conv_f32,
                             conv_f32.offset(key_dim * fp32),
@@ -1028,33 +1089,9 @@ impl Qwen3SsmLayer {
                             stream,
                         )?;
                     }
-                } else {
-                    ops::gdn_decode_f32_sequence(
-                        ctx.gpu,
-                        self.gdn_f32_sequence_k,
-                        ssm_state.h_state,
-                        conv_f32,
-                        conv_f32.offset(key_dim * fp32),
-                        conv_f32.offset(key_dim * 2 * fp32),
-                        gates_buf,
-                        gates_buf.offset(nv * fp32),
-                        gdn_f32,
-                        h_inter,
-                        num_tokens as u32,
-                        nk as u32,
-                        nv as u32,
-                        kd as u32,
-                        vd as u32,
-                        qkvz_size as u32,
-                        qkvz_size as u32,
-                        (nv * 2) as u32,
-                        qkvz_size as u32,
-                        (h_bytes / fp32) as u32,
-                        stream,
-                    )?;
-                }
-                anyhow::Result::<()>::Ok(())
-            })?;
+                    anyhow::Result::<()>::Ok(())
+                })?;
+            }
             let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
             crate::kprof!(ctx.gpu, stream, "ssm_gated_norm_fp32_multi_seq", {
                 ops::gated_rms_norm_f32_multi_seq(

@@ -314,6 +314,18 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "lm_head_argmax_reduce_sm120",
         ),
     ),
+    (
+        "kernels/gb10/common/gdn_correction_replay_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "gdn_verify_record_1d_sm120",
+            "gdn_commit_replay_1d_sm120",
+            "gdn_zero_tail_rows_sm120",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(
