@@ -5,14 +5,27 @@
 //
 // Kernels:
 //   1. `w4a4_gemm_m16_sk3_sm120`:
-//      Native Blackwell SM120/SM121 block-scaled FP4 Tensor Core decode GEMM
-//      (`mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64
-//        .row.col.f32.e2m1.e2m1.f32.ue4m3`) for `M <= 16` (`W=1`, `W=8`, `W=16`
-//      all fit in ONE `m16` tile height with N_TILE=64 -> 240 CTAs = 5.0 CTAs/SM
-//      at N=5120, split_k=3 on 48-SM GB10).
-//      - Weights (`B_packed`, `B_scale`) streamed via `LDG.E.EF.128` (`L2::evict_first`)
-//      - Activations (`A_packed`, `A_scale`) loaded via `LDG.E.128.CONSTANT` (`ld.global.nc`)
-//      - 2-stage register pipeline overlapping next-K global prefetch with MMA
+//      Native Blackwell SM120/SM121 Register-Direct block-scaled FP4 Tensor Core
+//      decode GEMM (`mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.
+//      m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3`) for `M <= 16` (`W=1`, `W=8`,
+//      `W=16` all fit in ONE `m16` tile height with N_TILE=64 -> 240 CTAs =
+//      5.0 CTAs/SM at N=5120, split_k=3 on 48-SM GB10):
+//      - ZERO B-SMEM staging (`0 B` SMEM) & ZERO per-K-step `__syncthreads()`!
+//        Every warp streams independently straight from global memory into
+//        registers via `K_SUPER = 128` (2x `K=64` tiles) coalesced 64B quads +
+//        exact 2-stage 4x4 intra-quad `SHFL.BFLY` register transpose (plus a
+//        clean `K=64` odd-tile tail).
+//      - 3-stage register-direct B pipeline (`2` `K_SUPER=128` tiles = `2,048 B`
+//        per warp = `40.96 KB/SM` at 5 CTAs/SM in flight simultaneously).
+//      - Weights (`B_packed`) streamed via `LDG.E.EF.128` (`L2::evict_first`,
+//        `.cs` L1-bypass so weights never evict L1 scales/activations).
+//      - Weight scales (`B_scale`) loaded via `LDG.E.CONSTANT` with
+//        `L2::evict_first` (`ld.global.nc.L2::cache_hint.u32`): L1-cached across
+//        4 consecutive `K_SUPER=128` steps (eliminates 4x-8x 32B DRAM sector
+//        re-fetch amplification while keeping L2 clean).
+//      - Activations (`A_packed`, `A_scale`) loaded via `LDG.E.128.CONSTANT` /
+//        `LDG.E.CONSTANT` (`ld.global.nc`, L1/L2 resident; rows 8..15 skipped
+//        uniformly when `M <= 8`).
 //      - Branchless 3-op SWAR E2M1 `-0.0` (0x8) -> `+0.0` (0x0) canonicalization
 //      - Deterministic K-slice partition independent of `M` (0 `atomicAdd`)
 //      - Explicit inline PTX `cvt.rn.bf16.f32` in epilogue (`split_k == 1`)
@@ -28,8 +41,15 @@
 #define W4SK_M_TILE     16u
 #define W4SK_N_TILE     64u
 #define W4SK_K_STEP     64u
+#define W4SK_K_SUPER    128u
 #define W4SK_GROUP_SIZE 16u
 #define W4SK_MAX_SPLITK 8u
+
+#if __CUDA_ARCH__ >= 1200
+#define W4SK_MIN_CTAS_PER_SM 6
+#else
+#define W4SK_MIN_CTAS_PER_SM 4
+#endif
 
 // 3-op branchless SWAR E2M1 `-0.0` (0x8) -> `+0.0` (0x0) canonicalization
 // across all 8 packed 4-bit nibbles with zero cross-nibble carry.
@@ -73,15 +93,17 @@ __device__ __forceinline__ uint4 w4sk_ldg_ef_128(
     return v;
 }
 
-// 32-bit streaming weight-scale load with cache-streaming + L2::evict_first
-// -> SASS `LDG.E.EF` with L2::evict_first policy descriptor.
-__device__ __forceinline__ unsigned int w4sk_ldg_ef_32(
+// 32-bit L1-cached read-only weight-scale load with L2::evict_first policy
+// -> SASS `LDG.E.CONSTANT` with `desc[UR]` L2::evict_first policy descriptor.
+// Caches the 32B scale sector in L1 across 4 consecutive K_SUPER=128 steps
+// (eliminating 4x-8x DRAM sector re-fetch amplification) without polluting L2.
+__device__ __forceinline__ unsigned int w4sk_ldg_nc_ef_32(
     const void* ptr,
     unsigned long long pol
 ) {
     unsigned int v;
     asm volatile(
-        "ld.global.cs.L2::cache_hint.u32 %0, [%1], %2;"
+        "ld.global.nc.L2::cache_hint.u32 %0, [%1], %2;"
         : "=r"(v)
         : "l"(ptr), "l"(pol));
     return v;
@@ -107,7 +129,75 @@ __device__ __forceinline__ unsigned int w4sk_ldg_nc_32(const void* ptr) {
     return v;
 }
 
-#if __CUDA_ARCH__ < 1200
+#if __CUDA_ARCH__ >= 1200
+// Exact 2-stage 4x4 intra-quad register transpose across lanes tid = lane_id & 3.
+//
+// Each 4-lane quad (group_id = lane_id >> 2, tid = 0..3) loads 64 contiguous
+// bytes (K_SUPER = 128 E2M1 elements) of one matrix row via 4 x LDG.128:
+//   lane t holds row t = (M[t][0], M[t][1], M[t][2], M[t][3]) = (v.x, v.y, v.z, v.w).
+// This 4x SHFL.BFLY butterfly transposes the 4x4 matrix directly in registers
+// (0 SMEM, 0 BAR.SYNC) so lane t receives column t = (M[0][t], M[1][t], M[2][t], M[3][t]):
+//   c0 = K[  0.. 32) word t  (b0 / a0 for K-step 0)
+//   c1 = K[ 32.. 64) word t  (b1 / a2 for K-step 0)
+//   c2 = K[ 64.. 96) word t  (b0 / a0 for K-step 1)
+//   c3 = K[ 96..128) word t  (b1 / a2 for K-step 1)
+// Also serves the K=64 odd-tile tail identically when lanes tid>=2 supply zero
+// (producing c0 = K[0..32) word t, c1 = K[32..64) word t across all tid=0..3).
+__device__ __forceinline__ void w4sk_quad_transpose_4x4(
+    uint4 v,
+    bool p1,
+    bool p2,
+    unsigned int& c0,
+    unsigned int& c1,
+    unsigned int& c2,
+    unsigned int& c3
+) {
+    const unsigned int e0 = p1 ? v.x : v.y;
+    const unsigned int e1 = p1 ? v.z : v.w;
+    const unsigned int k0 = p1 ? v.y : v.x;
+    const unsigned int k1 = p1 ? v.w : v.z;
+    const unsigned int r0 = __shfl_xor_sync(0xFFFFFFFFu, e0, 1);
+    const unsigned int r1 = __shfl_xor_sync(0xFFFFFFFFu, e1, 1);
+    const unsigned int t00 = p1 ? r0 : k0;
+    const unsigned int t10 = p1 ? k0 : r0;
+    const unsigned int t01 = p1 ? r1 : k1;
+    const unsigned int t11 = p1 ? k1 : r1;
+
+    const unsigned int s0 = p2 ? t00 : t01;
+    const unsigned int s1 = p2 ? t10 : t11;
+    const unsigned int q0 = __shfl_xor_sync(0xFFFFFFFFu, s0, 2);
+    const unsigned int q1 = __shfl_xor_sync(0xFFFFFFFFu, s1, 2);
+    c0 = p2 ? q0 : t00;
+    c1 = p2 ? q1 : t10;
+    c2 = p2 ? t01 : q0;
+    c3 = p2 ? t11 : q1;
+}
+
+__device__ __forceinline__ void w4sk_mma_m16n8k64(
+    float (&d)[4],
+    unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+    unsigned int b0, unsigned int b1,
+    unsigned int sfa, unsigned int sfb
+) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
+        "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
+        "{%14},{%15,%16},{%17},{%18,%19};"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1),
+          "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]),
+          "r"(sfa), "h"((unsigned short)0), "h"((unsigned short)0),
+          "r"(sfb), "h"((unsigned short)0), "h"((unsigned short)0));
+}
+
+struct W4SkBStage {
+    uint4 b0;
+    uint4 b1;
+    unsigned int bs;
+};
+#else
 __device__ __constant__ float W4SK_E2M1_LUT[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -126,11 +216,11 @@ __device__ __forceinline__ float w4sk_ue4m3_to_f32(unsigned char byte) {
 // 1. w4a4_gemm_m16_sk3_sm120
 //
 // Grid:  (ceil(N / 64), 1, split_k)
-// Block: (128, 1, 1) — 4 warps (each warp owns 16 N-cols x all M <= 16 rows)
-// SMEM:  2,880 B (Ap 512B + As 64B + Bp 2048B + Bs 256B)
+// Block: (128, 1, 1) — 4 independent warps (each owns 16 N-cols x M<=16 rows)
+// SMEM:  0 B on SM120+ (ZERO B-SMEM staging, ZERO __syncthreads()!)
 // =========================================================================
 extern "C" __global__
-__launch_bounds__(128, 4)
+__launch_bounds__(128, W4SK_MIN_CTAS_PER_SM)
 void w4a4_gemm_m16_sk3_sm120(
     const unsigned char* __restrict__ A_packed,       // [M, K/2] E2M1
     const unsigned char* __restrict__ A_scale,        // [M, K/16] UE4M3
@@ -155,143 +245,198 @@ void w4a4_gemm_m16_sk3_sm120(
     const unsigned int tile_begin = (sk * num_k_tiles) / split_k;
     const unsigned int tile_end = ((sk + 1u) * num_k_tiles) / split_k;
     const unsigned int k_begin = tile_begin << 6;
-    const unsigned int k_end = tile_end << 6;
 
     const int64_t half_K = (int64_t)(K >> 1);
     const int64_t num_groups = (int64_t)(K >> 4);
     const unsigned long long pol_ef = w4sk_l2_evict_first_policy();
 
 #if __CUDA_ARCH__ >= 1200
-    __shared__ alignas(16) unsigned char smem_Ap[W4SK_M_TILE][W4SK_K_STEP / 2];
-    __shared__ alignas(4)  unsigned char smem_As[W4SK_M_TILE][W4SK_K_STEP / W4SK_GROUP_SIZE];
-    __shared__ alignas(16) unsigned char smem_Bp[W4SK_N_TILE][W4SK_K_STEP / 2];
-    __shared__ alignas(4)  unsigned char smem_Bs[W4SK_N_TILE][W4SK_K_STEP / W4SK_GROUP_SIZE];
-
     const unsigned int warp_id = threadIdx.x >> 5;
     const unsigned int lane_id = threadIdx.x & 31u;
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid = lane_id & 3u;
+    const unsigned int q0 = group_id << 2;
+    const bool p1 = (tid & 1u) != 0u;
+    const bool p2 = (tid & 2u) != 0u;
 
     float acc[2][4];
     acc[0][0] = 0.0f; acc[0][1] = 0.0f; acc[0][2] = 0.0f; acc[0][3] = 0.0f;
     acc[1][0] = 0.0f; acc[1][1] = 0.0f; acc[1][2] = 0.0f; acc[1][3] = 0.0f;
 
-    // Precompute warp-uniform per-thread load coordinates for the 2-stage register pipeline:
-    //   - Threads  0..127 -> B_packed (1 x uint4 each, LDG.E.EF.128)
-    //   - Threads  0..63  -> B_scale  (1 x u32   each, LDG.E.EF)
-    //   - Threads 64..95  -> A_packed (1 x uint4 each, LDG.E.128.CONSTANT)
-    //   - Threads 96..111 -> A_scale  (1 x u32   each, LDG.E.CONSTANT)
-    const unsigned int bp_row = threadIdx.x >> 1;
-    const unsigned int bp_col = (threadIdx.x & 1u) << 4;
-    const unsigned int bp_gn = cta_n + bp_row;
-    const bool bp_valid = (bp_gn < N);
+    const unsigned int slice_tiles = tile_end - tile_begin;
+    const unsigned int num_super = slice_tiles >> 1;
+    const bool has_tail = (slice_tiles & 1u) != 0u;
+    const bool has_hi_rows = (M > 8u);
 
-    const unsigned int bs_row = threadIdx.x;
-    const unsigned int bs_gn = cta_n + bs_row;
-    const bool bs_valid = (threadIdx.x < W4SK_N_TILE) && (bs_gn < N);
+    // Precompute warp-independent direct global pointers (ZERO SMEM, ZERO BAR.SYNC):
+    //   - B_packed: each 4-lane quad (group_id, tid=0..3) streams 64 contiguous
+    //     bytes (2 x 32B sectors = K_SUPER=128) per N-subtile via LDG.E.EF.128.
+    //   - B_scale:  tid={0,1,2,3} load (n0 k0, n0 k1, n1 k0, n1 k1) via ONE
+    //     L1-cached L2::evict_first u32 load (100% lane utilization, 0 wasted
+    //     DRAM sector re-fetches). Masking (& 0x7F7F7F7Fu) is deferred to
+    //     consumption so ZERO ALU stalls on the freshly issued LDG.
+    //   - A_packed: each 4-lane quad loads 64B of row fr0=group_id (and fr1=
+    //     group_id+8 when M>8) via L1/L2-resident LDG.E.128.CONSTANT.
+    //   - A_scale:  tid={0,1,2,3} load (fr0 k0, fr1 k0, fr0 k1, fr1 k1) via ONE
+    //     LDG.E.CONSTANT load + 1x SHFL.BFLY(2).
+    const unsigned int warp_n = cta_n + warp_id * 16u;
+    const unsigned int b0_gn = warp_n + group_id;
+    const unsigned int b1_gn = b0_gn + 8u;
+    const bool b0_valid = (b0_gn < N);
+    const bool b1_valid = (b1_gn < N);
 
-    const unsigned int ap_idx = threadIdx.x - 64u;
-    const unsigned int ap_row = ap_idx >> 1;
-    const unsigned int ap_col = (ap_idx & 1u) << 4;
-    const bool ap_thread = (threadIdx.x >= 64u) && (threadIdx.x < 96u);
-    const bool ap_valid = ap_thread && (ap_row < M);
+    const unsigned int bs_gn = warp_n + ((tid >> 1) << 3) + group_id;
+    const bool bs_valid = (bs_gn < N);
 
-    const unsigned int as_row = threadIdx.x - 96u;
-    const bool as_thread = (threadIdx.x >= 96u) && (threadIdx.x < 112u);
-    const bool as_valid = as_thread && (as_row < M);
+    const unsigned int fr0 = group_id;
+    const unsigned int fr1 = group_id + 8u;
+    const bool a0_valid = (fr0 < M);
+    const bool a1_valid = (fr1 < M);
 
-    #define W4SK_PREFETCH_REGS(kb, r_bp, r_bs, r_ap, r_as) do { \
-        const int64_t gc_byte = (int64_t)((kb) >> 1); \
-        const int64_t gg_base = (int64_t)((kb) >> 4); \
-        (r_bp) = make_uint4(0u, 0u, 0u, 0u); \
-        if (bp_valid) { \
-            (r_bp) = w4sk_ldg_ef_128( \
-                B_packed + (int64_t)bp_gn * half_K + gc_byte + (int64_t)bp_col, pol_ef); \
-        } \
-        (r_bs) = 0u; \
-        if (bs_valid) { \
-            (r_bs) = w4sk_ldg_ef_32( \
-                B_scale + (int64_t)bs_gn * num_groups + gg_base, pol_ef) & 0x7F7F7F7Fu; \
-        } \
-        (r_ap) = make_uint4(0u, 0u, 0u, 0u); \
-        if (ap_valid) { \
-            (r_ap) = w4sk_ldg_nc_128( \
-                A_packed + (int64_t)ap_row * half_K + gc_byte + (int64_t)ap_col); \
-        } \
-        (r_as) = 0u; \
-        if (as_valid) { \
-            (r_as) = w4sk_ldg_nc_32( \
-                A_scale + (int64_t)as_row * num_groups + gg_base) & 0x7F7F7F7Fu; \
-        } \
+    const unsigned int as_row = group_id + ((tid & 1u) << 3);
+    const bool as_valid = (as_row < M);
+
+    const int64_t k0_byte = (int64_t)(k_begin >> 1) + (int64_t)(tid << 4);
+    const int64_t g0_base = (int64_t)(k_begin >> 4);
+    const int64_t row8_stride = half_K << 3;
+
+    // Since b1_gn = b0_gn + 8 and fr1 = fr0 + 8, b1_valid => b0_valid and
+    // a1_valid => a0_valid. Sharing b0_ptr + row8_stride and a0_ptr + row8_stride
+    // (row8_stride lives in uniform register UR) frees 4 vector registers for
+    // the 3-stage pipeline scheduler.
+    const unsigned char* b0_ptr = b0_valid ? (B_packed + (int64_t)b0_gn * half_K + k0_byte) : B_packed;
+    const unsigned char* bs_ptr = bs_valid ? (B_scale + (int64_t)bs_gn * num_groups + g0_base + (int64_t)((tid & 1u) << 2)) : B_scale;
+
+    const unsigned char* a0_ptr = a0_valid ? (A_packed + (int64_t)fr0 * half_K + k0_byte) : A_packed;
+    const unsigned char* as_ptr = as_valid ? (A_scale + (int64_t)as_row * num_groups + g0_base + (int64_t)((tid & 2u) << 1)) : A_scale;
+
+    #define W4SK_LOAD_B_SUPER(st) do { \
+        (st).b0 = b0_valid ? w4sk_ldg_ef_128(b0_ptr, pol_ef) : make_uint4(0u, 0u, 0u, 0u); \
+        (st).b1 = b1_valid ? w4sk_ldg_ef_128(b0_ptr + row8_stride, pol_ef) : make_uint4(0u, 0u, 0u, 0u); \
+        (st).bs = bs_valid ? w4sk_ldg_nc_ef_32(bs_ptr, pol_ef) : 0u; \
+        b0_ptr += 64; \
+        bs_ptr += 8; \
     } while (0)
 
-    #define W4SK_COMMIT_SMEM(r_bp, r_bs, r_ap, r_as) do { \
-        *(uint4*)&smem_Bp[bp_row][bp_col] = w4sk_canon_e2m1_u4(r_bp); \
-        if (threadIdx.x < W4SK_N_TILE) { \
-            *(unsigned int*)&smem_Bs[bs_row][0] = (r_bs); \
-        } \
-        if (ap_thread) { \
-            *(uint4*)&smem_Ap[ap_row][ap_col] = w4sk_canon_e2m1_u4(r_ap); \
-        } \
-        if (as_thread) { \
-            *(unsigned int*)&smem_As[as_row][0] = (r_as); \
-        } \
+    #define W4SK_LOAD_B_TAIL(st) do { \
+        (st).b0 = (b0_valid && !p2) ? w4sk_ldg_ef_128(b0_ptr, pol_ef) : make_uint4(0u, 0u, 0u, 0u); \
+        (st).b1 = (b1_valid && !p2) ? w4sk_ldg_ef_128(b0_ptr + row8_stride, pol_ef) : make_uint4(0u, 0u, 0u, 0u); \
+        (st).bs = (bs_valid && !p1) ? w4sk_ldg_nc_ef_32(bs_ptr, pol_ef) : 0u; \
     } while (0)
 
-    #define W4SK_COMPUTE_MMA() do { \
-        const unsigned int fr0 = group_id; \
-        const unsigned int fr1 = group_id + 8u; \
-        const unsigned int a_col = 4u * tid; \
-        const unsigned int a0 = *(const unsigned int*)&smem_Ap[fr0][a_col]; \
-        const unsigned int a1 = *(const unsigned int*)&smem_Ap[fr1][a_col]; \
-        const unsigned int a2 = *(const unsigned int*)&smem_Ap[fr0][a_col + 16u]; \
-        const unsigned int a3 = *(const unsigned int*)&smem_Ap[fr1][a_col + 16u]; \
-        const unsigned int m_sfa = group_id + 8u * (lane_id & 1u); \
-        const unsigned int sfa = *(const unsigned int*)&smem_As[m_sfa][0]; \
-        _Pragma("unroll") \
-        for (int nt = 0; nt < 2; ++nt) { \
-            const unsigned int nc = warp_id * 16u + (unsigned int)nt * 8u + group_id; \
-            const unsigned int b0 = *(const unsigned int*)&smem_Bp[nc][a_col]; \
-            const unsigned int b1 = *(const unsigned int*)&smem_Bp[nc][a_col + 16u]; \
-            const unsigned int sfb = *(const unsigned int*)&smem_Bs[nc][0]; \
-            asm volatile( \
-                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X." \
-                "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 " \
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13}," \
-                "{%14},{%15,%16},{%17},{%18,%19};" \
-                : "=f"(acc[nt][0]), "=f"(acc[nt][1]), \
-                  "=f"(acc[nt][2]), "=f"(acc[nt][3]) \
-                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), \
-                  "r"(b0), "r"(b1), \
-                  "f"(acc[nt][0]), "f"(acc[nt][1]), \
-                  "f"(acc[nt][2]), "f"(acc[nt][3]), \
-                  "r"(sfa), "h"((unsigned short)0), "h"((unsigned short)0), \
-                  "r"(sfb), "h"((unsigned short)0), "h"((unsigned short)0)); \
+    #define W4SK_COMPUTE_SUPER(st) do { \
+        const uint4 ra0 = a0_valid ? w4sk_ldg_nc_128(a0_ptr) : make_uint4(0u, 0u, 0u, 0u); \
+        const unsigned int ras_raw = as_valid ? w4sk_ldg_nc_32(as_ptr) : 0u; \
+        uint4 ra1 = make_uint4(0u, 0u, 0u, 0u); \
+        if (has_hi_rows && a1_valid) { \
+            ra1 = w4sk_ldg_nc_128(a0_ptr + row8_stride); \
         } \
+        a0_ptr += 64; \
+        as_ptr += 8; \
+        /* Hide L1 latency of A behind SWAR + quad-transpose of B[nt=0] */ \
+        unsigned int b0_k0, b1_k0, b0_k1, b1_k1; \
+        w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4((st).b0), p1, p2, b0_k0, b1_k0, b0_k1, b1_k1); \
+        const unsigned int bs_clean = (st).bs & 0x7F7F7F7Fu; \
+        const unsigned int sfb0_k0 = __shfl_sync(0xFFFFFFFFu, bs_clean, q0 + 0u); \
+        const unsigned int sfb0_k1 = __shfl_sync(0xFFFFFFFFu, bs_clean, q0 + 1u); \
+        unsigned int a0_k0, a2_k0, a0_k1, a2_k1; \
+        w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4(ra0), p1, p2, a0_k0, a2_k0, a0_k1, a2_k1); \
+        unsigned int a1_k0 = 0u, a3_k0 = 0u, a1_k1 = 0u, a3_k1 = 0u; \
+        if (has_hi_rows) { \
+            w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4(ra1), p1, p2, a1_k0, a3_k0, a1_k1, a3_k1); \
+        } \
+        const unsigned int ras = ras_raw & 0x7F7F7F7Fu; \
+        const unsigned int as_peer = __shfl_xor_sync(0xFFFFFFFFu, ras, 2); \
+        const unsigned int sfa_k0 = p2 ? as_peer : ras; \
+        const unsigned int sfa_k1 = p2 ? ras : as_peer; \
+        w4sk_mma_m16n8k64(acc[0], a0_k0, a1_k0, a2_k0, a3_k0, b0_k0, b1_k0, sfa_k0, sfb0_k0); \
+        w4sk_mma_m16n8k64(acc[0], a0_k1, a1_k1, a2_k1, a3_k1, b0_k1, b1_k1, sfa_k1, sfb0_k1); \
+        w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4((st).b1), p1, p2, b0_k0, b1_k0, b0_k1, b1_k1); \
+        const unsigned int sfb1_k0 = __shfl_sync(0xFFFFFFFFu, bs_clean, q0 + 2u); \
+        const unsigned int sfb1_k1 = __shfl_sync(0xFFFFFFFFu, bs_clean, q0 + 3u); \
+        w4sk_mma_m16n8k64(acc[1], a0_k0, a1_k0, a2_k0, a3_k0, b0_k0, b1_k0, sfa_k0, sfb1_k0); \
+        w4sk_mma_m16n8k64(acc[1], a0_k1, a1_k1, a2_k1, a3_k1, b0_k1, b1_k1, sfa_k1, sfb1_k1); \
     } while (0)
 
-    if (k_begin < k_end) {
-        uint4 cur_bp, cur_ap;
-        unsigned int cur_bs, cur_as;
-        W4SK_PREFETCH_REGS(k_begin, cur_bp, cur_bs, cur_ap, cur_as);
-        W4SK_COMMIT_SMEM(cur_bp, cur_bs, cur_ap, cur_as);
-        __syncthreads();
+    #define W4SK_COMPUTE_TAIL(st) do { \
+        const uint4 ra0 = (a0_valid && !p2) ? w4sk_ldg_nc_128(a0_ptr) : make_uint4(0u, 0u, 0u, 0u); \
+        const unsigned int ras_raw = (as_valid && !p2) ? w4sk_ldg_nc_32(as_ptr) : 0u; \
+        uint4 ra1 = make_uint4(0u, 0u, 0u, 0u); \
+        if (has_hi_rows && a1_valid && !p2) { \
+            ra1 = w4sk_ldg_nc_128(a0_ptr + row8_stride); \
+        } \
+        unsigned int b0_k0, b1_k0, u_b2, u_b3; \
+        w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4((st).b0), p1, p2, b0_k0, b1_k0, u_b2, u_b3); \
+        const unsigned int bs_clean = (st).bs & 0x7F7F7F7Fu; \
+        const unsigned int sfb0 = __shfl_sync(0xFFFFFFFFu, bs_clean, q0 + 0u); \
+        unsigned int a0_k0, a2_k0, u_a2, u_a3; \
+        w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4(ra0), p1, p2, a0_k0, a2_k0, u_a2, u_a3); \
+        unsigned int a1_k0 = 0u, a3_k0 = 0u; \
+        if (has_hi_rows) { \
+            w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4(ra1), p1, p2, a1_k0, a3_k0, u_a2, u_a3); \
+        } \
+        const unsigned int ras = ras_raw & 0x7F7F7F7Fu; \
+        const unsigned int as_peer = __shfl_xor_sync(0xFFFFFFFFu, ras, 2); \
+        const unsigned int sfa = p2 ? as_peer : ras; \
+        w4sk_mma_m16n8k64(acc[0], a0_k0, a1_k0, a2_k0, a3_k0, b0_k0, b1_k0, sfa, sfb0); \
+        w4sk_quad_transpose_4x4(w4sk_canon_e2m1_u4((st).b1), p1, p2, b0_k0, b1_k0, u_b2, u_b3); \
+        const unsigned int sfb1 = __shfl_sync(0xFFFFFFFFu, bs_clean, q0 + 2u); \
+        w4sk_mma_m16n8k64(acc[1], a0_k0, a1_k0, a2_k0, a3_k0, b0_k0, b1_k0, sfa, sfb1); \
+    } while (0)
 
-        for (unsigned int k_next = k_begin + W4SK_K_STEP; k_next < k_end; k_next += W4SK_K_STEP) {
-            uint4 nxt_bp, nxt_ap;
-            unsigned int nxt_bs, nxt_as;
-            W4SK_PREFETCH_REGS(k_next, nxt_bp, nxt_bs, nxt_ap, nxt_as);
-            W4SK_COMPUTE_MMA();
-            __syncthreads();
-            W4SK_COMMIT_SMEM(nxt_bp, nxt_bs, nxt_ap, nxt_as);
-            __syncthreads();
+    // Static 3-stage register ring (s0, s1, s2): keeps 2 full K_SUPER=128
+    // weight tiles (2,048 B/warp = 40.96 KB/SM at 5 CTAs/SM) concurrently in
+    // flight with ZERO register-shift MOVs and ZERO scoreboard stalls between
+    // in-flight stages, followed by a compact 0..2-iteration cleanup loop.
+    if (num_super >= 2u) {
+        W4SkBStage s0, s1, s2;
+        W4SK_LOAD_B_SUPER(s0);
+        W4SK_LOAD_B_SUPER(s1);
+        unsigned int it = 2u;
+        for (; it + 3u <= num_super; it += 3u) {
+            W4SK_LOAD_B_SUPER(s2);
+            W4SK_COMPUTE_SUPER(s0);
+            W4SK_LOAD_B_SUPER(s0);
+            W4SK_COMPUTE_SUPER(s1);
+            W4SK_LOAD_B_SUPER(s1);
+            W4SK_COMPUTE_SUPER(s2);
         }
-        W4SK_COMPUTE_MMA();
+        for (; it < num_super; ++it) {
+            W4SK_LOAD_B_SUPER(s2);
+            W4SK_COMPUTE_SUPER(s0);
+            s0 = s1;
+            s1 = s2;
+        }
+        if (has_tail) {
+            W4SK_LOAD_B_TAIL(s2);
+            W4SK_COMPUTE_SUPER(s0);
+            W4SK_COMPUTE_SUPER(s1);
+            W4SK_COMPUTE_TAIL(s2);
+        } else {
+            W4SK_COMPUTE_SUPER(s0);
+            W4SK_COMPUTE_SUPER(s1);
+        }
+    } else if (num_super == 1u) {
+        W4SkBStage s0;
+        W4SK_LOAD_B_SUPER(s0);
+        if (has_tail) {
+            W4SkBStage stail;
+            W4SK_LOAD_B_TAIL(stail);
+            W4SK_COMPUTE_SUPER(s0);
+            W4SK_COMPUTE_TAIL(stail);
+        } else {
+            W4SK_COMPUTE_SUPER(s0);
+        }
+    } else if (has_tail) {
+        W4SkBStage stail;
+        W4SK_LOAD_B_TAIL(stail);
+        W4SK_COMPUTE_TAIL(stail);
     }
 
-    #undef W4SK_PREFETCH_REGS
-    #undef W4SK_COMMIT_SMEM
-    #undef W4SK_COMPUTE_MMA
+    #undef W4SK_LOAD_B_SUPER
+    #undef W4SK_LOAD_B_TAIL
+    #undef W4SK_COMPUTE_SUPER
+    #undef W4SK_COMPUTE_TAIL
 
     const unsigned int r0 = group_id;
     const unsigned int r1 = group_id + 8u;
@@ -327,6 +472,7 @@ void w4a4_gemm_m16_sk3_sm120(
     }
 
 #else
+    const unsigned int k_end = tile_end << 6;
     // Exact scalar FP32 fallback for SM103a (< SM120):
     // 128 threads = 16 rows x 8 column strips of 8 columns each (64 N cols/CTA).
     // Preserves identical K-slice partition, 3-op SWAR E2M1 canonicalization,
@@ -367,7 +513,7 @@ void w4a4_gemm_m16_sk3_sm120(
             const uint4 bp_hi = w4sk_canon_e2m1_u4(
                 w4sk_ldg_ef_128(B_packed + (int64_t)col * half_K + gc_byte + 16, pol_ef));
             const unsigned int bs_w =
-                w4sk_ldg_ef_32(B_scale + (int64_t)col * num_groups + gg_base, pol_ef) & 0x7F7F7F7Fu;
+                w4sk_ldg_nc_ef_32(B_scale + (int64_t)col * num_groups + gg_base, pol_ef) & 0x7F7F7F7Fu;
 
             const unsigned int b_words[8] = {
                 bp_lo.x, bp_lo.y, bp_lo.z, bp_lo.w,
