@@ -4,7 +4,7 @@
 
 This document defines the seven non-negotiable engineering exactness guarantees enforced across Flux Engine's Blackwell (`sm_121a`/`sm_121f`/`sm_120a`/`sm_103a`) CUDA kernels, Rust runtime/scheduler control plane, and offline quantization & serving certification harnesses.
 
-Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST preserve these seven guarantees simultaneously—fast paths are never permitted to trade silent numerical drift, cross-request leakage, or non-deterministic speculative divergence for throughput.
+Every performance optimization introduced across Flux v1.2, v1.3, v1.4, and v1.5 MUST preserve these seven guarantees simultaneously—fast paths are never permitted to trade silent numerical drift, cross-request leakage, or non-deterministic speculative divergence for throughput.
 
 ---
 
@@ -30,7 +30,10 @@ Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST 
     - Bit-exact `Philox4_32_10` counter RNG keyed strictly by `(seed, abs_pos, 0, 0)`.
     - Exact IEEE `__fdiv_rn(logit, temp)` temperature scaling.
     - Prefix-aware presence and frequency penalty adjustments accumulated strictly over `0..col-1`, guaranteeing bit-identical acceptance/sampling outcomes across `W=1`, `W=8`, and `W=16`.
-- **Verification:** Live multi-concurrency `B=1` vs `B=4/8` and multi-width `W=1` vs `W=8` vs `W=16` certification in `tools/flux_exactness_cert.py` (`trajectory_exact_rate == 1.0`, `first_divergence == null`, `top1_flip_rate == 0.0`, `D_KL < 1e-4`).
+  - **Cross-`M` Deterministic Batch Dispatch (`ATLAS_DETERMINISTIC_BATCH=1`, default OFF):**
+    - Dynamic arrival batch sizes (`M = 1..128`) MUST NOT cross heterogeneous kernel/GEMM dispatch thresholds (`m4`/`m8`/`m17`/`m32`, `batched_verify_tc_dense_active`, cuBLASLt vs custom GEMV, `qwen4_hyper`, `qwen4_fast_proj`, `moe` decode/verify, `qwen3_attention/decode`, `qwen3_ssm/trait_decode_batched`, or `lm_head` batched verify selectors) when strict `B=1 == B=2 == B=4 == B=8 == B=16` invariance is requested.
+    - Enabling `ATLAS_DETERMINISTIC_BATCH=1` pins every decode/verify projection across `M = 1..128` to a single `M`-invariant, zero-atomic, fixed-order backend/tile, driving `batch_b1_vs_b8_exact` from `1/4` to `4/4`.
+- **Verification:** Live multi-concurrency `B=1` vs `B=4/8` (`4/4` canonical trajectories via `--require-batch-invariance`) and multi-width `W=1` vs `W=8` vs `W=16` certification in `tools/flux_exactness_cert.py` (`trajectory_exact_rate == 1.0`, `first_divergence == null`, `top1_flip_rate == 0.0`, `D_KL < 1e-4`).
 
 ### Guarantee 3 — FP4 / FP8 Numerical Hygiene
 
@@ -61,7 +64,13 @@ Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST 
 
 ### Guarantee 5 — Default OFF & Fail-Closed Control Plane
 
-- **Bit-Identical Default Baseline:** Every opt-in optimization (`ATLAS_GDN_1D_REPLAY`, `ATLAS_TENSOR_FP8_PREFILL`, `ATLAS_GDN_L2_WINDOW_MIB`, `ATLAS_GB10_FAST_PREFILL`, `ATLAS_SPEC_EXACT_GPU_ACCEPT`, `ATLAS_W4A4_DECODE_SK3`, `ATLAS_BITFP4_KV`, `ATLAS_BITFP4_RAZER_KV`, `ATLAS_FUSED_RMSNORM_NVFP4`, `ATLAS_LM_HEAD_FUSED_ARGMAX`, `ATLAS_DUAL_PLANE_NVFP4`, `ATLAS_DCOCO_SIDECAR*`, `ATLAS_DFLASH_DEFER_EMIT`, `ATLAS_DFLASH_OPT_BRANCH0`, etc.) defaults **OFF** when unset or empty, executing zero extra allocations and preserving the baseline code path.
+- **Bit-Identical Default Baseline:** Every opt-in optimization (`ATLAS_DETERMINISTIC_BATCH`, `ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX`, `ATLAS_LM_HEAD_INT8_BLOCK32`, `ATLAS_GDN_1D_REPLAY`, `ATLAS_TENSOR_FP8_PREFILL`, `ATLAS_GDN_L2_WINDOW_MIB`, `ATLAS_GB10_FAST_PREFILL`, `ATLAS_SPEC_EXACT_GPU_ACCEPT`, `ATLAS_W4A4_DECODE_SK3`, `ATLAS_BITFP4_KV`, `ATLAS_BITFP4_RAZER_KV`, `ATLAS_FUSED_RMSNORM_NVFP4`, `ATLAS_LM_HEAD_FUSED_ARGMAX`, `ATLAS_DUAL_PLANE_NVFP4`, `ATLAS_DCOCO_SIDECAR*`, `ATLAS_DFLASH_DEFER_EMIT`, `ATLAS_DFLASH_OPT_BRANCH0`, etc.) defaults **OFF** when unset or empty, executing zero extra allocations and preserving the baseline code path.
+- **Raw `/v1/completions` vs `/v1/chat/completions` Cross-Engine Tokenization Contract:**
+  - By default, `crates/spark-server/src/api/completions.rs` prepends `<think></think>\n\n` (`completion_thinking_prefix`) to raw string `prompt` requests on thinking-capable checkpoints so interactive raw completions do not silently enter open-ended chain-of-thought.
+  - Because cross-engine OpenAI-API exactness benchmarks feeding raw text to `/v1/completions` diverge at token `0` if one engine prepends `<think></think>\n\n` and another does not, cross-engine exactness certification MUST use one of three sanctioned exact-tokenization paths:
+    1. **Pre-tokenized `/v1/completions` via `"prompt_token_ids"`** (`tools/flux_exactness_cert.py --cross-engine-parity --endpoint /v1/completions --prompt-token-ids <path.json>`): bypasses both BPE tokenization and `<think></think>\n\n` injection verbatim.
+    2. **Chat endpoint with thinking explicitly disabled** (`tools/flux_exactness_cert.py --cross-engine-parity --endpoint /v1/chat/completions --enable-thinking false`): sends both `"enable_thinking": false` and `"chat_template_kwargs": {"enable_thinking": false}` so engines render the exact same non-thinking chat template.
+    3. **Opt-in raw-text server toggle (`ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1`, `ZERO_OR_ONE`, default OFF):** disables the automatic `<think></think>\n\n` prepend on raw `/v1/completions` text prompts when explicitly armed by the operator.
 - **Strict Environment Parsing:**
   - Every new control reads via `std::env::var_os` (never silently dropping `VarError::NotUnicode`) and fails closed on invalid tokens or partial multi-variable configurations.
   - Every env var is registered in `repro-kit/tools/env_inventory_overrides.tsv`, synced into `crates/spark-server/src/recipe_contract/env_catalog.tsv`, and (for `ATLAS_DFLASH_*`) classified in `cli_dflash_environment_rules.rs` + `cli_dflash_environment_census_tests.rs`.
@@ -102,7 +111,8 @@ Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST 
 | Cold needle passkey (`4K/8K/16K/32K`) | Verbatim recall incl. `FLUX-V12-KV-14336-9472` | `100%` exact | `tools/flux_exactness_cert.py` |
 | Verbatim `code_rust` | Canonical SHA-256 of emitted Rust function | Exact SHA-256 match | `tools/flux_exactness_cert.py` |
 | Cold-vs-warm prefix/GDN replay (Guarantee 7) | Matched cold/warm precision, trajectory & logprob diff | `100%` exact, `<= 1e-5` logprob diff, `D_KL < 1e-4` | `tools/flux_exactness_cert.py` |
-| Mixed batch invariance (`B=1` vs `B=4/8`) | Target trajectory & cross-slot canary check | `100%` exact, `0` canary leaks | `tools/flux_exactness_cert.py` |
+| Mixed batch invariance (`B=1` vs `B=4/8`) | `4/4` canonical trajectories & cross-slot canary check | `4/4` (`100%`) exact (`--require-batch-invariance`), `0` canary leaks | `tools/flux_exactness_cert.py` |
+| Cross-engine prompt-token parity | Pre-tokenized `prompt_token_ids` or chat `enable_thinking=false` | `100%` exact (`--cross-engine-parity`), `D_KL < 1e-4` | `tools/flux_exactness_cert.py` |
 | Verify-width invariance (`W=1` vs `W=8` vs `W=16`) | Trajectory exactness, first divergence, `D_KL` | `100%` exact, `first_div = null`, `top1_flip = 0`, `D_KL < 1e-4` | `tools/flux_exactness_cert.py` |
 | `INT8 per-32 BF16sc` (`8.50 bpw`) `lm_head` | 0-ULP `int8->BF16`, SQNR, `D_KL@T=1`, Pareto dominance | `SQNR >= 44.0 dB` (`~45.4 dB`), `D_KL < 1e-6`, `0%` flips, beats DualPlane & MXFP8 | `tools/certify_quant_exactness.py` |
 | `DualPlaneNvfp4` (`8.50 bpw`) `lm_head` | Weight/logit SQNR, Top-1 flip, `D_KL@T=1`, tie-break | `SQNR >= 37.5 dB`, `+6 dB` vs FP8, `flip < 0.1%`, `D_KL < 1e-4`, exact tie-break | `tools/certify_quant_exactness.py` |
@@ -113,7 +123,34 @@ Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST 
 
 ---
 
-## 3. Certification Commands
+## 3. Live GB10 Flux v1.4 Exactness Certification Receipts
+
+Measured directly on **NVIDIA GB10** (`SM 12.1`, `48 SMs`, `24.0 MiB` L2) at verified Flux v1.4 commit `d5df69cedb` (`33` kernels / `421` entries `PROVED (sm_121a PTX+SASS)`, `0 B` stack/spills, `0` odd `desc[UR]`).
+
+### 3.1 Live GB10 GPU Kernel `0-ULP` Exactness Proofs
+
+| Kernel / Track | Live GB10 Shape | Exactness Proof (`0-ULP`) | Observed GB10 Telemetry |
+|---|---|---|---|
+| `lm_head_int8_block32` (`V14-T5`) | `Qwen3.8-Flash-Next` (`V=248320, K=2560`, `675.4 MB` vs `1,271.4 MB` BF16) | `M1==M8 diff=0/248320`, `M1==M16 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `3.36–3.56 ms` (`190–201 GB/s`, `I2F=0`) |
+| `lm_head_int8_block32` (`V14-T5`) | `Qwen3.8-27B` (`V=248320, K=5120`, `1,350.9 MB` vs `2,542.8 MB` BF16) | `M1==M8 diff=0/248320`, `M1==M16 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `6.93–7.34 ms` (`184–195 GB/s`, `I2F=0`) |
+| `w4a4_decode_roofline_sm120` (`V14-T4A`) | `Qwen3.8-27B` `down_proj` (`5120×17408`, `split_k=3`, `50.14 MB`) | `M1==M8 diff=0/5120`, `M1==M16 diff=0/5120` | `M=1..16`: `402–478 us` (v1.5 register-direct targets `<= 215 us`) |
+| `w4a4_decode_roofline_sm120` (`V14-T4A`) | `Qwen3.8-27B` `gate_proj` (`17408×5120`, `split_k=3`, `50.14 MB`) | `M1==M8 diff=0/17408`, `M1==M16 diff=0/17408` | `M=1..16`: `440–471 us` (v1.5 register-direct targets `<= 215 us`) |
+| `gdn_correction_replay_sm120` (`V14-T1`) | `Qwen3.8-27B` (`48L`, `nk=16, nv=48, D=128`) | `status=0`, `515.0 KB/L` 1D record vs `48.0 MB` 2D snapshot | `verify_1d`: `33.1 us/L` (`W=8`) / `40.6 us/L` (`W=16`); 48L `commit_1d`: `1.402 ms` (`215.4 GB/s R+W`) |
+
+### 3.2 Live GB10 End-to-End Serving Exactness (`Qwen3.8-Flash-Next`)
+
+| Serving Exactness Gate | Flux v1.4 Live GB10 Receipt (`arm1` Base & `arm2` Opt-In) | Status / v1.5 Action |
+|---|---|---|
+| Cold-vs-warm prefix/GDN replay (`prefix_repeat_exact`) | **`4/4`** (`traj_code_ringbuf`, `traj_prose_nav`, `traj_code_dijkstra`, `traj_arith_seq`; 256-tok SHA-256 identical, `first_diff = null`) | **PASS (`4/4`)** |
+| Cold long-context needle recall | **`4/4`** (`needle_4k` 9,240 ptoks, `needle_8k` 18,467 ptoks, `needle_16k` 37,793 ptoks, plus `16,647`-ptok `FLUX-V12-KV-14336-9472` verbatim recall) | **PASS (`4/4`)** |
+| Cross-request canary isolation (`B=8`) | **`0` canary leaks** across every concurrent `B=8` batch | **PASS (`0` leaks)** |
+| Baseline `arm1` vs v1.4 opt-in `arm2` (`--compare`) | **`4/4` trajectory exact** (`diff = None`; matching SHA-256 `cb5977fdbf0df266`, `99e1b8bfb0a36534`, `c7bd29da45937832`, `352f3ac613aea27c`) | **PASS (`4/4`)** |
+| Mixed batch invariance (`batch_b1_vs_b8_exact`) | `1/4` under default dynamic-`M` routing (`arith_seq` exact; `diff=124/32/258` on `ringbuf/prose_nav/dijkstra`) | **Remediated in v1.5** via `ATLAS_DETERMINISTIC_BATCH=1` (target `4/4` under `--require-batch-invariance`) |
+| Raw `/v1/completions` cross-engine tokenization | Auto-prepended `<think></think>\n\n` shifted token `0` on raw string prompts | **Remediated in v1.5** via `--cross-engine-parity` (`--prompt-token-ids` / chat `enable_thinking=false`) & `ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1` |
+
+---
+
+## 4. Certification Commands
 
 ### Offline Self-Tests (CPU-Only, Safe with `CUDA_VISIBLE_DEVICES=""`)
 
@@ -132,25 +169,45 @@ python3 scripts/verify_no_leaks.py
 ### Live Server Certification & Cross-Config Comparison
 
 ```bash
-# Capture baseline reference (e.g., W=1 / default flags)
+# Capture baseline reference with strict cross-engine parity + 4/4 B=1==B=4/8 gate
 python3 tools/flux_exactness_cert.py \
   --base-url http://127.0.0.1:8080 \
   --model Qwen3.8-27B \
+  --endpoint /v1/chat/completions \
+  --enable-thinking false \
+  --cross-engine-parity \
+  --require-batch-invariance \
   --needle-lengths 4096,8192,16384,32768 \
   --batch-sizes 4,8 \
   --json-out /tmp/cert_baseline_w1.json
 
-# Capture candidate run (e.g., W=8 or W=16 with v1.4 opt-in flags enabled)
+# Or run exact pre-tokenized /v1/completions probes (zero tokenizer / think-prefix drift)
 python3 tools/flux_exactness_cert.py \
   --base-url http://127.0.0.1:8080 \
   --model Qwen3.8-27B \
+  --endpoint /v1/completions \
+  --cross-engine-parity \
+  --prompt-token-ids /path/to/prompts_token_ids.json \
+  --require-batch-invariance \
+  --batch-sizes 4,8 \
+  --json-out /tmp/cert_tids_ref.json
+
+# Capture candidate run (e.g., W=8 or W=16 with v1.5 opt-in flags such as ATLAS_DETERMINISTIC_BATCH=1)
+python3 tools/flux_exactness_cert.py \
+  --base-url http://127.0.0.1:8080 \
+  --model Qwen3.8-27B \
+  --endpoint /v1/chat/completions \
+  --enable-thinking false \
+  --cross-engine-parity \
+  --require-batch-invariance \
   --needle-lengths 4096,8192,16384,32768 \
   --batch-sizes 4,8 \
   --json-out /tmp/cert_candidate_w16.json
 
-# Certify exactness diff (trajectory exactness, first divergence, top-1 flip, D_KL < 1e-4)
+# Certify exactness diff (trajectory exactness, first divergence, top-1 flip, D_KL < 1e-4, 4/4 batch gate)
 python3 tools/flux_exactness_cert.py \
   --compare /tmp/cert_baseline_w1.json /tmp/cert_candidate_w16.json \
+  --require-batch-invariance \
   --max-kl 1e-4 --max-top1-flip-rate 0.0
 
 # Or certify W=1 == W=8 == W=16 directly across live servers

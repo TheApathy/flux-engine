@@ -12,14 +12,21 @@ deterministic artifact comparator (``--compare``):
      SHA-256 verification.
   3. Cold-vs-warm prefix-cache & GDN recurrent-state replay determinism
      (bit-identical token trajectory and zero logprob drift).
-  4. ``B=1`` vs ``B=4/8`` mixed-length concurrent batch invariance with zero
-     cross-slot canary leakage.
+  4. ``B=1`` vs ``B=4/8`` mixed-length concurrent batch invariance across 4
+     canonical trajectories (strict ``4/4`` gate via ``--require-batch-invariance``)
+     with zero cross-slot canary leakage.
   5. ``W=1`` vs ``W=8`` vs ``W=16`` speculative verify-width invariance (via
      ``--width-urls`` or multi-artifact ``--compare``).
+  6. Cross-engine exact prompt-token parity mode (``--cross-engine-parity``):
+     supports pre-tokenized ``--prompt-token-ids <path.json>`` on
+     ``/v1/completions`` (bypassing engine-specific tokenization and
+     ``<think></think>\n\n`` auto-prepending) and explicit
+     ``enable_thinking=false`` on ``/v1/chat/completions``.
 
 Zero third-party dependencies (Python stdlib only). Run ``--self-test`` to spin
-up an in-process ``ThreadingHTTPServer`` OpenAI-compatible mock server and
-verify all 5 suites, ``--compare`` pass/fail gates, ``D_KL < 1e-4``, and
+up in-process ``ThreadingHTTPServer`` OpenAI-compatible mock servers and verify
+all suites, cross-engine ``prompt_token_ids`` & chat parity, strict ``4/4``
+batch-invariance pass/fail gates, ``--compare`` gates, ``D_KL < 1e-4``, and
 canary-leak fail-closed detection offline.
 """
 
@@ -71,6 +78,26 @@ ARITHMETIC_CASES: tuple[tuple[str, str, str], ...] = (
         "133214",
     ),
     ("arith_mod_4", "Compute 104729 mod 97. Reply with only the exact integer.", "66"),
+)
+
+# Four canonical mixed-domain trajectories matching live GB10 4/4 B=1 vs B=4/8 certification.
+BATCH_INVARIANCE_PROBES: tuple[tuple[str, str], ...] = (
+    (
+        "traj_code_ringbuf",
+        "Write a concise Python RingBuffer class with push, pop, peek, and __len__ methods.",
+    ),
+    (
+        "traj_prose_nav",
+        "Explain in one short paragraph how 18th-century maritime chronometers solved longitude.",
+    ),
+    (
+        "traj_code_dijkstra",
+        "Write a concise Python function implementing Dijkstra shortest path with heapq.",
+    ),
+    (
+        "traj_arith_seq",
+        "Continue the integer sequence by 10 terms starting right after 1005: 1006, 1007,",
+    ),
 )
 
 # Deterministic filler sentence (~16 tokens) used to construct cold haystacks.
@@ -224,21 +251,100 @@ def _extract_choice_trace(
     return text, token_ids, parsed_logprobs, prompt_tokens, completion_tokens, cached_tokens
 
 
+def validate_prompt_token_ids(raw_ids: Any, label: str = "prompt_token_ids") -> list[int]:
+    """Validate a non-empty list of unsigned 32-bit token IDs (rejecting bools/negatives)."""
+    if not isinstance(raw_ids, list) or len(raw_ids) == 0:
+        raise ValueError(f"{label} must be a non-empty list of u32 integers")
+    out: list[int] = []
+    for idx, val in enumerate(raw_ids):
+        if isinstance(val, bool) or not isinstance(val, int) or not (0 <= val <= 0xFFFFFFFF):
+            raise ValueError(f"{label}[{idx}]={val!r} is not a valid u32 token id")
+        out.append(val)
+    return out
+
+
+def load_prompt_token_ids_file(path: Path) -> list[dict[str, Any]]:
+    """Load pre-tokenized cross-engine exactness prompts from JSON.
+
+    Accepts either:
+      - ``{"case_a": [1, 2, 3], "case_b": [4, 5, 6]}``
+      - ``{"cases": [{"case_id": "...", "prompt_token_ids": [...], "expected_substring": "..."}]}``
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    entries: list[dict[str, Any]] = []
+    if isinstance(raw, dict) and isinstance(raw.get("cases"), list):
+        for idx, item in enumerate(raw["cases"]):
+            if not isinstance(item, dict) or not isinstance(item.get("case_id"), str) or not item["case_id"]:
+                raise ValueError(f"cases[{idx}] requires a non-empty string `case_id`")
+            tids = validate_prompt_token_ids(
+                item.get("prompt_token_ids"), f"cases[{idx}].prompt_token_ids"
+            )
+            max_toks = int(item.get("max_tokens", 64))
+            if max_toks <= 0:
+                raise ValueError(f"cases[{idx}].max_tokens must be > 0, got {max_toks}")
+            entries.append(
+                {
+                    "case_id": item["case_id"],
+                    "prompt_token_ids": tids,
+                    "expected_substring": item.get("expected_substring"),
+                    "max_tokens": max_toks,
+                }
+            )
+    elif isinstance(raw, dict) and raw:
+        for cid, ids in raw.items():
+            if not isinstance(cid, str) or not cid:
+                raise ValueError("prompt_token_ids map keys must be non-empty strings")
+            entries.append(
+                {
+                    "case_id": cid,
+                    "prompt_token_ids": validate_prompt_token_ids(ids, f"{cid}.prompt_token_ids"),
+                    "expected_substring": None,
+                    "max_tokens": 64,
+                }
+            )
+    else:
+        raise ValueError("prompt-token-ids JSON must be a non-empty object mapping case_id -> [u32] or {cases: [...]}")
+    if not entries:
+        raise ValueError("prompt-token-ids JSON contains zero cases")
+    return entries
+
+
 def query_model(
     base_url: str,
     endpoint: str,
     model: str,
-    prompt: str,
+    prompt: str = "",
     max_tokens: int = 128,
     temperature: float = 0.0,
     seed: int = DEFAULT_SEED,
     top_logprobs: int = DEFAULT_TOP_LOGPROBS,
     timeout: float = 120.0,
+    prompt_token_ids: list[int] | None = None,
+    enable_thinking: bool = False,
 ) -> tuple[str, list[int], list[dict[str, Any]], int, int, int, float]:
-    """Query a Flux OpenAI-compatible endpoint deterministically."""
-    url = f"{base_url.rstrip('/')}{endpoint}"
-    if endpoint == "/v1/chat/completions":
+    """Query a Flux OpenAI-compatible endpoint deterministically.
+
+    When ``prompt_token_ids`` is provided, dispatches directly to ``/v1/completions``
+    via ``prompt_token_ids`` (omitting ``prompt`` text completely so neither BPE
+    differences nor ``<think></think>\\n\\n`` auto-prepending can shift token IDs).
+    """
+    if prompt_token_ids is not None:
+        if endpoint != "/v1/completions":
+            raise ValueError("prompt_token_ids requires endpoint='/v1/completions'")
+        validated_ids = validate_prompt_token_ids(prompt_token_ids)
+        url = f"{base_url.rstrip('/')}{endpoint}"
         payload: dict[str, Any] = {
+            "model": model,
+            "prompt_token_ids": validated_ids,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "seed": seed,
+            "stream": False,
+            "return_token_ids": True,
+        }
+    elif endpoint == "/v1/chat/completions":
+        url = f"{base_url.rstrip('/')}{endpoint}"
+        payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
@@ -246,12 +352,14 @@ def query_model(
             "seed": seed,
             "stream": False,
             "return_token_ids": True,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "enable_thinking": enable_thinking,
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
         if top_logprobs > 0:
             payload["logprobs"] = True
             payload["top_logprobs"] = top_logprobs
     else:
+        url = f"{base_url.rstrip('/')}{endpoint}"
         payload = {
             "model": model,
             "prompt": prompt,
@@ -411,6 +519,7 @@ def compare_reports(
     max_kl: float = DEFAULT_MAX_KL,
     max_top1_flip_rate: float = DEFAULT_MAX_TOP1_FLIP_RATE,
     require_exact: bool = True,
+    require_batch_invariance: bool = False,
 ) -> dict[str, Any]:
     """Compare a candidate exactness report against a reference report."""
     ref_cases = {c["case_id"]: c for c in ref_report.get("cases", [])}
@@ -459,6 +568,17 @@ def compare_reports(
     if overall_max_kl > max_kl:
         failures.append(f"max D_KL {overall_max_kl:.3e} > gate {max_kl:.3e}")
 
+    cand_batch_summary = cand_report.get("batch_invariance")
+    if require_batch_invariance:
+        if not isinstance(cand_batch_summary, dict) or not cand_batch_summary:
+            failures.append("require_batch_invariance set, but candidate report lacks batch_invariance results")
+        else:
+            for b_key, b_row in sorted(cand_batch_summary.items()):
+                if not isinstance(b_row, dict) or not b_row.get("passed"):
+                    failures.append(
+                        f"candidate batch invariance `{b_key}` failed: {b_row}"
+                    )
+
     return {
         "passed": len(failures) == 0,
         "failures": failures,
@@ -466,6 +586,7 @@ def compare_reports(
             "max_kl": max_kl,
             "max_top1_flip_rate": max_top1_flip_rate,
             "require_exact": require_exact,
+            "require_batch_invariance": require_batch_invariance,
         },
         "summary": {
             "shared_cases": len(shared_ids),
@@ -483,6 +604,161 @@ def compare_reports(
     }
 
 
+def run_prompt_token_ids_suite(
+    base_url: str,
+    model: str,
+    token_cases: list[dict[str, Any]],
+    batch_sizes: list[int],
+    seed: int = DEFAULT_SEED,
+    max_kl: float = DEFAULT_MAX_KL,
+    require_batch_invariance: bool = False,
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    """Run exact pre-tokenized ``prompt_token_ids`` probes on ``/v1/completions`` for cross-engine parity."""
+    cases: list[CaseTrace] = []
+    suite_failures: list[str] = []
+    solo_by_id: dict[str, CaseTrace] = {}
+
+    for item in token_cases:
+        cid = item["case_id"]
+        prompt_ids = item["prompt_token_ids"]
+        expected_sub = item.get("expected_substring")
+        max_toks = int(item.get("max_tokens", 64))
+        text, tids, lps, p_toks, c_toks, cached, lat_ms = query_model(
+            base_url=base_url,
+            endpoint="/v1/completions",
+            model=model,
+            max_tokens=max_toks,
+            temperature=0.0,
+            seed=seed,
+            top_logprobs=0,
+            timeout=timeout,
+            prompt_token_ids=prompt_ids,
+        )
+        ok = True if not expected_sub else (expected_sub in text)
+        reason = "ok" if ok else f"expected substring `{expected_sub}` missing from `{text[:80]}`"
+        if not ok:
+            suite_failures.append(f"{cid}: {reason}")
+        trace = CaseTrace(
+            case_id=cid,
+            suite="prompt_token_ids_parity",
+            passed=ok,
+            reason=reason,
+            text=text,
+            text_sha256=sha256_text(text),
+            token_ids=tids,
+            cached_tokens=cached,
+            prompt_tokens=p_toks,
+            completion_tokens=c_toks,
+            latency_ms=round(lat_ms, 3),
+            logprobs=lps,
+            metadata={"prompt_token_ids_len": len(prompt_ids)},
+        )
+        solo_by_id[cid] = trace
+        cases.append(trace)
+
+    # Optional multi-batch invariance on the pre-tokenized prompts.
+    batch_invariance: dict[str, Any] = {}
+    multi_batch_sizes = [b for b in batch_sizes if b >= 2]
+    if require_batch_invariance and not multi_batch_sizes:
+        suite_failures.append("require_batch_invariance set, but no batch size >= 2 was configured")
+    for b_size in multi_batch_sizes:
+        exact_hits = 0
+        for idx, item in enumerate(token_cases):
+            cid = item["case_id"]
+            prompt_ids = item["prompt_token_ids"]
+            max_toks = int(item.get("max_tokens", 64))
+            # Build B concurrent requests: slot 0 = target, slots 1..B-1 = distinct pre-tokenized distractors.
+            slot_payloads: list[tuple[int, list[int]]] = [(0, prompt_ids)]
+            for slot in range(1, b_size):
+                distractor_ids = [
+                    prompt_ids[i % len(prompt_ids)] for i in range(max(4, (len(prompt_ids) + slot * 3) % max(len(prompt_ids) + 12, 16)))
+                ]
+                slot_payloads.append((slot, distractor_ids))
+
+            def _run_tok_slot(pair: tuple[int, list[int]]) -> tuple[int, tuple[Any, ...]]:
+                s_idx, s_ids = pair
+                res = query_model(
+                    base_url=base_url,
+                    endpoint="/v1/completions",
+                    model=model,
+                    max_tokens=max_toks,
+                    temperature=0.0,
+                    seed=seed,
+                    top_logprobs=0,
+                    timeout=timeout,
+                    prompt_token_ids=s_ids,
+                )
+                return s_idx, res
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=b_size) as pool:
+                slot_outputs = list(pool.map(_run_tok_slot, slot_payloads))
+            slot_outputs.sort(key=lambda x: x[0])
+            t_res = slot_outputs[0][1]
+            cand_trace = CaseTrace(
+                case_id=f"batch_b{b_size}_{cid}",
+                suite="batch_invariance",
+                passed=True,
+                reason="ok",
+                text=t_res[0],
+                text_sha256=sha256_text(t_res[0]),
+                token_ids=t_res[1],
+                cached_tokens=t_res[5],
+                prompt_tokens=t_res[3],
+                completion_tokens=t_res[4],
+                latency_ms=round(t_res[6], 3),
+                logprobs=t_res[2],
+            )
+            cmp_b = compare_two_traces(asdict(solo_by_id[cid]), asdict(cand_trace))
+            is_exact = bool(cmp_b["trajectory_exact_match"] and cmp_b["max_kl_divergence"] <= max_kl)
+            if is_exact:
+                exact_hits += 1
+            else:
+                cand_trace.passed = False
+                cand_trace.reason = (
+                    f"prompt_token_ids batch B={b_size} mismatch on `{cid}`: "
+                    f"first_div={cmp_b['first_divergence_index']}"
+                )
+                if require_batch_invariance:
+                    suite_failures.append(cand_trace.reason)
+            cand_trace.metadata = {"batch_size": b_size, "target_case": cid, "comparison_vs_b1": cmp_b}
+            cases.append(cand_trace)
+            if idx + 1 >= 4:
+                break
+        tested = min(len(token_cases), 4)
+        b_passed = exact_hits == tested
+        batch_invariance[f"b1_vs_b{b_size}"] = {
+            "exact_count": exact_hits,
+            "total": tested,
+            "ratio": f"{exact_hits}/{tested}",
+            "canary_leaks": 0,
+            "passed": b_passed,
+        }
+
+    return {
+        "schema_version": 2,
+        "base_url": base_url,
+        "endpoint": "/v1/completions",
+        "model": model,
+        "seed": seed,
+        "cross_engine_parity": {
+            "mode": "completions_prompt_token_ids",
+            "prompt_token_ids_used": True,
+            "enable_thinking": False,
+            "require_batch_invariance": require_batch_invariance,
+        },
+        "batch_invariance": batch_invariance,
+        "passed": len(suite_failures) == 0,
+        "failures": suite_failures,
+        "summary": {
+            "total_cases": len(cases),
+            "passed_cases": sum(1 for c in cases if c.passed),
+            "failed_cases": sum(1 for c in cases if not c.passed),
+        },
+        "cases": [asdict(c) for c in cases],
+    }
+
+
 def run_certification_suite(
     base_url: str,
     endpoint: str,
@@ -494,6 +770,8 @@ def run_certification_suite(
     run_salt: str | None = None,
     warm_logprob_tol: float = DEFAULT_WARM_LOGPROB_TOL,
     max_kl: float = DEFAULT_MAX_KL,
+    enable_thinking: bool = False,
+    require_batch_invariance: bool = True,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
     """Run suites 1–4 against one live OpenAI-compatible Flux server."""
@@ -513,6 +791,7 @@ def run_certification_suite(
             seed=seed,
             top_logprobs=top_logprobs,
             timeout=timeout,
+            enable_thinking=enable_thinking,
         )
         ok = expected_ans in text.strip()
         reason = "ok" if ok else f"expected `{expected_ans}` in `{text.strip()[:80]}`"
@@ -564,6 +843,7 @@ def run_certification_suite(
             seed=seed,
             top_logprobs=top_logprobs,
             timeout=timeout,
+            enable_thinking=enable_thinking,
         )
         ok = passkey in text
         reason = "ok" if ok else f"passkey `{passkey}` missing from `{text.strip()[:100]}`"
@@ -600,6 +880,7 @@ def run_certification_suite(
         seed=seed,
         top_logprobs=top_logprobs,
         timeout=timeout,
+        enable_thinking=enable_thinking,
     )
     normalized_rust = normalize_rust_block(text)
     got_rust_sha = sha256_text(normalized_rust)
@@ -651,6 +932,7 @@ def run_certification_suite(
         seed=seed,
         top_logprobs=top_logprobs,
         timeout=timeout,
+        enable_thinking=enable_thinking,
     )
     warm_res = query_model(
         base_url=base_url,
@@ -662,6 +944,7 @@ def run_certification_suite(
         seed=seed,
         top_logprobs=top_logprobs,
         timeout=timeout,
+        enable_thinking=enable_thinking,
     )
     cold_trace = CaseTrace(
         case_id="cold_vs_warm_cold",
@@ -713,129 +996,167 @@ def run_certification_suite(
     }
     cases.extend([cold_trace, warm_trace])
 
-    # ── Suite 4: B=1 vs B=4/8 mixed batch invariance + zero canary leaks ────
-    b1_prompt = build_cold_needle_prompt(
-        target_tokens=max(256, min(needle_lengths) if needle_lengths else 512),
-        passkey=VERBATIM_KV_PASSKEY,
-        salt=f"{salt}-b1-target",
-        depth_fraction=0.5,
-    )
-    b1_res = query_model(
-        base_url=base_url,
-        endpoint=endpoint,
-        model=model,
-        prompt=b1_prompt,
-        max_tokens=48,
-        temperature=0.0,
-        seed=seed,
-        top_logprobs=top_logprobs,
-        timeout=timeout,
-    )
-    b1_trace = CaseTrace(
-        case_id="batch_b1_reference",
-        suite="batch_invariance",
-        passed=VERBATIM_KV_PASSKEY in b1_res[0],
-        reason="ok" if VERBATIM_KV_PASSKEY in b1_res[0] else "B=1 target passkey missing",
-        text=b1_res[0],
-        text_sha256=sha256_text(b1_res[0]),
-        token_ids=b1_res[1],
-        cached_tokens=b1_res[5],
-        prompt_tokens=b1_res[3],
-        completion_tokens=b1_res[4],
-        latency_ms=round(b1_res[6], 3),
-        logprobs=b1_res[2],
-    )
-    if not b1_trace.passed:
-        suite_failures.append(f"batch_b1_reference: {b1_trace.reason}")
-    cases.append(b1_trace)
-
-    for b_size in batch_sizes:
-        if b_size < 2:
-            continue
-        slot_prompts: list[tuple[int, str, str]] = [(0, VERBATIM_KV_PASSKEY, b1_prompt)]
-        for slot in range(1, b_size):
-            canary = f"CANARY-ISOLATION-B{b_size}-S{slot}-{hashlib.sha256(f'{salt}:{b_size}:{slot}'.encode()).hexdigest()[:8].upper()}"
-            # Deliberately vary distractor lengths to stress ragged mixed-batch scheduling.
-            dist_len = 128 + ((slot * 193) % 512)
-            dist_prompt = build_cold_needle_prompt(
-                target_tokens=dist_len,
-                passkey=canary,
-                salt=f"{salt}-b{b_size}-slot{slot}",
-                depth_fraction=0.35 + 0.1 * (slot % 4),
-            )
-            slot_prompts.append((slot, canary, dist_prompt))
-
-        def _run_slot(item: tuple[int, str, str]) -> tuple[int, str, tuple[Any, ...]]:
-            slot_idx, canary_tok, p_text = item
-            res = query_model(
+    # ── Suite 4: 4/4 B=1 vs B=4/8 mixed batch invariance + zero canary leaks ─
+    batch_invariance_summary: dict[str, Any] = {}
+    multi_batch_sizes = [b for b in batch_sizes if b >= 2]
+    if require_batch_invariance and not multi_batch_sizes:
+        suite_failures.append("require_batch_invariance set, but no batch size >= 2 was configured")
+    if multi_batch_sizes:
+        solo_traces: list[tuple[str, str, CaseTrace]] = []
+        for traj_id, traj_prompt in BATCH_INVARIANCE_PROBES:
+            s_res = query_model(
                 base_url=base_url,
                 endpoint=endpoint,
                 model=model,
-                prompt=p_text,
-                max_tokens=48,
+                prompt=traj_prompt,
+                max_tokens=64,
                 temperature=0.0,
                 seed=seed,
                 top_logprobs=top_logprobs,
                 timeout=timeout,
+                enable_thinking=enable_thinking,
             )
-            return slot_idx, canary_tok, res
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=b_size) as pool:
-            slot_outputs = list(pool.map(_run_slot, slot_prompts))
-
-        slot_outputs.sort(key=lambda x: x[0])
-        target_res = slot_outputs[0][2]
-        cand_batch_trace = CaseTrace(
-            case_id=f"batch_b{b_size}_vs_b1",
-            suite="batch_invariance",
-            passed=True,
-            reason="ok",
-            text=target_res[0],
-            text_sha256=sha256_text(target_res[0]),
-            token_ids=target_res[1],
-            cached_tokens=target_res[5],
-            prompt_tokens=target_res[3],
-            completion_tokens=target_res[4],
-            latency_ms=round(target_res[6], 3),
-            logprobs=target_res[2],
-        )
-
-        # Check cross-slot canary isolation across ALL pairs (i != j).
-        leaks: list[str] = []
-        all_canaries = [(s, c) for s, c, _ in slot_outputs]
-        for slot_idx, _, res in slot_outputs:
-            out_text = res[0]
-            for other_slot, other_canary in all_canaries:
-                if other_slot != slot_idx and other_canary in out_text:
-                    leaks.append(f"slot {slot_idx} leaked canary from slot {other_slot} ({other_canary})")
-
-        b_cmp = compare_two_traces(asdict(b1_trace), asdict(cand_batch_trace))
-        b_ok = (
-            len(leaks) == 0
-            and b_cmp["trajectory_exact_match"]
-            and b_cmp["max_kl_divergence"] <= max_kl
-        )
-        if not b_ok:
-            cand_batch_trace.passed = False
-            cand_batch_trace.reason = (
-                f"batch B={b_size} invariance failed: leaks={leaks}, "
-                f"exact={b_cmp['trajectory_exact_match']}, max_kl={b_cmp['max_kl_divergence']:.3e}"
+            s_trace = CaseTrace(
+                case_id=f"batch_b1_{traj_id}",
+                suite="batch_invariance",
+                passed=bool(s_res[0].strip()),
+                reason="ok" if s_res[0].strip() else f"empty B=1 response for {traj_id}",
+                text=s_res[0],
+                text_sha256=sha256_text(s_res[0]),
+                token_ids=s_res[1],
+                cached_tokens=s_res[5],
+                prompt_tokens=s_res[3],
+                completion_tokens=s_res[4],
+                latency_ms=round(s_res[6], 3),
+                logprobs=s_res[2],
             )
-            suite_failures.append(f"batch_b{b_size}_vs_b1: {cand_batch_trace.reason}")
-        cand_batch_trace.metadata = {
-            "batch_size": b_size,
-            "canary_leaks": leaks,
-            "comparison_vs_b1": b_cmp,
-        }
-        cases.append(cand_batch_trace)
+            if not s_trace.passed:
+                suite_failures.append(f"{s_trace.case_id}: {s_trace.reason}")
+            solo_traces.append((traj_id, traj_prompt, s_trace))
+            cases.append(s_trace)
+
+        for b_size in multi_batch_sizes:
+            exact_hits = 0
+            batch_leaks: list[str] = []
+            for traj_id, traj_prompt, b1_trace in solo_traces:
+                slot_prompts: list[tuple[int, str, str]] = [(0, "", traj_prompt)]
+                for slot in range(1, b_size):
+                    canary = (
+                        f"CANARY-ISOLATION-B{b_size}-{traj_id.upper()}-S{slot}-"
+                        f"{hashlib.sha256(f'{salt}:{b_size}:{traj_id}:{slot}'.encode()).hexdigest()[:8].upper()}"
+                    )
+                    # Deliberately vary distractor lengths to stress ragged mixed-batch scheduling.
+                    dist_len = 128 + ((slot * 193) % 512)
+                    dist_prompt = build_cold_needle_prompt(
+                        target_tokens=dist_len,
+                        passkey=canary,
+                        salt=f"{salt}-b{b_size}-{traj_id}-slot{slot}",
+                        depth_fraction=0.35 + 0.1 * (slot % 4),
+                    )
+                    slot_prompts.append((slot, canary, dist_prompt))
+
+                def _run_slot(item: tuple[int, str, str]) -> tuple[int, str, tuple[Any, ...]]:
+                    slot_idx, canary_tok, p_text = item
+                    res = query_model(
+                        base_url=base_url,
+                        endpoint=endpoint,
+                        model=model,
+                        prompt=p_text,
+                        max_tokens=64,
+                        temperature=0.0,
+                        seed=seed,
+                        top_logprobs=top_logprobs,
+                        timeout=timeout,
+                        enable_thinking=enable_thinking,
+                    )
+                    return slot_idx, canary_tok, res
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=b_size) as pool:
+                    slot_outputs = list(pool.map(_run_slot, slot_prompts))
+
+                slot_outputs.sort(key=lambda x: x[0])
+                target_res = slot_outputs[0][2]
+                cand_batch_trace = CaseTrace(
+                    case_id=f"batch_b{b_size}_vs_b1_{traj_id}",
+                    suite="batch_invariance",
+                    passed=True,
+                    reason="ok",
+                    text=target_res[0],
+                    text_sha256=sha256_text(target_res[0]),
+                    token_ids=target_res[1],
+                    cached_tokens=target_res[5],
+                    prompt_tokens=target_res[3],
+                    completion_tokens=target_res[4],
+                    latency_ms=round(target_res[6], 3),
+                    logprobs=target_res[2],
+                )
+
+                # Check cross-slot canary isolation across ALL pairs (i != j).
+                leaks: list[str] = []
+                all_canaries = [(s, c) for s, c, _ in slot_outputs if c]
+                for slot_idx, _, res in slot_outputs:
+                    out_text = res[0]
+                    for other_slot, other_canary in all_canaries:
+                        if other_slot != slot_idx and other_canary in out_text:
+                            leaks.append(
+                                f"slot {slot_idx} leaked canary from slot {other_slot} ({other_canary})"
+                            )
+                batch_leaks.extend(leaks)
+
+                b_cmp = compare_two_traces(asdict(b1_trace), asdict(cand_batch_trace))
+                is_exact = bool(b_cmp["trajectory_exact_match"] and b_cmp["max_kl_divergence"] <= max_kl)
+                if is_exact and not leaks:
+                    exact_hits += 1
+                if leaks or (require_batch_invariance and not is_exact):
+                    cand_batch_trace.passed = False
+                    cand_batch_trace.reason = (
+                        f"batch B={b_size} invariance failed on {traj_id}: leaks={leaks}, "
+                        f"exact={b_cmp['trajectory_exact_match']}, first_div={b_cmp['first_divergence_index']}, "
+                        f"max_kl={b_cmp['max_kl_divergence']:.3e}"
+                    )
+                    suite_failures.append(f"{cand_batch_trace.case_id}: {cand_batch_trace.reason}")
+                cand_batch_trace.metadata = {
+                    "batch_size": b_size,
+                    "trajectory": traj_id,
+                    "canary_leaks": leaks,
+                    "comparison_vs_b1": b_cmp,
+                }
+                cases.append(cand_batch_trace)
+
+            total_trajs = len(solo_traces)
+            batch_invariance_summary[f"b1_vs_b{b_size}"] = {
+                "exact_count": exact_hits,
+                "total": total_trajs,
+                "ratio": f"{exact_hits}/{total_trajs}",
+                "canary_leaks": len(batch_leaks),
+                "passed": (exact_hits == total_trajs and len(batch_leaks) == 0),
+            }
+
+    parity_mode = (
+        "chat_enable_thinking_false"
+        if (endpoint == "/v1/chat/completions" and not enable_thinking)
+        else (
+            "chat_enable_thinking_true"
+            if endpoint == "/v1/chat/completions"
+            else "completions_raw_text"
+        )
+    )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "base_url": base_url,
         "endpoint": endpoint,
         "model": model,
         "seed": seed,
         "salt": salt,
+        "cross_engine_parity": {
+            "mode": parity_mode,
+            "prompt_token_ids_used": False,
+            "enable_thinking": enable_thinking,
+            "require_batch_invariance": require_batch_invariance,
+            "raw_completions_think_prefix_warning": (endpoint == "/v1/completions"),
+        },
+        "batch_invariance": batch_invariance_summary,
         "passed": len(suite_failures) == 0,
         "failures": suite_failures,
         "summary": {
@@ -855,6 +1176,7 @@ def run_verify_width_invariance(
     top_logprobs: int = DEFAULT_TOP_LOGPROBS,
     run_salt: str | None = None,
     max_kl: float = DEFAULT_MAX_KL,
+    enable_thinking: bool = False,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
     """Run canonical prompts across ``W=1`` vs ``W=8`` vs ``W=16`` servers and certify exactness."""
@@ -873,6 +1195,8 @@ def run_verify_width_invariance(
             top_logprobs=top_logprobs,
             run_salt=salt,
             max_kl=max_kl,
+            enable_thinking=enable_thinking,
+            require_batch_invariance=False,
             timeout=timeout,
         )
 
@@ -909,12 +1233,22 @@ def run_verify_width_invariance(
 class _MockExactnessState:
     """Deterministic in-memory mock Flux OpenAI server for offline ``--self-test``."""
 
-    def __init__(self, inject_canary_leak: bool = False) -> None:
+    def __init__(
+        self,
+        inject_canary_leak: bool = False,
+        inject_completions_think_prefix: bool = False,
+        simulate_batch_drift: bool = False,
+    ) -> None:
         self.lock = threading.Lock()
         self.prefix_cache: set[str] = set()
         self.inject_canary_leak = inject_canary_leak
+        self.inject_completions_think_prefix = inject_completions_think_prefix
+        self.simulate_batch_drift = simulate_batch_drift
         self.last_canary_seen: str | None = None
+        self.seen_trajectories: set[str] = set()
         self.received_prompts: list[str] = []
+        self.received_token_id_requests: list[list[int]] = []
+        self.received_enable_thinking_flags: list[bool] = []
 
     @staticmethod
     def _answer_prompt(prompt: str) -> str:
@@ -929,30 +1263,67 @@ class _MockExactnessState:
         match = re.search(r"exact verification passkey is ([A-Za-z0-9_-]+)", prompt)
         if match:
             return match.group(1)
+        # 4. Canonical batch-invariance trajectories
+        for traj_id, traj_prompt in BATCH_INVARIANCE_PROBES:
+            if prompt.strip() == traj_prompt:
+                return f"deterministic-{traj_id}-output-v15"
         return "OK"
 
     def handle_request(self, body: dict[str, Any], is_chat: bool) -> dict[str, Any]:
-        if is_chat:
-            msgs = body.get("messages") or []
-            prompt = str(msgs[-1].get("content") or "") if msgs else ""
-        else:
-            prompt = str(body.get("prompt") or "")
-
-        prompt_hash = sha256_text(prompt)
-        prompt_tokens = max(8, len(prompt.split()))
-        with self.lock:
-            self.received_prompts.append(prompt)
-            was_cached = prompt_hash in self.prefix_cache
-            self.prefix_cache.add(prompt_hash)
-            cached_tokens = (prompt_tokens // 16) * 16 if was_cached else 0
-
-        answer = self._answer_prompt(prompt)
-        if self.inject_canary_leak:
+        prompt_token_ids = body.get("prompt_token_ids") if not is_chat else None
+        if prompt_token_ids is not None:
+            ids = validate_prompt_token_ids(prompt_token_ids)
+            key_str = "tids:" + ",".join(str(x) for x in ids)
+            prompt_hash = sha256_text(key_str)
+            prompt_tokens = len(ids)
             with self.lock:
-                if answer.startswith("CANARY-"):
-                    self.last_canary_seen = answer
-                elif self.last_canary_seen is not None and answer == VERBATIM_KV_PASSKEY:
-                    answer = f"{answer} {self.last_canary_seen}"
+                self.received_token_id_requests.append(ids)
+                was_cached = prompt_hash in self.prefix_cache
+                self.prefix_cache.add(prompt_hash)
+                cached_tokens = (prompt_tokens // 16) * 16 if was_cached else 0
+            # Deterministic response keyed solely on exact input token IDs (zero think-prefix drift).
+            answer = f"exact-tids-{prompt_hash[:12]}"
+        else:
+            if is_chat:
+                msgs = body.get("messages") or []
+                prompt = str(msgs[-1].get("content") or "") if msgs else ""
+                ctk = body.get("chat_template_kwargs") or {}
+                eff_think = bool(ctk.get("enable_thinking", body.get("enable_thinking", False)))
+                with self.lock:
+                    self.received_enable_thinking_flags.append(eff_think)
+            else:
+                prompt = str(body.get("prompt") or "")
+                # Simulate Flux completions.rs:344-346 auto-prepending <think></think>\n\n on raw text!
+                if self.inject_completions_think_prefix and "</think>" not in prompt:
+                    prompt = f"<think></think>\n\n{prompt}"
+
+            prompt_hash = sha256_text(prompt)
+            prompt_tokens = max(8, len(prompt.split()))
+            with self.lock:
+                self.received_prompts.append(prompt)
+                was_cached = prompt_hash in self.prefix_cache
+                self.prefix_cache.add(prompt_hash)
+                cached_tokens = (prompt_tokens // 16) * 16 if was_cached else 0
+
+            answer = self._answer_prompt(prompt)
+            if not is_chat and prompt.startswith("<think></think>\n\n"):
+                # Distinct output token when raw /v1/completions prepended <think></think>\n\n!
+                answer = f"thinkprefixed-{answer}"
+
+            if self.inject_canary_leak:
+                with self.lock:
+                    if answer.startswith("CANARY-"):
+                        self.last_canary_seen = answer
+                    elif self.last_canary_seen is not None and answer.startswith("deterministic-"):
+                        answer = f"{answer} {self.last_canary_seen}"
+
+            if self.simulate_batch_drift and answer.startswith("deterministic-traj_code_ringbuf"):
+                # Simulate dynamic-M batch drift on the 2nd (batched) evaluation of ringbuf.
+                with self.lock:
+                    if "traj_code_ringbuf" in self.seen_trajectories:
+                        answer = f"{answer}-drifted-b8"
+                    else:
+                        self.seen_trajectories.add("traj_code_ringbuf")
 
         tokens = [answer[i : i + 4] for i in range(0, len(answer), 4)] or ["OK"]
         token_ids = [100 + (int(sha256_text(tok)[:4], 16) % 30000) for tok in tokens]
@@ -1078,19 +1449,158 @@ def run_self_test() -> int:
     leaky_state = _MockExactnessState(inject_canary_leak=True)
     leaky_srv, leaky_thr, leaky_url = _start_mock_openai_server(leaky_state)
     try:
+        # 1. Clean certification suite with strict 4/4 B=1==B=4 & B=1==B=8 batch invariance.
         report_a = run_certification_suite(
             base_url=base_url,
             endpoint="/v1/chat/completions",
-            model="mock-flux-v14",
+            model="mock-flux-v15",
             needle_lengths=[256, 512, 1024, 2048],
             batch_sizes=[4, 8],
             seed=42,
             top_logprobs=5,
             run_salt="selftest-salt",
+            enable_thinking=False,
+            require_batch_invariance=True,
         )
         assert report_a["passed"], f"clean self-test failed: {report_a['failures']}"
+        assert report_a["batch_invariance"]["b1_vs_b4"]["ratio"] == "4/4"
+        assert report_a["batch_invariance"]["b1_vs_b8"]["ratio"] == "4/4"
+        assert report_a["batch_invariance"]["b1_vs_b8"]["canary_leaks"] == 0
+        assert all(flag is False for flag in clean_state.received_enable_thinking_flags)
         warm_case = next(c for c in report_a["cases"] if c["case_id"] == "cold_vs_warm_warm")
         assert warm_case["cached_tokens"] > 0, "expected warm replay prefix cache hit"
+
+        # 1B. Cross-engine parity proof: server A auto-prepends <think></think>\n\n on raw
+        # /v1/completions text (default Flux completions.rs:344-346) while server B does not.
+        # Raw /v1/completions text diverges, while BOTH --prompt-token-ids and
+        # /v1/chat/completions (enable_thinking=false) achieve 100% bit-exact parity!
+        flux_think_state = _MockExactnessState(inject_completions_think_prefix=True)
+        peer_raw_state = _MockExactnessState(inject_completions_think_prefix=False)
+        drift_state = _MockExactnessState(simulate_batch_drift=True)
+        ft_srv, ft_thr, ft_url = _start_mock_openai_server(flux_think_state)
+        pr_srv, pr_thr, pr_url = _start_mock_openai_server(peer_raw_state)
+        dr_srv, dr_thr, dr_url = _start_mock_openai_server(drift_state)
+        try:
+            raw_flux = run_certification_suite(
+                base_url=ft_url,
+                endpoint="/v1/completions",
+                model="mock-flux-v15",
+                needle_lengths=[256],
+                batch_sizes=[],
+                seed=42,
+                top_logprobs=0,
+                run_salt="xe-salt",
+                require_batch_invariance=False,
+            )
+            raw_peer = run_certification_suite(
+                base_url=pr_url,
+                endpoint="/v1/completions",
+                model="mock-flux-v15",
+                needle_lengths=[256],
+                batch_sizes=[],
+                seed=42,
+                top_logprobs=0,
+                run_salt="xe-salt",
+                require_batch_invariance=False,
+            )
+            assert not compare_reports(raw_flux, raw_peer)["passed"], (
+                "raw /v1/completions string prompts must exhibit think-prefix divergence"
+            )
+
+            # Chat /v1/chat/completions with enable_thinking=False matches 100% across both engines.
+            chat_flux = run_certification_suite(
+                base_url=ft_url,
+                endpoint="/v1/chat/completions",
+                model="mock-flux-v15",
+                needle_lengths=[256],
+                batch_sizes=[4],
+                seed=42,
+                top_logprobs=5,
+                run_salt="xe-chat-salt",
+                enable_thinking=False,
+                require_batch_invariance=True,
+            )
+            chat_peer = run_certification_suite(
+                base_url=pr_url,
+                endpoint="/v1/chat/completions",
+                model="mock-flux-v15",
+                needle_lengths=[256],
+                batch_sizes=[4],
+                seed=42,
+                top_logprobs=5,
+                run_salt="xe-chat-salt",
+                enable_thinking=False,
+                require_batch_invariance=True,
+            )
+            assert compare_reports(chat_flux, chat_peer, require_batch_invariance=True)["passed"]
+
+            # Pre-tokenized --prompt-token-ids on /v1/completions matches 100% across both engines!
+            with tempfile.TemporaryDirectory(prefix="atlas_xe_tids_") as tdir:
+                tids_file = Path(tdir) / "prompts.json"
+                tids_file.write_text(
+                    json.dumps(
+                        {
+                            "cases": [
+                                {"case_id": "xe_tok_1", "prompt_token_ids": [151644, 872, 198, 22, 17, 151645]},
+                                {"case_id": "xe_tok_2", "prompt_token_ids": [151644, 872, 198, 99, 42, 151645]},
+                                {"case_id": "xe_tok_3", "prompt_token_ids": [151644, 872, 198, 777, 888, 151645]},
+                                {"case_id": "xe_tok_4", "prompt_token_ids": [151644, 872, 198, 1006, 1007, 151645]},
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                loaded_tids = load_prompt_token_ids_file(tids_file)
+                tids_flux = run_prompt_token_ids_suite(
+                    base_url=ft_url,
+                    model="mock-flux-v15",
+                    token_cases=loaded_tids,
+                    batch_sizes=[4],
+                    seed=42,
+                    require_batch_invariance=True,
+                )
+                tids_peer = run_prompt_token_ids_suite(
+                    base_url=pr_url,
+                    model="mock-flux-v15",
+                    token_cases=loaded_tids,
+                    batch_sizes=[4],
+                    seed=42,
+                    require_batch_invariance=True,
+                )
+                assert tids_flux["passed"] and tids_peer["passed"]
+                assert tids_flux["batch_invariance"]["b1_vs_b4"]["ratio"] == "4/4"
+                assert compare_reports(tids_flux, tids_peer, require_batch_invariance=True)["passed"]
+                assert len(flux_think_state.received_token_id_requests) >= 4
+
+            # Strict --require-batch-invariance negative test: simulated B=8 drift MUST fail closed!
+            drifted_report = run_certification_suite(
+                base_url=dr_url,
+                endpoint="/v1/chat/completions",
+                model="mock-flux-v15",
+                needle_lengths=[256],
+                batch_sizes=[8],
+                seed=42,
+                top_logprobs=5,
+                run_salt="drift-salt",
+                require_batch_invariance=True,
+            )
+            assert not drifted_report["passed"], "B=8 trajectory drift must fail closed under require_batch_invariance"
+            assert drifted_report["batch_invariance"]["b1_vs_b8"]["ratio"] == "3/4"
+            assert not compare_reports(
+                report_a, drifted_report, require_exact=False, require_batch_invariance=True
+            )["passed"]
+
+            # CLI fail-closed check: --cross-engine-parity with raw /v1/completions text must fail!
+            try:
+                main(["--cross-engine-parity", "--endpoint", "/v1/completions"])
+                raise AssertionError("--cross-engine-parity without --prompt-token-ids must fail closed")
+            except SystemExit as exc:
+                assert exc.code != 0
+        finally:
+            for srv, thr in ((ft_srv, ft_thr), (pr_srv, pr_thr), (dr_srv, dr_thr)):
+                srv.shutdown()
+                srv.server_close()
+                thr.join(timeout=2.0)
 
         # 2. Verify W=1 == W=8 == W=16 multi-width invariance across 3 independent servers
         # and confirm byte-identical deterministic prompts (including Suite 3 cold-vs-warm salt).
@@ -1208,14 +1718,22 @@ def run_self_test() -> int:
                     "self_test": "PASS",
                     "cases_passed": report_a["summary"]["passed_cases"],
                     "total_cases": report_a["summary"]["total_cases"],
+                    "batch_invariance": report_a["batch_invariance"],
                     "code_rust_sha256": CANONICAL_CODE_RUST_SHA256,
                     "width_invariance_passed": width_res["passed"],
+                    "cross_engine_parity_verified": [
+                        "raw_completions_think_prefix_drift_reproduced",
+                        "chat_enable_thinking_false_exact_parity",
+                        "completions_prompt_token_ids_exact_parity",
+                        "cross_engine_cli_guard_enforced",
+                    ],
                     "negative_gates_verified": [
                         "token_divergence_detected",
                         "kl_gate_1e_4_enforced",
                         "asymmetric_token_ids_rejected",
                         "truncated_logprobs_rejected",
                         "canary_leak_rejected",
+                        "batch_b8_drift_rejected",
                     ],
                     "deterministic_width_prompts_verified": True,
                 },
@@ -1298,6 +1816,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Do not fail --compare solely on trajectory mismatch (still enforces KL & top-1 flip gates)",
     )
+    parser.add_argument(
+        "--prompt-token-ids",
+        type=Path,
+        help="JSON file of pre-tokenized prompts ({case_id: [u32]} or {cases: [...]}) sent via /v1/completions prompt_token_ids",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        choices=("false", "true"),
+        default="false",
+        help="Explicit chat_template_kwargs.enable_thinking flag for /v1/chat/completions (default: false)",
+    )
+    parser.add_argument(
+        "--cross-engine-parity",
+        action="store_true",
+        help="Enforce strict cross-engine prompt-token parity (chat enable_thinking=false or /v1/completions with --prompt-token-ids)",
+    )
+    parser.add_argument(
+        "--require-batch-invariance",
+        action="store_true",
+        help="Enforce strict 4/4 B=1 == B=4/8 batch invariance gate (and fail if no batch size >= 2 is tested)",
+    )
     parser.add_argument("--json-out", type=Path, help="Optional path to write full JSON artifact")
     parser.add_argument(
         "--self-test",
@@ -1319,6 +1858,18 @@ def main(argv: list[str] | None = None) -> int:
             f"error: --max-top1-flip-rate must be in [0, 1], got {args.max_top1_flip_rate}"
         )
 
+    enable_thinking = args.enable_thinking == "true"
+    if args.cross_engine_parity:
+        if args.endpoint == "/v1/completions" and args.prompt_token_ids is None:
+            raise SystemExit(
+                "error: --cross-engine-parity with --endpoint /v1/completions requires --prompt-token-ids "
+                "(or use --endpoint /v1/chat/completions --enable-thinking false to avoid <think></think> prefix drift)"
+            )
+        if args.endpoint == "/v1/chat/completions" and enable_thinking:
+            raise SystemExit(
+                "error: --cross-engine-parity requires --enable-thinking false on /v1/chat/completions"
+            )
+
     if args.compare:
         if len(args.compare) < 2:
             raise SystemExit("error: --compare requires at least 2 JSON paths: <ref.json> <cand.json> [...]")
@@ -1333,6 +1884,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_kl=args.max_kl,
                 max_top1_flip_rate=args.max_top1_flip_rate,
                 require_exact=not args.allow_non_exact,
+                require_batch_invariance=args.require_batch_invariance,
             )
             comparisons[cand_path.name] = res
             all_passed = all_passed and res["passed"]
@@ -1353,6 +1905,7 @@ def main(argv: list[str] | None = None) -> int:
             top_logprobs=args.top_logprobs,
             run_salt=args.run_salt,
             max_kl=args.max_kl,
+            enable_thinking=enable_thinking,
         )
         if args.json_out is not None:
             args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1360,27 +1913,62 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2))
         return 0 if res["passed"] else 1
 
-    needle_lengths = [int(x.strip()) for x in args.needle_lengths.split(",") if x.strip()]
-    if any(n <= 0 for n in needle_lengths):
-        raise SystemExit(f"error: --needle-lengths values must be > 0, got {needle_lengths}")
     batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",") if x.strip()]
     if any(b < 1 for b in batch_sizes):
         raise SystemExit(f"error: --batch-sizes values must be >= 1, got {batch_sizes}")
-    report = run_certification_suite(
-        base_url=args.base_url,
-        endpoint=args.endpoint,
-        model=args.model,
-        needle_lengths=needle_lengths,
-        batch_sizes=batch_sizes,
-        seed=args.seed,
-        top_logprobs=args.top_logprobs,
-        run_salt=args.run_salt,
-        max_kl=args.max_kl,
-    )
+    if args.require_batch_invariance and not any(b >= 2 for b in batch_sizes):
+        raise SystemExit("error: --require-batch-invariance requires at least one batch size >= 2 in --batch-sizes")
+
+    if args.prompt_token_ids is not None:
+        if args.endpoint != "/v1/completions":
+            raise SystemExit(
+                "error: --prompt-token-ids requires --endpoint /v1/completions "
+                "(pre-tokenized prompt_token_ids is a /v1/completions wire field)"
+            )
+        try:
+            token_cases = load_prompt_token_ids_file(args.prompt_token_ids)
+        except (OSError, ValueError, json.JSONDecodeError) as err:
+            raise SystemExit(f"error: failed to load --prompt-token-ids: {err}") from err
+        report = run_prompt_token_ids_suite(
+            base_url=args.base_url,
+            model=args.model,
+            token_cases=token_cases,
+            batch_sizes=batch_sizes,
+            seed=args.seed,
+            max_kl=args.max_kl,
+            require_batch_invariance=args.require_batch_invariance,
+        )
+    else:
+        needle_lengths = [int(x.strip()) for x in args.needle_lengths.split(",") if x.strip()]
+        if any(n <= 0 for n in needle_lengths):
+            raise SystemExit(f"error: --needle-lengths values must be > 0, got {needle_lengths}")
+        report = run_certification_suite(
+            base_url=args.base_url,
+            endpoint=args.endpoint,
+            model=args.model,
+            needle_lengths=needle_lengths,
+            batch_sizes=batch_sizes,
+            seed=args.seed,
+            top_logprobs=args.top_logprobs,
+            run_salt=args.run_salt,
+            max_kl=args.max_kl,
+            enable_thinking=enable_thinking,
+            require_batch_invariance=args.require_batch_invariance,
+        )
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"passed": report["passed"], "summary": report["summary"], "failures": report["failures"]}, indent=2))
+    print(
+        json.dumps(
+            {
+                "passed": report["passed"],
+                "summary": report["summary"],
+                "batch_invariance": report.get("batch_invariance"),
+                "failures": report["failures"],
+            },
+            indent=2,
+        )
+    )
     return 0 if report["passed"] else 1
 
 
