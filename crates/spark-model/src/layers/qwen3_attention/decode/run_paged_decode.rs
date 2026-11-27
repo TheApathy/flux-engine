@@ -55,13 +55,17 @@ fn paged_decode_splitk_enabled() -> bool {
 /// The aggressive regime is kept for completeness — it can be useful as a
 /// scaffold for a future BC=4-aware split-K kernel that combines work-stealing
 /// with batched loads — but the env var must remain OFF by default.
-fn compute_num_splits_for_sms(
+fn compute_num_splits_for_sms_with_policy(
     num_q_heads: u32,
     num_seqs: u32,
     max_seq_len_host: u32,
     aggressive: bool,
     sm_count: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
 ) -> u32 {
+    if det_batch.is_enabled() {
+        return 1;
+    }
     // Non-aggressive `BufferSizes::splitk_workspace` allocates a fixed 48-slot
     // (`sm121::NUM_SMS`) partial buffer. Cap legacy occupancy splits to that
     // slot envelope so high-SM discrete GPUs (e.g. 170-188 SMs) never overflow
@@ -109,18 +113,37 @@ fn compute_num_splits_for_sms(
     seq_target.max(occupancy_floor).min(max_splits_cap)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn compute_num_splits_for_sms(
+    num_q_heads: u32,
+    num_seqs: u32,
+    max_seq_len_host: u32,
+    aggressive: bool,
+    sm_count: u32,
+) -> u32 {
+    compute_num_splits_for_sms_with_policy(
+        num_q_heads,
+        num_seqs,
+        max_seq_len_host,
+        aggressive,
+        sm_count,
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+    )
+}
+
 fn compute_num_splits_for(
     num_q_heads: u32,
     num_seqs: u32,
     max_seq_len_host: u32,
     aggressive: bool,
 ) -> u32 {
-    compute_num_splits_for_sms(
+    compute_num_splits_for_sms_with_policy(
         num_q_heads,
         num_seqs,
         max_seq_len_host,
         aggressive,
         atlas_core::device::active_sm_count(),
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
     )
 }
 
@@ -128,14 +151,15 @@ const fn flat_window_min_seq_len_host(num_seqs: u32, max_seq_len_host: u32) -> u
     max_seq_len_host.saturating_sub(num_seqs.saturating_sub(1))
 }
 
-fn flat_window_crosses_k1_split_boundary_for_sms(
+fn flat_window_crosses_k1_split_boundary_for_sms_with_policy(
     num_q_heads: u32,
     num_seqs: u32,
     max_seq_len_host: u32,
     aggressive: bool,
     sm_count: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
 ) -> bool {
-    if !aggressive || num_seqs <= 1 {
+    if det_batch.is_enabled() || !aggressive || num_seqs <= 1 {
         return false;
     }
     let num_sms = sm_count.max(1);
@@ -148,8 +172,39 @@ fn flat_window_crosses_k1_split_boundary_for_sms(
         return false;
     }
     let min_seq_len_host = flat_window_min_seq_len_host(num_seqs, max_seq_len_host);
-    compute_num_splits_for_sms(num_q_heads, 1, min_seq_len_host, true, num_sms)
-        != compute_num_splits_for_sms(num_q_heads, 1, max_seq_len_host, true, num_sms)
+    compute_num_splits_for_sms_with_policy(
+        num_q_heads,
+        1,
+        min_seq_len_host,
+        true,
+        num_sms,
+        det_batch,
+    ) != compute_num_splits_for_sms_with_policy(
+        num_q_heads,
+        1,
+        max_seq_len_host,
+        true,
+        num_sms,
+        det_batch,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn flat_window_crosses_k1_split_boundary_for_sms(
+    num_q_heads: u32,
+    num_seqs: u32,
+    max_seq_len_host: u32,
+    aggressive: bool,
+    sm_count: u32,
+) -> bool {
+    flat_window_crosses_k1_split_boundary_for_sms_with_policy(
+        num_q_heads,
+        num_seqs,
+        max_seq_len_host,
+        aggressive,
+        sm_count,
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+    )
 }
 
 fn flat_window_crosses_k1_split_boundary_for(
@@ -158,12 +213,13 @@ fn flat_window_crosses_k1_split_boundary_for(
     max_seq_len_host: u32,
     aggressive: bool,
 ) -> bool {
-    flat_window_crosses_k1_split_boundary_for_sms(
+    flat_window_crosses_k1_split_boundary_for_sms_with_policy(
         num_q_heads,
         num_seqs,
         max_seq_len_host,
         aggressive,
         atlas_core::device::active_sm_count(),
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
     )
 }
 
@@ -214,13 +270,17 @@ fn gqa4_kernel(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
         .map_err(|e| anyhow::anyhow!("{GQA4_SELECTOR}: kernel unavailable: {e}"))
 }
 
-const fn bf16_gqa4_geometry(
+const fn bf16_gqa4_geometry_with_policy(
     num_seqs: u32,
     sliding: u32,
     head_dim: u32,
     num_q_heads: u32,
     num_kv_heads: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
 ) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
     num_seqs > 1
         && sliding == 0
         && head_dim == 256
@@ -228,6 +288,24 @@ const fn bf16_gqa4_geometry(
         && num_q_heads.is_multiple_of(4)
         && num_q_heads.is_multiple_of(num_kv_heads)
         && (num_q_heads / num_kv_heads).is_multiple_of(4)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+const fn bf16_gqa4_geometry(
+    num_seqs: u32,
+    sliding: u32,
+    head_dim: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+) -> bool {
+    bf16_gqa4_geometry_with_policy(
+        num_seqs,
+        sliding,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+    )
 }
 
 const GQA12_RAGGED_SELECTOR: &str = "ATLAS_PAGED_DECODE_RAGGED_GQA";
@@ -265,15 +343,17 @@ fn gqa12_ragged_mode() -> Gqa12RaggedMode {
     })
 }
 
-const fn gqa12_ragged_eligible(
+const fn gqa12_ragged_eligible_with_policy(
     mode: Gqa12RaggedMode,
     num_seqs: u32,
     head_dim: u32,
     num_q_heads: u32,
     num_kv_heads: u32,
     tree_or_indir: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
 ) -> bool {
-    if tree_or_indir
+    if det_batch.is_enabled()
+        || tree_or_indir
         || head_dim != 256
         || num_kv_heads == 0
         || num_seqs == 0
@@ -291,6 +371,26 @@ const fn gqa12_ragged_eligible(
         // rows so 8..=256 covers concurrent multi-request and batched verify.
         Gqa12RaggedMode::Auto => gqa_ratio >= 8 && num_seqs >= 8,
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+const fn gqa12_ragged_eligible(
+    mode: Gqa12RaggedMode,
+    num_seqs: u32,
+    head_dim: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    tree_or_indir: bool,
+) -> bool {
+    gqa12_ragged_eligible_with_policy(
+        mode,
+        num_seqs,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        tree_or_indir,
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+    )
 }
 
 #[inline]
@@ -391,12 +491,13 @@ impl Qwen3AttentionLayer {
         head_dim: u32,
         num_seqs: u32,
     ) -> Result<()> {
-        if bf16_gqa4_geometry(
+        if bf16_gqa4_geometry_with_policy(
             num_seqs,
             self.sliding_window.unwrap_or(0),
             head_dim,
             num_q_heads,
             num_kv_heads,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         ) && gqa4_selected()
         {
             gqa4_kernel(gpu)?;
@@ -440,13 +541,14 @@ impl Qwen3AttentionLayer {
         let Some((main_k, red_k)) = self.paged_decode_gqa12_ragged_k else {
             return Ok(false);
         };
-        if !gqa12_ragged_eligible(
+        if !gqa12_ragged_eligible_with_policy(
             gqa12_ragged_mode(),
             num_seqs,
             head_dim,
             num_q_heads,
             num_kv_heads,
             tree_or_indir,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         ) {
             return Ok(false);
         }
@@ -649,8 +751,14 @@ impl Qwen3AttentionLayer {
             && head_dim == 256
             && self.paged_decode_bf16_gated_k.0 != 0
             && crate::layers::qwen4_qsa::qwen4_qsa_fused_gate_enabled()
-            && !(bf16_gqa4_geometry(num_seqs, sliding, head_dim, num_q_heads, num_kv_heads)
-                && gqa4_selected())
+            && !(bf16_gqa4_geometry_with_policy(
+                num_seqs,
+                sliding,
+                head_dim,
+                num_q_heads,
+                num_kv_heads,
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+            ) && gqa4_selected())
         {
             ops::paged_decode_attn_bf16_gated(
                 gpu,
@@ -737,7 +845,9 @@ impl Qwen3AttentionLayer {
                             self.attn_layer_idx
                         );
                     }
-                    let bitfp4_splits = if workspace == DevicePtr::NULL {
+                    let bitfp4_splits = if workspace == DevicePtr::NULL
+                        || crate::layers::deterministic_batch::deterministic_batch_enabled()
+                    {
                         1
                     } else {
                         super::super::bitfp4_kv::compute_bitfp4_decode_splits(
@@ -1233,8 +1343,14 @@ impl Qwen3AttentionLayer {
                 let sliding = self.sliding_window.unwrap_or(0);
                 // Default-off GQA-fused twin (ATLAS_QWEN4_PREFILL_ATTN_GQA=1):
                 // bit-identical per-head math, K/V loads shared by 4 heads.
-                if bf16_gqa4_geometry(num_seqs, sliding, head_dim, num_q_heads, num_kv_heads)
-                    && gqa4_selected()
+                if bf16_gqa4_geometry_with_policy(
+                    num_seqs,
+                    sliding,
+                    head_dim,
+                    num_q_heads,
+                    num_kv_heads,
+                    crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+                ) && gqa4_selected()
                 {
                     let kernel = gqa4_kernel(gpu)?;
                     static LOGGED: std::sync::Once = std::sync::Once::new();
@@ -1427,12 +1543,119 @@ mod dynamic_sm_tests {
     use spark_runtime::kv_cache::KvCacheDtype;
 
     use super::{
-        GQA12_MAX_PARTS, GQA12_MAX_PARTS_BF16_WIDE, compute_num_splits_for_sms,
-        flat_window_crosses_k1_split_boundary_for_sms,
-        gqa12_ragged_grid_and_workspace_bytes_for_sms,
+        GQA12_MAX_PARTS, GQA12_MAX_PARTS_BF16_WIDE, Gqa12RaggedMode,
+        bf16_gqa4_geometry_with_policy, compute_num_splits_for_sms,
+        compute_num_splits_for_sms_with_policy, flat_window_crosses_k1_split_boundary_for_sms,
+        flat_window_crosses_k1_split_boundary_for_sms_with_policy,
+        gqa12_ragged_eligible_with_policy, gqa12_ragged_grid_and_workspace_bytes_for_sms,
         gqa12_ragged_grid_and_workspace_bytes_for_sms_with_cap,
         gqa12_ragged_max_parts_for_kv_and_sm,
     };
+    use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+    #[test]
+    fn deterministic_batch_pins_single_split_and_disables_ragged_gqa_across_1_to_128() {
+        for sm in [48u32, 188u32] {
+            for m in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+                assert_eq!(
+                    compute_num_splits_for_sms_with_policy(
+                        24,
+                        m,
+                        16_384,
+                        false,
+                        sm,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    1,
+                    "legacy split-K must pin to 1 at M={m} sm={sm}"
+                );
+                assert_eq!(
+                    compute_num_splits_for_sms_with_policy(
+                        24,
+                        m,
+                        16_384,
+                        true,
+                        sm,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    1,
+                    "aggressive split-K must pin to 1 at M={m} sm={sm}"
+                );
+                assert!(!flat_window_crosses_k1_split_boundary_for_sms_with_policy(
+                    24,
+                    m,
+                    1025,
+                    true,
+                    sm,
+                    DeterministicBatchPolicy::Enabled,
+                ));
+                assert!(!bf16_gqa4_geometry_with_policy(
+                    m,
+                    0,
+                    256,
+                    24,
+                    2,
+                    DeterministicBatchPolicy::Enabled,
+                ));
+                for mode in [Gqa12RaggedMode::Auto, Gqa12RaggedMode::ForceOn] {
+                    assert!(
+                        !gqa12_ragged_eligible_with_policy(
+                            mode,
+                            m,
+                            256,
+                            24,
+                            2,
+                            false,
+                            DeterministicBatchPolicy::Enabled,
+                        ),
+                        "gqa12_ragged must be disabled at M={m} mode={mode:?}"
+                    );
+                }
+            }
+        }
+
+        // Baseline (Disabled) retains B=1 num_splits=2 vs B=8 num_splits=1 and B>=8 gqa12_ragged.
+        assert_eq!(
+            compute_num_splits_for_sms_with_policy(
+                24,
+                1,
+                16_384,
+                false,
+                48,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            2
+        );
+        assert_eq!(
+            compute_num_splits_for_sms_with_policy(
+                24,
+                8,
+                16_384,
+                false,
+                48,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            1
+        );
+        assert!(!gqa12_ragged_eligible_with_policy(
+            Gqa12RaggedMode::Auto,
+            1,
+            256,
+            24,
+            2,
+            false,
+            DeterministicBatchPolicy::Disabled,
+        ));
+        assert!(gqa12_ragged_eligible_with_policy(
+            Gqa12RaggedMode::Auto,
+            8,
+            256,
+            24,
+            2,
+            false,
+            DeterministicBatchPolicy::Disabled,
+        ));
+    }
 
     #[test]
     fn legacy_splitk_never_overflows_fixed_48_slot_workspace_on_high_sm_gpus() {

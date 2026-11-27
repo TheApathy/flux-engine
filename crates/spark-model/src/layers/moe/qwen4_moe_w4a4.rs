@@ -224,6 +224,21 @@ impl W4a4Mode {
         }
     }
 
+    /// Policy-aware variant of [`Self::admits_with_boundary`]:
+    /// `ATLAS_DETERMINISTIC_BATCH=1` disables persistent atomic W4A4 dispatch.
+    #[must_use]
+    pub(crate) const fn admits_with_boundary_and_policy(
+        self,
+        eligibility: W4a4Eligibility,
+        boundary: W4a4ProtectedBoundary,
+        det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    ) -> bool {
+        if det_batch.is_enabled() {
+            return false;
+        }
+        self.admits_with_boundary(eligibility, boundary)
+    }
+
     /// Evaluates per-dispatch eligibility for `v32_w4a4` with an explicit boundary-layer policy.
     #[must_use]
     pub(crate) const fn admits_with_boundary(
@@ -1114,6 +1129,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn deterministic_batch_disables_w4a4_across_1_to_128() {
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for rows in [1usize, 2, 4, 8, 16, 32, 64, 128, 512] {
+            let elig = W4a4Eligibility {
+                rows,
+                w4a8_is_v28: true,
+                v28_m64_forced: false,
+                has_corrections: false,
+                l2_windowed: false,
+                v29_m256_active: false,
+                v30_2cta_active: false,
+                verify_scope_active: false,
+                kernels_loaded: true,
+                layer_idx: Some(10),
+                num_layers: Some(48),
+            };
+            for mode in [W4a4Mode::GateUp, W4a4Mode::All] {
+                assert!(
+                    !mode.admits_with_boundary_and_policy(
+                        elig,
+                        W4a4ProtectedBoundary::DEFAULT,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    "w4a4 must stay disabled at rows={rows} for mode={mode:?}"
+                );
+            }
+        }
+
+        let elig_prefill = W4a4Eligibility {
+            rows: 512,
+            w4a8_is_v28: true,
+            v28_m64_forced: false,
+            has_corrections: false,
+            l2_windowed: false,
+            v29_m256_active: false,
+            v30_2cta_active: false,
+            verify_scope_active: false,
+            kernels_loaded: true,
+            layer_idx: Some(10),
+            num_layers: Some(48),
+        };
+        assert!(W4a4Mode::All.admits_with_boundary_and_policy(
+            elig_prefill,
+            W4a4ProtectedBoundary::DEFAULT,
+            DeterministicBatchPolicy::Disabled,
+        ));
     }
 }
 

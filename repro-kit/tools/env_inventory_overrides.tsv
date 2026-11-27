@@ -134,3 +134,4 @@ ATLAS_GDN_L2_WINDOW_MIB	RESOURCE	opt-in L2-resident token window budget in MiB f
 ATLAS_SPEC_EXACT_GPU_ACCEPT	ROUTE	opt-in hardened on-GPU exact speculative acceptance with Philox4_32_10 and two-pass sparse residual sampling (ops/exact_spec_accept.rs)
 ATLAS_W4A4_DECODE_SK3	NUMERICS	opt-in 48-SM roofline W4A4 decode GEMM (split_k=3 deterministic reduction, ops/w4a4_decode_sk3.rs)
 ATLAS_LM_HEAD_INT8_BLOCK32	NUMERICS	opt-in native SM121 INT8 Block-32 BF16-scale (8.50 bpw) LM-head GEMM and fused online argmax (ops/lm_head_int8_block32.rs)
+ATLAS_DETERMINISTIC_BATCH	NUMERICS	opt-in M-invariant deterministic batch decode/verify routing guaranteeing B=1==B=2==B=4==B=8==B=16 bit-exactness (layers/deterministic_batch.rs)

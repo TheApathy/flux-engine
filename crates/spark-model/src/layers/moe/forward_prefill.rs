@@ -160,13 +160,14 @@ impl MoeLayer {
                 || crate::model::qwen4_prefill_engagement::slot_r2_active_for(num_tokens);
         let ep_multi_gpu =
             ctx.config.ep_world_size > 1 && ctx.comm.as_ref().is_some_and(|c| c.world_size() > 1);
-        match trait_decode::decide_small_batch_prefill(
+        match trait_decode::decide_small_batch_prefill_with_policy(
             num_tokens,
             frankenstein_decode,
             prefill_native_or_r2,
             ep_multi_gpu,
             self.t_lanes_rows_route(),
             self.gate_nvfp4.is_some(),
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         ) {
             trait_decode::SmallBatchPrefillAction::ScalarDecodeM1 => {
                 self.forward(input, ctx, stream)?;

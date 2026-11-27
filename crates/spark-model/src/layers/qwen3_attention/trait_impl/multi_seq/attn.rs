@@ -11,7 +11,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
 use super::ctx::MultiSeqCtx;
-use super::qkv::{raw_attn_proj_tc_override, resolve_attn_proj_tc_for_sm};
+use super::qkv::{raw_attn_proj_tc_override, resolve_attn_proj_tc_for_sm_with_policy};
 use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
@@ -1708,7 +1708,12 @@ impl Qwen3AttentionLayer {
             && self.qwen4_attn_hyper.is_none()
             && !serial_o_proj
             && o_proj_m17_astage_route != AttnOProjM17AStageRoute::Complete
-            && resolve_attn_proj_tc_for_sm(raw_attn_proj_tc_override(), sm_count, n);
+            && resolve_attn_proj_tc_for_sm_with_policy(
+                raw_attn_proj_tc_override(),
+                sm_count,
+                n,
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+            );
         let mut o_proj_done = false;
         if o_proj_sm120_fast {
             let sm120_max_m = crate::layers::dense_ffn::sm120_coalesced_max_m();
@@ -1834,7 +1839,10 @@ impl Qwen3AttentionLayer {
             .or(self.o_dense_bf16.as_ref())
         {
             // BF16 dense O projection (decode-only override or BF16 dense models).
-            if n > 1 && self.dense_gemm_k.0 != 0 {
+            if n > 1
+                && self.dense_gemm_k.0 != 0
+                && !crate::layers::deterministic_batch::deterministic_batch_enabled()
+            {
                 ops::dense_gemm(
                     fwd.gpu,
                     self.dense_gemm_k,

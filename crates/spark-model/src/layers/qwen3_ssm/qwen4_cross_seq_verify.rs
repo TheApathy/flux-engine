@@ -149,6 +149,30 @@ enum CrossSeqSplitV4Plan {
 
 #[inline]
 #[must_use]
+const fn plan_cross_seq_splitv4_with_policy(
+    split_v_enabled: bool,
+    num_seqs: usize,
+    lazy: bool,
+    needs_scaled_fp16: bool,
+    has_fp32_kernel: bool,
+    has_scaled_fp16_kernel: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> CrossSeqSplitV4Plan {
+    if det_batch.is_enabled() {
+        return CrossSeqSplitV4Plan::Disabled;
+    }
+    plan_cross_seq_splitv4(
+        split_v_enabled,
+        num_seqs,
+        lazy,
+        needs_scaled_fp16,
+        has_fp32_kernel,
+        has_scaled_fp16_kernel,
+    )
+}
+
+#[inline]
+#[must_use]
 const fn plan_cross_seq_splitv4(
     split_v_enabled: bool,
     num_seqs: usize,
@@ -607,7 +631,8 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if crate::layers::qwen4_oracle::root().is_some()
+        if crate::layers::deterministic_batch::deterministic_batch_enabled()
+            || crate::layers::qwen4_oracle::root().is_some()
             || !cross_seq_verify_ba_gemm_eligible(
                 tc_dense_scope,
                 rows,
@@ -932,7 +957,11 @@ impl Qwen3SsmLayer {
         // ── Row-parallel: output projection and attention inject ──
         let output = ctx.buffers.moe_output();
         if tc_dense_fp8
-            && crate::layers::qwen4_fast_proj::batched_verify_dense_proj_tc_admits(rows, h)
+            && crate::layers::qwen4_fast_proj::batched_verify_dense_proj_tc_admits_with_policy(
+                rows,
+                h,
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+            )
             && ssm_tc_dense_fp8_available(ctx.gpu, &self.ssm.out_proj, rows, h, value_dim)
         {
             crate::layers::qwen4_fast_proj::clear_prequant_fp8_act();
@@ -2240,13 +2269,14 @@ impl Qwen3SsmLayer {
         } else {
             KernelHandle(0)
         };
-        let splitv4_plan = plan_cross_seq_splitv4(
+        let splitv4_plan = plan_cross_seq_splitv4_with_policy(
             super::qwen4_gdn_split_v_enabled_for_single_seq(),
             n,
             lazy,
             needs_scaled_fp16,
             splitv4_k.0 != 0,
             scaled_splitv4_k.0 != 0,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         );
         let max_lanes = crate::layers::qwen4_verify_lanes::MAX_LANES;
         let split_done_ptr = if splitv4_plan != CrossSeqSplitV4Plan::Disabled && n <= max_lanes {
@@ -3276,6 +3306,49 @@ mod c1_parity_source_tests {
         assert_eq!(
             plan_cross_seq_splitv4(true, 8, true, true, true, true),
             CrossSeqSplitV4Plan::Disabled
+        );
+
+        use super::plan_cross_seq_splitv4_with_policy;
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+        for c in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(
+                plan_cross_seq_splitv4_with_policy(
+                    true,
+                    c,
+                    true,
+                    false,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                CrossSeqSplitV4Plan::Disabled,
+                "cross-seq split-V must stay disabled at C={c}"
+            );
+            assert_eq!(
+                plan_cross_seq_splitv4_with_policy(
+                    true,
+                    c,
+                    true,
+                    true,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                CrossSeqSplitV4Plan::Disabled,
+                "cross-seq scaled-FP16 split-V must stay disabled at C={c}"
+            );
+        }
+        assert_eq!(
+            plan_cross_seq_splitv4_with_policy(
+                true,
+                1,
+                true,
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            CrossSeqSplitV4Plan::ScaledFp16Capable
         );
 
         // Scratch layout for C=4, K=8 (32 rows), nv=48 fits well within 40 MiB GDN_FI arena.

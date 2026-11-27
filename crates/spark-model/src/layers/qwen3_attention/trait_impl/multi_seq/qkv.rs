@@ -257,6 +257,18 @@ pub(super) fn raw_attn_proj_tc_override() -> AttnProjTcOverride {
     })
 }
 
+pub(super) const fn resolve_attn_proj_tc_for_sm_with_policy(
+    env_override: AttnProjTcOverride,
+    sm_count: u32,
+    rows: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    resolve_attn_proj_tc_for_sm(env_override, sm_count, rows)
+}
+
 pub(super) const fn resolve_attn_proj_tc_for_sm(
     env_override: AttnProjTcOverride,
     sm_count: u32,
@@ -416,6 +428,7 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_enabled();
         if matches!(
             exact_route,
             Some(
@@ -434,19 +447,22 @@ impl Qwen3AttentionLayer {
             )
         ) {
             self.ms_qkv_serial(c)?;
-        } else if n == 3
+        } else if !det_batch
+            && n == 3
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
         {
             self.ms_qkv_batch3(c)?;
-        } else if n == 2
+        } else if !det_batch
+            && n == 2
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
         {
             self.ms_qkv_batch2(c)?;
-        } else if n > 3
+        } else if !det_batch
+            && n > 3
             && n <= 32
             && self.w4a16_gemm_t_m16_k.0 != 0
             && crate::layers::tc_nvfp4_m16_enabled()
@@ -456,7 +472,8 @@ impl Qwen3AttentionLayer {
             && self.v_nvfp4_t.is_some()
         {
             self.ms_qkv_batched_m16(c)?;
-        } else if n > 3
+        } else if !det_batch
+            && n > 3
             && n <= 32
             && attn_qkv_batched_plain_enabled()
             && (!self.gated || attn_qkv_batched_gated_unsafe_enabled())
@@ -511,7 +528,12 @@ impl Qwen3AttentionLayer {
         } = *c;
         let sm_count = atlas_core::device::active_sm_count();
         let tc_override = raw_attn_proj_tc_override();
-        if !resolve_attn_proj_tc_for_sm(tc_override, sm_count, n) {
+        if !resolve_attn_proj_tc_for_sm_with_policy(
+            tc_override,
+            sm_count,
+            n,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        ) {
             return Ok(false);
         }
         if !per_seq_qkv.is_multiple_of(bf16) {
@@ -2223,5 +2245,37 @@ mod selector_flag_tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn deterministic_batch_disables_attn_proj_tc_across_1_to_128() {
+        use super::resolve_attn_proj_tc_for_sm_with_policy;
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for sm in [48u32, 188u32] {
+            for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+                for ov in [
+                    AttnProjTcOverride::Auto,
+                    AttnProjTcOverride::Enabled,
+                    AttnProjTcOverride::Disabled,
+                ] {
+                    assert!(
+                        !resolve_attn_proj_tc_for_sm_with_policy(
+                            ov,
+                            sm,
+                            m,
+                            DeterministicBatchPolicy::Enabled,
+                        ),
+                        "attn proj TC must be disabled at M={m} sm={sm} ov={ov:?}"
+                    );
+                }
+            }
+        }
+        assert!(resolve_attn_proj_tc_for_sm_with_policy(
+            AttnProjTcOverride::Auto,
+            188,
+            8,
+            DeterministicBatchPolicy::Disabled,
+        ));
     }
 }

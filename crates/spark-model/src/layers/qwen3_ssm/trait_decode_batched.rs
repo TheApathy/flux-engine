@@ -240,8 +240,10 @@ impl Qwen3SsmLayer {
                 )?;
             }
         } else if self.sequential_qkvz
-            && (2..=32).contains(&num_tokens)
-            && !super::super::ssm_proj_tc_enabled()
+            && ((crate::layers::deterministic_batch::deterministic_batch_enabled()
+                && (2..=crate::layers::deterministic_batch::DETERMINISTIC_BATCH_MAX_ROWS)
+                    .contains(&num_tokens))
+                || ((2..=32).contains(&num_tokens) && !super::super::ssm_proj_tc_enabled()))
             && let Some(nvfp4) = self.qkvz_nvfp4.as_ref()
         {
             crate::kprof!(ctx.gpu, stream, "ssm_qkvz_exact", {
@@ -1206,17 +1208,32 @@ impl Qwen3SsmLayer {
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
         crate::kprof!(ctx.gpu, stream, "ssm_out_proj", {
             if let Some(ref dense_out) = self.out_proj_dense {
-                ops::dense_gemm(
-                    ctx.gpu,
-                    self.dense_gemm_k,
-                    normed_out_buf,
-                    dense_out,
-                    out_proj_buf,
-                    k,
-                    h as u32,
-                    value_dim as u32,
-                    stream,
-                )?;
+                if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+                    for t in 0..num_tokens {
+                        ops::dense_gemv(
+                            ctx.gpu,
+                            self.dense_gemv_k,
+                            normed_out_buf.offset(t * value_dim * bf16),
+                            dense_out,
+                            out_proj_buf.offset(t * h * bf16),
+                            h as u32,
+                            value_dim as u32,
+                            stream,
+                        )?;
+                    }
+                } else {
+                    ops::dense_gemm(
+                        ctx.gpu,
+                        self.dense_gemm_k,
+                        normed_out_buf,
+                        dense_out,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                }
             } else if force_serial_out {
                 serial_diag::prove_serial_path(serial_diag::SerialPath::Out);
                 // Losslessness diagnostic matching `ssm_forward` exactly.
@@ -1236,9 +1253,11 @@ impl Qwen3SsmLayer {
                         stream,
                     )?;
                 }
-            } else if (2..=32).contains(&num_tokens)
+            } else if ((crate::layers::deterministic_batch::deterministic_batch_enabled()
+                && (2..=crate::layers::deterministic_batch::DETERMINISTIC_BATCH_MAX_ROWS)
+                    .contains(&num_tokens))
+                || ((2..=32).contains(&num_tokens) && !super::super::ssm_proj_tc_enabled()))
                 && !self.ssm.out_proj.is_null()
-                && !super::super::ssm_proj_tc_enabled()
             {
                 crate::kprof!(ctx.gpu, stream, "ssm_out_exact", {
                     self.project_nvfp4_rows_exact_or_k1(
@@ -1543,7 +1562,8 @@ impl Qwen3SsmLayer {
             return Ok(());
         }
 
-        if num_tokens == 3 {
+        let det_batch_ffn = crate::layers::deterministic_batch::deterministic_batch_enabled();
+        if !det_batch_ffn && num_tokens == 3 {
             // Fused K=3 MoE: 5 kernel launches instead of 15
             crate::kprof!(ctx.gpu, stream, "ssm_ffn_forward_k3", {
                 self.ffn.forward_k3(normed2_base, ctx, stream)?;
@@ -1561,7 +1581,7 @@ impl Qwen3SsmLayer {
                 )?;
                 anyhow::Result::<()>::Ok(())
             })?;
-        } else if num_tokens == 2 {
+        } else if !det_batch_ffn && num_tokens == 2 {
             // Fused K=2 MoE: 5 kernel launches instead of 10
             self.ffn.forward_k2(normed2_base, ctx, stream)?;
             // Batched residual add for 2 tokens (flat element-wise, 2*h elements)
@@ -1603,7 +1623,8 @@ impl Qwen3SsmLayer {
             // interaction that has since been resolved upstream; keeping
             // it suppressed the fast kernel on truncated-γ verifies,
             // costing the prose path 15-20 tok/s.
-            let try_kgamma = num_tokens >= super::super::TC_VERIFY_MIN_ROWS
+            let try_kgamma = !det_batch_ffn
+                && num_tokens >= super::super::TC_VERIFY_MIN_ROWS
                 && (super::super::ffn_kgamma_m16_enabled()
                     || self.ffn.exact_kgamma_applicable(num_tokens as u32));
             let used_kgamma = if try_kgamma {

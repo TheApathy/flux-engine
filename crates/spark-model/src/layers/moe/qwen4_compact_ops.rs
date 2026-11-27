@@ -2251,8 +2251,11 @@ impl MoeLayer {
                 layer_idx: Some(layer_idx),
                 num_layers: Some(ctx.config.num_hidden_layers),
             };
-            if w4a4_mode.admits_with_boundary(w4a4_elig, w4a4_boundary)
-                && crate::layers::qwen4_oracle::root().is_none()
+            if w4a4_mode.admits_with_boundary_and_policy(
+                w4a4_elig,
+                w4a4_boundary,
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+            ) && crate::layers::qwen4_oracle::root().is_none()
             {
                 // If shared-expert overlap pre-quantized MXFP8 x into `expert_up_out`,
                 // place NVFP4 `xq`/`xs`/`x_scale2` (`rows * 1444 B` = 23.7 MiB @ 16K) in

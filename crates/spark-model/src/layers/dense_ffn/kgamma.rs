@@ -12,7 +12,7 @@ use super::policy::{
     ExactFfnDispatch, ExactFfnMaterializedAvailability, ExactFfnMaterializedRoute,
     ExactFfnPhysicalRoute, FFN_KGAMMA_AUTO_TC_SM_THRESHOLD, FFN_KGAMMA_WIDE_MAX_ROWS, FfnTcPolicy,
     exact_ffn_auto_kgamma_applicable, exact_ffn_dispatch, exact_ffn_lowreg_gate_up_m16_enabled,
-    exact_ffn_materialized_route, exact_ffn_physical_route, exact_ffn_row_offsets,
+    exact_ffn_materialized_route, exact_ffn_physical_route_with_policy, exact_ffn_row_offsets,
     exact_ffn_split_m8_enabled, exact_ffn_tc_override, ffn_tc_active_for_rows, ffn_tc_policy,
     kgamma_fused_gateup_active, kgamma_m32_allowed, kgamma_m128_active, kgamma_wide_active,
     w3_kgamma_applicable,
@@ -237,7 +237,7 @@ impl DenseFfnLayer {
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
 
-        if exact_ffn_physical_route(
+        if exact_ffn_physical_route_with_policy(
             rows,
             intermediate,
             exact_ffn_split_m8_enabled(),
@@ -245,6 +245,7 @@ impl DenseFfnLayer {
                 .tier_is_complete(ops::ExactFfnTier::M8),
             self.exact_ffn_kernels.materialized_m8_is_complete(),
             ctx.buffers.sizes().ssm_conv_out_f32,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         ) == ExactFfnPhysicalRoute::SplitM8x2
         {
             return self.forward_kgamma_exact_split_m8(input, ctx, hidden, intermediate, stream);
@@ -463,7 +464,8 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<bool> {
         let output = ctx.buffers.moe_output();
-        if !ops::w4a4_decode_sk3_enabled()
+        if crate::layers::deterministic_batch::deterministic_batch_enabled()
+            || !ops::w4a4_decode_sk3_enabled()
             || n == 0
             || n > ops::W4A4_DECODE_SK3_MAX_M
             || self.bf16_weights.is_some()

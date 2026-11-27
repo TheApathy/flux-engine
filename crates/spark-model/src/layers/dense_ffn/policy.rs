@@ -718,6 +718,28 @@ pub(super) fn exact_ffn_row_offsets(
     })
 }
 
+pub(super) fn exact_ffn_physical_route_with_policy(
+    rows: u32,
+    intermediate: u32,
+    split_m8_enabled: bool,
+    m8_exact_complete: bool,
+    m8_materialized_complete: bool,
+    scratch_bytes: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> ExactFfnPhysicalRoute {
+    if det_batch.is_enabled() {
+        return ExactFfnPhysicalRoute::Native;
+    }
+    exact_ffn_physical_route(
+        rows,
+        intermediate,
+        split_m8_enabled,
+        m8_exact_complete,
+        m8_materialized_complete,
+        scratch_bytes,
+    )
+}
+
 pub(super) fn exact_ffn_physical_route(
     rows: u32,
     intermediate: u32,
@@ -794,6 +816,20 @@ pub(super) fn ffn_tc_policy() -> FfnTcPolicy {
     })
 }
 
+/// Policy-aware SM- and row-aware resolver for tensor-core `forward_kgamma`.
+#[must_use]
+pub(super) const fn resolve_ffn_tc_for_rows_with_policy(
+    policy: FfnTcPolicy,
+    sm_count: u32,
+    rows: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    resolve_ffn_tc_for_rows(policy, sm_count, rows)
+}
+
 /// Pure SM- and row-aware resolver for tensor-core `forward_kgamma`.
 #[must_use]
 pub(super) const fn resolve_ffn_tc_for_rows(policy: FfnTcPolicy, sm_count: u32, rows: u32) -> bool {
@@ -820,16 +856,25 @@ pub(super) fn resolve_kgamma_sm_auto_flag(raw: Option<&str>, sm_count: u32) -> b
 
 /// Explicit `ATLAS_FFN_TC=1` REFREEZE switch (used by single-token `decode_tc_parity_route`).
 pub(super) fn exact_ffn_tc_override() -> bool {
-    matches!(ffn_tc_policy(), FfnTcPolicy::Enabled)
+    !crate::layers::deterministic_batch::deterministic_batch_enabled()
+        && matches!(ffn_tc_policy(), FfnTcPolicy::Enabled)
 }
 
 #[must_use]
 pub(super) fn ffn_tc_active_for_rows(rows: u32) -> bool {
-    resolve_ffn_tc_for_rows(ffn_tc_policy(), atlas_core::device::active_sm_count(), rows)
+    resolve_ffn_tc_for_rows_with_policy(
+        ffn_tc_policy(),
+        atlas_core::device::active_sm_count(),
+        rows,
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+    )
 }
 
 #[must_use]
 pub(super) fn kgamma_wide_active() -> bool {
+    if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = RAW.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_WIDE").ok());
     resolve_kgamma_sm_auto_flag(raw.as_deref(), atlas_core::device::active_sm_count())
@@ -837,6 +882,9 @@ pub(super) fn kgamma_wide_active() -> bool {
 
 #[must_use]
 pub(super) fn kgamma_m128_active() -> bool {
+    if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = RAW.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_M128").ok());
     resolve_kgamma_sm_auto_flag(raw.as_deref(), atlas_core::device::active_sm_count())
@@ -850,6 +898,9 @@ pub(super) fn kgamma_m32_allowed() -> bool {
 
 #[must_use]
 pub(super) fn kgamma_fused_gateup_active() -> bool {
+    if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = RAW.get_or_init(|| std::env::var("ATLAS_FFN_FUSED_GATEUP").ok());
     resolve_kgamma_sm_auto_flag(raw.as_deref(), atlas_core::device::active_sm_count())
@@ -863,6 +914,9 @@ pub(super) fn resolve_kgamma_cublaslt_opt_in(raw: Option<&str>, sm_count: u32) -
 #[cfg(feature = "cuda")]
 #[must_use]
 pub(super) fn kgamma_cublaslt_opt_in(gpu: &dyn GpuBackend) -> bool {
+    if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = RAW.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_CUBLASLT").ok());
     resolve_kgamma_cublaslt_opt_in(raw.as_deref(), gpu_sm_count(gpu))
@@ -891,5 +945,68 @@ pub(super) fn exact_ffn_materialized_route(
         ExactFfnMaterializedRoute::Split
     } else {
         ExactFfnMaterializedRoute::Inline
+    }
+}
+
+#[cfg(test)]
+mod deterministic_batch_tests {
+    use super::{
+        ExactFfnPhysicalRoute, FfnTcPolicy, exact_ffn_physical_route_with_policy,
+        resolve_ffn_tc_for_rows_with_policy,
+    };
+    use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+    #[test]
+    fn deterministic_batch_disables_dense_ffn_tc_and_m16_split_across_1_to_128() {
+        for sm in [48u32, 188u32] {
+            for m in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+                for tc in [
+                    FfnTcPolicy::Auto,
+                    FfnTcPolicy::Enabled,
+                    FfnTcPolicy::Disabled,
+                ] {
+                    assert!(
+                        !resolve_ffn_tc_for_rows_with_policy(
+                            tc,
+                            sm,
+                            m,
+                            DeterministicBatchPolicy::Enabled,
+                        ),
+                        "dense FFN TC must be disabled at M={m} sm={sm}"
+                    );
+                }
+                assert_eq!(
+                    exact_ffn_physical_route_with_policy(
+                        m,
+                        17_408,
+                        true,
+                        true,
+                        true,
+                        16 * 1024 * 1024,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    ExactFfnPhysicalRoute::Native,
+                    "dense FFN physical route must stay Native at M={m}"
+                );
+            }
+        }
+        assert!(resolve_ffn_tc_for_rows_with_policy(
+            FfnTcPolicy::Auto,
+            188,
+            8,
+            DeterministicBatchPolicy::Disabled,
+        ));
+        assert_eq!(
+            exact_ffn_physical_route_with_policy(
+                16,
+                17_408,
+                true,
+                true,
+                true,
+                16 * 1024 * 1024,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            ExactFfnPhysicalRoute::SplitM8x2
+        );
     }
 }

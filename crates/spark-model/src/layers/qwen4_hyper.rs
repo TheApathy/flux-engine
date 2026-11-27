@@ -1636,12 +1636,13 @@ impl Qwen4HyperConnection {
         // disjoint buffers, so the dual launch computes both, each output with
         // the exact tiers' arithmetic; the inject then no longer waits for the
         // up projection.
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_enabled();
         let dual_inject = self
             .inject
             .as_ref()
-            .filter(|_| self.dual_rows_admits(num_tokens, r));
-        let use_sw_tail_rows = self.sw_tail_rows_admits(num_tokens);
-        let use_tail_rows = !use_sw_tail_rows && self.tail_rows_admits(num_tokens);
+            .filter(|_| !det_batch && self.dual_rows_admits(num_tokens, r));
+        let use_sw_tail_rows = !det_batch && self.sw_tail_rows_admits(num_tokens);
+        let use_tail_rows = !det_batch && !use_sw_tail_rows && self.tail_rows_admits(num_tokens);
         let fused_dual_silu = dual_inject.is_some() && self.exact_pf_dual_silu_rows_k.0 != 0;
         if let Some(weight) = dual_inject {
             HC_DUAL_ROWS_LAUNCHED.call_once(|| {
@@ -2505,7 +2506,9 @@ impl Qwen4HyperConnection {
                 || num_tokens > 8 && self.exact_pf_dual_silu_rows_m10_k.0 != 0
                 || num_tokens <= 8 && self.exact_pf_dual_silu_rows_k.0 != 0);
 
-        let down_route = select_batched_hc_down_route_v2(
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+        let down_route = select_batched_hc_down_route_v2_with_policy(
             num_tokens,
             self.inject.is_some(),
             dual_coalesced_ready,
@@ -2515,6 +2518,7 @@ impl Qwen4HyperConnection {
             fp8_down_ready,
             dual_silu_exact_ready,
             w4a16_gemm_ready,
+            det_batch,
         );
         let down_fallback = select_batched_hc_down_route(
             num_tokens,
@@ -2526,13 +2530,14 @@ impl Qwen4HyperConnection {
             dual_silu_exact_ready,
             w4a16_gemm_ready,
         );
-        let up_route = select_batched_hc_up_route_v2(
+        let up_route = select_batched_hc_up_route_v2_with_policy(
             num_tokens,
             upmix_coalesced_ready,
             coalesced_up_ready,
             upmix_w4_ready,
             fp8_up_ready,
             w4a16_gemm_ready,
+            det_batch,
         );
         let up_fallback = select_batched_hc_up_route(
             num_tokens,
@@ -2547,7 +2552,12 @@ impl Qwen4HyperConnection {
         };
         let fast_tc_ready = fast_tc_pair.is_some();
 
-        match select_batched_hc_tc_route(true, fast_tc_ready, w4a16_gemm_ready) {
+        match select_batched_hc_tc_route_with_policy(
+            true,
+            fast_tc_ready,
+            w4a16_gemm_ready,
+            det_batch,
+        ) {
             BatchedHcTcRoute::Exact => Ok(None),
             BatchedHcTcRoute::FastTc => {
                 let (d_route, u_route, layout) =
@@ -2699,13 +2709,15 @@ impl Qwen4HyperConnection {
                     let grid_x = div_ceil(self.rank as u32, co_n)
                         + if n2 > 0 { div_ceil(n2, co_n) } else { 0 };
                     let grid_y = div_ceil(num_tokens as u32, tier.tile_m());
-                    let grid_z = select_dual_split_k_grid_z(
+                    let grid_z = select_dual_split_k_grid_z_with_policy(
                         tier,
                         grid_x,
                         grid_y,
                         r,
                         sm_count,
                         self.dual_splitk_scratch.is_some(),
+                        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(
+                        ),
                     );
                     let pdl = hc_pdl_enabled_for_sm(sm_count);
                     let launch = KernelLaunch::new(gpu, kernel)
@@ -3640,6 +3652,9 @@ pub(crate) fn parse_batched_verify_tc_dense_min_rows_override(raw: Option<&str>)
 
 #[must_use]
 pub(crate) fn batched_verify_tc_dense_enabled() -> bool {
+    if crate::layers::deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         parse_batched_verify_tc_dense(std::env::var(BATCHED_VERIFY_TC_DENSE_ENV).ok().as_deref())
@@ -3667,6 +3682,22 @@ pub(crate) const fn batched_verify_tc_dense_admits(
     graph_capture: bool,
 ) -> bool {
     enabled && !graph_capture && rows >= min_rows
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn batched_verify_tc_component_admits_with_policy(
+    component: BatchedVerifyTcComponent,
+    enabled: bool,
+    min_rows_override: Option<usize>,
+    rows: usize,
+    graph_capture: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    batched_verify_tc_component_admits(component, enabled, min_rows_override, rows, graph_capture)
 }
 
 #[inline]
@@ -3700,12 +3731,13 @@ pub(crate) fn batched_verify_tc_component_active(
     {
         return false;
     }
-    batched_verify_tc_component_admits(
+    batched_verify_tc_component_admits_with_policy(
         component,
         batched_verify_tc_dense_enabled(),
         batched_verify_tc_dense_min_rows_override(),
         rows,
         graph_capture,
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
     )
 }
 
@@ -3980,6 +4012,20 @@ enum BatchedHcTcRoute {
 
 #[inline]
 #[must_use]
+const fn select_batched_hc_tc_route_with_policy(
+    tc_dense_active: bool,
+    fast_tc_ready: bool,
+    w4a16_gemm_ready: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> BatchedHcTcRoute {
+    if det_batch.is_enabled() {
+        return BatchedHcTcRoute::Exact;
+    }
+    select_batched_hc_tc_route(tc_dense_active, fast_tc_ready, w4a16_gemm_ready)
+}
+
+#[inline]
+#[must_use]
 const fn select_batched_hc_tc_route(
     tc_dense_active: bool,
     fast_tc_ready: bool,
@@ -4227,6 +4273,23 @@ impl DualCoalescedTier {
 /// (falling back to divisors of `K / 256` if needed to saturate `sm_count`)
 /// whose total CTA count fits within one 2-CTA/SM wave (`<= 2 * sm_count`) and
 /// strictly within the pre-allocated FP32 partial workspace.
+#[inline]
+#[must_use]
+const fn select_dual_split_k_grid_z_with_policy(
+    tier: DualCoalescedTier,
+    grid_x: u32,
+    grid_y: u32,
+    k: usize,
+    sm_count: u32,
+    has_scratch: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> u32 {
+    if det_batch.is_enabled() {
+        return 1;
+    }
+    select_dual_split_k_grid_z(tier, grid_x, grid_y, k, sm_count, has_scratch)
+}
+
 #[inline]
 #[must_use]
 const fn select_dual_split_k_grid_z(
@@ -4642,6 +4705,37 @@ const fn is_fast_tc_pair(down: BatchedHcDownRoute, up: BatchedHcUpRoute) -> bool
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[must_use]
+const fn select_batched_hc_down_route_v2_with_policy(
+    rows: usize,
+    has_inject: bool,
+    dual_coalesced_ready: bool,
+    dual_silu_m10_ready: bool,
+    exact_small_ready: bool,
+    coalesced_down_ready: bool,
+    fp8_down_ready: bool,
+    dual_silu_exact_ready: bool,
+    w4a16_gemm_ready: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<BatchedHcDownRoute> {
+    if det_batch.is_enabled() {
+        return None;
+    }
+    select_batched_hc_down_route_v2(
+        rows,
+        has_inject,
+        dual_coalesced_ready,
+        dual_silu_m10_ready,
+        exact_small_ready,
+        coalesced_down_ready,
+        fp8_down_ready,
+        dual_silu_exact_ready,
+        w4a16_gemm_ready,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[must_use]
 const fn select_batched_hc_down_route_v2(
     rows: usize,
     has_inject: bool,
@@ -4727,6 +4821,30 @@ const fn select_batched_hc_down_route(
     } else {
         None
     }
+}
+
+#[inline]
+#[must_use]
+const fn select_batched_hc_up_route_v2_with_policy(
+    rows: usize,
+    upmix_coalesced_ready: bool,
+    coalesced_up_ready: bool,
+    upmix_w4_ready: bool,
+    fp8_up_ready: bool,
+    w4a16_gemm_ready: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> Option<BatchedHcUpRoute> {
+    if det_batch.is_enabled() {
+        return None;
+    }
+    select_batched_hc_up_route_v2(
+        rows,
+        upmix_coalesced_ready,
+        coalesced_up_ready,
+        upmix_w4_ready,
+        fp8_up_ready,
+        w4a16_gemm_ready,
+    )
 }
 
 #[inline]
@@ -6616,5 +6734,81 @@ mod batched_verify_tc_dense_tests {
             let _ = gpu.free(ptr);
         }
         Ok(())
+    }
+
+    #[test]
+    fn deterministic_batch_pins_hyperconnection_routes_across_1_to_128() {
+        use super::{
+            BatchedHcTcRoute, DualCoalescedTier, select_batched_hc_down_route_v2_with_policy,
+            select_batched_hc_tc_route_with_policy, select_batched_hc_up_route_v2_with_policy,
+            select_dual_split_k_grid_z_with_policy,
+        };
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(
+                select_batched_hc_tc_route_with_policy(
+                    true,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                BatchedHcTcRoute::Exact,
+                "HC TC route must pin Exact at M={m}"
+            );
+            assert_eq!(
+                select_batched_hc_down_route_v2_with_policy(
+                    m,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                None,
+                "HC down fast-TC route must be disabled at M={m}"
+            );
+            assert_eq!(
+                select_batched_hc_up_route_v2_with_policy(
+                    m,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    DeterministicBatchPolicy::Enabled,
+                ),
+                None,
+                "HC up fast-TC route must be disabled at M={m}"
+            );
+            for sm in [48u32, 188u32] {
+                assert_eq!(
+                    select_dual_split_k_grid_z_with_policy(
+                        DualCoalescedTier::N8Sk8M32V2,
+                        41,
+                        1,
+                        10_240,
+                        sm,
+                        true,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    1,
+                    "HC dual split-K grid_z must pin to 1 at M={m} sm={sm}"
+                );
+            }
+        }
+        assert_eq!(
+            select_batched_hc_tc_route_with_policy(
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            BatchedHcTcRoute::FastTc
+        );
     }
 }

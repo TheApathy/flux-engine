@@ -4,6 +4,7 @@ pub mod deepseek_v41_attn;
 pub mod deepseek_v41_engram;
 pub mod deepseek_vision;
 pub mod dense_ffn;
+pub mod deterministic_batch;
 pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
@@ -211,6 +212,9 @@ pub fn bitfp4_razer_kv_enabled() -> bool {
 /// via `OnceLock` — `std::env::var` is non-trivial to call on every
 /// decode hop.
 pub fn tc_nvfp4_m16_enabled() -> bool {
+    if deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_TC_NVFP4_M16").ok().as_deref() == Some("1"))
 }
@@ -227,6 +231,9 @@ pub fn tc_nvfp4_m16_enabled() -> bool {
 /// `w4a16_gemv_dual_batch3` GEMV path. Default off until A/B-validated
 /// (production fallback stays the GEMV).
 pub fn tc_nvfp4_k3_enabled() -> bool {
+    if deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_TC_NVFP4_K3").ok().as_deref() == Some("1"))
 }
@@ -240,6 +247,9 @@ pub fn tc_nvfp4_k3_enabled() -> bool {
 /// fall-throughs. Default off so the existing path stays the baseline;
 /// `ATLAS_SSM_OUT_BATCH3=1` enables the experiment. Cached via `OnceLock`.
 pub fn ssm_out_batch3_enabled() -> bool {
+    if deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_OUT_BATCH3").ok().as_deref() == Some("1"))
 }
@@ -256,6 +266,9 @@ pub fn ssm_out_batch3_enabled() -> bool {
 /// bit-exact: counting md5 unchanged) but off by default to preserve the
 /// baseline. Cached via `OnceLock`.
 pub fn ssm_out_proj_m32n64() -> bool {
+    if deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_OUT_M32N64").ok().as_deref() == Some("1"))
 }
@@ -277,6 +290,19 @@ const AUTO_PROJ_SPLITK_WIDE_DEFAULT: u32 = 8;
 
 #[inline]
 #[must_use]
+pub(crate) fn resolve_proj_splitk_with_policy(
+    raw: Option<&str>,
+    sm_count: u32,
+    det_batch: deterministic_batch::DeterministicBatchPolicy,
+) -> u32 {
+    if det_batch.is_enabled() {
+        return 0;
+    }
+    resolve_proj_splitk(raw, sm_count)
+}
+
+#[inline]
+#[must_use]
 fn resolve_proj_splitk(raw: Option<&str>, sm_count: u32) -> u32 {
     match raw {
         Some(s) => s
@@ -288,6 +314,19 @@ fn resolve_proj_splitk(raw: Option<&str>, sm_count: u32) -> u32 {
         None if sm_count > AUTO_SPLITK_SM_THRESHOLD => AUTO_PROJ_SPLITK_DEFAULT,
         None => 0,
     }
+}
+
+#[inline]
+#[must_use]
+pub(crate) fn resolve_narrow_proj_splitk_with_policy(
+    raw: Option<&str>,
+    sm_count: u32,
+    det_batch: deterministic_batch::DeterministicBatchPolicy,
+) -> u32 {
+    if det_batch.is_enabled() {
+        return 0;
+    }
+    resolve_narrow_proj_splitk(raw, sm_count)
 }
 
 /// SM-aware split-K resolver for narrow-N projections (`N <= 5120`: `ffn_down`,
@@ -334,7 +373,11 @@ fn resolve_kgamma_splitk_enabled(raw: Option<&str>, sm_count: u32) -> bool {
 pub fn ssm_out_splitk() -> u32 {
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = RAW.get_or_init(|| std::env::var("ATLAS_SSM_OUT_SPLITK").ok());
-    resolve_narrow_proj_splitk(raw.as_deref(), atlas_core::device::active_sm_count())
+    resolve_narrow_proj_splitk_with_policy(
+        raw.as_deref(),
+        atlas_core::device::active_sm_count(),
+        deterministic_batch::deterministic_batch_policy_or_disabled(),
+    )
 }
 
 /// Split-K factor for the SSM `qkvz` projection [M=17, N=12288, K=5120]
@@ -347,7 +390,11 @@ pub fn ssm_out_splitk() -> u32 {
 pub fn ssm_qkvz_splitk() -> u32 {
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = RAW.get_or_init(|| std::env::var("ATLAS_SSM_QKVZ_SPLITK").ok());
-    resolve_proj_splitk(raw.as_deref(), atlas_core::device::active_sm_count())
+    resolve_proj_splitk_with_policy(
+        raw.as_deref(),
+        atlas_core::device::active_sm_count(),
+        deterministic_batch::deterministic_batch_policy_or_disabled(),
+    )
 }
 
 /// `ATLAS_SSM_PROJ_TC=1` REFREEZE switch: un-shadow the split-K tensor-core
@@ -359,6 +406,9 @@ pub fn ssm_qkvz_splitk() -> u32 {
 /// completion hash must be re-established after enabling. Default off (the
 /// exact branches keep shadowing the TC paths).
 pub fn ssm_proj_tc_enabled() -> bool {
+    if deterministic_batch::deterministic_batch_enabled() {
+        return false;
+    }
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_PROJ_TC").ok().as_deref() == Some("1"))
 }
@@ -556,7 +606,11 @@ pub fn ssm_ba_batched_enabled() -> bool {
 pub fn attn_qkv_splitk() -> u32 {
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let raw = RAW.get_or_init(|| std::env::var("ATLAS_ATTN_QKV_SPLITK").ok());
-    resolve_narrow_proj_splitk(raw.as_deref(), atlas_core::device::active_sm_count())
+    resolve_narrow_proj_splitk_with_policy(
+        raw.as_deref(),
+        atlas_core::device::active_sm_count(),
+        deterministic_batch::deterministic_batch_policy_or_disabled(),
+    )
 }
 
 /// Diagnostic correctness oracle for the attention output projection during

@@ -133,6 +133,30 @@ fn gqa12_ragged_mode_from(raw: Option<&str>) -> Gqa12RaggedMode {
 
 #[inline]
 #[must_use]
+const fn gqa12_ragged_eligible_with_policy(
+    mode: Gqa12RaggedMode,
+    num_seqs: u32,
+    head_dim: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    tree_or_indir: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    gqa12_ragged_eligible(
+        mode,
+        num_seqs,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        tree_or_indir,
+    )
+}
+
+#[inline]
+#[must_use]
 const fn gqa12_ragged_eligible(
     mode: Gqa12RaggedMode,
     num_seqs: u32,
@@ -711,7 +735,11 @@ impl Qwen3AttentionLayer {
         // ── Row-parallel: O projection and inject for every row ──
         let o_out = ctx.buffers.norm_output();
         let oproj_tc_fp8 = tc_dense_fp8
-            && crate::layers::qwen4_fast_proj::batched_verify_dense_proj_tc_admits(rows, h);
+            && crate::layers::qwen4_fast_proj::batched_verify_dense_proj_tc_admits_with_policy(
+                rows,
+                h,
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+            );
         if oproj_tc_fp8
             && self.try_qwen4_oproj_direct_nvfp4(
                 staging.raw_rows,
@@ -1091,13 +1119,14 @@ impl Qwen3AttentionLayer {
         if !gqa12_ragged_reduce_gated_eligible(reduce_gated_k.0, output.0, gate.0, gate_stride) {
             return Ok(false);
         }
-        if !gqa12_ragged_eligible(
+        if !gqa12_ragged_eligible_with_policy(
             gqa12_ragged_mode(),
             num_seqs,
             head_dim,
             num_q_heads,
             num_kv_heads,
             tree_or_indir,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
         ) {
             return Ok(false);
         }
@@ -2247,6 +2276,47 @@ mod c1_parity_source_tests {
         ));
         assert!(!gqa12_ragged_reduce_gated_eligible(
             1, 0x1000, 0x2000, 13_311
+        ));
+    }
+
+    #[test]
+    fn deterministic_batch_disables_cross_seq_gqa12_ragged_across_1_to_128() {
+        use super::{Gqa12RaggedMode, gqa12_ragged_eligible_with_policy};
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for m in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+            for mode in [Gqa12RaggedMode::Auto, Gqa12RaggedMode::ForceOn] {
+                assert!(
+                    !gqa12_ragged_eligible_with_policy(
+                        mode,
+                        m,
+                        256,
+                        24,
+                        2,
+                        false,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    "cross-seq gqa12_ragged must stay disabled at M={m} mode={mode:?}"
+                );
+            }
+        }
+        assert!(!gqa12_ragged_eligible_with_policy(
+            Gqa12RaggedMode::Auto,
+            1,
+            256,
+            24,
+            2,
+            false,
+            DeterministicBatchPolicy::Disabled,
+        ));
+        assert!(gqa12_ragged_eligible_with_policy(
+            Gqa12RaggedMode::Auto,
+            8,
+            256,
+            24,
+            2,
+            false,
+            DeterministicBatchPolicy::Disabled,
         ));
     }
 

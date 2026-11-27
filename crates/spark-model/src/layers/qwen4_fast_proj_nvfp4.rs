@@ -154,6 +154,30 @@ impl Nvfp4FastProjMode {
             && k.is_multiple_of(32)
     }
 
+    /// Policy-aware variant of [`Self::admits_call`].
+    ///
+    /// Under `ATLAS_DETERMINISTIC_BATCH=1`, batched-verify scopes (`scope_active == true`)
+    /// never switch from exact scalar GEMV to cuBLASLt NVFP4 at `m >= verify_min_m`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    #[must_use]
+    pub(crate) const fn admits_call_with_policy(
+        self,
+        m: usize,
+        n: usize,
+        k: usize,
+        ldc: usize,
+        qg: Option<(usize, usize)>,
+        scope_active: bool,
+        verify_min_m: usize,
+        det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    ) -> bool {
+        if det_batch.is_enabled() && scope_active {
+            return false;
+        }
+        self.admits_call(m, n, k, ldc, qg, scope_active, verify_min_m)
+    }
+
     /// Whether a full projection call `(m, n, k, ldc, qg)` should execute on
     /// native cuBLASLt NVFP4 under `scope_active` (batched verify vs prefill).
     ///
@@ -183,6 +207,24 @@ impl Nvfp4FastProjMode {
         } else {
             true
         }
+    }
+
+    /// Policy-aware variant of [`Self::admits_coalesced_verify`].
+    #[inline]
+    #[must_use]
+    pub(crate) const fn admits_coalesced_verify_with_policy(
+        self,
+        scope_active: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        verify_min_m: usize,
+        det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    ) -> bool {
+        if det_batch.is_enabled() {
+            return false;
+        }
+        self.admits_coalesced_verify(scope_active, m, n, k, verify_min_m)
     }
 
     /// Whether a `try_coalesced_nvfp4_w4a16_gemm` call inside a batched-verify
@@ -1172,7 +1214,17 @@ pub(crate) fn try_gemm_bf16(
     stream: u64,
 ) -> Result<bool> {
     let active_mode = mode()?;
-    if !active_mode.admits_call(m, n, k, ldc, qg, scope_active, verify_min_m()) {
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+    if !active_mode.admits_call_with_policy(
+        m,
+        n,
+        k,
+        ldc,
+        qg,
+        scope_active,
+        verify_min_m(),
+        det_batch,
+    ) {
         return Ok(false);
     }
     let ran = run_bf16_gemm_unchecked(
@@ -1226,7 +1278,17 @@ pub(crate) fn try_gemm_bf16_with_amax(
     stream: u64,
 ) -> Result<bool> {
     let active_mode = mode()?;
-    if !active_mode.admits_call(m, n, k, ldc, qg, scope_active, verify_min_m()) {
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+    if !active_mode.admits_call_with_policy(
+        m,
+        n,
+        k,
+        ldc,
+        qg,
+        scope_active,
+        verify_min_m(),
+        det_batch,
+    ) {
         return Ok(false);
     }
     let ran = run_bf16_gemm_unchecked(
@@ -1277,7 +1339,15 @@ pub(crate) fn try_gemm_coalesced_verify(
 ) -> Result<bool> {
     let active_mode = mode()?;
     let scope_active = crate::layers::qwen4_hyper::batched_verify_tc_dense_scope_active();
-    if !active_mode.admits_coalesced_verify(scope_active, m, n, k, verify_min_m()) {
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+    if !active_mode.admits_coalesced_verify_with_policy(
+        scope_active,
+        m,
+        n,
+        k,
+        verify_min_m(),
+        det_batch,
+    ) {
         return Ok(false);
     }
     let ran = run_bf16_gemm_unchecked(gpu, act, None, weight, out, m, n, k, n, None, true, stream)?;
@@ -1315,7 +1385,17 @@ pub(crate) fn try_gemm_from_e4m3(
     stream: u64,
 ) -> Result<bool> {
     let active_mode = mode()?;
-    if !active_mode.admits_call(m, n, k, ldc, qg, scope_active, verify_min_m()) {
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+    if !active_mode.admits_call_with_policy(
+        m,
+        n,
+        k,
+        ldc,
+        qg,
+        scope_active,
+        verify_min_m(),
+        det_batch,
+    ) {
         return Ok(false);
     }
     let ran = run_e4m3_gemm_unchecked(

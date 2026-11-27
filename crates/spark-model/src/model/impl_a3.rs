@@ -364,6 +364,25 @@ fn raw_lm_head_tc_env_override() -> LmHeadTcEnvOverride {
 /// (coalesced small-M for `2..=16`, native cuBLASLt NVFP4 for `24..=128`) even
 /// when `ATLAS_LM_HEAD_TC` is unset. Preserves GB10 (`<= 64` SMs) and Qwen4
 /// (`is_qwen4_exp`) unchanged, and honors explicit `ATLAS_LM_HEAD_TC=0`.
+/// Policy-aware auto-TC batched LM-head eligibility: `ATLAS_DETERMINISTIC_BATCH=1`
+/// keeps `M=1..=128` on the 0-ULP exact GEMV family instead of flipping `M>=2`
+/// onto SM120 coalesced / cuBLASLt NVFP4 Tensor Cores.
+#[inline]
+#[must_use]
+pub(crate) const fn should_auto_tc_batched_lm_head_for_policy(
+    is_qwen4_exp: bool,
+    env_disabled: bool,
+    sm_count: u32,
+    num_tokens: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    !is_qwen4_exp && num_tokens >= 2 && sm_count > HIGH_SM_LM_HEAD_THRESHOLD && !env_disabled
+}
+
+#[cfg(test)]
 #[inline]
 #[must_use]
 const fn should_auto_tc_batched_lm_head(
@@ -372,10 +391,13 @@ const fn should_auto_tc_batched_lm_head(
     sm_count: u32,
     num_tokens: u32,
 ) -> bool {
-    !is_qwen4_exp
-        && num_tokens >= 2
-        && sm_count > HIGH_SM_LM_HEAD_THRESHOLD
-        && !matches!(env_override, LmHeadTcEnvOverride::Disabled)
+    should_auto_tc_batched_lm_head_for_policy(
+        is_qwen4_exp,
+        matches!(env_override, LmHeadTcEnvOverride::Disabled),
+        sm_count,
+        num_tokens,
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+    )
 }
 
 #[inline]
@@ -986,8 +1008,10 @@ impl TransformerModel {
                 ops::dense_gemv_fp8w(self.gpu.as_ref(), gemv_k, hidden, fp8, logits, v, h, stream)?;
                 dispatched = true;
             }
-        } else if num_tokens >= 2
-            && h > 0
+        } else if select_target_fp8_lm_head_uses_coalesced_with_policy(
+            num_tokens,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        ) && h > 0
             && h.is_multiple_of(64)
             && hidden.0.is_multiple_of(16)
             && fp8.weight.0.is_multiple_of(16)
@@ -1106,18 +1130,23 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let logits = self.buffers.logits();
-        if num_tokens == 1 {
+        if select_target_bf16_lm_head_serial_gemv_with_policy(
+            num_tokens,
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        ) {
             log_qwen4_target_bf16_lm_head_engagement(0, "dense_gemv_bf16", num_tokens, v, h);
-            ops::dense_gemv(
-                self.gpu.as_ref(),
-                self.dense_gemv_kernel,
-                hidden,
-                &self.lm_head_weight,
-                logits,
-                v,
-                h,
-                stream,
-            )?;
+            for row in 0..num_tokens {
+                ops::dense_gemv(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_kernel,
+                    hidden.offset(row as usize * h as usize * 2),
+                    &self.lm_head_weight,
+                    logits.offset(row as usize * v as usize * 2),
+                    v,
+                    h,
+                    stream,
+                )?;
+            }
         } else {
             let mut dispatched = false;
             if h > 0
@@ -1585,17 +1614,20 @@ impl TransformerModel {
                 (num_tokens as usize) <= logits_cap_rows,
                 "NVFP4 speculative LM-head rows {num_tokens} exceed logits buffer capacity {logits_cap_rows}"
             );
+            let det_batch =
+                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
             let sm_count = atlas_core::device::active_sm_count();
-            let sm120_auto_tc = should_auto_tc_batched_lm_head(
+            let sm120_auto_tc = should_auto_tc_batched_lm_head_for_policy(
                 self.config.is_qwen4_exp(),
-                raw_lm_head_tc_env_override(),
+                matches!(raw_lm_head_tc_env_override(), LmHeadTcEnvOverride::Disabled),
                 sm_count,
                 num_tokens,
+                det_batch,
             );
             let graph_capture = spark_runtime::gpu_capture_region::active_capture_region()
                 .is_some()
                 || self.gpu.stream_is_capturing(stream);
-            if num_tokens == 1 && self.decode_tc_parity_lm_head() {
+            if num_tokens == 1 && !det_batch.is_enabled() && self.decode_tc_parity_lm_head() {
                 self.lm_head_tc_rows(hidden, logits, 1, v, stream)?;
             } else if num_tokens == 1 {
                 // A one-row tail (for example, a chunked diagnostic verify)
@@ -1613,7 +1645,8 @@ impl TransformerModel {
                     stream,
                 )?;
             } else if sm120_auto_tc
-                || (lm_head_tc_enabled()
+                || (!det_batch.is_enabled()
+                    && lm_head_tc_enabled()
                     && self.lm_head_nvfp4_t.is_some()
                     && self.w4a16_gemm_t_m32_n64_kernel.0 != 0)
             {
@@ -2245,11 +2278,14 @@ impl TransformerModel {
             let v = self.verify_lmhead_vocab();
             return self.lm_head_bf16_rows(hidden, num_tokens, v, h, stream);
         }
-        let tc_dense_active = crate::layers::qwen4_hyper::batched_verify_tc_component_active(
-            crate::layers::qwen4_hyper::BatchedVerifyTcComponent::LmHead,
-            num_tokens as usize,
-            false,
-        );
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+        let tc_dense_active = !det_batch.is_enabled()
+            && crate::layers::qwen4_hyper::batched_verify_tc_component_active(
+                crate::layers::qwen4_hyper::BatchedVerifyTcComponent::LmHead,
+                num_tokens as usize,
+                false,
+            );
         let Some(ref nvfp4) = self.lm_head_nvfp4 else {
             return self.lm_head_qwen4_rows(hidden, num_tokens, stream);
         };
@@ -2274,20 +2310,23 @@ impl TransformerModel {
         let has_tc_transposed = lm_head_tc_enabled()
             && self.lm_head_nvfp4_t.is_some()
             && self.w4a16_gemm_t_m32_n64_kernel.0 != 0;
-        if should_use_v2_coalesced_verify_lm_head(
-            has_tc_transposed,
-            num_tokens,
-            atlas_core::device::active_sm_count(),
-        ) && crate::layers::qwen4_fast_proj::try_coalesced_nvfp4_w4a16_gemm(
-            self.gpu.as_ref(),
-            hidden,
-            nvfp4,
-            logits,
-            num_tokens as usize,
-            v as usize,
-            h as usize,
-            stream,
-        )? {
+        if !det_batch.is_enabled()
+            && should_use_v2_coalesced_verify_lm_head(
+                has_tc_transposed,
+                num_tokens,
+                atlas_core::device::active_sm_count(),
+            )
+            && crate::layers::qwen4_fast_proj::try_coalesced_nvfp4_w4a16_gemm(
+                self.gpu.as_ref(),
+                hidden,
+                nvfp4,
+                logits,
+                num_tokens as usize,
+                v as usize,
+                h as usize,
+                stream,
+            )?
+        {
             let route_label = crate::layers::qwen4_fast_proj::coalesced_nvfp4_dispatch_symbol(
                 num_tokens as usize,
                 v as usize,
@@ -2372,7 +2411,8 @@ impl TransformerModel {
         } else {
             KernelHandle(0)
         };
-        let route = select_batched_verify_lm_head_route(
+        let route = select_batched_verify_lm_head_route_with_policy(
+            det_batch,
             tc_dense_active,
             num_tokens,
             v,
@@ -2583,8 +2623,32 @@ fn launch_w4a16_gemm_coalesced(
         .launch(stream)
 }
 
+/// Whether `lm_head_fp8_rows` engages coalesced FP8 Tensor Core GEMMs (`M>=2`)
+/// rather than per-row exact `dense_gemv_fp8w`. Under `ATLAS_DETERMINISTIC_BATCH=1`,
+/// returns `false` across all `M=1..=128` so every row runs identical `dense_gemv_fp8w`.
+#[inline]
+#[must_use]
+pub(crate) const fn select_target_fp8_lm_head_uses_coalesced_with_policy(
+    num_tokens: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    !det_batch.is_enabled() && num_tokens >= 2
+}
+
+/// Whether `lm_head_bf16_rows` runs per-row `dense_gemv_bf16` instead of
+/// `bf16_gemm_coalesced_m*` / `cublaslt_bf16_gemm`. Under `ATLAS_DETERMINISTIC_BATCH=1`,
+/// returns `true` across all `M=1..=128` so every row matches `M=1` bit-for-bit.
+#[inline]
+#[must_use]
+pub(crate) const fn select_target_bf16_lm_head_serial_gemv_with_policy(
+    num_tokens: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    num_tokens == 1 || det_batch.is_enabled()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BatchedVerifyLmHeadRoute {
+pub(crate) enum BatchedVerifyLmHeadRoute {
     Exact,
     TcTransposedM32N64,
     W4a16GemmCoalescedM32,
@@ -2598,7 +2662,8 @@ enum BatchedVerifyLmHeadRoute {
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[must_use]
-const fn select_batched_verify_lm_head_route(
+pub(crate) const fn select_batched_verify_lm_head_route_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
     tc_dense_active: bool,
     num_tokens: u32,
     vocab: u32,
@@ -2613,7 +2678,7 @@ const fn select_batched_verify_lm_head_route(
     has_pipe: bool,
     has_gemm: bool,
 ) -> BatchedVerifyLmHeadRoute {
-    if !tc_dense_active {
+    if det_batch.is_enabled() || !tc_dense_active {
         return BatchedVerifyLmHeadRoute::Exact;
     }
     if has_tc_transposed {
@@ -2645,6 +2710,42 @@ const fn select_batched_verify_lm_head_route(
         return BatchedVerifyLmHeadRoute::W4a16Gemm;
     }
     BatchedVerifyLmHeadRoute::Exact
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[must_use]
+const fn select_batched_verify_lm_head_route(
+    tc_dense_active: bool,
+    num_tokens: u32,
+    vocab: u32,
+    hidden: u32,
+    ab_aligned16: bool,
+    aligned16: bool,
+    has_tc_transposed: bool,
+    has_coalesced_m32: bool,
+    has_coalesced_m64: bool,
+    has_coalesced_m128: bool,
+    has_pipe_m128n128: bool,
+    has_pipe: bool,
+    has_gemm: bool,
+) -> BatchedVerifyLmHeadRoute {
+    select_batched_verify_lm_head_route_with_policy(
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+        tc_dense_active,
+        num_tokens,
+        vocab,
+        hidden,
+        ab_aligned16,
+        aligned16,
+        has_tc_transposed,
+        has_coalesced_m32,
+        has_coalesced_m64,
+        has_coalesced_m128,
+        has_pipe_m128n128,
+        has_pipe,
+        has_gemm,
+    )
 }
 
 #[cfg(test)]
