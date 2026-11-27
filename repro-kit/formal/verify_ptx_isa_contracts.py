@@ -326,6 +326,18 @@ CRITICAL_KERNELS: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
             "gdn_zero_tail_rows_sm120",
         ),
     ),
+    (
+        "kernels/gb10/common/tensor_fp8_quant_sm120.cu",
+        False,
+        False,
+        True,
+        False,
+        (
+            "tensor_fp8_absmax_bf16_sm120",
+            "bf16_to_tensor_fp8_sm120",
+            "rms_norm_tensor_fp8_sm120",
+        ),
+    ),
 )
 
 PLAIN_FP8_MMA_RE = re.compile(

@@ -128,3 +128,6 @@ ATLAS_DCOCO_SIDECAR	RESOURCE	canonical filesystem path to authenticated ATLDC001
 ATLAS_DCOCO_SIDECAR_SHA256	RESOURCE	expected SHA-256 digest authenticating ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
 ATLAS_DCOCO_SIDECAR_SIZE	RESOURCE	expected exact byte size authenticating ATLDC001 DCOCO-v2 corrector sidecar (dcoco_weights.rs)
 ATLAS_GDN_1D_REPLAY	ROUTE	opt-in SM121 1D GDN correction-record verify & device-driven cross-layer replay commit (layers/ops/gdn_correction.rs); 0-ULP bit-exact
+ATLAS_GB10_FAST_PREFILL	NUMERICS	opt-in GB10 fast prefill umbrella enabling SM12.1 cuBLASLt NVFP4, fused RMSNorm->NVFP4, scalar Tensor-FP8, 10 MiB L2 GDN windowing, and fast conv1d (ops/tensor_fp8.rs)
+ATLAS_TENSOR_FP8_PREFILL	NUMERICS	opt-in scalar Tensor-FP8 E4M3 prefill projections with [0.125, 8.0] bounded epilogue deferral via cuBLASLt (ops/tensor_fp8.rs)
+ATLAS_GDN_L2_WINDOW_MIB	RESOURCE	opt-in L2-resident token window budget in MiB for GDN prefill recurrence; carries exact FP32 h_state and conv_state across windows (qwen3_ssm/gdn_l2_window.rs)

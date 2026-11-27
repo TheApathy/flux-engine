@@ -84,6 +84,21 @@ impl Qwen3AttentionLayer {
             anyhow::bail!("w8a16_gemm kernel not loaded — cannot prefill with FP8 weights");
         } else if let Some(fp8) = self.o_fp8 {
             use crate::layers::PrefillProjectionPipeRoute as Route;
+            if ops::try_tensor_fp8_prefill_proj_single(
+                ctx.gpu,
+                attn_out,
+                fp8,
+                o_out,
+                n,
+                h,
+                nq * hd,
+                1.0,
+                true,
+                "attn_o_proj",
+                stream,
+            )? {
+                return Ok(o_out);
+            }
             match crate::layers::prefill_fp8_w8_route(
                 crate::layers::prefill_fp8_w8_enabled(),
                 n,

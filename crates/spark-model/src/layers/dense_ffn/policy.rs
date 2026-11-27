@@ -25,6 +25,11 @@ pub(super) const fn is_sm120_compute_capability(cc: Option<(u32, u32)>) -> bool 
     matches!(cc, Some((12, 0)))
 }
 
+/// True when the active GPU is Blackwell GB10 (`SM121`, DGX Spark).
+pub(super) const fn is_sm121_compute_capability(cc: Option<(u32, u32)>) -> bool {
+    matches!(cc, Some((12, 1)))
+}
+
 /// True when the active GPU supports warp-level SM120/SM121 `kind::mxf4nvf4.block_scale` MMA.
 ///
 /// `None` (unit-test mock backends without a CUDA device) returns `true` so existing
@@ -90,6 +95,7 @@ pub(super) fn prefill_ffn_cublaslt_nvfp4_policy() -> CublasLtNvfp4Policy {
 /// `k_blocks % 4 == 0` for `quantize_bf16_to_nvfp4_atlas_128x4` and `N % 8 == 0` for
 /// `cublaslt::nvfp4_gemm_block_scaled`), the `128x4` activation quantizer kernel, and either
 /// static checkpoint scales or the dynamic absmax kernel.
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "pure const policy predicate mirroring every eligibility dimension"
@@ -104,11 +110,44 @@ pub(super) const fn cublaslt_nvfp4_route_enabled(
     has_quantizer_128x4: bool,
     has_scale_source: bool,
 ) -> bool {
+    cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
+        policy,
+        cc,
+        flashinfer_ffn,
+        m,
+        h,
+        inter,
+        has_quantizer_128x4,
+        has_scale_source,
+        false,
+    )
+}
+
+/// Same eligibility check as [`cublaslt_nvfp4_route_enabled`], additionally
+/// allowing `CublasLtNvfp4Policy::Auto` to engage on SM12.1 (GB10) when the
+/// opt-in `ATLAS_GB10_FAST_PREFILL=1` umbrella is active and FlashInfer FFN is
+/// absent. Explicit `ATLAS_CUBLASLT_NVFP4=0` (`Disabled`) still disables.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pure const policy predicate mirroring every eligibility dimension including GB10 umbrella"
+)]
+pub(super) const fn cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
+    policy: CublasLtNvfp4Policy,
+    cc: Option<(u32, u32)>,
+    flashinfer_ffn: FlashInferFfnAvailability,
+    m: u32,
+    h: u32,
+    inter: u32,
+    has_quantizer_128x4: bool,
+    has_scale_source: bool,
+    gb10_fast_prefill: bool,
+) -> bool {
     let policy_allows = match policy {
         CublasLtNvfp4Policy::Disabled => false,
         CublasLtNvfp4Policy::Auto => {
             is_blackwell_dc_compute_capability(cc)
-                || (is_sm120_compute_capability(cc)
+                || ((is_sm120_compute_capability(cc)
+                    || (gb10_fast_prefill && is_sm121_compute_capability(cc)))
                     && matches!(flashinfer_ffn, FlashInferFfnAvailability::Absent))
         }
         CublasLtNvfp4Policy::Enabled => true,
@@ -374,6 +413,7 @@ pub(super) fn parse_proj_27b_cublaslt_nvfp4_policy(
     }
 }
 
+#[cfg(test)]
 #[must_use]
 pub(super) const fn resolve_proj_27b_cublaslt_nvfp4(
     proj_policy: Proj27bCublasLtNvfp4Policy,
@@ -381,12 +421,36 @@ pub(super) const fn resolve_proj_27b_cublaslt_nvfp4(
     sm_count: u32,
     cc: Option<(u32, u32)>,
 ) -> bool {
+    resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill(
+        proj_policy,
+        ffn_policy,
+        sm_count,
+        cc,
+        false,
+    )
+}
+
+/// Same resolver as [`resolve_proj_27b_cublaslt_nvfp4`], additionally allowing
+/// `Auto` to engage on SM12.1 (GB10, `sm_count <= 64`) when
+/// `ATLAS_GB10_FAST_PREFILL=1` is active and neither `ATLAS_27B_PROJ_CUBLASLT_NVFP4=0`
+/// nor `ATLAS_CUBLASLT_NVFP4=0` opted out.
+#[must_use]
+pub(super) const fn resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill(
+    proj_policy: Proj27bCublasLtNvfp4Policy,
+    ffn_policy: CublasLtNvfp4Policy,
+    sm_count: u32,
+    cc: Option<(u32, u32)>,
+    gb10_fast_prefill: bool,
+) -> bool {
     match proj_policy {
         Proj27bCublasLtNvfp4Policy::Disabled => false,
         Proj27bCublasLtNvfp4Policy::Enabled => true,
         Proj27bCublasLtNvfp4Policy::Auto => {
-            if sm_count <= PROJ_27B_CUBLASLT_NVFP4_SM_THRESHOLD {
+            if matches!(ffn_policy, CublasLtNvfp4Policy::Disabled) {
                 return false;
+            }
+            if sm_count <= PROJ_27B_CUBLASLT_NVFP4_SM_THRESHOLD {
+                return gb10_fast_prefill && is_sm121_compute_capability(cc);
             }
             match ffn_policy {
                 CublasLtNvfp4Policy::Disabled => false,
@@ -415,11 +479,12 @@ pub(super) fn proj_27b_cublaslt_nvfp4_enabled(cc: Option<(u32, u32)>) -> bool {
         let raw = std::env::var("ATLAS_27B_PROJ_CUBLASLT_NVFP4").ok();
         parse_proj_27b_cublaslt_nvfp4_policy(raw.as_deref())
     });
-    resolve_proj_27b_cublaslt_nvfp4(
+    resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill(
         proj_policy,
         prefill_ffn_cublaslt_nvfp4_policy(),
         atlas_core::device::active_sm_count(),
         cc,
+        crate::layers::ops::gb10_fast_prefill_enabled(),
     )
 }
 

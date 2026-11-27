@@ -75,14 +75,15 @@ use policy::{
     Proj27bCublasLtNvfp4Policy, cublaslt_fused_silu_quantize_scale,
     cublaslt_merged_gate_up_allow_materialize, cublaslt_merged_gate_up_vram_ok,
     cublaslt_merged_gate_up_vram_ok_for_sm, cublaslt_nvfp4_route_enabled,
-    exact_ffn_auto_kgamma_applicable, exact_ffn_dispatch, exact_ffn_materialized_route,
-    exact_ffn_physical_route, exact_ffn_row_offsets, is_blackwell_dc_compute_capability,
-    is_sm120_compute_capability, parse_cublaslt_merged_gate_up_policy, parse_cublaslt_nvfp4_policy,
-    parse_ffn_prefill_l2_strip, parse_ffn_tc_policy, parse_proj_27b_cublaslt_nvfp4_policy,
-    prefill_ffn_fast_route, prefill_fused_epilogue_route, proj_27b_cublaslt_nvfp4_shape_ok,
-    resolve_ffn_tc_for_rows, resolve_kgamma_cublaslt_opt_in, resolve_kgamma_sm_auto_flag,
-    resolve_proj_27b_cublaslt_nvfp4, resolve_sm_auto_opt_in, select_cublaslt_quantize_128x4_kernel,
-    supports_warp_nvfp4_mma, w3_kgamma_applicable,
+    cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill, exact_ffn_auto_kgamma_applicable,
+    exact_ffn_dispatch, exact_ffn_materialized_route, exact_ffn_physical_route,
+    exact_ffn_row_offsets, is_blackwell_dc_compute_capability, is_sm120_compute_capability,
+    parse_cublaslt_merged_gate_up_policy, parse_cublaslt_nvfp4_policy, parse_ffn_prefill_l2_strip,
+    parse_ffn_tc_policy, parse_proj_27b_cublaslt_nvfp4_policy, prefill_ffn_fast_route,
+    prefill_fused_epilogue_route, proj_27b_cublaslt_nvfp4_shape_ok, resolve_ffn_tc_for_rows,
+    resolve_kgamma_cublaslt_opt_in, resolve_kgamma_sm_auto_flag, resolve_proj_27b_cublaslt_nvfp4,
+    resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill, resolve_sm_auto_opt_in,
+    select_cublaslt_quantize_128x4_kernel, supports_warp_nvfp4_mma, w3_kgamma_applicable,
 };
 #[cfg(test)]
 use sm120_coalesced::{Sm120CoalescedSmallMRoute, select_sm120_coalesced_small_m_route};

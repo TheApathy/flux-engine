@@ -131,6 +131,78 @@ pub fn fused_rmsnorm_nvfp4_policy() -> Result<FusedRmsNormNvfp4Policy> {
         .map_err(anyhow::Error::msg)
 }
 
+/// Effective fused `RMSNorm/SwiGLU -> E2M1` policy resolving
+/// `ATLAS_FUSED_RMSNORM_NVFP4` together with the `ATLAS_GB10_FAST_PREFILL`
+/// umbrella.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectiveFusedRmsNormNvfp4Policy {
+    /// Disabled (unset with `ATLAS_GB10_FAST_PREFILL` off, or explicit `=0`).
+    Disabled,
+    /// Auto-enabled by `ATLAS_GB10_FAST_PREFILL=1` while
+    /// `ATLAS_FUSED_RMSNORM_NVFP4` is unset: engages whenever the layer
+    /// satisfies all kernel, scale, and alignment contracts, and falls back
+    /// cleanly on ineligible layers (e.g. dynamic-scale or BF16 FFN).
+    AutoGb10FastPrefill,
+    /// Explicitly enabled via `ATLAS_FUSED_RMSNORM_NVFP4=1`: fails closed on
+    /// any incompatible configuration.
+    ExplicitEnabled,
+}
+
+impl EffectiveFusedRmsNormNvfp4Policy {
+    /// True when the fused `RMSNorm/SwiGLU -> E2M1` path should be attempted.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// True when incompatibilities must return an error rather than falling back.
+    #[must_use]
+    pub const fn is_fail_closed(self) -> bool {
+        matches!(self, Self::ExplicitEnabled)
+    }
+}
+
+/// Resolve `ATLAS_FUSED_RMSNORM_NVFP4` together with `ATLAS_GB10_FAST_PREFILL`.
+///
+/// Explicit `"0"` always disables even when `gb10_fast_prefill` is `true`;
+/// explicit `"1"` stays fail-closed (`ExplicitEnabled`); unset promotes to
+/// `AutoGb10FastPrefill` when `gb10_fast_prefill` is `true` and stays
+/// `Disabled` otherwise.
+pub fn resolve_effective_fused_rmsnorm_nvfp4_policy(
+    value: std::result::Result<String, std::env::VarError>,
+    gb10_fast_prefill: bool,
+) -> std::result::Result<EffectiveFusedRmsNormNvfp4Policy, &'static str> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(if gb10_fast_prefill {
+            EffectiveFusedRmsNormNvfp4Policy::AutoGb10FastPrefill
+        } else {
+            EffectiveFusedRmsNormNvfp4Policy::Disabled
+        }),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_FUSED_RMSNORM_NVFP4 must be valid UTF-8 and exactly 0 or 1")
+        }
+        Ok(raw) => match raw.as_str() {
+            "0" => Ok(EffectiveFusedRmsNormNvfp4Policy::Disabled),
+            "1" => Ok(EffectiveFusedRmsNormNvfp4Policy::ExplicitEnabled),
+            _ => Err("ATLAS_FUSED_RMSNORM_NVFP4 must be exactly 0 or 1"),
+        },
+    }
+}
+
+/// Read and cache the effective `ATLAS_FUSED_RMSNORM_NVFP4` policy fail-closed.
+pub fn effective_fused_rmsnorm_nvfp4_policy() -> Result<EffectiveFusedRmsNormNvfp4Policy> {
+    static GATE: OnceLock<std::result::Result<EffectiveFusedRmsNormNvfp4Policy, &'static str>> =
+        OnceLock::new();
+    let gb10_fast = super::gb10_fast_prefill_policy()?;
+    (*GATE.get_or_init(|| {
+        resolve_effective_fused_rmsnorm_nvfp4_policy(
+            std::env::var(RMSNORM_NVFP4_ENV_VAR),
+            gb10_fast == super::Gb10FastPrefillPolicy::Enabled,
+        )
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
 /// Resolved CUDA kernel handles for `rms_norm_nvfp4_sm120.cu`.
 #[derive(Debug, Clone, Copy)]
 pub struct FusedRmsNormNvfp4Kernels {

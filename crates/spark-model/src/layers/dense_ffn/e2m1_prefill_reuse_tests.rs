@@ -703,6 +703,94 @@ fn cublaslt_merged_gate_up_and_27b_proj_policies_protect_gb10_and_vram() {
     assert!(!proj_27b_cublaslt_nvfp4_shape_ok(8_192, 5_120, 5_100));
 }
 
+#[test]
+fn gb10_fast_prefill_enables_sm121_cublaslt_while_preserving_defaults_and_opt_out() {
+    use super::{
+        CublasLtNvfp4Policy, FlashInferFfnAvailability, Proj27bCublasLtNvfp4Policy,
+        cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill,
+        resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill,
+    };
+
+    // SM12.1 FFN stays OFF by default when ATLAS_GB10_FAST_PREFILL is off.
+    assert!(!cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
+        CublasLtNvfp4Policy::Auto,
+        Some((12, 1)),
+        FlashInferFfnAvailability::Absent,
+        512,
+        5120,
+        17408,
+        true,
+        true,
+        false,
+    ));
+    // Under ATLAS_GB10_FAST_PREFILL=1, Auto enables SM12.1 when FlashInfer FFN is absent.
+    assert!(cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
+        CublasLtNvfp4Policy::Auto,
+        Some((12, 1)),
+        FlashInferFfnAvailability::Absent,
+        512,
+        5120,
+        17408,
+        true,
+        true,
+        true,
+    ));
+    // FlashInfer FFN still takes precedence when prepared, and explicit =0 always disables.
+    assert!(!cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
+        CublasLtNvfp4Policy::Auto,
+        Some((12, 1)),
+        FlashInferFfnAvailability::Prepared,
+        512,
+        5120,
+        17408,
+        true,
+        true,
+        true,
+    ));
+    assert!(!cublaslt_nvfp4_route_enabled_with_gb10_fast_prefill(
+        CublasLtNvfp4Policy::Disabled,
+        Some((12, 1)),
+        FlashInferFfnAvailability::Absent,
+        512,
+        5120,
+        17408,
+        true,
+        true,
+        true,
+    ));
+
+    // SM12.1 (<= 64 SMs) SSM/Attn projections: OFF by default, ON under ATLAS_GB10_FAST_PREFILL=1,
+    // and OFF when either projection or FFN policy explicitly opts out.
+    assert!(!resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill(
+        Proj27bCublasLtNvfp4Policy::Auto,
+        CublasLtNvfp4Policy::Auto,
+        48,
+        Some((12, 1)),
+        false,
+    ));
+    assert!(resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill(
+        Proj27bCublasLtNvfp4Policy::Auto,
+        CublasLtNvfp4Policy::Auto,
+        48,
+        Some((12, 1)),
+        true,
+    ));
+    assert!(!resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill(
+        Proj27bCublasLtNvfp4Policy::Disabled,
+        CublasLtNvfp4Policy::Auto,
+        48,
+        Some((12, 1)),
+        true,
+    ));
+    assert!(!resolve_proj_27b_cublaslt_nvfp4_with_gb10_fast_prefill(
+        Proj27bCublasLtNvfp4Policy::Auto,
+        CublasLtNvfp4Policy::Disabled,
+        48,
+        Some((12, 1)),
+        true,
+    ));
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn merged_128x4_scales_equal_concatenated_halves_for_128_aligned_inter() {

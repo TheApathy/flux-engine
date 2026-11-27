@@ -564,6 +564,25 @@ impl Qwen3SsmLayer {
         {
             return Ok(());
         }
+        // Opt-in scalar Tensor-FP8 prefill (`ATLAS_TENSOR_FP8_PREFILL=1` or
+        // `ATLAS_GB10_FAST_PREFILL=1`) when a prepared uniform-scale E4M3 weight
+        // is resident (`qkvz_fp8w.is_none()` ensures native 128x128 block-scaled
+        // FP8 checkpoints are never misrouted).
+        if self.qkvz_fp8w.is_none() {
+            let prepared_e4m3 = self
+                .ssm_qkvz_e4m3
+                .lock()
+                .ok()
+                .and_then(|slot| *slot)
+                .or(self.qkvz_fp8);
+            if let Some(w_e4m3) = prepared_e4m3
+                && ops::try_tensor_fp8_prefill_proj_single(
+                    ctx.gpu, normed, w_e4m3, proj_dst, k, n, h, 1.0, true, "ssm_qkvz", stream,
+                )?
+            {
+                return Ok(());
+            }
+        }
         // cuBLASLt FP8: needs the NVFP4 weight materialised as e4m3 once, then
         // multiplies exactly the bytes the W4A16 kernel would have built.
         if crate::layers::ssm_proj_cublaslt_enabled() {
@@ -763,6 +782,27 @@ impl Qwen3SsmLayer {
             Ok(())
         } else if let Some(fp8) = self.out_proj_fp8 {
             use crate::layers::PrefillProjectionPipeRoute as Route;
+            // Opt-in scalar Tensor-FP8 prefill (`ATLAS_TENSOR_FP8_PREFILL=1` or
+            // `ATLAS_GB10_FAST_PREFILL=1`) for pre-dequanted uniform-scale E4M3
+            // weights (`out_proj_fp8w.is_none()` guards against 128x128 block-scaled
+            // native FP8 checkpoints).
+            if self.out_proj_fp8w.is_none()
+                && ops::try_tensor_fp8_prefill_proj_single(
+                    ctx.gpu,
+                    normed_out_buf,
+                    fp8,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    1.0,
+                    true,
+                    "ssm_out_proj",
+                    stream,
+                )?
+            {
+                return Ok(());
+            }
             // Weights here are already e4m3 in memory, so the library GEMM takes
             // the identical operands with no conversion pass.
             if self.try_cublaslt_fp8_proj(
