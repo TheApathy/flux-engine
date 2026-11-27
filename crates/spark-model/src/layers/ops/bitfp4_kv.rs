@@ -208,6 +208,10 @@ pub fn reshape_and_cache_bitfp4_kv_block16(
     if num_tokens == 0 || num_kv_heads == 0 {
         return Ok(());
     }
+    anyhow::ensure!(
+        key_stride.is_multiple_of(8),
+        "BitDecoding-FP4 K write requires 16-byte aligned key_stride (multiple of 8 BF16 elems, got {key_stride})"
+    );
     let mask = flags.to_mask();
 
     // 1. Token-wise K write: 1 warp per (token, kv_head)
@@ -274,6 +278,14 @@ pub fn paged_decode_attn_bitfp4_sm120(
     anyhow::ensure!(
         num_kv_heads > 0 && num_q_heads.is_multiple_of(num_kv_heads),
         "BitDecoding-FP4 requires num_q_heads ({num_q_heads}) divisible by num_kv_heads ({num_kv_heads})"
+    );
+    anyhow::ensure!(
+        num_splits <= 1 || !workspace.is_null(),
+        "BitDecoding-FP4 split-K (num_splits={num_splits}) requires a non-null workspace"
+    );
+    anyhow::ensure!(
+        q_stride.is_multiple_of(8),
+        "BitDecoding-FP4 decode requires 16-byte aligned q_stride (multiple of 8 BF16 elems, got {q_stride})"
     );
     if num_seqs == 0 {
         return Ok(());
@@ -343,6 +355,14 @@ pub fn paged_decode_attn_bitfp4_kgamma_sm120(
         num_kv_heads > 0 && num_q_heads.is_multiple_of(num_kv_heads),
         "BitDecoding-FP4 kgamma requires num_q_heads ({num_q_heads}) divisible by num_kv_heads ({num_kv_heads})"
     );
+    anyhow::ensure!(
+        num_splits <= 1 || !workspace.is_null(),
+        "BitDecoding-FP4 kgamma split-K (num_splits={num_splits}) requires a non-null workspace"
+    );
+    anyhow::ensure!(
+        q_stride.is_multiple_of(8),
+        "BitDecoding-FP4 kgamma requires 16-byte aligned q_stride (multiple of 8 BF16 elems, got {q_stride})"
+    );
     if num_qtile == 0 {
         return Ok(());
     }
@@ -396,6 +416,13 @@ pub fn paged_decode_attn_bitfp4_reduce(
     num_rows: u32,
     stream: u64,
 ) -> Result<()> {
+    anyhow::ensure!(
+        num_splits > 0 && !workspace.is_null(),
+        "BitDecoding-FP4 reduce requires num_splits > 0 (got {num_splits}) and a non-null workspace"
+    );
+    if num_q_heads == 0 || num_rows == 0 {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, reduce_kernel)
         .grid([num_q_heads, num_rows, 1])
         .block([32, 1, 1])

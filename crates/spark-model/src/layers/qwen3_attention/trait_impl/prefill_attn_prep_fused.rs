@@ -87,6 +87,13 @@ impl Qwen3AttentionLayer {
         match layer_kv_dtype {
             KvCacheDtype::Nvfp4 => {
                 ensure!(
+                    self.active_bitfp4_kv(hd, u32::try_from(block_size)?)
+                        .is_none(),
+                    "ATLAS_BITFP4_KV=1 is incompatible with qwen4_attn_prep_fused_nvfp4 \
+                     (legacy token-major NVFP4 KV writer, layer {}); unset ATLAS_BITFP4_KV",
+                    layer
+                );
+                ensure!(
                     k.fused_nvfp4.0 != 0,
                     "{SELECTOR}: qwen4_attn_prep_fused_nvfp4 kernel unavailable"
                 );

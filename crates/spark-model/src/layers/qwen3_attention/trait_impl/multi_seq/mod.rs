@@ -131,7 +131,10 @@ impl Qwen3AttentionLayer {
             stream,
             max_seq_len_host,
             Some(qkv_base),
-        );
+        )
+        // Cross-sequence DFlash verify invokes this entry once per sequence for
+        // that sequence's K verify rows, which all share row 0's block table.
+        .with_shared_block_table(true);
         let meta = ctx
             .attn_metadata
             .expect("attention layer requires metadata");
@@ -201,7 +204,7 @@ impl Qwen3AttentionLayer {
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
-        _block_tables: &[Vec<u32>],
+        block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
         qkv_base_override: Option<DevicePtr>,
@@ -219,6 +222,8 @@ impl Qwen3AttentionLayer {
             .max()
             .unwrap_or(0)
             .saturating_add(1) as u32;
+        let shared_block_table = block_tables.len() == num_seqs
+            && crate::layers::qwen3_attention::bitfp4_kv::block_tables_all_shared(block_tables);
         let c = ctx::MultiSeqCtx::new_with_qkv_base(
             self,
             ctx,
@@ -229,7 +234,8 @@ impl Qwen3AttentionLayer {
             stream,
             max_seq_len_host,
             qkv_base_override,
-        );
+        )
+        .with_shared_block_table(shared_block_table);
         let serial = crate::model::env_diag::DflashSerialControls::current();
         let serial_norms = c.n > 1 && serial.layer_norms;
 

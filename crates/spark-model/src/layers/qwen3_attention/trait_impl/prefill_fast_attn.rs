@@ -641,6 +641,13 @@ impl Qwen3AttentionLayer {
         match layer_kv_dtype {
             KvCacheDtype::Nvfp4 => {
                 ensure!(
+                    self.active_bitfp4_kv(hd, u32::try_from(block_size)?)
+                        .is_none(),
+                    "ATLAS_BITFP4_KV=1 is incompatible with qwen4_attn_prep_fused_nvfp4 \
+                     (legacy token-major NVFP4 KV writer, layer {}); unset ATLAS_BITFP4_KV",
+                    layer
+                );
+                ensure!(
                     k.fused_nvfp4.0 != 0,
                     "{}: qwen4_attn_prep_fused_nvfp4 kernel unavailable",
                     qwen4_attn_prep::SELECTOR
@@ -1306,6 +1313,17 @@ impl Qwen3AttentionLayer {
                 )?;
                 let layer_kv_dtype = kv_cache.dtype_for_layer(self.attn_layer_idx);
                 if layer_kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Nvfp4 {
+                    ensure!(
+                        self.active_bitfp4_kv(
+                            u32::try_from(hd)?,
+                            u32::try_from(kv_cache.block_size())?,
+                        )
+                        .is_none(),
+                        "ATLAS_BITFP4_KV=1 fast continuation prefill over block-16 transposed V^T \
+                         KV cache is not yet supported (layer {}); use single-chunk prefill or \
+                         unset ATLAS_BITFP4_KV",
+                        self.attn_layer_idx
+                    );
                     ensure!(
                         self.prefill_attn_paged_nvfp4_64_k.0 != 0,
                         "fast NVFP4 continuation attention requires prefill_attn_paged_nvfp4_64"

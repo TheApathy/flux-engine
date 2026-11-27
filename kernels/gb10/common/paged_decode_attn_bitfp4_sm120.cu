@@ -143,6 +143,10 @@ __device__ __forceinline__ unsigned char quant2_e2m1(float v0, float v1) {
         "}"
         : "=r"(r)
         : "f"(v0), "f"(v1));
+    // Canonicalize hardware `-0.0` (0x8) -> `+0.0` (0x0) so `0x8` is reserved
+    // exclusively for RaZeR-KV ±5.0 remapping. Zero cross-nibble carry.
+    const unsigned int neg0 = r & ~((r & 0x77777777u) + 0x77777777u) & 0x88888888u;
+    r ^= neg0;
     return static_cast<unsigned char>(r & 0xffu);
 #else
     auto q1 = [](float x) -> unsigned int {
@@ -178,6 +182,10 @@ __device__ __forceinline__ unsigned int quant8_e2m1(const float v[8], float q_in
         "}"
         : "=r"(r)
         : "f"(v0), "f"(v1), "f"(v2), "f"(v3), "f"(v4), "f"(v5), "f"(v6), "f"(v7));
+    // Canonicalize hardware `-0.0` (0x8) -> `+0.0` (0x0) so vanilla/4o6 candidates
+    // can never emit `0x8` that RaZeR decode would remap to `+5.0 * scale`.
+    const unsigned int neg0 = r & ~((r & 0x77777777u) + 0x77777777u) & 0x88888888u;
+    r ^= neg0;
     return r;
 #else
     const unsigned int b0 = quant2_e2m1(v[0] * q_inv, v[1] * q_inv);
@@ -503,11 +511,13 @@ __device__ __forceinline__ void paged_decode_bitfp4_core(
         unsigned int sl = 0u;
         if (tid < num_q_active) {
             if constexpr (!kIsKgamma) {
-                sl = static_cast<unsigned int>(seq_lens[seq_idx]);
+                const int raw_sl = seq_lens[seq_idx];
+                sl = (raw_sl > 0) ? static_cast<unsigned int>(raw_sl) : 0u;
             } else {
                 const unsigned int q_flat = q_chunk_base + tid;
                 const unsigned int q_row = q_flat / gqa_ratio;
-                sl = static_cast<unsigned int>(seq_lens[q_row]);
+                const int raw_sl = seq_lens[q_row];
+                sl = (raw_sl > 0) ? static_cast<unsigned int>(raw_sl) : 0u;
             }
         }
         sm.sQSeqLen[tid] = sl;

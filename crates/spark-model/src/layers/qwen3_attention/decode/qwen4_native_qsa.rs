@@ -56,6 +56,16 @@ impl Qwen3AttentionLayer {
                 "native Qwen4 QSA rows need this layer's QSA indexer; serve with --qwen4-qsa"
             )
         })?;
+        let (_, layer_hd) = kv_cache.config().dims_for_layer(self.attn_layer_idx);
+        let bitfp4_active = self
+            .active_bitfp4_kv(layer_hd as u32, kv_cache.block_size() as u32)
+            .is_some();
+        anyhow::ensure!(
+            !bitfp4_active,
+            "ATLAS_BITFP4_KV=1 is incompatible with native Qwen4 QSA sparse NVFP4 attention \
+             (layer {}); unset ATLAS_BITFP4_KV or disable --qwen4-qsa",
+            self.attn_layer_idx
+        );
         anyhow::ensure!(
             self.mla.is_none()
                 && matches!(self.kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Nvfp4)

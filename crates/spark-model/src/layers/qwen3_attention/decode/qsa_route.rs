@@ -139,6 +139,13 @@ impl Qwen3AttentionLayer {
             .unwrap_or(ctx.config.num_key_value_heads) as u32;
         let hd = self.head_dim_override.unwrap_or(ctx.config.head_dim) as u32;
         let bs = kv_cache.block_size() as u32;
+        if self.active_bitfp4_kv(hd, bs).is_some() {
+            anyhow::bail!(
+                "ATLAS_BITFP4_KV=1 is incompatible with Qwen4 QSA NVFP4 attention \
+                 (layer {}); unset ATLAS_BITFP4_KV or disable --qwen4-qsa",
+                self.attn_layer_idx
+            );
+        }
         let q_dim = nq * hd;
         let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim };
         let q_proj_bytes = q_proj_dim as usize * 2;
@@ -388,6 +395,13 @@ impl Qwen3AttentionLayer {
             .unwrap_or(ctx.config.num_key_value_heads) as u32;
         let hd = self.head_dim_override.unwrap_or(ctx.config.head_dim) as u32;
         let bs = kv_cache.block_size() as u32;
+        if self.active_bitfp4_kv(hd, bs).is_some() {
+            anyhow::bail!(
+                "ATLAS_BITFP4_KV=1 is incompatible with Qwen4 QSA NVFP4 attention \
+                 (layer {}); unset ATLAS_BITFP4_KV or disable --qwen4-qsa",
+                self.attn_layer_idx
+            );
+        }
         let q_dim = nq * hd;
         let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim };
         let q_proj_bytes = q_proj_dim as usize * 2;

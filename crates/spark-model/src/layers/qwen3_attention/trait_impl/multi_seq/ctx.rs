@@ -46,6 +46,11 @@ pub(super) struct MultiSeqCtx<'a> {
     pub normed: DevicePtr,
     /// Per-token concatenated QKV output [Q | K | V] strided by `per_seq_qkv`.
     pub qkv_buf: DevicePtr,
+    /// True only when every row `0..n` in this multi-seq call attends over the
+    /// SAME sequence block table (e.g. K=gamma verify for a single sequence).
+    /// Must be `false` for concurrent independent user requests so single-table
+    /// `kgamma` kernels never leak sequence 0's KV blocks to sequences `1..n-1`.
+    pub shared_block_table: bool,
 }
 
 impl<'a> MultiSeqCtx<'a> {
@@ -126,6 +131,14 @@ impl<'a> MultiSeqCtx<'a> {
             per_seq_qkv,
             normed,
             qkv_buf,
+            shared_block_table: false,
         }
+    }
+
+    /// Mark whether every row in this multi-seq call shares sequence 0's block table.
+    #[must_use]
+    pub(super) const fn with_shared_block_table(mut self, shared: bool) -> Self {
+        self.shared_block_table = shared;
+        self
     }
 }

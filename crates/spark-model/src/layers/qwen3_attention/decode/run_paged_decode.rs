@@ -729,9 +729,14 @@ impl Qwen3AttentionLayer {
             KvCacheDtype::Nvfp4 => {
                 let num_splits = compute_num_splits(num_q_heads, num_seqs, max_seq_len_host);
 
-                if kv_indirection == DevicePtr::NULL
-                    && let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(head_dim, block_size)
-                {
+                if let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(head_dim, block_size) {
+                    if kv_indirection != DevicePtr::NULL {
+                        anyhow::bail!(
+                            "ATLAS_BITFP4_KV=1 does not support tree-aware KV indirection \
+                             (layer {}); unset ATLAS_BITFP4_KV or disable tree speculation",
+                            self.attn_layer_idx
+                        );
+                    }
                     let bitfp4_splits = if workspace == DevicePtr::NULL {
                         1
                     } else {

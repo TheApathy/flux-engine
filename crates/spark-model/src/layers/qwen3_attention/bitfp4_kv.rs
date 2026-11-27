@@ -77,6 +77,27 @@ pub(crate) const fn resolve_bitfp4_kv_route(
     }
 }
 
+/// Returns `true` iff `block_tables` is non-empty and every row shares the
+/// exact same block table (single-sequence speculative `K = gamma` verify).
+/// Concurrent independent requests have distinct block tables and return `false`.
+#[inline]
+#[must_use]
+pub(in crate::layers::qwen3_attention) fn block_tables_all_shared(
+    block_tables: &[Vec<u32>],
+) -> bool {
+    !block_tables.is_empty() && block_tables.windows(2).all(|w| w[0] == w[1])
+}
+
+/// Returns `true` iff a multi-seq BitDecoding-FP4 decode call may use the
+/// single-table `paged_decode_attn_bitfp4_kgamma_sm120` kernel (which indexes
+/// `block_tables[0]` for every row). Concurrent independent requests (`!shared_block_table`)
+/// MUST route to per-sequence `paged_decode_attn_bitfp4_sm120` (`block_tables[blockIdx.z]`).
+#[inline]
+#[must_use]
+pub(crate) const fn bitfp4_kgamma_eligible(num_rows: usize, shared_block_table: bool) -> bool {
+    shared_block_table && num_rows >= 2 && num_rows <= 32
+}
+
 /// Compute `num_splits` for BitDecoding-FP4 decode (`Q_SUB = 8`, 2 CTAs/SM target),
 /// capped to fit within the existing `splitk_workspace` slot budget.
 #[inline]
@@ -342,6 +363,14 @@ pub(crate) mod reference {
             }
         }
         best_code
+    }
+
+    /// Exact mirror of the 2-op `-0.0` (`0x8`) -> `+0.0` (`0x0`) SWAR
+    /// canonicalizer in `quant8_e2m1` / `quant2_e2m1`.
+    #[must_use]
+    pub const fn canonicalize_e2m1_neg_zero_u32(r: u32) -> u32 {
+        let neg0 = r & !((r & 0x7777_7777).wrapping_add(0x7777_7777)) & 0x8888_8888;
+        r ^ neg0
     }
 
     /// Exact mirror of `bitfp4::razer_swar_split_u32` (6-op branchless SWAR).
@@ -661,6 +690,30 @@ mod tests {
                         "mixed word=0x{word:08X} neg_sv={neg_sv} slot={slot}"
                     );
                 }
+            }
+        }
+
+        // 3. Hardware `-0.0` (0x8) -> `+0.0` (0x0) SWAR canonicalizer: exhaustive + mixed.
+        for nib in 0u8..16u8 {
+            let packed = (nib as u32) * 0x1111_1111u32;
+            let canon = canonicalize_e2m1_neg_zero_u32(packed);
+            let want = if nib == 0x8 { 0x0u8 } else { nib };
+            assert_eq!(canon, (want as u32) * 0x1111_1111u32, "nib=0x{nib:X}");
+        }
+        for &word in &patterns {
+            let canon = canonicalize_e2m1_neg_zero_u32(word);
+            for slot in 0..8 {
+                let nib = ((word >> (slot * 4)) & 0xF) as u8;
+                let got = ((canon >> (slot * 4)) & 0xF) as u8;
+                let want = if nib == 0x8 { 0x0u8 } else { nib };
+                assert_eq!(got, want, "canon word=0x{word:08X} slot={slot}");
+            }
+            // After canonicalization, running RaZeR split must NEVER turn a
+            // canonicalized vanilla/4o6 word into ±5.0 (comp must be identically 0).
+            for neg_sv in 0u32..=1u32 {
+                let (w_main, w_comp) = razer_swar_split_u32(canon, neg_sv);
+                assert_eq!(w_main, canon);
+                assert_eq!(w_comp, 0u32);
             }
         }
     }
@@ -1304,5 +1357,39 @@ mod tests {
         assert_eq!(compute_bitfp4_decode_splits(24, 4, 24, 8192, 48, 48), 1);
         // K=17 verify (102 queries/kv -> 7 chunks x 4 kv = 28 CTAs) -> 4 splits (112 CTAs).
         assert_eq!(compute_bitfp4_kgamma_splits(24, 4, 17, 8192, 48, 64), 4);
+    }
+
+    #[test]
+    fn kgamma_dispatch_requires_shared_block_table_to_prevent_cross_tenant_reads() {
+        // Single-sequence K=17 verify: all 17 rows share the identical block table.
+        let shared_k17: Vec<Vec<u32>> = vec![vec![3, 7, 11]; 17];
+        assert!(block_tables_all_shared(&shared_k17));
+        assert!(bitfp4_kgamma_eligible(
+            shared_k17.len(),
+            block_tables_all_shared(&shared_k17)
+        ));
+
+        // Concurrent batched decode (C=2..32 independent user requests): distinct block tables.
+        let distinct_c4: Vec<Vec<u32>> = vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]];
+        assert!(!block_tables_all_shared(&distinct_c4));
+        assert!(!bitfp4_kgamma_eligible(
+            distinct_c4.len(),
+            block_tables_all_shared(&distinct_c4)
+        ));
+
+        // Even a single differing trailing row disqualifies single-table kgamma.
+        let mostly_shared: Vec<Vec<u32>> = vec![vec![1, 2], vec![1, 2], vec![1, 9]];
+        assert!(!block_tables_all_shared(&mostly_shared));
+        assert!(!bitfp4_kgamma_eligible(
+            mostly_shared.len(),
+            block_tables_all_shared(&mostly_shared)
+        ));
+
+        // Boundary row counts: n=1, n=0, n=33 stay on per-sequence decode even if shared.
+        assert!(!block_tables_all_shared(&[]));
+        assert!(!bitfp4_kgamma_eligible(1, true));
+        assert!(bitfp4_kgamma_eligible(2, true));
+        assert!(bitfp4_kgamma_eligible(32, true));
+        assert!(!bitfp4_kgamma_eligible(33, true));
     }
 }

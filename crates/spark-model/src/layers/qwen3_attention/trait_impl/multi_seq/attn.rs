@@ -1114,72 +1114,114 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        // Native Blackwell SM120/SM121 BitDecoding-FP4 K=gamma verify path
+        // Native Blackwell SM120/SM121 BitDecoding-FP4 decode & K=gamma verify path
         // (opt-in via `ATLAS_BITFP4_KV=1`, plus optional `ATLAS_BITFP4_RAZER_KV=1`).
-        // Stacks up to 16 `(q_row, q_head)` queries per CTA sharing a single
-        // double-buffered FP4 KV scan (`B_k = 64` = 4 Flux blocks).
-        if (2..=32).contains(&n)
-            && kv_indir == spark_runtime::gpu::DevicePtr::NULL
-            && fwd.ddtree_parent_ids_dev.is_none()
-            && let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(hd, bs)
-        {
-            let workspace = fwd.buffers.splitk_workspace();
-            let slot_bytes = n
-                .saturating_mul(nq as usize)
-                .saturating_mul(hd as usize + 2)
-                .saturating_mul(std::mem::size_of::<f32>());
-            let max_splits_cap =
-                if workspace == spark_runtime::gpu::DevicePtr::NULL || slot_bytes == 0 {
-                    1
-                } else {
-                    (fwd.buffers.sizes().splitk_workspace / slot_bytes).clamp(1, 64) as u32
-                };
-            let num_splits =
-                crate::layers::qwen3_attention::bitfp4_kv::compute_bitfp4_kgamma_splits(
+        //
+        // Once BitDecoding-FP4 is active on this layer, K is stored WHT-rotated and
+        // V is stored block-16 channel-transposed (`V^T`), so execution MUST NEVER
+        // fall through into legacy token-major NVFP4 kernels (`paged_decode_attn_kgamma_nvfp4*`):
+        //   - Tree-aware / DDTree indirection -> fail closed (`anyhow::bail!`).
+        //   - Single-sequence flat K=gamma (`c.shared_block_table && 2..=32`) ->
+        //     `paged_decode_attn_bitfp4_kgamma_sm120` (16 stacked queries/CTA sharing
+        //     row 0's block table).
+        //   - Independent concurrent requests (`!c.shared_block_table`), `n == 1`, or
+        //     `n > 32` -> route directly to `self.run_paged_decode` ->
+        //     `paged_decode_attn_bitfp4_sm120` (indexes `block_tables[blockIdx.z]`
+        //     per sequence, preventing cross-tenant KV reads).
+        if let Some((bitfp4_k, flags)) = self.active_bitfp4_kv(hd, bs) {
+            if kv_indir != spark_runtime::gpu::DevicePtr::NULL
+                || fwd.ddtree_parent_ids_dev.is_some()
+            {
+                anyhow::bail!(
+                    "ATLAS_BITFP4_KV=1 does not support tree-aware or DDTree KV indirection \
+                     (layer {}); unset ATLAS_BITFP4_KV or disable tree speculation",
+                    self.attn_layer_idx
+                );
+            }
+            if crate::layers::qwen3_attention::bitfp4_kv::bitfp4_kgamma_eligible(
+                n,
+                c.shared_block_table,
+            ) {
+                let workspace = fwd.buffers.splitk_workspace();
+                let slot_bytes = n
+                    .saturating_mul(nq as usize)
+                    .saturating_mul(hd as usize + 2)
+                    .saturating_mul(std::mem::size_of::<f32>());
+                let max_splits_cap =
+                    if workspace == spark_runtime::gpu::DevicePtr::NULL || slot_bytes == 0 {
+                        1
+                    } else {
+                        (fwd.buffers.sizes().splitk_workspace / slot_bytes).clamp(1, 64) as u32
+                    };
+                let num_splits =
+                    crate::layers::qwen3_attention::bitfp4_kv::compute_bitfp4_kgamma_splits(
+                        nq,
+                        nkv,
+                        n as u32,
+                        max_seq_len_host,
+                        atlas_core::device::active_sm_count(),
+                        max_splits_cap,
+                    );
+                ops::paged_decode_attn_bitfp4_kgamma_sm120(
+                    fwd.gpu,
+                    bitfp4_k,
+                    q_contiguous,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    attn_out,
+                    workspace,
+                    meta.block_table,
+                    meta.seq_len,
+                    meta.max_blocks_per_seq,
                     nq,
                     nkv,
+                    inv_sqrt_d,
+                    num_splits,
+                    q_stride_elems,
+                    kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    kv_cache.nvfp4_data_bytes() as u64,
                     n as u32,
-                    max_seq_len_host,
-                    atlas_core::device::active_sm_count(),
-                    max_splits_cap,
-                );
-            ops::paged_decode_attn_bitfp4_kgamma_sm120(
+                    flags,
+                    ops::BitFp4Bf16Sink::default(),
+                    stream,
+                )?;
+                if num_splits > 1 {
+                    ops::paged_decode_attn_bitfp4_reduce(
+                        fwd.gpu,
+                        bitfp4_k.reduce,
+                        workspace,
+                        attn_out,
+                        meta.seq_len,
+                        nq,
+                        num_splits,
+                        n as u32,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
+            return self.run_paged_decode(
                 fwd.gpu,
-                bitfp4_k,
                 q_contiguous,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                kv_cache,
                 attn_out,
-                workspace,
                 meta.block_table,
                 meta.seq_len,
                 meta.max_blocks_per_seq,
+                n as u32,
                 nq,
                 nkv,
+                hd,
+                bs,
                 inv_sqrt_d,
-                num_splits,
                 q_stride_elems,
-                kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
-                kv_cache.nvfp4_data_bytes() as u64,
-                n as u32,
-                flags,
-                ops::BitFp4Bf16Sink::default(),
+                fwd.buffers.splitk_workspace(),
+                spark_runtime::gpu::DevicePtr::NULL,
+                spark_runtime::gpu::DevicePtr::NULL,
+                0,
+                max_seq_len_host,
                 stream,
-            )?;
-            if num_splits > 1 {
-                ops::paged_decode_attn_bitfp4_reduce(
-                    fwd.gpu,
-                    bitfp4_k.reduce,
-                    workspace,
-                    attn_out,
-                    meta.seq_len,
-                    nq,
-                    num_splits,
-                    n as u32,
-                    stream,
-                )?;
-            }
-            return Ok(());
+            );
         }
 
         // FlashAttention-v2 inspired K=γ-fused path. Active when:

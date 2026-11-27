@@ -62,6 +62,14 @@ impl Qwen3AttentionLayer {
         if !self.high_speed_swap_engaged(kv_cache) {
             return Ok(());
         }
+        if self.active_bitfp4_kv(hd, bs as u32).is_some() {
+            anyhow::bail!(
+                "ATLAS_BITFP4_KV=1 is incompatible with --high-speed-swap (host NVFP4 \
+                 dequantizer expects token-major V rather than block-16 transposed V^T, \
+                 layer {}); unset ATLAS_BITFP4_KV or disable --high-speed-swap",
+                self.attn_layer_idx
+            );
+        }
         let layer_u32 = self.attn_layer_idx as u32;
         let block_floats = bs * (nkv as usize) * (hd as usize);
 
