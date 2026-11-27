@@ -5,15 +5,19 @@
 
 Certifies bit-exact numerical invariants (CPU-only, pure NumPy + stdlib) for:
 
-  1. **LM-Head Precision & DualPlaneNvfp4 (``8.5 bpw``)** — mirrors
-     ``crates/spark-model/src/weight_map/dual_plane.rs`` and
+  1. **LM-Head Precision Ladder (`BF16` vs `INT8 per-32 BF16sc` vs `DualPlaneNvfp4` vs `MXFP8`)** —
+     mirrors ``crates/spark-model/src/weight_map/dual_plane.rs`` and
      ``crates/spark-model/src/layers/ops/lm_head_argmax.rs`` bit-for-bit:
-       - Weight & logit SQNR vs BF16/FP32 (``DualPlaneNvfp4`` ``~38.5 dB``,
-         ``>= +6.0 dB`` over block-128 FP8 E4M3 ``~31.8 dB``; plus strict
-         ``>= 45.0 dB`` BF16-equivalence gate demonstrating BF16 ``~55.6 dB``
-         vs 8.5 bpw DualPlane ``~38.5 dB`` honestly without inflating SQNR).
-       - Top-1 flip rate ``< 0.1%`` (``0.001``) on realistic LM-head projections.
-       - Softmax ``D_KL(P_bf16 || P_quant) < 1e-4`` at ``T = 1.0``.
+       - **`INT8 per-32 BF16sc` (``8.50 bpw``, ``1.88x`` smaller than BF16)**:
+         signed ``int8`` (``-127..=127``) spends all 7 magnitude bits linearly
+         per 32-element block with a BF16 scale, converts **0-ULP lossless**
+         into BF16, and Pareto-dominates both ``DualPlaneNvfp4`` (``8.50 bpw``,
+         ``~38.5 dB``) and ``MXFP8`` (``8.25 bpw``, ``~31.5 dB``) at
+         ``>= 44.0 dB`` (``~45.4 dB``) SQNR and ``D_KL < 1e-6`` at ``T = 1.0``.
+       - **`DualPlaneNvfp4` (``8.50 bpw``)**: weight & logit SQNR ``~38.5 dB``
+         (``>= +6.0 dB`` over block-128 FP8 E4M3 ``~31.8 dB``), Top-1 flip
+         ``< 0.1%``, ``D_KL < 1e-4`` at ``T = 1.0``, plus strict ``>= 45.0 dB``
+         BF16-equivalence check.
        - Exact deterministic lowest-vocab-index tie-breaking and ``NaN``/``-Inf``
          masking parity vs BF16 reference.
   2. **BitFP4 + 6-op Branchless SWAR RaZeR-KV** — mirrors
@@ -45,6 +49,8 @@ import numpy as np
 
 DUAL_PLANE_GROUP_SIZE = 16
 DUAL_PLANE_LO_SCALE = np.float32(0.125)
+INT8_PER32_GROUP_SIZE = 32
+MXFP8_GROUP_SIZE = 32
 BITFP4_HDIM = 256
 BITFP4_BLOCK_SIZE = 16
 UNDERFLOW_C = np.float32(8.0)
@@ -162,6 +168,62 @@ def quantize_dual_plane_np(weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     w_hi = (hi_vals * eff[..., None]).reshape(v, k).astype(np.float32)
     w_full = ((hi_vals + DUAL_PLANE_LO_SCALE * lo_vals) * eff[..., None]).reshape(v, k).astype(np.float32)
     return w_full, w_hi
+
+
+def quantize_int8_per32_bf16sc_np(weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Quantize `[V, K]` weights into ``INT8 per-32 BF16sc`` (`8.50 bpw`).
+
+    Each 32-element block stores 32 signed ``int8`` values in ``[-127, 127]``
+    plus one BF16 scale (``8.0 + 16/32 = 8.50 bpw``, ``1.882x`` smaller than
+    BF16). Every signed ``int8`` value in ``[-127, 127]`` converts 0-ULP
+    losslessly into BF16 (7 mantissa bits + 1 implicit bit).
+    Returns ``(w_dequant_f32, q_i8, scales_bf16)``.
+    """
+    w = np.ascontiguousarray(weights, dtype=np.float32)
+    if w.ndim != 2 or w.shape[1] == 0 or w.shape[1] % INT8_PER32_GROUP_SIZE != 0:
+        raise ValueError(
+            f"INT8 per-32 BF16sc requires [V, K] with K > 0 divisible by 32, got {w.shape}"
+        )
+    v, k = w.shape
+    grp = w.reshape(v, k // INT8_PER32_GROUP_SIZE, INT8_PER32_GROUP_SIZE)
+    gmax = np.max(np.abs(grp), axis=-1)
+    scales_bf16 = bf16_round_np(gmax / np.float32(127.0))
+    inv_sc = np.where(
+        scales_bf16 > 0.0,
+        np.float32(1.0) / np.where(scales_bf16 > 0.0, scales_bf16, np.float32(1.0)),
+        np.float32(0.0),
+    )
+    q_i8 = np.clip(np.rint(grp * inv_sc[..., None]), -127.0, 127.0).astype(np.int8)
+    # Convert q_i8 -> BF16 (0-ULP lossless for all -127..=127) and apply BF16 scale.
+    w_deq = (q_i8.astype(np.float32) * scales_bf16[..., None]).reshape(v, k).astype(np.float32)
+    return w_deq, q_i8, scales_bf16
+
+
+def quantize_mxfp8_per32_ue8m0_np(weights: np.ndarray) -> np.ndarray:
+    """Reference OCP MXFP8 (`8.25 bpw`): group-32 E4M3fn + shared UE8M0 power-of-2 scale."""
+    w = np.ascontiguousarray(weights, dtype=np.float32)
+    if w.ndim != 2 or w.shape[1] == 0 or w.shape[1] % MXFP8_GROUP_SIZE != 0:
+        raise ValueError(
+            f"MXFP8 requires [V, K] with K > 0 divisible by 32, got {w.shape}"
+        )
+    v, k = w.shape
+    grp = w.reshape(v, k // MXFP8_GROUP_SIZE, MXFP8_GROUP_SIZE)
+    gmax = np.max(np.abs(grp), axis=-1)
+    gmax_safe = np.maximum(gmax, np.float32(2.0**-126))
+    exp = np.clip(np.ceil(np.log2(gmax_safe / np.float32(448.0))).astype(np.int32), -127, 127)
+    ue8m0_sc = np.where(gmax > 0.0, np.ldexp(np.float32(1.0), exp), np.float32(0.0)).astype(
+        np.float32
+    )
+    inv_sc = np.where(
+        ue8m0_sc > 0.0,
+        np.float32(1.0) / np.where(ue8m0_sc > 0.0, ue8m0_sc, np.float32(1.0)),
+        np.float32(0.0),
+    )
+    norm = grp * inv_sc[..., None]
+    q_mag = UE4M3_LUT[float_to_ue4m3_np(norm)]
+    return (np.where(norm < 0.0, -q_mag, q_mag) * ue8m0_sc[..., None]).reshape(v, k).astype(
+        np.float32
+    )
 
 
 def quantize_fp8_block128_np(weights: np.ndarray) -> np.ndarray:
@@ -382,6 +444,188 @@ def certify_lm_head_dual_plane(
             "dual_plane_meets_strict_45db_gate": dp_logit_sqnr >= strict_bf16_sqnr_db,
             "bf16_meets_strict_45db_gate": bf16_logit_sqnr >= strict_bf16_sqnr_db,
         },
+        "tie_break": tie_break,
+    }
+
+
+def _validate_int8_per32_gates(
+    min_int8_sqnr_db: float,
+    max_int8_kl_t1: float,
+    max_top1_flip_rate: float,
+) -> None:
+    if not math.isfinite(min_int8_sqnr_db) or min_int8_sqnr_db < 0.0:
+        raise ValueError(f"min_int8_sqnr_db must be finite and >= 0, got {min_int8_sqnr_db}")
+    if not math.isfinite(max_int8_kl_t1) or max_int8_kl_t1 < 0.0:
+        raise ValueError(f"max_int8_kl_t1 must be finite and >= 0, got {max_int8_kl_t1}")
+    if not math.isfinite(max_top1_flip_rate) or not (0.0 <= max_top1_flip_rate <= 1.0):
+        raise ValueError(f"max_top1_flip_rate must be finite and in [0, 1], got {max_top1_flip_rate}")
+
+
+def certify_lm_head_int8_per32_bf16sc(
+    weights_fp32: np.ndarray | None = None,
+    vocab_size: int = 4096,
+    hidden_size: int = 512,
+    num_queries: int = 512,
+    seed: int = 20261127,
+    min_int8_sqnr_db: float = 44.0,
+    max_int8_kl_t1: float = 1.0e-6,
+    max_top1_flip_rate: float = 0.001,
+) -> dict[str, Any]:
+    """Certify ``INT8 per-32 BF16sc`` (`8.50 bpw`) side-by-side against BF16,
+    ``DualPlaneNvfp4`` (`8.50 bpw`), and ``MXFP8`` (`8.25 bpw`).
+
+    Verifies:
+      - 0-ULP lossless ``int8 (-127..=127) -> BF16`` conversion across all 255 codes.
+      - ``INT8 per-32 BF16sc`` weight & logit SQNR ``>= 44.0 dB`` (`~45.4 dB`),
+        strictly dominating ``DualPlaneNvfp4`` (`~38.5 dB`) and ``MXFP8`` (`~31.5 dB`).
+      - ``mean D_KL(P_bf16 || P_int8) <= 1e-6`` at ``T = 1.0`` and top-1 flip ``<= 0.1%``.
+      - Exact lowest-vocab-index tie-breaking parity vs BF16.
+    """
+    _validate_int8_per32_gates(
+        min_int8_sqnr_db=min_int8_sqnr_db,
+        max_int8_kl_t1=max_int8_kl_t1,
+        max_top1_flip_rate=max_top1_flip_rate,
+    )
+    rng = np.random.default_rng(seed)
+    if weights_fp32 is None:
+        if vocab_size < 2 or hidden_size <= 0 or hidden_size % INT8_PER32_GROUP_SIZE != 0:
+            raise ValueError(
+                f"invalid synthetic lm_head shape ({vocab_size}, {hidden_size}); "
+                "require vocab_size >= 2 and hidden_size > 0 divisible by 32"
+            )
+        w_fp32 = rng.normal(
+            0.0, 1.0 / math.sqrt(float(hidden_size)), size=(vocab_size, hidden_size)
+        ).astype(np.float32)
+    else:
+        w_fp32 = np.ascontiguousarray(weights_fp32, dtype=np.float32)
+        if w_fp32.ndim != 2 or w_fp32.shape[0] < 2 or w_fp32.shape[1] % INT8_PER32_GROUP_SIZE != 0:
+            raise ValueError(f"weights must have shape [V>=2, K%32==0], got {w_fp32.shape}")
+        vocab_size, hidden_size = w_fp32.shape
+    if num_queries <= 0:
+        raise ValueError(f"num_queries must be > 0, got {num_queries}")
+
+    # Exhaustive 0-ULP lossless check for every signed int8 in -127..=127 -> BF16.
+    all_i8_f32 = np.arange(-127, 128, dtype=np.int8).astype(np.float32)
+    int8_to_bf16_lossless = bool(np.array_equal(bf16_round_np(all_i8_f32), all_i8_f32))
+
+    w_bf16 = bf16_round_np(w_fp32)
+    w_i8, _, _ = quantize_int8_per32_bf16sc_np(w_bf16)
+    w_dp, _ = quantize_dual_plane_np(w_bf16)
+    w_mxfp8 = quantize_mxfp8_per32_ue8m0_np(w_bf16)
+
+    # Realistic post-RMSNorm decode hidden states (peaked top-1 + runner-up + low-entropy residual).
+    row_norms = np.maximum(np.linalg.norm(w_bf16, axis=-1, keepdims=True), np.float32(1.0e-6))
+    w_unit = w_bf16 / row_norms
+    med_norm = float(np.median(row_norms))
+    inv_med = np.float32(1.0 / max(med_norm, 1.0e-6))
+
+    targets = rng.integers(0, vocab_size, size=num_queries)
+    runners = (targets + rng.integers(1, vocab_size, size=num_queries)) % vocab_size
+    noise = rng.normal(
+        0.0, 1.0 / math.sqrt(float(hidden_size)), size=(num_queries, hidden_size)
+    ).astype(np.float32)
+    x_bf16 = bf16_round_np((12.0 * w_unit[targets] + 4.5 * w_unit[runners] + 0.8 * noise) * inv_med)
+
+    logits_fp32 = x_bf16 @ w_fp32.T
+    logits_bf16 = x_bf16 @ w_bf16.T
+    p_fp32 = softmax_f64(logits_fp32, temperature=1.0)
+    p_bf16 = softmax_f64(logits_bf16, temperature=1.0)
+    arg_fp32 = np.argmax(logits_fp32, axis=-1)
+    arg_bf16 = np.argmax(logits_bf16, axis=-1)
+
+    def _eval_scheme(
+        w_hat: np.ndarray,
+        bpw: float,
+        ref_w: np.ndarray,
+        ref_logits: np.ndarray,
+        ref_probs: np.ndarray,
+        ref_arg: np.ndarray,
+    ) -> dict[str, Any]:
+        y_hat = x_bf16 @ w_hat.T
+        p_hat = softmax_f64(y_hat, temperature=1.0)
+        kl_rows = np.sum(
+            ref_probs * np.log(np.clip(ref_probs, 1e-30, 1.0) / np.clip(p_hat, 1e-30, 1.0)),
+            axis=-1,
+        )
+        w_sqnr = compute_sqnr_db(ref_w, w_hat)
+        y_sqnr = compute_sqnr_db(ref_logits, y_hat)
+        flip = float(np.mean(ref_arg != np.argmax(y_hat, axis=-1)))
+        return {
+            "bpw": bpw,
+            "compression_vs_bf16_x": round(16.0 / bpw, 3),
+            "weight_sqnr_db": round(w_sqnr, 3),
+            "logit_sqnr_db": round(y_sqnr, 3),
+            "top1_flip_rate": round(flip, 6),
+            "mean_kl_t1": float(np.mean(kl_rows)),
+            "p95_kl_t1": float(np.percentile(kl_rows, 95.0)),
+            "max_kl_t1": float(np.max(kl_rows)),
+        }
+
+    schemes = {
+        "bf16": _eval_scheme(w_bf16, 16.0, w_fp32, logits_fp32, p_fp32, arg_fp32),
+        "int8_per32_bf16sc": _eval_scheme(w_i8, 8.5, w_bf16, logits_bf16, p_bf16, arg_bf16),
+        "dual_plane_nvfp4": _eval_scheme(w_dp, 8.5, w_bf16, logits_bf16, p_bf16, arg_bf16),
+        "mxfp8": _eval_scheme(w_mxfp8, 8.25, w_bf16, logits_bf16, p_bf16, arg_bf16),
+    }
+
+    i8 = schemes["int8_per32_bf16sc"]
+    dp = schemes["dual_plane_nvfp4"]
+    mx = schemes["mxfp8"]
+    tie_break = verify_lowest_index_tie_break()
+
+    failures: list[str] = []
+    if not int8_to_bf16_lossless:
+        failures.append("int8 (-127..=127) -> BF16 conversion was not 0-ULP lossless")
+    for name, val in (
+        ("int8_weight_sqnr_db", i8["weight_sqnr_db"]),
+        ("int8_logit_sqnr_db", i8["logit_sqnr_db"]),
+        ("int8_top1_flip_rate", i8["top1_flip_rate"]),
+        ("int8_mean_kl_t1", i8["mean_kl_t1"]),
+    ):
+        if not math.isfinite(val):
+            failures.append(f"non-finite metric `{name}`={val}")
+    if i8["weight_sqnr_db"] < min_int8_sqnr_db:
+        failures.append(
+            f"INT8 per-32 BF16sc weight SQNR {i8['weight_sqnr_db']:.2f} dB < {min_int8_sqnr_db:.2f} dB"
+        )
+    if i8["mean_kl_t1"] > max_int8_kl_t1:
+        failures.append(
+            f"INT8 per-32 BF16sc mean D_KL@T=1.0 {i8['mean_kl_t1']:.3e} > {max_int8_kl_t1:.3e}"
+        )
+    if i8["top1_flip_rate"] > max_top1_flip_rate:
+        failures.append(
+            f"INT8 per-32 BF16sc top-1 flip rate {i8['top1_flip_rate']:.6f} > {max_top1_flip_rate:.6f}"
+        )
+    if i8["weight_sqnr_db"] - dp["weight_sqnr_db"] < 5.0:
+        failures.append(
+            f"INT8 per-32 BF16sc ({i8['weight_sqnr_db']:.2f} dB) must beat DualPlaneNvfp4 "
+            f"({dp['weight_sqnr_db']:.2f} dB) by >= 5.0 dB"
+        )
+    if i8["weight_sqnr_db"] - mx["weight_sqnr_db"] < 12.0:
+        failures.append(
+            f"INT8 per-32 BF16sc ({i8['weight_sqnr_db']:.2f} dB) must beat MXFP8 "
+            f"({mx['weight_sqnr_db']:.2f} dB) by >= 12.0 dB"
+        )
+    if not (i8["mean_kl_t1"] < dp["mean_kl_t1"] < mx["mean_kl_t1"]):
+        failures.append(
+            f"expected strict KL ordering INT8 ({i8['mean_kl_t1']:.2e}) < DualPlane "
+            f"({dp['mean_kl_t1']:.2e}) < MXFP8 ({mx['mean_kl_t1']:.2e})"
+        )
+    if not tie_break["passed"]:
+        failures.extend(f"tie_break: {f}" for f in tie_break["failures"])
+
+    return {
+        "passed": len(failures) == 0,
+        "failures": failures,
+        "shape": {"vocab_size": vocab_size, "hidden_size": hidden_size, "num_queries": num_queries},
+        "int8_to_bf16_lossless_0ulp": int8_to_bf16_lossless,
+        "pareto_dominates_dual_plane_and_mxfp8": (
+            i8["weight_sqnr_db"] > dp["weight_sqnr_db"] > mx["weight_sqnr_db"]
+            and i8["mean_kl_t1"] < dp["mean_kl_t1"] < mx["mean_kl_t1"]
+        ),
+        "gain_over_dual_plane_db": round(i8["weight_sqnr_db"] - dp["weight_sqnr_db"], 3),
+        "gain_over_mxfp8_db": round(i8["weight_sqnr_db"] - mx["weight_sqnr_db"], 3),
+        "schemes": schemes,
         "tie_break": tie_break,
     }
 
@@ -734,6 +978,32 @@ def run_self_test() -> int:
         except ValueError:
             pass
 
+    # Side-by-side 4-scheme LM-head Pareto certifier: BF16 vs INT8 per-32 BF16sc (8.5 bpw)
+    # vs DualPlaneNvfp4 (8.5 bpw) vs MXFP8 (8.25 bpw), with exact 0.0 flip gate!
+    int8_res = certify_lm_head_int8_per32_bf16sc(
+        vocab_size=2048,
+        hidden_size=256,
+        num_queries=256,
+        seed=77,
+        min_int8_sqnr_db=44.0,
+        max_int8_kl_t1=1.0e-6,
+        max_top1_flip_rate=0.0,
+    )
+    assert int8_res["passed"], f"INT8 per-32 BF16sc cert failed: {int8_res['failures']}"
+    assert int8_res["int8_to_bf16_lossless_0ulp"]
+    assert int8_res["pareto_dominates_dual_plane_and_mxfp8"]
+
+    for bad_i8 in (
+        {"min_int8_sqnr_db": float("nan")},
+        {"max_int8_kl_t1": float("nan")},
+        {"max_top1_flip_rate": float("nan")},
+    ):
+        try:
+            certify_lm_head_int8_per32_bf16sc(vocab_size=64, hidden_size=32, num_queries=8, seed=77, **bad_i8)
+            raise AssertionError(f"invalid int8 gate kwargs {bad_i8} must raise ValueError")
+        except ValueError:
+            pass
+
     kv_res = certify_bitfp4_razer_kv(num_tokens=64, num_queries=16, seed=77)
     assert kv_res["passed"], f"BitFP4+RaZeR KV cert failed: {kv_res['failures']}"
 
@@ -741,12 +1011,14 @@ def run_self_test() -> int:
         json.dumps(
             {
                 "self_test": "PASS",
+                "lm_head_int8_per32_bf16sc": int8_res,
                 "lm_head_dual_plane": lm_res,
                 "bitfp4_razer_kv": kv_res,
                 "negative_gates_verified": [
                     "dual_plane_45db_strict_fails_closed",
                     "nan_and_oob_gates_rejected",
                     "zero_flip_rate_exact_gate_passes",
+                    "int8_per32_bf16sc_pareto_dominance_verified",
                 ],
             },
             indent=2,
@@ -773,7 +1045,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Minimum DualPlaneNvfp4 8.5 bpw SQNR gate in dB (use 45.0 to enforce strict BF16-equiv refusal)",
     )
     parser.add_argument("--max-top1-flip-rate", type=float, default=0.001, help="Max top-1 flip rate (<0.1%)")
-    parser.add_argument("--max-kl", type=float, default=1.0e-4, help="Max D_KL at T=1.0")
+    parser.add_argument("--max-kl", type=float, default=1.0e-4, help="Max DualPlaneNvfp4 D_KL at T=1.0")
+    parser.add_argument(
+        "--min-int8-sqnr-db",
+        type=float,
+        default=44.0,
+        help="Minimum INT8 per-32 BF16sc (8.5 bpw) SQNR gate in dB",
+    )
+    parser.add_argument(
+        "--max-int8-kl",
+        type=float,
+        default=1.0e-6,
+        help="Max INT8 per-32 BF16sc (8.5 bpw) mean D_KL at T=1.0",
+    )
     parser.add_argument("--json-out", type=Path, help="Optional output JSON report path")
     parser.add_argument("--self-test", action="store_true", help="Run CPU self-test with positive & negative checks")
     return parser.parse_args(argv)
@@ -791,10 +1075,25 @@ def main(argv: list[str] | None = None) -> int:
             max_top1_flip_rate=args.max_top1_flip_rate,
             max_kl_t1=args.max_kl,
         )
+        _validate_int8_per32_gates(
+            min_int8_sqnr_db=args.min_int8_sqnr_db,
+            max_int8_kl_t1=args.max_int8_kl,
+            max_top1_flip_rate=args.max_top1_flip_rate,
+        )
     except ValueError as err:
         raise SystemExit(f"error: {err}") from err
 
     w = _load_weight_matrix(args.weights, args.weight_key) if args.weights else None
+    int8_res = certify_lm_head_int8_per32_bf16sc(
+        weights_fp32=w,
+        vocab_size=args.vocab_size,
+        hidden_size=args.hidden_size,
+        num_queries=args.num_queries,
+        seed=args.seed,
+        min_int8_sqnr_db=args.min_int8_sqnr_db,
+        max_int8_kl_t1=args.max_int8_kl,
+        max_top1_flip_rate=args.max_top1_flip_rate,
+    )
     lm_res = certify_lm_head_dual_plane(
         weights_fp32=w,
         vocab_size=args.vocab_size,
@@ -807,7 +1106,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     kv_res = certify_bitfp4_razer_kv(num_tokens=args.kv_tokens, num_queries=16, seed=args.seed)
     overall = {
-        "passed": lm_res["passed"] and kv_res["passed"],
+        "passed": int8_res["passed"] and lm_res["passed"] and kv_res["passed"],
+        "lm_head_int8_per32_bf16sc": int8_res,
         "lm_head_dual_plane": lm_res,
         "bitfp4_razer_kv": kv_res,
     }

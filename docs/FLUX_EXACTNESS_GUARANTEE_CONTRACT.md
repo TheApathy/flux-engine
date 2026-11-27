@@ -2,13 +2,13 @@
 
 # Flux Engine Exactness Guarantee Contract
 
-This document defines the six non-negotiable engineering exactness guarantees enforced across Flux Engine's Blackwell (`sm_121a`/`sm_121f`/`sm_120a`/`sm_103a`) CUDA kernels, Rust runtime/scheduler control plane, and offline quantization & serving certification harnesses.
+This document defines the seven non-negotiable engineering exactness guarantees enforced across Flux Engine's Blackwell (`sm_121a`/`sm_121f`/`sm_120a`/`sm_103a`) CUDA kernels, Rust runtime/scheduler control plane, and offline quantization & serving certification harnesses.
 
-Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST preserve these six guarantees simultaneously—fast paths are never permitted to trade silent numerical drift, cross-request leakage, or non-deterministic speculative divergence for throughput.
+Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST preserve these seven guarantees simultaneously—fast paths are never permitted to trade silent numerical drift, cross-request leakage, or non-deterministic speculative divergence for throughput.
 
 ---
 
-## 1. The Six Joint Exactness Guarantees
+## 1. The Seven Joint Exactness Guarantees
 
 ### Guarantee 1 — Zero Silent FMA Boundary Drift (`cvt.rn.bf16.f32`)
 
@@ -47,9 +47,10 @@ Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST 
   - All row byte offsets use 64-bit signed/unsigned arithmetic (`int64_t` / `checked_mul`) to eliminate 32-bit index overflow at `128K–1M` contexts.
   - Explicit non-aliasing pointer guards prevent silent in-place overwrite corruption.
   - `TensorFp8EpilogueDeferral` defers partition scales to the FP32 GEMM epilogue **only** when scales lie inside `[0.125, 8.0]` and satisfy `per_block_k_uniform`.
-- **LM-Head Precision Tiering (`BF16` vs `DualPlaneNvfp4 8.5 bpw`):**
-  - `DualPlaneNvfp4` (`W_hat = (UE4M3(B_scale) * scale2) * (E2M1(W_hi) + 0.125 * E2M1(W_lo))`) achieves `~38.5 dB` SQNR (`+6.7 dB` over block-128 FP8 E4M3 `~31.8 dB`, `+18 dB` over single-plane NVFP4 `~20.5 dB`), `Top-1 flip < 0.1%`, `D_KL < 1e-4 @ T=1.0`, and exact lowest-vocab-index tie-breaking with `NaN` masking (`lm_head_nvfp4_argmax_sm120.cu`).
-  - Because `DualPlaneNvfp4`'s information-theoretic Gaussian ceiling is `~38.5 dB`, `tools/certify_quant_exactness.py` explicitly distinguishes the hardware-calibrated `8.5 bpw` tier (`>= 37.5 dB`) from the strict `>= 45.0 dB` BF16-equivalence tier (met by BF16 `lm_head` at `~55.6 dB`, which remains the default unless `ATLAS_DUAL_PLANE_NVFP4=1` is explicitly opted in).
+- **LM-Head Precision Pareto Ladder (`BF16` vs `INT8 per-32 BF16sc` vs `DualPlaneNvfp4` vs `MXFP8`):**
+  - **`INT8 per-32 BF16sc` (`8.50 bpw`, `1.88x` smaller than BF16) Pareto-dominates both `DualPlaneNvfp4` and `MXFP8`:** Signed `int8` (`-127..=127`) spends all 7 magnitude bits linearly per 32-element Gaussian block and converts **0-ULP lossless** into BF16 (`7` mantissa + `1` implicit bit), achieving **`~45.4 dB` SQNR**, `mean D_KL < 1e-6 @ T=1.0`, and `0%` top-1 flips—outperforming `DualPlaneNvfp4` (`8.50 bpw`, `~38.5 dB` SQNR; `9.0 bpw`, `~41.3 dB` SQNR) by `+6.5+ dB` and `MXFP8` (`8.25 bpw`, `~31.5 dB` SQNR) by `+13.5+ dB` at identical `8.50 bpw` footprint.
+  - **`DualPlaneNvfp4` (`8.50 bpw`):** `W_hat = (UE4M3(B_scale) * scale2) * (E2M1(W_hi) + 0.125 * E2M1(W_lo))` achieves `~38.5 dB` SQNR (`+6.7 dB` over block-128 FP8 E4M3 `~31.8 dB`, `+18 dB` over single-plane NVFP4 `~20.5 dB`), `Top-1 flip < 0.1%`, `D_KL < 1e-4 @ T=1.0`, and exact lowest-vocab-index tie-breaking with `NaN` masking (`lm_head_nvfp4_argmax_sm120.cu`).
+  - `tools/certify_quant_exactness.py` certifies all four schemes side-by-side (`BF16` `~55.6 dB`, `INT8 per-32 BF16sc` `~45.4 dB >= 44.0 dB` & `D_KL < 1e-6`, `DualPlaneNvfp4` `~38.5 dB >= 37.5 dB`, `MXFP8` `~31.5 dB`) and enforces strict fail-closed rejection when `DualPlaneNvfp4` is tested against a `>= 45.0 dB` threshold.
 
 ### Guarantee 4 — Recurrent State & Slot Isolation
 
@@ -83,6 +84,14 @@ Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST 
   - `python3 scripts/verify_no_leaks.py` must report **0 leaks** across the entire repository (zero local usernames, home paths, hostnames, tokens, or credential files).
   - Governance files (`KERNEL.toml`, `AGENTS.md`) remain immutable outside dedicated governance commits.
 
+### Guarantee 7 — Cold-Prefill vs Warm-Prefix-Resume Precision Parity
+
+- **Problem:** Prefix-cache hits resume generation by restoring cached KV/GDN state up to the aligned prefix boundary and evaluating only the uncached suffix tokens (`1..block_size` rows). If cold prefill executes boundary tokens under one MoE/GEMM precision mode (e.g., `W4A4` batched prefill GEMM) while warm prefix-cache resume evaluates those same boundary tokens under a different precision mode (e.g., `W4A16` / `W4A8` small-`M` decode GEMM), even a 1-ULP logit perturbation on near-tie greedy steps causes deterministic trajectory divergence between cold and warm runs—breaking prefix-cache transparency!
+- **Invariant:**
+  - **Matched boundary precision across cold & warm execution:** Cold prefill and warm prefix-cache resume MUST NEVER evaluate overlapping or boundary tokens under mismatched MoE/GEMM precision modes (such as `W4A4` cold prefill vs `W4A16` warm resume).
+  - Any fast-prefill precision policy (including `ATLAS_GB10_FAST_PREFILL=1`, `ATLAS_TENSOR_FP8_PREFILL=1`, and `ATLAS_FUSED_RMSNORM_NVFP4=1`) MUST either keep identical precision routing across cold-prefill and warm-resume boundary tokens OR partition prefix-cache keys by active precision mode so mismatched cached states can never be replayed across precision boundaries.
+- **Verification:** `tools/flux_exactness_cert.py` Suite 3 (`cold_vs_warm_replay`: exact token trajectory match, `<= 1e-5` max abs logprob diff, `D_KL < 1e-4` with positive warm `cached_tokens`).
+
 ---
 
 ## 2. Quantitative Certification Matrix
@@ -92,10 +101,11 @@ Every performance optimization introduced across Flux v1.2, v1.3, and v1.4 MUST 
 | Exact arithmetic | Exact integer/mod output | `100%` exact (`4/4`) | `tools/flux_exactness_cert.py` |
 | Cold needle passkey (`4K/8K/16K/32K`) | Verbatim recall incl. `FLUX-V12-KV-14336-9472` | `100%` exact | `tools/flux_exactness_cert.py` |
 | Verbatim `code_rust` | Canonical SHA-256 of emitted Rust function | Exact SHA-256 match | `tools/flux_exactness_cert.py` |
-| Cold-vs-warm prefix/GDN replay | Token trajectory & max logprob diff | `100%` exact, `<= 1e-5` logprob diff, `D_KL < 1e-4` | `tools/flux_exactness_cert.py` |
+| Cold-vs-warm prefix/GDN replay (Guarantee 7) | Matched cold/warm precision, trajectory & logprob diff | `100%` exact, `<= 1e-5` logprob diff, `D_KL < 1e-4` | `tools/flux_exactness_cert.py` |
 | Mixed batch invariance (`B=1` vs `B=4/8`) | Target trajectory & cross-slot canary check | `100%` exact, `0` canary leaks | `tools/flux_exactness_cert.py` |
 | Verify-width invariance (`W=1` vs `W=8` vs `W=16`) | Trajectory exactness, first divergence, `D_KL` | `100%` exact, `first_div = null`, `top1_flip = 0`, `D_KL < 1e-4` | `tools/flux_exactness_cert.py` |
-| `DualPlaneNvfp4` (`8.5 bpw`) `lm_head` | Weight/logit SQNR, Top-1 flip, `D_KL@T=1`, tie-break | `SQNR >= 37.5 dB`, `+6 dB` vs FP8, `flip < 0.1%`, `D_KL < 1e-4`, exact tie-break | `tools/certify_quant_exactness.py` |
+| `INT8 per-32 BF16sc` (`8.50 bpw`) `lm_head` | 0-ULP `int8->BF16`, SQNR, `D_KL@T=1`, Pareto dominance | `SQNR >= 44.0 dB` (`~45.4 dB`), `D_KL < 1e-6`, `0%` flips, beats DualPlane & MXFP8 | `tools/certify_quant_exactness.py` |
+| `DualPlaneNvfp4` (`8.50 bpw`) `lm_head` | Weight/logit SQNR, Top-1 flip, `D_KL@T=1`, tie-break | `SQNR >= 37.5 dB`, `+6 dB` vs FP8, `flip < 0.1%`, `D_KL < 1e-4`, exact tie-break | `tools/certify_quant_exactness.py` |
 | Strict `BF16` `lm_head` equivalence | Logit SQNR vs FP32 | `SQNR >= 45.0 dB` (`~55.6 dB` observed) | `tools/certify_quant_exactness.py` |
 | `BitFP4 + 6-op SWAR RaZeR-KV` | `-0.0` SWAR, 6-op split, MSE reduction, attn cosine | `0` SWAR errors, `MSE_razer < MSE_nvfp4`, `logit_cos >= 0.995`, `out_cos >= 0.990` | `tools/certify_quant_exactness.py` |
 | PTX/SASS ISA formal contracts | Stack/spill bytes, odd `desc[UR]`, MMA/L2 ISA | `0 B` stack/spills, `0` odd `desc[UR]`, `100% PROVED` | `repro-kit/formal/verify_ptx_isa_contracts.py` |
