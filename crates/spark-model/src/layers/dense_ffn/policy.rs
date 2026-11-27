@@ -668,6 +668,18 @@ pub(super) const fn exact_ffn_auto_kgamma_applicable(
     )
 }
 
+pub(super) const fn w3_kgamma_applicable_with_policy(
+    rows: u32,
+    activation_silu: bool,
+    prepared: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    if det_batch.is_enabled() {
+        return false;
+    }
+    w3_kgamma_applicable(rows, activation_silu, prepared)
+}
+
 pub(super) const fn w3_kgamma_applicable(rows: u32, activation_silu: bool, prepared: bool) -> bool {
     rows > 1 && rows <= 32 && activation_silu && prepared
 }
@@ -922,6 +934,23 @@ pub(super) fn kgamma_cublaslt_opt_in(gpu: &dyn GpuBackend) -> bool {
     resolve_kgamma_cublaslt_opt_in(raw.as_deref(), gpu_sm_count(gpu))
 }
 
+/// Policy-aware variant of [`exact_ffn_materialized_route`]:
+/// `ATLAS_DETERMINISTIC_BATCH=1` pins exact FFN to [`ExactFfnMaterializedRoute::Inline`]
+/// across all `M=1..=128`, eliminating the `rows=5..=8` (`Split`) and `rows=9..=17`
+/// (`FusedM17`, skipping BF16 `gate_out`/`up_out` round-trip) flips.
+pub(super) fn exact_ffn_materialized_route_with_policy(
+    rows: u32,
+    intermediate: u32,
+    handles: ExactFfnMaterializedAvailability,
+    scratch_bytes: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> ExactFfnMaterializedRoute {
+    if det_batch.is_enabled() {
+        return ExactFfnMaterializedRoute::Inline;
+    }
+    exact_ffn_materialized_route(rows, intermediate, handles, scratch_bytes)
+}
+
 pub(super) fn exact_ffn_materialized_route(
     rows: u32,
     intermediate: u32,
@@ -951,13 +980,22 @@ pub(super) fn exact_ffn_materialized_route(
 #[cfg(test)]
 mod deterministic_batch_tests {
     use super::{
-        ExactFfnPhysicalRoute, FfnTcPolicy, exact_ffn_physical_route_with_policy,
-        resolve_ffn_tc_for_rows_with_policy,
+        ExactFfnMaterializedAvailability, ExactFfnMaterializedRoute, ExactFfnPhysicalRoute,
+        FfnTcPolicy, exact_ffn_materialized_route_with_policy,
+        exact_ffn_physical_route_with_policy, resolve_ffn_tc_for_rows_with_policy,
+        w3_kgamma_applicable_with_policy,
     };
     use crate::layers::deterministic_batch::DeterministicBatchPolicy;
 
     #[test]
     fn deterministic_batch_disables_dense_ffn_tc_and_m16_split_across_1_to_128() {
+        let all_mat = ExactFfnMaterializedAvailability {
+            m8_dual_silu: true,
+            m8_f32_down: true,
+            m17_dual_silu: true,
+            m17_f32_down: true,
+            m17_fused_dual_silu: true,
+        };
         for sm in [48u32, 188u32] {
             for m in [1u32, 2, 4, 8, 16, 32, 64, 128] {
                 for tc in [
@@ -988,6 +1026,26 @@ mod deterministic_batch_tests {
                     ExactFfnPhysicalRoute::Native,
                     "dense FFN physical route must stay Native at M={m}"
                 );
+                assert_eq!(
+                    exact_ffn_materialized_route_with_policy(
+                        m,
+                        17_408,
+                        all_mat,
+                        16 * 1024 * 1024,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    ExactFfnMaterializedRoute::Inline,
+                    "dense FFN materialized route must stay Inline at M={m}"
+                );
+                assert!(
+                    !w3_kgamma_applicable_with_policy(
+                        m,
+                        true,
+                        true,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    "W3 kgamma must stay disabled at M={m}"
+                );
             }
         }
         assert!(resolve_ffn_tc_for_rows_with_policy(
@@ -1008,5 +1066,31 @@ mod deterministic_batch_tests {
             ),
             ExactFfnPhysicalRoute::SplitM8x2
         );
+        assert_eq!(
+            exact_ffn_materialized_route_with_policy(
+                8,
+                17_408,
+                all_mat,
+                16 * 1024 * 1024,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            ExactFfnMaterializedRoute::Split
+        );
+        assert_eq!(
+            exact_ffn_materialized_route_with_policy(
+                16,
+                17_408,
+                all_mat,
+                16 * 1024 * 1024,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            ExactFfnMaterializedRoute::FusedM17
+        );
+        assert!(w3_kgamma_applicable_with_policy(
+            8,
+            true,
+            true,
+            DeterministicBatchPolicy::Disabled,
+        ));
     }
 }

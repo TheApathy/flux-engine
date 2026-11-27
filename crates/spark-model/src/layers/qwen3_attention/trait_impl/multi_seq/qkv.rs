@@ -428,7 +428,8 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        let det_batch = crate::layers::deterministic_batch::deterministic_batch_enabled();
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy()?.is_enabled();
         if matches!(
             exact_route,
             Some(

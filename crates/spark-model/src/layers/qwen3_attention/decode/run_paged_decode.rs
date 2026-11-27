@@ -744,6 +744,7 @@ impl Qwen3AttentionLayer {
         gate: Option<(DevicePtr, u32)>,
         stream: u64,
     ) -> Result<bool> {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let sliding = self.sliding_window.unwrap_or(0);
         if let Some((gate_ptr, gate_stride)) = gate
             && self.kv_dtype == KvCacheDtype::Bf16
@@ -757,7 +758,7 @@ impl Qwen3AttentionLayer {
                 head_dim,
                 num_q_heads,
                 num_kv_heads,
-                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+                det_batch,
             ) && gqa4_selected())
         {
             ops::paged_decode_attn_bf16_gated(

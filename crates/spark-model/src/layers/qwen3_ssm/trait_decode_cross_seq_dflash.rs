@@ -355,8 +355,7 @@ impl Qwen3SsmLayer {
         label: &'static str,
         stream: u64,
     ) -> Result<()> {
-        let det_batch =
-            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let sm_count = atlas_core::device::active_sm_count();
         let tc_override = raw_ssm_proj_tc_override();
         let tc_enabled =
@@ -883,8 +882,7 @@ impl Qwen3SsmLayer {
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_beta_stride = nv * 2 * FP32;
         let sm_count = atlas_core::device::active_sm_count();
-        let det_batch =
-            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         match select_cross_seq_ba_route_with_policy(
             total_rows,
             sm_count,

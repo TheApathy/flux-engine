@@ -1351,10 +1351,10 @@ impl Qwen3SsmLayer {
         // (splitting a 33-row tail into `17 + 16`) so default exactness holds
         // and legacy `w4a16_gemm` is never hit. MoE / BF16-dense / None return
         // `Ok(false)` on the first chunk and execute the per-seq loop below.
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let mut ffn_batched = false;
-        if num_seqs >= 2 {
-            let wide_ready = !crate::layers::deterministic_batch::deterministic_batch_enabled()
-                && self.ffn.wide_kgamma_ready(num_seqs as u32);
+        if should_use_multi_seq_batched_ffn_with_policy(num_seqs, det_batch) {
+            let wide_ready = self.ffn.wide_kgamma_ready(num_seqs as u32);
             let chunks = plan_multi_seq_ffn_chunks(num_seqs, wide_ready);
             ffn_batched = !chunks.is_empty();
             for (start, count) in chunks {
@@ -1719,6 +1719,15 @@ impl Qwen3SsmLayer {
     }
 }
 
+#[inline]
+#[must_use]
+const fn should_use_multi_seq_batched_ffn_with_policy(
+    num_seqs: usize,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    num_seqs >= 2 && !det_batch.is_enabled()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1919,5 +1928,30 @@ mod tests {
         // Wide TC mode dispatches C=48/64 in a single shot.
         assert_eq!(plan_multi_seq_ffn_chunks(48, true), vec![(0, 48)]);
         assert_eq!(plan_multi_seq_ffn_chunks(64, true), vec![(0, 64)]);
+    }
+
+    #[test]
+    fn deterministic_batch_disables_multi_seq_batched_ffn_across_1_to_128() {
+        use super::should_use_multi_seq_batched_ffn_with_policy;
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert!(
+                !should_use_multi_seq_batched_ffn_with_policy(m, DeterministicBatchPolicy::Enabled),
+                "multi-seq batched FFN must stay disabled at M={m}"
+            );
+        }
+        assert!(!should_use_multi_seq_batched_ffn_with_policy(
+            1,
+            DeterministicBatchPolicy::Disabled
+        ));
+        assert!(should_use_multi_seq_batched_ffn_with_policy(
+            2,
+            DeterministicBatchPolicy::Disabled
+        ));
+        assert!(should_use_multi_seq_batched_ffn_with_policy(
+            8,
+            DeterministicBatchPolicy::Disabled
+        ));
     }
 }

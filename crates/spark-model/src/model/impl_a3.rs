@@ -189,9 +189,22 @@ fn log_qwen4_target_bf16_lm_head_engagement(
 /// committed token may differ from the scalar oracle by MMA-vs-FMA rounding
 /// (a re-reference in the same class as `ATLAS_FFN_TC=1`). Default OFF: the
 /// exact scalar path remains the commit authority until this is qualified.
+#[inline]
+#[must_use]
+pub(crate) const fn lm_head_tc_enabled_with_policy(
+    raw_enabled: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    !det_batch.is_enabled() && raw_enabled
+}
+
 pub(super) fn lm_head_tc_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var("ATLAS_LM_HEAD_TC").ok().as_deref() == Some("1"))
+    let raw = *CACHE.get_or_init(|| std::env::var("ATLAS_LM_HEAD_TC").ok().as_deref() == Some("1"));
+    lm_head_tc_enabled_with_policy(
+        raw,
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+    )
 }
 
 fn log_lm_head_tc_engagement(rows: u32, vocab: u32, hidden: u32) {
@@ -986,6 +999,7 @@ impl TransformerModel {
         h: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let fp8 = self
             .lm_head_fp8
             .as_ref()
@@ -1008,10 +1022,8 @@ impl TransformerModel {
                 ops::dense_gemv_fp8w(self.gpu.as_ref(), gemv_k, hidden, fp8, logits, v, h, stream)?;
                 dispatched = true;
             }
-        } else if select_target_fp8_lm_head_uses_coalesced_with_policy(
-            num_tokens,
-            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
-        ) && h > 0
+        } else if select_target_fp8_lm_head_uses_coalesced_with_policy(num_tokens, det_batch)
+            && h > 0
             && h.is_multiple_of(64)
             && hidden.0.is_multiple_of(16)
             && fp8.weight.0.is_multiple_of(16)
@@ -1129,11 +1141,9 @@ impl TransformerModel {
         h: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let logits = self.buffers.logits();
-        if select_target_bf16_lm_head_serial_gemv_with_policy(
-            num_tokens,
-            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
-        ) {
+        if select_target_bf16_lm_head_serial_gemv_with_policy(num_tokens, det_batch) {
             log_qwen4_target_bf16_lm_head_engagement(0, "dense_gemv_bf16", num_tokens, v, h);
             for row in 0..num_tokens {
                 ops::dense_gemv(
@@ -1578,6 +1588,7 @@ impl TransformerModel {
         num_tokens: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let h = self.config.hidden_size as u32;
         // Verify-side vocab truncation: shrink the logical GEMM/GEMV output
         // dimension (and the matching argmax range in the scheduler) to the
@@ -1614,8 +1625,6 @@ impl TransformerModel {
                 (num_tokens as usize) <= logits_cap_rows,
                 "NVFP4 speculative LM-head rows {num_tokens} exceed logits buffer capacity {logits_cap_rows}"
             );
-            let det_batch =
-                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
             let sm_count = atlas_core::device::active_sm_count();
             let sm120_auto_tc = should_auto_tc_batched_lm_head_for_policy(
                 self.config.is_qwen4_exp(),
@@ -1859,29 +1868,22 @@ impl TransformerModel {
                     }
                 }
             }
-        } else if num_tokens == 2 {
-            // Preserve dense M=2 as two BF16 GEMVs. The FP32 logits path is
-            // decode-only and does not apply to batched verification.
-            ops::dense_gemv(
-                self.gpu.as_ref(),
-                self.dense_gemv_kernel,
-                hidden,
-                &self.lm_head_weight,
-                logits,
-                v,
-                h,
-                stream,
-            )?;
-            ops::dense_gemv(
-                self.gpu.as_ref(),
-                self.dense_gemv_kernel,
-                hidden.offset(h as usize * 2),
-                &self.lm_head_weight,
-                logits.offset(v as usize * 2),
-                v,
-                h,
-                stream,
-            )?;
+        } else if select_dense_bf16_lm_head_serial_gemv_with_policy(num_tokens, det_batch) {
+            // Preserve dense M=1..=2 as BF16 GEMVs, and under
+            // ATLAS_DETERMINISTIC_BATCH=1 keep all M=1..=128 on identical
+            // per-row dense_gemv_bf16 (no M>=3 dense_gemm flip).
+            for row in 0..num_tokens {
+                ops::dense_gemv(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_kernel,
+                    hidden.offset(row as usize * h as usize * 2),
+                    &self.lm_head_weight,
+                    logits.offset(row as usize * v as usize * 2),
+                    v,
+                    h,
+                    stream,
+                )?;
+            }
         } else {
             ops::dense_gemm(
                 self.gpu.as_ref(),
@@ -1917,6 +1919,7 @@ impl TransformerModel {
         if num_tokens <= 32 {
             return self.lm_head_batched(hidden, num_tokens, stream);
         }
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         anyhow::ensure!(
             (33..=crate::layers::QWEN4_NATIVE_MAX_ROWS as u32).contains(&num_tokens),
             "Qwen4 multi-sequence LM-head rows must be in 1..={}, got {num_tokens}",
@@ -1937,7 +1940,8 @@ impl TransformerModel {
         }
         let logits = self.buffers.logits();
         if let Some(ref nvfp4) = self.lm_head_nvfp4 {
-            if lm_head_tc_enabled()
+            if !det_batch.is_enabled()
+                && lm_head_tc_enabled()
                 && self.lm_head_nvfp4_t.is_some()
                 && self.w4a16_gemm_t_m32_n64_kernel.0 != 0
             {
@@ -1995,6 +1999,19 @@ impl TransformerModel {
                     }
                     offset += chunk;
                 }
+            }
+        } else if select_dense_bf16_lm_head_serial_gemv_with_policy(num_tokens, det_batch) {
+            for row in 0..num_tokens {
+                ops::dense_gemv(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_kernel,
+                    hidden.offset(row as usize * h as usize * 2),
+                    &self.lm_head_weight,
+                    logits.offset(row as usize * v as usize * 2),
+                    v,
+                    h,
+                    stream,
+                )?;
             }
         } else {
             ops::dense_gemm(
@@ -2056,6 +2073,7 @@ impl TransformerModel {
     }
 
     pub(super) fn lm_head(&self, hidden: DevicePtr, stream: u64) -> Result<DevicePtr> {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let h = self.config.hidden_size as u32;
         let v = self.config.vocab_size as u32;
         // Pick the output buffer: FP32 scratch when use_fp32_logits is on,
@@ -2078,7 +2096,7 @@ impl TransformerModel {
         if !fp32 && self.use_target_bf16_lm_head() {
             return self.lm_head_bf16_rows(hidden, 1, v, h, stream);
         }
-        if !fp32 && self.decode_tc_parity_lm_head() {
+        if !fp32 && !det_batch.is_enabled() && self.decode_tc_parity_lm_head() {
             // ATLAS_DECODE_TC_PARITY=1: one row through the verify's
             // ATLAS_LM_HEAD_TC=1 kernel so plain decode and speculative
             // verify produce bit-identical logits.
@@ -2278,8 +2296,7 @@ impl TransformerModel {
             let v = self.verify_lmhead_vocab();
             return self.lm_head_bf16_rows(hidden, num_tokens, v, h, stream);
         }
-        let det_batch =
-            crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled();
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let tc_dense_active = !det_batch.is_enabled()
             && crate::layers::qwen4_hyper::batched_verify_tc_component_active(
                 crate::layers::qwen4_hyper::BatchedVerifyTcComponent::LmHead,
@@ -2645,6 +2662,19 @@ pub(crate) const fn select_target_bf16_lm_head_serial_gemv_with_policy(
     det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
 ) -> bool {
     num_tokens == 1 || det_batch.is_enabled()
+}
+
+/// Whether the non-Qwen4 dense BF16 LM-head fallback (`lm_head_batched` /
+/// `lm_head_qwen4_rows`) runs per-row `dense_gemv_bf16` instead of `dense_gemm`.
+/// Under `ATLAS_DETERMINISTIC_BATCH=1`, returns `true` for all `M=1..=128`,
+/// preventing the `M>=3` and `M>=33` `dense_gemm` flips.
+#[inline]
+#[must_use]
+pub(crate) const fn select_dense_bf16_lm_head_serial_gemv_with_policy(
+    num_tokens: u32,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    num_tokens <= 2 || det_batch.is_enabled()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

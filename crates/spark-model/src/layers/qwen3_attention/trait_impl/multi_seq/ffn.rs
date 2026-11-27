@@ -53,7 +53,8 @@ impl Qwen3AttentionLayer {
             ..
         } = *c;
         let serial = crate::model::env_diag::DflashSerialControls::current();
-        let det_batch = crate::layers::deterministic_batch::deterministic_batch_enabled();
+        let det_batch =
+            crate::layers::deterministic_batch::deterministic_batch_policy()?.is_enabled();
         let force_serial_ffn = n > 1 && serial.ffn;
         let force_serial_norms = n > 1 && serial.layer_norms;
 

@@ -561,6 +561,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let _det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         anyhow::ensure!(
             matches!(rows, 4 | 5 | 9)
                 || (crate::layers::qwen4_hybrid_all_k()

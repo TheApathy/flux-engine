@@ -12,10 +12,10 @@ use super::policy::{
     ExactFfnDispatch, ExactFfnMaterializedAvailability, ExactFfnMaterializedRoute,
     ExactFfnPhysicalRoute, FFN_KGAMMA_AUTO_TC_SM_THRESHOLD, FFN_KGAMMA_WIDE_MAX_ROWS, FfnTcPolicy,
     exact_ffn_auto_kgamma_applicable, exact_ffn_dispatch, exact_ffn_lowreg_gate_up_m16_enabled,
-    exact_ffn_materialized_route, exact_ffn_physical_route_with_policy, exact_ffn_row_offsets,
-    exact_ffn_split_m8_enabled, exact_ffn_tc_override, ffn_tc_active_for_rows, ffn_tc_policy,
-    kgamma_fused_gateup_active, kgamma_m32_allowed, kgamma_m128_active, kgamma_wide_active,
-    w3_kgamma_applicable,
+    exact_ffn_materialized_route_with_policy, exact_ffn_physical_route_with_policy,
+    exact_ffn_row_offsets, exact_ffn_split_m8_enabled, exact_ffn_tc_override,
+    ffn_tc_active_for_rows, ffn_tc_policy, kgamma_fused_gateup_active, kgamma_m32_allowed,
+    kgamma_m128_active, kgamma_wide_active, w3_kgamma_applicable, w3_kgamma_applicable_with_policy,
 };
 use super::sm120_coalesced::{
     sm120_coalesced_m16_env_enabled, sm120_coalesced_max_m, try_coalesced_nvfp4_sm120_small_m,
@@ -254,7 +254,7 @@ impl DenseFfnLayer {
         // Attention/SSM has completed before FFN on this stream, so its FP32
         // recurrence workspace is dead until the next layer. Reuse it only
         // when the arena's authoritative byte capacity covers every row.
-        let route = exact_ffn_materialized_route(
+        let route = exact_ffn_materialized_route_with_policy(
             rows,
             intermediate,
             ExactFfnMaterializedAvailability {
@@ -268,6 +268,7 @@ impl DenseFfnLayer {
                     && (!self.sparsity_measure_active() || ctx.graph_capture),
             },
             ctx.buffers.sizes().ssm_conv_out_f32,
+            crate::layers::deterministic_batch::deterministic_batch_policy()?,
         );
 
         let preactivation_f32 = ctx.buffers.ssm_conv_out_f32();
@@ -400,6 +401,155 @@ impl DenseFfnLayer {
         }
 
         self.measure_exact_kgamma_inputs(input, gate_out, up_out, ctx, hidden, intermediate, stream)
+    }
+
+    /// Deterministic per-row fallback for `forward_kgamma` under
+    /// `ATLAS_DETERMINISTIC_BATCH=1` when the batched exact W4+SiLU tier is
+    /// ineligible (BF16, W3, GeLU, `n > 32`, or missing exact handles).
+    /// Executes the exact same single-token `M=1` kernels as `decode.rs::forward`
+    /// for every row `0..rows`, writing directly to `output[row]`.
+    fn forward_kgamma_deterministic_per_row(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        rows: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size as u32;
+        let inter = ctx.config.intermediate_size as u32;
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+        let output = ctx.buffers.moe_output();
+
+        for row in 0..rows as usize {
+            let input_row = input.offset(row * h as usize * 2);
+            let output_row = output.offset(row * h as usize * 2);
+            if let Some(ref bf16w) = self.bf16_weights {
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_bf16_k,
+                    input_row,
+                    &bf16w.gate_proj,
+                    gate_out,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_bf16_k,
+                    input_row,
+                    &bf16w.up_proj,
+                    up_out,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out,
+                    up_out,
+                    gate_out,
+                    inter,
+                    stream,
+                )?;
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_bf16_k,
+                    gate_out,
+                    &bf16w.down_proj,
+                    output_row,
+                    h,
+                    inter,
+                    stream,
+                )?;
+                continue;
+            }
+            if self.has_w3_gemv()
+                && let Some(ref w3) = self.w3_weights
+            {
+                ops::w3a16_gemv_dual(
+                    ctx.gpu,
+                    self.w3a16_gemv_dual_k,
+                    input_row,
+                    &w3.gate_proj,
+                    gate_out,
+                    &w3.up_proj,
+                    up_out,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                ops::w3a16_gemv_silu_input(
+                    ctx.gpu,
+                    self.w3a16_gemv_silu_input_k,
+                    gate_out,
+                    up_out,
+                    &w3.down_proj,
+                    output_row,
+                    h,
+                    inter,
+                    stream,
+                )?;
+                continue;
+            }
+            ops::w4a16_decode_gemv_dual(
+                ctx.gpu,
+                self.w4a16_gemv_dual,
+                self.w4a16_gemv_dual_sw,
+                self.gemv_sw,
+                input_row,
+                &self.weights.gate_proj,
+                gate_out,
+                &self.weights.up_proj,
+                up_out,
+                inter,
+                h,
+                stream,
+            )?;
+            match self.activation {
+                FfnActivation::SiLU => {
+                    ops::w4a16_decode_gemv_silu_input(
+                        ctx.gpu,
+                        self.w4a16_gemv_silu_input,
+                        self.w4a16_gemv_silu_input_sw,
+                        self.gemv_sw,
+                        gate_out,
+                        up_out,
+                        &self.weights.down_proj,
+                        output_row,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                }
+                FfnActivation::GeLU => {
+                    ops::silu_mul(
+                        ctx.gpu,
+                        self.act_mul,
+                        gate_out,
+                        up_out,
+                        gate_out,
+                        inter,
+                        stream,
+                    )?;
+                    ops::w4a16_decode_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv,
+                        self.w4a16_gemv_sw,
+                        self.gemv_sw,
+                        gate_out,
+                        &self.weights.down_proj,
+                        output_row,
+                        h,
+                        inter,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// K=γ verify batch (DFlash γ ≥ 16, typical n=17 with γ=16).
@@ -686,6 +836,7 @@ impl DenseFfnLayer {
         n: u32,
         stream: u64,
     ) -> Result<()> {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         debug_assert!(
             n > 1 || self.decode_tc_parity_route() || ops::w4a4_decode_sk3_enabled(),
             "forward_kgamma is for batched verify; use forward() at n=1"
@@ -712,13 +863,22 @@ impl DenseFfnLayer {
             ExactFfnDispatch::PerRowK1 => {
                 return self.forward_kgamma_k1_rows(input, ctx, n, stream);
             }
-            ExactFfnDispatch::Existing => {}
+            ExactFfnDispatch::Existing => {
+                if det_batch.is_enabled() {
+                    return self.forward_kgamma_deterministic_per_row(input, ctx, n, stream);
+                }
+            }
         }
 
         if w3_kgamma_applicable(
             n,
             self.activation == FfnActivation::SiLU,
             self.has_w3_gemm(),
+        ) && w3_kgamma_applicable_with_policy(
+            n,
+            self.activation == FfnActivation::SiLU,
+            self.has_w3_gemm(),
+            det_batch,
         ) {
             let w3 = self
                 .w3_weights_t

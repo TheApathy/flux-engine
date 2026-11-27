@@ -1623,8 +1623,8 @@ impl Qwen3SsmLayer {
             // interaction that has since been resolved upstream; keeping
             // it suppressed the fast kernel on truncated-γ verifies,
             // costing the prose path 15-20 tok/s.
-            let try_kgamma = !det_batch_ffn
-                && num_tokens >= super::super::TC_VERIFY_MIN_ROWS
+            let try_kgamma = num_tokens >= super::super::TC_VERIFY_MIN_ROWS
+                && !det_batch_ffn
                 && (super::super::ffn_kgamma_m16_enabled()
                     || self.ffn.exact_kgamma_applicable(num_tokens as u32));
             let used_kgamma = if try_kgamma {

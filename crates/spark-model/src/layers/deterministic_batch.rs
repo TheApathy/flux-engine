@@ -9,6 +9,7 @@
 
 use std::ffi::OsStr;
 use std::fmt;
+#[cfg(not(test))]
 use std::sync::OnceLock;
 
 /// Environment variable gating `M`-invariant deterministic batch decode/verify.
@@ -131,39 +132,63 @@ pub fn parse_deterministic_batch_os(
 /// Return the cached process-wide [`DeterministicBatchPolicy`] read from
 /// [`DETERMINISTIC_BATCH_ENV`].
 ///
+/// Fallible decode/verify/LM-head entry points propagate this error via `?` so
+/// malformed or non-UTF-8 values fail closed instead of silently running
+/// non-deterministic batch dispatch.
+///
 /// # Errors
 /// Returns [`DeterministicBatchEnvError`] if [`DETERMINISTIC_BATCH_ENV`] contains
 /// non-UTF-8 bytes or a value other than exact `"0"` or `"1"`.
 pub fn deterministic_batch_policy()
 -> std::result::Result<DeterministicBatchPolicy, DeterministicBatchEnvError> {
-    static POLICY: OnceLock<
-        std::result::Result<DeterministicBatchPolicy, DeterministicBatchEnvError>,
-    > = OnceLock::new();
-    POLICY
-        .get_or_init(|| {
-            let raw = std::env::var_os(DETERMINISTIC_BATCH_ENV);
-            let parsed = parse_deterministic_batch_os(raw.as_deref());
-            match &parsed {
-                Ok(DeterministicBatchPolicy::Enabled) => {
-                    tracing::info!(
-                        selector = DETERMINISTIC_BATCH_ENV,
-                        max_rows = DETERMINISTIC_BATCH_MAX_ROWS,
-                        "ATLAS_DETERMINISTIC_BATCH=1 engaged: forcing M-invariant, \
-                         zero-atomic, fixed-order decode/verify dispatch"
-                    );
+    let read_live = || {
+        let raw = std::env::var_os(DETERMINISTIC_BATCH_ENV);
+        parse_deterministic_batch_os(raw.as_deref())
+    };
+    #[cfg(not(test))]
+    {
+        static POLICY: OnceLock<
+            std::result::Result<DeterministicBatchPolicy, DeterministicBatchEnvError>,
+        > = OnceLock::new();
+        POLICY
+            .get_or_init(|| {
+                let parsed = read_live();
+                match &parsed {
+                    Ok(DeterministicBatchPolicy::Enabled) => {
+                        tracing::info!(
+                            selector = DETERMINISTIC_BATCH_ENV,
+                            max_rows = DETERMINISTIC_BATCH_MAX_ROWS,
+                            "ATLAS_DETERMINISTIC_BATCH=1 engaged: forcing M-invariant, \
+                             zero-atomic, fixed-order decode/verify dispatch"
+                        );
+                    }
+                    Ok(DeterministicBatchPolicy::Disabled) => {}
+                    Err(err) => {
+                        tracing::error!(
+                            selector = DETERMINISTIC_BATCH_ENV,
+                            error = %err,
+                            "invalid ATLAS_DETERMINISTIC_BATCH value; failing closed"
+                        );
+                    }
                 }
-                Ok(DeterministicBatchPolicy::Disabled) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        selector = DETERMINISTIC_BATCH_ENV,
-                        error = %err,
-                        "invalid ATLAS_DETERMINISTIC_BATCH value; failing closed to disabled"
-                    );
-                }
-            }
-            parsed
-        })
-        .clone()
+                parsed
+            })
+            .clone()
+    }
+    #[cfg(test)]
+    {
+        read_live()
+    }
+}
+
+/// Validate [`DETERMINISTIC_BATCH_ENV`] and return the active policy as an
+/// [`anyhow::Result`], failing closed on invalid or non-UTF-8 values.
+///
+/// # Errors
+/// Returns an error if [`DETERMINISTIC_BATCH_ENV`] is neither unset, `"0"`, nor `"1"`.
+#[inline]
+pub fn deterministic_batch_policy_checked() -> anyhow::Result<DeterministicBatchPolicy> {
+    deterministic_batch_policy().map_err(anyhow::Error::from)
 }
 
 /// Return the active [`DeterministicBatchPolicy`] for dispatch selectors,
@@ -271,7 +296,9 @@ mod tests {
             BatchedVerifyTcComponent, batched_verify_tc_component_admits_with_policy,
         };
         use crate::model::impl_a3::{
-            BatchedVerifyLmHeadRoute, select_batched_verify_lm_head_route_with_policy,
+            BatchedVerifyLmHeadRoute, lm_head_tc_enabled_with_policy,
+            select_batched_verify_lm_head_route_with_policy,
+            select_dense_bf16_lm_head_serial_gemv_with_policy,
             select_target_bf16_lm_head_serial_gemv_with_policy,
             select_target_fp8_lm_head_uses_coalesced_with_policy,
             should_auto_tc_batched_lm_head_for_policy,
@@ -394,6 +421,17 @@ mod tests {
                 "BF16 target LM head must stay on serial dense_gemv_bf16 at M={m}"
             );
             assert!(
+                select_dense_bf16_lm_head_serial_gemv_with_policy(
+                    m,
+                    DeterministicBatchPolicy::Enabled
+                ),
+                "dense BF16 LM-head fallback must stay on serial dense_gemv_bf16 at M={m}"
+            );
+            assert!(
+                !lm_head_tc_enabled_with_policy(true, DeterministicBatchPolicy::Enabled),
+                "ATLAS_LM_HEAD_TC must stay disabled at M={m}"
+            );
+            assert!(
                 !should_auto_tc_batched_lm_head_for_policy(
                     false,
                     false,
@@ -404,7 +442,7 @@ mod tests {
                 "SM120 auto-TC batched LM head must stay disabled at M={m}"
             );
         }
-        // Baseline (Disabled) retains M=1 GEMV vs M>=2 coalesced/auto-TC dispatch.
+        // Baseline (Disabled) retains M=1 GEMV vs M>=2 coalesced/auto-TC/dense_gemm dispatch.
         assert!(!select_target_fp8_lm_head_uses_coalesced_with_policy(
             1,
             DeterministicBatchPolicy::Disabled
@@ -421,6 +459,22 @@ mod tests {
             8,
             DeterministicBatchPolicy::Disabled
         ));
+        assert!(select_dense_bf16_lm_head_serial_gemv_with_policy(
+            2,
+            DeterministicBatchPolicy::Disabled
+        ));
+        assert!(!select_dense_bf16_lm_head_serial_gemv_with_policy(
+            3,
+            DeterministicBatchPolicy::Disabled
+        ));
+        assert!(!select_dense_bf16_lm_head_serial_gemv_with_policy(
+            33,
+            DeterministicBatchPolicy::Disabled
+        ));
+        assert!(lm_head_tc_enabled_with_policy(
+            true,
+            DeterministicBatchPolicy::Disabled
+        ));
         assert!(should_auto_tc_batched_lm_head_for_policy(
             false,
             false,
@@ -428,6 +482,57 @@ mod tests {
             8,
             DeterministicBatchPolicy::Disabled
         ));
+    }
+
+    #[test]
+    fn deterministic_batch_policy_fails_closed_on_invalid_live_env_values() {
+        use crate::layers::qwen4_verify_lanes::{ScopedEnvVar, test_env_lock};
+
+        let _lock = test_env_lock();
+        {
+            let _unset = ScopedEnvVar::remove(DETERMINISTIC_BATCH_ENV);
+            assert_eq!(
+                deterministic_batch_policy(),
+                Ok(DeterministicBatchPolicy::Disabled)
+            );
+            assert_eq!(
+                deterministic_batch_policy_checked().unwrap(),
+                DeterministicBatchPolicy::Disabled
+            );
+        }
+        {
+            let _zero = ScopedEnvVar::set(DETERMINISTIC_BATCH_ENV, "0");
+            assert_eq!(
+                deterministic_batch_policy(),
+                Ok(DeterministicBatchPolicy::Disabled)
+            );
+            assert_eq!(
+                deterministic_batch_policy_checked().unwrap(),
+                DeterministicBatchPolicy::Disabled
+            );
+        }
+        {
+            let _one = ScopedEnvVar::set(DETERMINISTIC_BATCH_ENV, "1");
+            assert_eq!(
+                deterministic_batch_policy(),
+                Ok(DeterministicBatchPolicy::Enabled)
+            );
+            assert_eq!(
+                deterministic_batch_policy_checked().unwrap(),
+                DeterministicBatchPolicy::Enabled
+            );
+        }
+        for bad in ["", " ", " 1 ", "true", "false", "yes", "on", "2", "-1"] {
+            let _bad = ScopedEnvVar::set(DETERMINISTIC_BATCH_ENV, bad);
+            let err = deterministic_batch_policy().expect_err("invalid env must fail closed");
+            assert_eq!(
+                err,
+                DeterministicBatchEnvError::InvalidValue(bad.to_owned())
+            );
+            let checked = deterministic_batch_policy_checked()
+                .expect_err("checked policy must propagate error via ?");
+            assert!(checked.to_string().contains(DETERMINISTIC_BATCH_ENV));
+        }
     }
 
     #[test]

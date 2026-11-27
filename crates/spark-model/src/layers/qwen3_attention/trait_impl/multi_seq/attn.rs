@@ -1700,6 +1700,7 @@ impl Qwen3AttentionLayer {
             ordinary_nvfp4,
             self.w4a16_exact_o_proj_kernels.route_for_rows(n as u32),
         );
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let sm_count = atlas_core::device::active_sm_count();
         // Native Qwen4 (`qwen4_attn_hyper.is_some()`) preflights and requires
         // the bit-exact O-projection tier, so exclude it from the non-exact
@@ -1712,7 +1713,7 @@ impl Qwen3AttentionLayer {
                 raw_attn_proj_tc_override(),
                 sm_count,
                 n,
-                crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+                det_batch,
             );
         let mut o_proj_done = false;
         if o_proj_sm120_fast {
@@ -1901,146 +1902,251 @@ impl Qwen3AttentionLayer {
             )?;
         } else if exact_o_dispatch == ExactAttnOProjDispatch::PerRowK1 {
             self.ms_o_proj_nvfp4_k1(c, attn_out, o_out)?;
-        } else if n == 3 && !self.attn.o_proj.is_null() {
-            ops::w4a16_gemv_batch3(
-                fwd.gpu,
-                self.w4a16_gemv_batch3_k,
-                attn_out,
-                &self.attn.o_proj,
-                o_out,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
-        } else if n == 2 && !self.attn.o_proj.is_null() {
-            ops::w4a16_gemv_batch2(
-                fwd.gpu,
-                self.w4a16_gemv_batch2_k,
-                attn_out,
-                &self.attn.o_proj,
-                o_out,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
-        } else if n > 3
-            && n <= 32
-            && self.w4a16_gemm_t_m32_n64_k.0 != 0
-            && let Some(nvfp4_t) = self.o_nvfp4_t.as_ref()
-        {
-            // K=γ verify: single M=n GEMM via the m32_n64 kernel (single
-            // B read, full SM occupancy) — replaces the n per-token GEMV
-            // launches (17 weight re-reads at DFlash K=17). The T-weights +
-            // transposed-kernel combination is production-validated (FFN
-            // m32 + qkv m128_t, token-exact 2026-06-11); only the legacy
-            // m16 KERNEL below remains quarantined.
-            ops::w4a16_gemm_n64_m32(
-                fwd.gpu,
-                self.w4a16_gemm_t_m32_n64_k,
-                attn_out,
-                nvfp4_t,
-                o_out,
-                n as u32,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
-        } else if n > 32
-            && sm_count > 64
-            && h <= 8192
-            && self.w4a16_gemm_t_m32_n64_k.0 != 0
-            && let Some(nvfp4_t) = self.o_nvfp4_t.as_ref()
-        {
-            // On wide-SM GPUs (> 64 SMs), prefer m32_n64 (160 CTAs at C=64, H=5120)
-            // over 40-CTA m128 for full SM utilization.
-            ops::w4a16_gemm_n64_m32(
-                fwd.gpu,
-                self.w4a16_gemm_t_m32_n64_k,
-                attn_out,
-                nvfp4_t,
-                o_out,
-                n as u32,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
-        } else if n > 32
-            && self.w4a16_gemm_t_m128_k.0 != 0
-            && let Some(nvfp4_t) = self.o_nvfp4_t.as_ref()
-        {
-            // Wide multi-seq decode (C=48/64..): single M=n transposed TC GEMM
-            // reading o_proj once instead of falling through to N serial GEMVs.
-            ops::w4a16_gemm_n128_m128(
-                fwd.gpu,
-                self.w4a16_gemm_t_m128_k,
-                attn_out,
-                nvfp4_t,
-                o_out,
-                n as u32,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
-        } else if n > 32
-            && self.w4a16_gemm_t_m32_n64_k.0 != 0
-            && let Some(nvfp4_t) = self.o_nvfp4_t.as_ref()
-        {
-            ops::w4a16_gemm_n64_m32(
-                fwd.gpu,
-                self.w4a16_gemm_t_m32_n64_k,
-                attn_out,
-                nvfp4_t,
-                o_out,
-                n as u32,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
-        } else if n > 3
-            && n <= 32
-            && self.w4a16_gemm_t_m16_k.0 != 0
-            && crate::layers::tc_nvfp4_m16_enabled()
-            && super::qkv::tc_nvfp4_m16_ms_attn_enabled()
-            && let Some(nvfp4_t) = self.o_nvfp4_t.as_ref()
-        {
-            // K=γ verify path (DFlash γ>3): batch O-projection as a single
-            // M=n GEMM using the small-M specialization, replacing n per-token
-            // GEMV launches. attn_out is already contiguous [n, nq*hd] and
-            // o_out is [n, h] — no scatter needed.
-            //
-            // Gated by the same ATLAS_TC_NVFP4_M16_MS_ATTN flag as
-            // `ms_qkv_batched_m16` because the multi_seq attention m16
-            // dispatch currently produces numerically different output
-            // vs the per-token GEMV fallback (see qkv.rs comment for the
-            // root-cause investigation status).
-            ops::w4a16_gemm_n128_m16(
-                fwd.gpu,
-                self.w4a16_gemm_t_m16_k,
-                attn_out,
-                nvfp4_t,
-                o_out,
-                n as u32,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
         } else {
-            for i in 0..n {
-                let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
-                let o_out_i = o_out.offset(i * h * bf16);
-                ops::w4a16_gemv(
-                    fwd.gpu,
-                    self.w4a16_gemv_k,
-                    attn_out_i,
-                    &self.attn.o_proj,
-                    o_out_i,
-                    h as u32,
-                    nq * hd,
-                    stream,
-                )?;
+            let has_m16_enabled = self.w4a16_gemm_t_m16_k.0 != 0
+                && crate::layers::tc_nvfp4_m16_enabled()
+                && super::qkv::tc_nvfp4_m16_ms_attn_enabled();
+            match select_ms_o_proj_existing_fallback_route_with_policy(
+                n,
+                sm_count,
+                h,
+                !self.attn.o_proj.is_null(),
+                self.o_nvfp4_t.is_some(),
+                self.w4a16_gemm_t_m32_n64_k.0 != 0,
+                self.w4a16_gemm_t_m128_k.0 != 0,
+                has_m16_enabled,
+                det_batch,
+            ) {
+                MsOProjFallbackRoute::PerRowK1 => {
+                    self.ms_o_proj_nvfp4_k1(c, attn_out, o_out)?;
+                }
+                MsOProjFallbackRoute::Batch3 => {
+                    ops::w4a16_gemv_batch3(
+                        fwd.gpu,
+                        self.w4a16_gemv_batch3_k,
+                        attn_out,
+                        &self.attn.o_proj,
+                        o_out,
+                        h as u32,
+                        nq * hd,
+                        stream,
+                    )?;
+                }
+                MsOProjFallbackRoute::Batch2 => {
+                    ops::w4a16_gemv_batch2(
+                        fwd.gpu,
+                        self.w4a16_gemv_batch2_k,
+                        attn_out,
+                        &self.attn.o_proj,
+                        o_out,
+                        h as u32,
+                        nq * hd,
+                        stream,
+                    )?;
+                }
+                MsOProjFallbackRoute::TcM32N64 => {
+                    if let Some(nvfp4_t) = self.o_nvfp4_t.as_ref() {
+                        ops::w4a16_gemm_n64_m32(
+                            fwd.gpu,
+                            self.w4a16_gemm_t_m32_n64_k,
+                            attn_out,
+                            nvfp4_t,
+                            o_out,
+                            n as u32,
+                            h as u32,
+                            nq * hd,
+                            stream,
+                        )?;
+                    }
+                }
+                MsOProjFallbackRoute::TcM128 => {
+                    if let Some(nvfp4_t) = self.o_nvfp4_t.as_ref() {
+                        ops::w4a16_gemm_n128_m128(
+                            fwd.gpu,
+                            self.w4a16_gemm_t_m128_k,
+                            attn_out,
+                            nvfp4_t,
+                            o_out,
+                            n as u32,
+                            h as u32,
+                            nq * hd,
+                            stream,
+                        )?;
+                    }
+                }
+                MsOProjFallbackRoute::TcM16 => {
+                    if let Some(nvfp4_t) = self.o_nvfp4_t.as_ref() {
+                        ops::w4a16_gemm_n128_m16(
+                            fwd.gpu,
+                            self.w4a16_gemm_t_m16_k,
+                            attn_out,
+                            nvfp4_t,
+                            o_out,
+                            n as u32,
+                            h as u32,
+                            nq * hd,
+                            stream,
+                        )?;
+                    }
+                }
+                MsOProjFallbackRoute::SerialGemv => {
+                    for i in 0..n {
+                        let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
+                        let o_out_i = o_out.offset(i * h * bf16);
+                        ops::w4a16_gemv(
+                            fwd.gpu,
+                            self.w4a16_gemv_k,
+                            attn_out_i,
+                            &self.attn.o_proj,
+                            o_out_i,
+                            h as u32,
+                            nq * hd,
+                            stream,
+                        )?;
+                    }
+                }
             }
         }
         Ok(o_out)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MsOProjFallbackRoute {
+    PerRowK1,
+    Batch3,
+    Batch2,
+    TcM32N64,
+    TcM128,
+    TcM16,
+    SerialGemv,
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[must_use]
+const fn select_ms_o_proj_existing_fallback_route_with_policy(
+    n: usize,
+    sm_count: u32,
+    h: usize,
+    has_o_proj: bool,
+    has_o_nvfp4_t: bool,
+    has_m32_n64: bool,
+    has_m128: bool,
+    has_m16_enabled: bool,
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> MsOProjFallbackRoute {
+    if det_batch.is_enabled() && has_o_proj {
+        return MsOProjFallbackRoute::PerRowK1;
+    }
+    if !det_batch.is_enabled() && n == 3 && has_o_proj {
+        return MsOProjFallbackRoute::Batch3;
+    }
+    if !det_batch.is_enabled() && n == 2 && has_o_proj {
+        return MsOProjFallbackRoute::Batch2;
+    }
+    if !det_batch.is_enabled() && has_o_nvfp4_t {
+        if n > 3 && n <= 32 && has_m32_n64 {
+            return MsOProjFallbackRoute::TcM32N64;
+        }
+        if n > 32 && sm_count > 64 && h <= 8192 && has_m32_n64 {
+            return MsOProjFallbackRoute::TcM32N64;
+        }
+        if n > 32 && has_m128 {
+            return MsOProjFallbackRoute::TcM128;
+        }
+        if n > 32 && has_m32_n64 {
+            return MsOProjFallbackRoute::TcM32N64;
+        }
+        if n > 3 && n <= 32 && has_m16_enabled {
+            return MsOProjFallbackRoute::TcM16;
+        }
+    }
+    MsOProjFallbackRoute::SerialGemv
+}
+
+#[cfg(test)]
+mod deterministic_batch_tests {
+    use super::{MsOProjFallbackRoute, select_ms_o_proj_existing_fallback_route_with_policy};
+    use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+    #[test]
+    fn deterministic_batch_pins_o_proj_existing_fallback_to_per_row_k1_across_1_to_128() {
+        for sm in [48u32, 188u32] {
+            for m in [1usize, 2, 3, 4, 8, 16, 32, 64, 128] {
+                assert_eq!(
+                    select_ms_o_proj_existing_fallback_route_with_policy(
+                        m,
+                        sm,
+                        5120,
+                        true,
+                        true,
+                        true,
+                        true,
+                        true,
+                        DeterministicBatchPolicy::Enabled,
+                    ),
+                    MsOProjFallbackRoute::PerRowK1,
+                    "O-proj existing fallback drifted at M={m} sm={sm}"
+                );
+            }
+        }
+        assert_eq!(
+            select_ms_o_proj_existing_fallback_route_with_policy(
+                2,
+                48,
+                5120,
+                true,
+                true,
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            MsOProjFallbackRoute::Batch2
+        );
+        assert_eq!(
+            select_ms_o_proj_existing_fallback_route_with_policy(
+                3,
+                48,
+                5120,
+                true,
+                true,
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            MsOProjFallbackRoute::Batch3
+        );
+        assert_eq!(
+            select_ms_o_proj_existing_fallback_route_with_policy(
+                8,
+                48,
+                5120,
+                true,
+                true,
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            MsOProjFallbackRoute::TcM32N64
+        );
+        assert_eq!(
+            select_ms_o_proj_existing_fallback_route_with_policy(
+                64,
+                48,
+                5120,
+                true,
+                true,
+                true,
+                true,
+                true,
+                DeterministicBatchPolicy::Disabled,
+            ),
+            MsOProjFallbackRoute::TcM128
+        );
     }
 }
 
