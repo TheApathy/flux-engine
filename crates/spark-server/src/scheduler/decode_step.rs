@@ -4,6 +4,68 @@
 
 use super::*;
 
+fn fail_decode_deterministic_batch_env(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    cache_on_finish: &mut Vec<bool>,
+    error: &spark_model::layers::deterministic_batch::DeterministicBatchEnvError,
+) {
+    tracing::error!("invalid ATLAS_DETERMINISTIC_BATCH in step_decode_only: {error}");
+    for mut a in active.drain(..) {
+        send_error(model, &mut a, &format!("{error}"));
+    }
+    cache_on_finish.clear();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_decode_only_canonical_per_slot(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    cache_on_finish: &mut Vec<bool>,
+    think_end_token: Option<u32>,
+    think_start_token: Option<u32>,
+    code_fence_token: Option<u32>,
+    tool_call_start_token: Option<u32>,
+    tool_call_end_token: Option<u32>,
+    reflection_suppress_ids: &[u32],
+    adaptive_sampling: bool,
+) {
+    let orig_active = std::mem::take(active);
+    let orig_cache = std::mem::take(cache_on_finish);
+    let mut next_active = Vec::with_capacity(orig_active.len());
+    let mut next_cache = Vec::with_capacity(orig_cache.len());
+    for (seq_item, cache_flag) in orig_active.into_iter().zip(orig_cache) {
+        let mut slot_active = vec![seq_item];
+        let mut slot_cache = vec![cache_flag];
+        step_decode_only(
+            model,
+            &mut slot_active,
+            &mut slot_cache,
+            think_end_token,
+            think_start_token,
+            code_fence_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            reflection_suppress_ids,
+            adaptive_sampling,
+        );
+        if !slot_active.is_empty()
+            && let Err(e) = model.sync_secondary()
+        {
+            fail_closed_scheduler_transition(
+                &mut slot_active,
+                &mut slot_cache,
+                "deterministic batch decode_only per-slot sync_secondary",
+                &e,
+            );
+        }
+        next_active.extend(slot_active);
+        next_cache.extend(slot_cache);
+    }
+    *active = next_active;
+    *cache_on_finish = next_cache;
+}
+
 /// Decode-only step: batched decode for all active sequences (no MTP).
 pub fn step_decode_only(
     model: &dyn Model,
@@ -18,6 +80,28 @@ pub fn step_decode_only(
     adaptive_sampling: bool,
 ) {
     debug_assert_eq!(active.len(), cache_on_finish.len());
+    let det_batch = match deterministic_batch_route::scheduler_deterministic_batch_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            fail_decode_deterministic_batch_env(model, active, cache_on_finish, &error);
+            return;
+        }
+    };
+    if deterministic_batch_route::decode_runs_canonical_per_slot(det_batch, active.len()) {
+        step_decode_only_canonical_per_slot(
+            model,
+            active,
+            cache_on_finish,
+            think_end_token,
+            think_start_token,
+            code_fence_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            reflection_suppress_ids,
+            adaptive_sampling,
+        );
+        return;
+    }
     let t0 = std::time::Instant::now();
     let n = active.len();
     let tokens: Vec<u32> = active.iter().map(|a| a.last_token).collect();

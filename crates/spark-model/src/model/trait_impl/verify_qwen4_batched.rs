@@ -662,11 +662,11 @@ fn with_qsa_dense_prefix_graph_bit(
     key
 }
 
-/// True when a cohort with at least one `qwen4_qsa_required` sequence stays
-/// strictly inside the pre-2048 dense-attention prefix (`seq_len + k <= 2048`)
-/// with uniform QSA journaling (`verify_journal_rows(k)`) and pre-allocated
-/// multi-seq QSA staging, mirroring `verify_d::qwen4_qsa_dense_prefix_graph_eligible`.
-fn batched_verify_qsa_dense_prefix_eligible<I>(
+/// Whether `batched_verify_qsa_dense_prefix_eligible` may admit a cohort under
+/// `det_batch`: `DeterministicBatchPolicy::Enabled` refuses cross-sequence QSA
+/// dense-prefix graph staging.
+fn batched_verify_qsa_dense_prefix_eligible_with_policy<I>(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
     num_leaders: usize,
     has_verify_meta_dev: bool,
     has_qsa_scratch: bool,
@@ -675,6 +675,9 @@ fn batched_verify_qsa_dense_prefix_eligible<I>(
 where
     I: IntoIterator<Item = (bool, usize, usize)>,
 {
+    if det_batch.is_enabled() {
+        return false;
+    }
     if num_leaders == 0
         || num_leaders > crate::layers::qwen4_qsa::QSA_CROSS_SEQ_MAX_SEQS
         || !has_verify_meta_dev
@@ -699,6 +702,29 @@ where
         }
     }
     any_qsa
+}
+
+/// True when a cohort with at least one `qwen4_qsa_required` sequence stays
+/// strictly inside the pre-2048 dense-attention prefix (`seq_len + k <= 2048`)
+/// with uniform QSA journaling (`verify_journal_rows(k)`) and pre-allocated
+/// multi-seq QSA staging, mirroring `verify_d::qwen4_qsa_dense_prefix_graph_eligible`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn batched_verify_qsa_dense_prefix_eligible<I>(
+    num_leaders: usize,
+    has_verify_meta_dev: bool,
+    has_qsa_scratch: bool,
+    leaders: I,
+) -> bool
+where
+    I: IntoIterator<Item = (bool, usize, usize)>,
+{
+    batched_verify_qsa_dense_prefix_eligible_with_policy(
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        num_leaders,
+        has_verify_meta_dev,
+        has_qsa_scratch,
+        leaders,
+    )
 }
 
 /// Minimum eager warmup passes required before capturing a suffix CUDA graph
@@ -935,7 +961,16 @@ pub(in crate::model) fn take_dedup_follower_commit_skip(slot_idx: usize) -> bool
     (DEDUP_FOLLOWER_COMMIT_SKIP[slot_idx / 64].fetch_and(!mask, Ordering::AcqRel) & mask) != 0
 }
 
-fn batched_k5_dedup_enabled() -> bool {
+#[inline]
+#[must_use]
+pub(crate) const fn batched_k5_dedup_enabled_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
+}
+
+fn batched_k5_dedup_env_enabled() -> bool {
     let read_live = || {
         std::env::var("ATLAS_QWEN4_BATCHED_K5_DEDUP")
             .ok()
@@ -951,6 +986,14 @@ fn batched_k5_dedup_enabled() -> bool {
     {
         read_live()
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn batched_k5_dedup_enabled() -> bool {
+    batched_k5_dedup_enabled_with_policy(
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        batched_k5_dedup_env_enabled(),
+    )
 }
 
 /// Cached wrapper around [`super::verify_d::k5_hybrid_selected`] (avoids
@@ -1310,6 +1353,35 @@ pub(crate) fn cross_seq_proposer_admitted(
     }
 }
 
+/// Whether cross-sequence batched verify may be admitted under `det_batch`:
+/// `DeterministicBatchPolicy::Enabled` refuses cross-sequence frames so every
+/// sequence runs the canonical `B=1` per-slot verifier.
+#[inline]
+#[must_use]
+pub(crate) const fn cross_seq_verify_admitted_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+) -> bool {
+    !det_batch.is_enabled()
+}
+
+/// Whether the cross-sequence verify frame admits the active LM-head route
+/// under `det_batch`: `DeterministicBatchPolicy::Enabled` strictly refuses
+/// `ATLAS_LM_HEAD_TC=1` regardless of `tc_dense_frame`, while `Disabled`
+/// preserves exact baseline admission.
+#[inline]
+#[must_use]
+pub(crate) const fn lm_head_route_admitted_for_frame_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    tc_dense_frame: bool,
+    lm_head_tc_active: bool,
+) -> bool {
+    if det_batch.is_enabled() {
+        !lm_head_tc_active
+    } else {
+        tc_dense_frame || !lm_head_tc_active
+    }
+}
+
 /// Whether the cross-sequence verify frame admits the active LM-head route:
 /// wide frames (`tc_dense_frame == true`, `rows >= min_rows`) admit Tensor Core
 /// LM-head execution including `ATLAS_LM_HEAD_TC=1`; small frames (`rows < 4`
@@ -1317,11 +1389,16 @@ pub(crate) fn cross_seq_proposer_admitted(
 /// refusal of `ATLAS_LM_HEAD_TC=1`.
 #[inline]
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const fn lm_head_route_admitted_for_frame(
     tc_dense_frame: bool,
     lm_head_tc_active: bool,
 ) -> bool {
-    tc_dense_frame || !lm_head_tc_active
+    lm_head_route_admitted_for_frame_with_policy(
+        crate::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+        tc_dense_frame,
+        lm_head_tc_active,
+    )
 }
 
 /// Predict the next verify step's row-0 `(bonus_token, committed_prior_len)`
@@ -1524,6 +1601,12 @@ impl TransformerModel {
         seqs: &[&SequenceState],
     ) -> Result<Qwen4CrossSeqFrame> {
         self.ensure_verify_healthy()?;
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
+        ensure!(
+            cross_seq_verify_admitted_with_policy(det_batch),
+            "cross-sequence verify disabled under ATLAS_DETERMINISTIC_BATCH=1 \
+             (canonical B=1 per-slot verify required)"
+        );
         crate::layers::qwen4_verify_lanes::require_fixed_k5_policy()?;
         ensure!(
             crate::layers::qwen4_verify_lanes::batched_k5_selected()?,
@@ -1725,7 +1808,11 @@ impl TransformerModel {
             !self.use_fp32_logits
                 && self.verify_lmhead_vocab() as usize == self.config.vocab_size
                 && self.lm_head_nvfp4.is_some()
-                && lm_head_route_admitted_for_frame(tc_dense_frame, lm_head_tc_active),
+                && lm_head_route_admitted_for_frame_with_policy(
+                    det_batch,
+                    tc_dense_frame,
+                    lm_head_tc_active
+                ),
             "cross-sequence verify requires exact BF16 full-vocabulary NVFP4 logits \
              (ATLAS_LM_HEAD_TC=1 requires batched verify TC dense)"
         );
@@ -2819,9 +2906,10 @@ impl TransformerModel {
             .store(false, std::sync::atomic::Ordering::Release);
         self.ddtree_dfs_inv_perm.lock().clear();
 
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
         let receipt_on = verify_logits_receipt_selected_cached()?;
         let dedup_allowed = self.comm.is_none()
-            && batched_k5_dedup_enabled()
+            && batched_k5_dedup_enabled_with_policy(det_batch, batched_k5_dedup_env_enabled())
             && !receipt_on
             && !frame.is_ragged()
             && frame.min_k() >= 2
@@ -3079,7 +3167,8 @@ impl TransformerModel {
             super::verify_d::verify_argmax_rows_selected() && self.argmax_rows_kernel.0 != 0;
         let all_non_qsa = unique_leaders.iter().all(|&s| !seqs[s].qwen4_qsa_required);
         let qsa_dense_prefix = !all_non_qsa
-            && batched_verify_qsa_dense_prefix_eligible(
+            && batched_verify_qsa_dense_prefix_eligible_with_policy(
+                det_batch,
                 unique_leaders.len(),
                 !staging.verify_meta_dev.is_null(),
                 staging.qsa_scratch.is_allocated(),
@@ -5644,5 +5733,53 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn deterministic_batch_gates_cross_seq_verify_lm_head_dedup_and_qsa_dense_prefix() {
+        use super::{
+            batched_k5_dedup_enabled_with_policy,
+            batched_verify_qsa_dense_prefix_eligible_with_policy,
+            cross_seq_verify_admitted_with_policy, lm_head_route_admitted_for_frame_with_policy,
+        };
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        let on = DeterministicBatchPolicy::Enabled;
+        let off = DeterministicBatchPolicy::Disabled;
+
+        assert!(!cross_seq_verify_admitted_with_policy(on));
+        assert!(cross_seq_verify_admitted_with_policy(off));
+
+        assert!(!lm_head_route_admitted_for_frame_with_policy(
+            on, true, true
+        ));
+        assert!(lm_head_route_admitted_for_frame_with_policy(
+            on, true, false
+        ));
+        assert!(lm_head_route_admitted_for_frame_with_policy(
+            off, true, true
+        ));
+        assert!(!lm_head_route_admitted_for_frame_with_policy(
+            off, false, true
+        ));
+
+        assert!(!batched_k5_dedup_enabled_with_policy(on, true));
+        assert!(batched_k5_dedup_enabled_with_policy(off, true));
+        assert!(!batched_k5_dedup_enabled_with_policy(off, false));
+
+        assert!(!batched_verify_qsa_dense_prefix_eligible_with_policy(
+            on,
+            2,
+            true,
+            true,
+            [(true, 512, 8), (true, 1024, 8)],
+        ));
+        assert!(batched_verify_qsa_dense_prefix_eligible_with_policy(
+            off,
+            2,
+            true,
+            true,
+            [(true, 512, 8), (true, 1024, 8)],
+        ));
     }
 }

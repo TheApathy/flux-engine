@@ -19,6 +19,9 @@ use anyhow::{Result, bail, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 use crate::layer::{ForwardContext, Qwen4CrossSeqFrame};
+use crate::layers::deterministic_batch::{
+    DeterministicBatchPolicy, deterministic_batch_policy, deterministic_batch_policy_or_disabled,
+};
 use crate::layers::{FfnComponent, Qwen4HyperConnection};
 
 /// `ATLAS_QWEN4_BATCHED_HC_FUSE_INJECT_GN` (default ON unless `"0"`): fuse
@@ -35,9 +38,21 @@ pub(crate) fn parse_batched_hc_fuse_inject_gn(raw: Option<&str>) -> bool {
     raw.map(str::trim) != Some("0")
 }
 
+/// Resolve `ATLAS_QWEN4_BATCHED_HC_FUSE_INJECT_GN` under `det_batch`:
+/// `DeterministicBatchPolicy::Enabled` disables cross-sequence HC inject/GN
+/// deferral so every layer preserves canonical unfused `B=1` ordering.
 #[inline]
 #[must_use]
-pub(crate) fn batched_hc_fuse_inject_gn_enabled() -> bool {
+pub(crate) const fn batched_hc_fuse_inject_gn_enabled_with_policy(
+    det_batch: DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
+}
+
+#[inline]
+#[must_use]
+fn batched_hc_fuse_inject_gn_env_enabled() -> bool {
     let read_live = || {
         parse_batched_hc_fuse_inject_gn(
             std::env::var(BATCHED_HC_FUSE_INJECT_GN_ENV).ok().as_deref(),
@@ -52,6 +67,15 @@ pub(crate) fn batched_hc_fuse_inject_gn_enabled() -> bool {
     {
         read_live()
     }
+}
+
+#[inline]
+#[must_use]
+pub(crate) fn batched_hc_fuse_inject_gn_enabled() -> bool {
+    batched_hc_fuse_inject_gn_enabled_with_policy(
+        deterministic_batch_policy_or_disabled(),
+        batched_hc_fuse_inject_gn_env_enabled(),
+    )
 }
 
 pub(crate) fn log_batched_hc_fuse_inject_gn_engaged(rows: usize) {
@@ -219,21 +243,41 @@ fn read_moe_tiling_live() -> std::result::Result<MoeTiling, String> {
     parse_moe_tiling(raw.as_deref()).map_err(str::to_owned)
 }
 
+/// Resolve MoE tiling under `det_batch`: `DeterministicBatchPolicy::Enabled`
+/// forces sequence-aligned tiling (`MoeTiling::Sequence`) so no MoE launch
+/// spans across distinct sequences.
+#[inline]
+#[must_use]
+pub(crate) const fn moe_tiling_with_policy(
+    det_batch: DeterministicBatchPolicy,
+    env_tiling: MoeTiling,
+) -> MoeTiling {
+    if det_batch.is_enabled() {
+        MoeTiling::Sequence
+    } else {
+        env_tiling
+    }
+}
+
 pub(crate) fn moe_tiling() -> Result<MoeTiling> {
-    #[cfg(not(test))]
-    {
-        static CACHED: std::sync::OnceLock<std::result::Result<MoeTiling, String>> =
-            std::sync::OnceLock::new();
-        CACHED
-            .get_or_init(read_moe_tiling_live)
-            .as_ref()
-            .copied()
-            .map_err(|msg| anyhow::Error::msg(msg.clone()))
-    }
-    #[cfg(test)]
-    {
-        read_moe_tiling_live().map_err(anyhow::Error::msg)
-    }
+    let det_batch = deterministic_batch_policy()?;
+    let env_tiling = {
+        #[cfg(not(test))]
+        {
+            static CACHED: std::sync::OnceLock<std::result::Result<MoeTiling, String>> =
+                std::sync::OnceLock::new();
+            CACHED
+                .get_or_init(read_moe_tiling_live)
+                .as_ref()
+                .copied()
+                .map_err(|msg| anyhow::Error::msg(msg.clone()))?
+        }
+        #[cfg(test)]
+        {
+            read_moe_tiling_live().map_err(anyhow::Error::msg)?
+        }
+    };
+    Ok(moe_tiling_with_policy(det_batch, env_tiling))
 }
 
 /// `ATLAS_QWEN4_K5_BATCH_HYPER` (default ON unless `"0"`, cached via `OnceLock`
@@ -259,6 +303,7 @@ pub(crate) fn preflight(
     frame: Qwen4CrossSeqFrame,
     ctx: &ForwardContext,
 ) -> Result<()> {
+    let _det_batch = deterministic_batch_policy()?;
     let rows = frame.rows();
     let mlp_hyper = mlp_hyper.ok_or_else(|| {
         anyhow::anyhow!("cross-sequence Qwen4 verify requires an MLP hyperconnection")
@@ -353,7 +398,12 @@ pub(crate) fn run(
     }
     spark_runtime::cublaslt::stage_timer::mark("x_moe", stream);
     let moe_out = ctx.buffers.moe_output();
-    if batched_hc_fuse_inject_gn_enabled() && defer_mlp_tail_allowed() {
+    let det_batch = deterministic_batch_policy()?;
+    if batched_hc_fuse_inject_gn_enabled_with_policy(
+        det_batch,
+        batched_hc_fuse_inject_gn_env_enabled(),
+    ) && defer_mlp_tail_allowed()
+    {
         defer_pending_inject(PendingBatchedHcInject {
             hyper: hidden,
             core: moe_out,
@@ -484,6 +534,26 @@ mod tests {
         {
             let _g = ScopedEnvVar::set(MOE_TILE_ENV, "invalid");
             assert!(moe_tiling().is_err());
+        }
+        {
+            let _det = ScopedEnvVar::set(
+                crate::layers::deterministic_batch::DETERMINISTIC_BATCH_ENV,
+                "1",
+            );
+            let _hc = ScopedEnvVar::set(BATCHED_HC_FUSE_INJECT_GN_ENV, "1");
+            let _tile = ScopedEnvVar::set(MOE_TILE_ENV, "frame");
+            assert!(!batched_hc_fuse_inject_gn_enabled());
+            assert_eq!(moe_tiling().unwrap(), MoeTiling::Sequence);
+        }
+        {
+            let _det = ScopedEnvVar::set(
+                crate::layers::deterministic_batch::DETERMINISTIC_BATCH_ENV,
+                "bogus",
+            );
+            assert!(
+                moe_tiling().is_err(),
+                "invalid ATLAS_DETERMINISTIC_BATCH must fail closed in moe_tiling"
+            );
         }
 
         // `k5_batch_hyper_enabled`: default ON, "0" disables.

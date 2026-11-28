@@ -80,12 +80,32 @@ pub(super) fn run_standard_chunk_loop(
     } else {
         max_prefill_tokens
     };
+    let det_batch =
+        match super::super::deterministic_batch_route::scheduler_deterministic_batch_policy() {
+            Ok(policy) => policy,
+            Err(error) => {
+                drain_before_prefill_cleanup(
+                    model,
+                    prefill_stream,
+                    "invalid ATLAS_DETERMINISTIC_BATCH in run_standard_chunk_loop",
+                );
+                tracing::error!(
+                    "invalid ATLAS_DETERMINISTIC_BATCH in run_standard_chunk_loop: {error}"
+                );
+                completed_indices.push((idx, None));
+                return;
+            }
+        };
     let chunk_len = prefill_chunk_policy::prefill_chunk_len(prefill_chunk_policy::ChunkRequest {
         offset: p.chunk_offset,
         remaining,
         max_prefill_tokens: req_max_prefill_tokens,
         plan: chunk_plan,
-        decode_rows_active: !active.is_empty(),
+        decode_rows_active:
+            super::super::deterministic_batch_route::prefill_chunk_sees_active_decode(
+                det_batch,
+                !active.is_empty(),
+            ),
         single_chunk_required: model.is_mla(),
     });
     let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
@@ -105,6 +125,8 @@ pub(super) fn run_standard_chunk_loop(
         // `mixed_forward` enters the generic multi-row layer paths, which do
         // not yet implement Qwen4/mHC PLE, highway, or active-QSA semantics.
         && model.hc_mult() == 0;
+    let can_mix =
+        super::super::deterministic_batch_route::prefill_mixed_forward_allowed(det_batch, can_mix);
 
     if can_mix {
         // Fused prefill+decode: its wall time is not "one chunk, then decode".

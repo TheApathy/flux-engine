@@ -98,7 +98,24 @@ pub(crate) fn resolve_native_batch_qsa_mode(
     }
 }
 
+/// Resolve `ATLAS_QWEN4_NATIVE_BATCH_QSA` under `det_batch`:
+/// `DeterministicBatchPolicy::Enabled` forces [`NativeQsaMode::Off`] so QSA
+/// rows always take the canonical serialized C1 path.
+#[inline]
+#[must_use]
+pub(crate) const fn native_batch_qsa_mode_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_mode: NativeQsaMode,
+) -> NativeQsaMode {
+    if det_batch.is_enabled() {
+        NativeQsaMode::Off
+    } else {
+        env_mode
+    }
+}
+
 pub(crate) fn native_batch_qsa_mode() -> Result<NativeQsaMode> {
+    let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
     let raw = match std::env::var(NATIVE_BATCH_QSA_ENV) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -106,7 +123,8 @@ pub(crate) fn native_batch_qsa_mode() -> Result<NativeQsaMode> {
             anyhow::bail!("{NATIVE_BATCH_QSA_ENV} must be valid UTF-8")
         }
     };
-    parse_native_batch_qsa_selector(raw.as_deref()).map_err(anyhow::Error::msg)
+    let parsed = parse_native_batch_qsa_selector(raw.as_deref()).map_err(anyhow::Error::msg)?;
+    Ok(native_batch_qsa_mode_with_policy(det_batch, parsed))
 }
 
 /// Route of one row from its immutable admission flag and pre-step length.
@@ -462,5 +480,39 @@ mod tests {
         assert!(NativeAttnRoute::IndexedDense.maintains_index());
         assert!(!NativeAttnRoute::IndexedDense.is_sparse());
         assert!(NativeAttnRoute::Sparse.is_sparse());
+    }
+
+    #[test]
+    fn deterministic_batch_forces_native_batch_qsa_off_and_fails_closed() {
+        use crate::layers::deterministic_batch::{
+            DETERMINISTIC_BATCH_ENV, DeterministicBatchPolicy,
+        };
+        use crate::layers::qwen4_verify_lanes::{ScopedEnvVar, test_env_lock};
+
+        assert_eq!(
+            native_batch_qsa_mode_with_policy(
+                DeterministicBatchPolicy::Enabled,
+                NativeQsaMode::PerRow
+            ),
+            NativeQsaMode::Off
+        );
+        assert_eq!(
+            native_batch_qsa_mode_with_policy(
+                DeterministicBatchPolicy::Disabled,
+                NativeQsaMode::PerRow
+            ),
+            NativeQsaMode::PerRow
+        );
+
+        let _lock = test_env_lock();
+        {
+            let _det = ScopedEnvVar::set(DETERMINISTIC_BATCH_ENV, "1");
+            let _qsa = ScopedEnvVar::set(NATIVE_BATCH_QSA_ENV, "1");
+            assert_eq!(native_batch_qsa_mode().unwrap(), NativeQsaMode::Off);
+        }
+        {
+            let _det = ScopedEnvVar::set(DETERMINISTIC_BATCH_ENV, "invalid");
+            assert!(native_batch_qsa_mode().is_err());
+        }
     }
 }

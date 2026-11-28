@@ -28,7 +28,70 @@ use crate::traits::{Model, PrefillSlice, SequenceState};
 #[path = "qwen4_short_batch.rs"]
 mod qwen4_short_batch;
 
+/// Resolve Q12 kernel-batched prefill under `det_batch`:
+/// `DeterministicBatchPolicy::Enabled` disables cross-stream prefill batching
+/// so every prompt runs the canonical `B=1` `prefill_chunk_dispatch` path.
+#[inline]
+#[must_use]
+pub(super) const fn q12_batched_enabled_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
+}
+
 impl TransformerModel {
+    /// Canonical `B=1` sequential per-stream prefill dispatch used when
+    /// `ATLAS_DETERMINISTIC_BATCH=1` is active on a multi-stream batch.
+    fn prefill_batch_chunk_canonical_serial(
+        &self,
+        streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        let n = streams.len();
+        let completing_count = streams.iter().filter(|s| s.is_last_chunk).count();
+        let last_completing = streams.iter().rposition(|s| s.is_last_chunk);
+        let preserve_distinct = completing_count >= 2 && self.config.pp_rank == 0;
+        let vocab_row_bytes = if preserve_distinct {
+            self.validate_distinct_bf16_logits_rows(n, self.config.vocab_size)?
+        } else {
+            0
+        };
+        let mut saved_logits: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
+        let mut logits = Vec::with_capacity(n);
+        for (b, slice) in streams.iter_mut().enumerate() {
+            let ptr = self.prefill_chunk_dispatch(
+                slice.prompt_tokens,
+                slice.seq,
+                slice.chunk_start,
+                slice.chunk_len,
+                slice.is_last_chunk,
+                stream,
+            )?;
+            if preserve_distinct
+                && slice.is_last_chunk
+                && !ptr.is_null()
+                && Some(b) != last_completing
+            {
+                self.gpu.synchronize(stream)?;
+                let mut host_row = vec![0u8; vocab_row_bytes];
+                self.gpu.copy_d2h(ptr, &mut host_row)?;
+                saved_logits[b] = Some(host_row);
+            }
+            logits.push(ptr);
+        }
+        if preserve_distinct && let Some(last_idx) = last_completing {
+            self.restore_batched_prefill_logits_rows(
+                &mut logits,
+                &saved_logits,
+                last_idx,
+                vocab_row_bytes,
+                stream,
+            )?;
+        }
+        Ok(logits)
+    }
+
     /// Batched-prefill dispatch for N concurrent streams. See module docs.
     ///
     /// Returns `Vec<DevicePtr>` parallel to `streams`: each entry is the
@@ -50,6 +113,10 @@ impl TransformerModel {
         );
         if n == 0 {
             return Ok(Vec::new());
+        }
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
+        if det_batch.is_enabled() && n > 1 {
+            return self.prefill_batch_chunk_canonical_serial(streams, stream);
         }
         let multi_chunk = crate::layers::qwen4_prefill_moe::multi_chunk_selected()?;
         if n > 1 && self.config.is_qwen4_exp() {
@@ -162,9 +229,12 @@ impl TransformerModel {
         // the kernel-batched path without rebuilding. Default is enabled
         // (any unset / non-"0" value). Useful for the kernel-validation
         // session when isolating a regression to the batched path.
-        let q12_batched_enabled = std::env::var("ATLAS_Q12_BATCHED")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
+        let q12_batched_enabled = q12_batched_enabled_with_policy(
+            det_batch,
+            std::env::var("ATLAS_Q12_BATCHED")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
+        );
         if q12_batched_enabled && self.kernel_batched_eligible(streams) {
             tracing::debug!(
                 target: "atlas::q12",

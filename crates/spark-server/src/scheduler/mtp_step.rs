@@ -273,8 +273,11 @@ fn post_verify_sync_and_history_graft(
     active: &mut [ActiveSeq],
     num_drafts: usize,
     depth_policy: verify_qwen4_batched_step::DraftDepthPolicy,
+    det_batch: spark_model::layers::deterministic_batch::DeterministicBatchPolicy,
 ) {
-    history_ring::sync_active_validated_tokens(active);
+    if !det_batch.is_enabled() {
+        history_ring::sync_active_validated_tokens(active);
+    }
     if num_drafts == 0
         || model.dflash_draft_sample_method()
             == spark_model::dflash_sampling::DflashDraftSampleMethod::Probabilistic
@@ -282,7 +285,10 @@ fn post_verify_sync_and_history_graft(
         return;
     }
     let live_seqs = active.iter().filter(|a| !a.finished).count();
-    if !history_graft_allowed(live_seqs, depth_policy) {
+    if !deterministic_batch_route::history_graft_allowed_with_policy(
+        det_batch,
+        history_graft_allowed(live_seqs, depth_policy),
+    ) {
         return;
     }
     for a in active.iter_mut() {
@@ -704,6 +710,34 @@ fn try_batched_native_k1_bootstrap(
     leftover
 }
 
+fn step_mtp_canonical_per_slot(
+    model: &dyn Model,
+    active: &mut [ActiveSeq],
+    num_drafts: usize,
+    think: &ThinkSpecCtx<'_>,
+    cache_on_finish: &mut [bool],
+) {
+    for idx in 0..active.len() {
+        step_mtp(
+            model,
+            &mut active[idx..=idx],
+            num_drafts,
+            think,
+            &mut cache_on_finish[idx..=idx],
+        );
+        if !active[idx].finished
+            && let Err(e) = model.sync_secondary()
+        {
+            fail_closed_scheduler_transition(
+                &mut active[idx..=idx],
+                &mut cache_on_finish[idx..=idx],
+                "deterministic batch step_mtp per-slot sync_secondary",
+                &e,
+            );
+        }
+    }
+}
+
 /// Bootstrap empty sequences, then dispatch policy-safe speculative verify.
 pub fn step_mtp(
     model: &dyn Model,
@@ -713,6 +747,22 @@ pub fn step_mtp(
     cache_on_finish: &mut [bool],
 ) {
     assert_eq!(active.len(), cache_on_finish.len());
+    let det_batch = match deterministic_batch_route::scheduler_deterministic_batch_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            fail_closed_scheduler_transition(
+                active,
+                cache_on_finish,
+                "invalid ATLAS_DETERMINISTIC_BATCH in step_mtp",
+                &error,
+            );
+            return;
+        }
+    };
+    if deterministic_batch_route::decode_runs_canonical_per_slot(det_batch, active.len()) {
+        step_mtp_canonical_per_slot(model, active, num_drafts, think, cache_on_finish);
+        return;
+    }
     for a in active.iter_mut() {
         if a.temperature > 0.0
             && a.seed.is_none()
@@ -724,11 +774,16 @@ pub fn step_mtp(
             ));
         }
     }
-    history_ring::sync_active_validated_tokens(active);
+    if !det_batch.is_enabled() {
+        history_ring::sync_active_validated_tokens(active);
+    }
     // ATLAS_QWEN4_BATCHED_ADAPTIVE_K / ATLAS_QWEN4_BATCHED_K5_LADDER (opt-in):
     // narrower drafts at higher concurrency. Lossless; unset keeps
     // `num_drafts` unchanged.
-    let live_seqs = active.iter().filter(|a| !a.finished).count();
+    let live_seqs = deterministic_batch_route::mtp_effective_live_seqs(
+        det_batch,
+        active.iter().filter(|a| !a.finished).count(),
+    );
     let _mtp_dloop_guard = spark_model::layers::mtp_dloop::MtpDloopCohortGuard::enter(
         live_seqs,
         model.mtp_dloop_max_verify_k(),
@@ -740,6 +795,12 @@ pub fn step_mtp(
         live_seqs,
     );
     let num_drafts = verify_qwen4_batched_step::effective_num_drafts(model, live_seqs, num_drafts);
+    // Under ATLAS_DETERMINISTIC_BATCH=1, keep DFlash propose strictly
+    // synchronous across both B=1 and B>=2 so single-request and concurrent
+    // slots execute identical kernels and never alias shared async scratch.
+    let _suppress_det_async = det_batch
+        .is_enabled()
+        .then(spark_model::layers::dflash_head::async_propose::SingleSeqAsyncSuppressGuard::enter);
     // Stage-1 DFlash grammar gate: drop drafts proposed before the grammar
     // became constraining (e.g. the block whose emission opened a
     // `<tool_call>`). DFlash drafts and the K=γ verify argmax bypass the
@@ -894,14 +955,19 @@ pub fn step_mtp(
         }
         return;
     }
-    let serial_bootstrap_idxs = try_batched_native_k1_bootstrap(
-        model,
-        active,
-        &bootstrap_idxs,
-        num_drafts,
-        think,
-        cache_on_finish,
-    );
+    let serial_bootstrap_idxs =
+        if deterministic_batch_route::mtp_batched_bootstrap_allowed(det_batch, true) {
+            try_batched_native_k1_bootstrap(
+                model,
+                active,
+                &bootstrap_idxs,
+                num_drafts,
+                think,
+                cache_on_finish,
+            )
+        } else {
+            bootstrap_idxs.clone()
+        };
     let _suppress_single_async = (live_seqs > 1)
         .then(spark_model::layers::dflash_head::async_propose::SingleSeqAsyncSuppressGuard::enter);
     for &idx in &serial_bootstrap_idxs {
@@ -1141,10 +1207,15 @@ pub fn step_mtp(
             );
             let depth_key = a.depth_controller_key();
             let seq_drafts = resolve_seq_drafts(model, depth_policy, depth_key, num_drafts);
-            let allow_history_graft = history_graft_allowed(live_seqs, depth_policy);
+            let allow_history_graft = deterministic_batch_route::history_graft_allowed_with_policy(
+                det_batch,
+                history_graft_allowed(live_seqs, depth_policy),
+            );
             let _depth_session = super::adaptive_depth::ActiveDepthSessionGuard::new(depth_key);
             super::stochastic_verify_walk::publish_seq_gumbel_draft_spec(a);
-            history_ring::sync_one_validated_tokens(a.session_hash, &a.output_tokens);
+            if !det_batch.is_enabled() {
+                history_ring::sync_one_validated_tokens(a.session_hash, &a.output_tokens);
+            }
             let retrieved = retrieval_chain(a, tok, num_drafts).or_else(|| {
                 (allow_history_graft && a.grammar_state.is_none())
                     .then(|| {
@@ -1244,7 +1315,10 @@ pub fn step_mtp(
     // continue below exactly as before.
     // ATLAS_QWEN4_BATCHED_ADAPTIVE_K: a chain proposed at an earlier,
     // wider concurrency step is shortened to this step's width first.
-    if model.qwen4_batched_k5_armed() && verify_qwen4_batched_step::adaptive_selected() {
+    if deterministic_batch_route::mtp_cross_seq_verify_allowed(
+        det_batch,
+        model.qwen4_batched_k5_armed() && verify_qwen4_batched_step::adaptive_selected(),
+    ) {
         verify_qwen4_batched_step::narrow_pending_drafts(active, &verify_idxs, num_drafts);
         verify_qwen4_batched_step::harmonize_cohort_widths(
             model,
@@ -1254,7 +1328,10 @@ pub fn step_mtp(
             think,
         );
     }
-    if model.qwen4_batched_k5_armed() && verify_idxs.len() >= 2 {
+    if deterministic_batch_route::mtp_cross_seq_verify_allowed(
+        det_batch,
+        model.qwen4_batched_k5_armed() && verify_idxs.len() >= 2,
+    ) {
         let plan = verify_qwen4_batched_step::plan_for_cohort(
             model,
             active,
@@ -1289,7 +1366,10 @@ pub fn step_mtp(
     // thread). This routes c eligible seqs (drafts.len()==1, no
     // grammar, not finished) through ONE c-batched K=2 verify call —
     // 2 batched forwards/layer instead of 2c.
-    if spark_model::layers::mtp_k2_batch_cseq_enabled() && verify_idxs.len() >= 2 {
+    if deterministic_batch_route::mtp_cross_seq_verify_allowed(
+        det_batch,
+        spark_model::layers::mtp_k2_batch_cseq_enabled() && verify_idxs.len() >= 2,
+    ) {
         let mut batched_idxs: Vec<usize> = Vec::new();
         let mut leftover_idxs: Vec<usize> = Vec::new();
         for &idx in &verify_idxs {
@@ -1351,7 +1431,7 @@ pub fn step_mtp(
             dispatch_verify(model, a, &drafts, num_drafts, think, depth_policy);
         }
         suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
-        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy);
+        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy, det_batch);
         return;
     }
 
@@ -1363,7 +1443,10 @@ pub fn step_mtp(
     // forwards/layer + per-step intermediate D2D snapshots (~8 ms
     // overhead). Other verify_idxs (K=2/K=4/DFlash/grammar-active) fall
     // through to the per-seq loop below.
-    if spark_model::layers::mtp_k3_batch_cseq_enabled() && verify_idxs.len() >= 2 {
+    if deterministic_batch_route::mtp_cross_seq_verify_allowed(
+        det_batch,
+        spark_model::layers::mtp_k3_batch_cseq_enabled() && verify_idxs.len() >= 2,
+    ) {
         let mut batched_idxs: Vec<usize> = Vec::new();
         let mut leftover_idxs: Vec<usize> = Vec::new();
         for &idx in &verify_idxs {
@@ -1425,7 +1508,7 @@ pub fn step_mtp(
             dispatch_verify(model, a, &drafts, num_drafts, think, depth_policy);
         }
         suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
-        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy);
+        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy, det_batch);
         return;
     }
 
@@ -1435,7 +1518,10 @@ pub fn step_mtp(
     // drafts.len()>=4, equal K, no grammar, not thinking, no tree payload /
     // tree-or-portfolio method, not finished. Others fall through per-seq.
     if batched_dflash_verify_allowed(
-        dflash_batched_verify_enabled(),
+        deterministic_batch_route::mtp_cross_seq_verify_allowed(
+            det_batch,
+            dflash_batched_verify_enabled(),
+        ),
         verify_idxs.len(),
         model.is_ep(),
         model.proposer_is_dflash(),
@@ -1518,7 +1604,7 @@ pub fn step_mtp(
             }
         }
         suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
-        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy);
+        post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy, det_batch);
         return;
     }
 
@@ -1578,7 +1664,7 @@ pub fn step_mtp(
         }
     }
     suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
-    post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy);
+    post_verify_sync_and_history_graft(model, active, num_drafts, depth_policy, det_batch);
 }
 
 #[cfg(test)]

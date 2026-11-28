@@ -525,6 +525,23 @@ fn initial_prefill_chunk_budget(max_prefill_tokens: usize, max_batch_tokens: usi
     )
 }
 
+fn fail_new_requests_deterministic_batch(
+    new_reqs: Vec<InferenceRequest>,
+    error: &spark_model::layers::deterministic_batch::DeterministicBatchEnvError,
+) {
+    tracing::error!("invalid ATLAS_DETERMINISTIC_BATCH in start_new_requests: {error}");
+    let msg = format!("{error}");
+    for req in new_reqs {
+        let mut sink = match req {
+            InferenceRequest::Streaming { token_tx, .. } => ResponseSink::Streaming(token_tx),
+            InferenceRequest::Blocking { response_tx, .. } => {
+                ResponseSink::Blocking(Some(response_tx))
+            }
+        };
+        send_error_to_sink(&mut sink, &msg);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_new_requests(
     model: &dyn Model,
@@ -554,6 +571,13 @@ pub(super) fn start_new_requests(
     prefilling: &mut Vec<PrefillInProgress>,
     ledger: &mut super::prefill_slo::PrefillTickLedger,
 ) {
+    let det_batch = match super::deterministic_batch_route::scheduler_deterministic_batch_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            fail_new_requests_deterministic_batch(new_reqs, &error);
+            return;
+        }
+    };
     start_new_requests_with_short_batch(
         model,
         new_reqs,
@@ -581,7 +605,10 @@ pub(super) fn start_new_requests(
         active,
         prefilling,
         ledger,
-        short_batch_enabled(),
+        super::deterministic_batch_route::prefill_short_batch_allowed(
+            det_batch,
+            short_batch_enabled(),
+        ),
     );
 }
 
@@ -615,10 +642,20 @@ fn start_new_requests_with_short_batch(
     ledger: &mut super::prefill_slo::PrefillTickLedger,
     short_batch_allowed: bool,
 ) {
+    let det_batch = match super::deterministic_batch_route::scheduler_deterministic_batch_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            fail_new_requests_deterministic_batch(new_reqs, &error);
+            return;
+        }
+    };
+    let short_batch_allowed = super::deterministic_batch_route::prefill_short_batch_allowed(
+        det_batch,
+        short_batch_allowed,
+    );
     let active_start = active.len();
     let complete_all_chunks = chunked
-        && active_start == 0
-        && prefilling.is_empty()
+        && (det_batch.is_enabled() || (active_start == 0 && prefilling.is_empty()))
         && model.hc_mult() > 0
         && chunk_plan.slo.is_none();
     let mut req_queue: VecDeque<InferenceRequest> = new_reqs.into();
@@ -734,11 +771,18 @@ fn start_new_requests_with_short_batch(
                 max_prefill_tokens,
                 max_batch_tokens,
                 chunk_plan,
-                !complete_all_chunks && !active.is_empty(),
+                super::deterministic_batch_route::prefill_chunk_sees_active_decode(
+                    det_batch,
+                    !complete_all_chunks && !active.is_empty(),
+                ),
                 model.is_mla(),
                 prompt_len,
             );
-            let next_tokens = req_queue.front().map(|next_req| next_req.prompt_tokens());
+            let next_tokens = if det_batch.is_enabled() {
+                None
+            } else {
+                req_queue.front().map(|next_req| next_req.prompt_tokens())
+            };
             match start_chunked_prefill_with_defer(
                 think_end_token,
                 think_start_token,
@@ -1615,5 +1659,135 @@ mod tests {
         );
         assert!(m.frees.lock().unwrap().is_empty(), "nothing is freed");
         assert!(prefilling.is_empty());
+    }
+
+    #[test]
+    fn deterministic_batch_disables_qwen4_short_prefill_burst_and_fails_closed_on_invalid_env() {
+        use spark_model::layers::deterministic_batch::DETERMINISTIC_BATCH_ENV;
+
+        // Enabled: concurrent short-batch-eligible Qwen4 prompts run strictly
+        // through canonical B=1 `prefill_chunk` (zero `prefill_batch_chunk` calls).
+        {
+            let _det =
+                super::super::deterministic_batch_route::test_support::ScopedDetBatchEnv::set(
+                    Some("1"),
+                );
+            let m = Qwen4ShortBatchMock::new(64, 64);
+            let mut active = Vec::new();
+            let mut prefilling = Vec::new();
+            let mut grammar_engine = None;
+            let mut ledger = super::super::prefill_slo::PrefillTickLedger::default();
+            let pending = empty_pending();
+
+            let mut reqs = Vec::new();
+            let mut rxs = Vec::new();
+            for len in [20usize, 24, 28, 32] {
+                let (req, rx) = blocking_request(vec![7u32; len]);
+                reqs.push(req);
+                rxs.push(rx);
+            }
+
+            start_new_requests_with_short_batch(
+                &m,
+                reqs,
+                &pending,
+                &[],
+                usize::MAX,
+                0,
+                16,
+                0,
+                8,
+                true,
+                512,
+                512,
+                super::super::prefill_chunk_policy::ChunkPlan::default(),
+                &[17],
+                0,
+                0,
+                &mut grammar_engine,
+                512,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut active,
+                &mut prefilling,
+                &mut ledger,
+                true,
+            );
+
+            assert!(
+                m.batch_calls.lock().unwrap().is_empty(),
+                "ATLAS_DETERMINISTIC_BATCH=1 must never invoke prefill_batch_chunk"
+            );
+            assert_eq!(
+                *m.serial_calls.lock().unwrap(),
+                vec![20, 24, 28, 32],
+                "every prompt must prefill via canonical single-sequence prefill_chunk"
+            );
+            assert_eq!(active.len(), 4);
+            assert!(prefilling.is_empty());
+            drop(rxs);
+        }
+
+        // Invalid env: fail closed all incoming requests with zero model work.
+        {
+            let _det =
+                super::super::deterministic_batch_route::test_support::ScopedDetBatchEnv::set(
+                    Some("bogus"),
+                );
+            let m = Qwen4ShortBatchMock::new(64, 64);
+            let mut active = Vec::new();
+            let mut prefilling = Vec::new();
+            let mut grammar_engine = None;
+            let mut ledger = super::super::prefill_slo::PrefillTickLedger::default();
+            let pending = empty_pending();
+            let (req0, mut rx0) = blocking_request(vec![7u32; 20]);
+            let (req1, mut rx1) = blocking_request(vec![9u32; 24]);
+
+            start_new_requests(
+                &m,
+                vec![req0, req1],
+                &pending,
+                &[],
+                usize::MAX,
+                0,
+                16,
+                0,
+                8,
+                true,
+                512,
+                512,
+                super::super::prefill_chunk_policy::ChunkPlan::default(),
+                &[17],
+                0,
+                0,
+                &mut grammar_engine,
+                512,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut active,
+                &mut prefilling,
+                &mut ledger,
+            );
+
+            assert!(m.batch_calls.lock().unwrap().is_empty());
+            assert!(m.serial_calls.lock().unwrap().is_empty());
+            assert!(active.is_empty());
+            assert!(prefilling.is_empty());
+            for rx in [&mut rx0, &mut rx1] {
+                match rx.try_recv() {
+                    Ok(Err(err)) => {
+                        assert!(err.to_string().contains(DETERMINISTIC_BATCH_ENV), "{err:#}")
+                    }
+                    Ok(Ok(_)) => panic!("expected fail-closed env error, got Ok response"),
+                    Err(_) => panic!("expected fail-closed env error, channel closed"),
+                }
+            }
+        }
     }
 }
