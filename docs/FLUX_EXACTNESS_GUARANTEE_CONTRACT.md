@@ -123,30 +123,29 @@ Every performance optimization introduced across Flux v1.2, v1.3, v1.4, v1.5, an
 
 ---
 
-## 3. Live GB10 Flux v1.4 Exactness Certification Receipts
+## 3. Live GB10 Flux v1.4 – v1.6 Exactness Certification Receipts
 
-Measured directly on **NVIDIA GB10** (`SM 12.1`, `48 SMs`, `24.0 MiB` L2) at verified Flux v1.4 commit `d5df69cedb` (`33` kernels / `421` entries `PROVED (sm_121a PTX+SASS)`, `0 B` stack/spills, `0` odd `desc[UR]`).
+Measured directly on **NVIDIA GB10** (`SM 12.1`, `48 SMs`, `24.0 MiB` L2) across verified Flux v1.4 (`d5df69cedb`), v1.5 (`fd01b4dfda`), and v1.6 (`33` kernels / `422` entries `PROVED (sm_121a PTX+SASS)`, `0 B` stack/spills, `0` odd `desc[UR]`).
 
 ### 3.1 Live GB10 GPU Kernel `0-ULP` Exactness Proofs
 
 | Kernel / Track | Live GB10 Shape | Exactness Proof (`0-ULP`) | Observed GB10 Telemetry |
 |---|---|---|---|
-| `lm_head_int8_block32` (`V14-T5` / `V15-T2` / `V16-T3`) | `Qwen3.8-Flash-Next` (`V=248320, K=2560`, `675.4 MB` vs `1,271.4 MB` BF16) | `M1==M8==M16==M32==M64 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `3.23–3.29 ms` (`206.9 GB/s`, `I2F=0`); `M=32`: `3.45 ms` (`192.1 GB/s`, `1.89x`); `M=64`: `5.54 ms` (v1.5 `128t`) / `256t` bank-conflict-free `80-reg` in v1.6 |
-| `lm_head_int8_block32` (`V14-T5` / `V15-T2` / `V16-T3`) | `Qwen3.8-27B` (`V=248320, K=5120`, `1,350.9 MB` vs `2,542.8 MB` BF16) | `M1==M8==M16==M32==M64 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `6.81–7.11 ms` (`196.7 GB/s`, `I2F=0`); `M=32`: `7.36 ms` (`177.2 GB/s`) |
+| `lm_head_int8_block32` (`V14-T5` / `V15-T2` / `V16-T3`) | `Qwen3.8-Flash-Next` (`V=248320, K=2560`, `675.4 MB` vs `1,271.4 MB` BF16) | `128t(M=1)==256t(M=33): 0/248320`, `128t(M=64)==256t(M=64)` ALL 64 rows: **`0/15,892,480` diffs**, `gemm == fused argmax` | `M=1..16`: `3.23–3.29 ms` (`206.9 GB/s`, `I2F=0`); `M=32`: `3.32 ms` (`204.0 GB/s`); `M=64` (`256t` bank-conflict-free `80-reg`): **`3.428 ms` (`198.2 GB/s`, `1.58x` vs v1.5 `5.54 ms`, `3.97x` vs v1.4 `13.6 ms`)** |
+| `lm_head_int8_block32` (`V14-T5` / `V15-T2` / `V16-T3`) | `Qwen3.8-27B` (`V=248320, K=5120`, `1,350.9 MB` vs `2,542.8 MB` BF16) | `128t(M=1)==256t(M=33): 0/248320`, `128t(M=64)==256t(M=64)` ALL 64 rows: **`0/15,892,480` diffs** | `M=1..16`: `6.81–7.12 ms` (`196.7 GB/s`, `I2F=0`); `M=32`: `7.17 ms` (`189.9 GB/s`); `M=64` (`256t`): **`7.370 ms` (`183.2 GB/s`, `1.48x` vs `11.06 ms`)** |
 | `w4a4_decode_roofline_sm120` v2 (`V14-T4A` / `V15-T3`) | `Qwen3.8-27B` `down_proj` (`5120×17408`, `split_k=3`, `50.14 MB`, `0 B` SMEM, `80 regs`) | `M1==M8 diff=0/5120`, `M1==M16 diff=0/5120` | `M=1..16`: `254.7–277.2 us` (`196.9 GB/s`, `1.63x` vs v1.4 `420 us`) |
 | `w4a4_decode_roofline_sm120` v2 (`V14-T4A` / `V15-T3`) | `Qwen3.8-27B` `gate_proj` (`17408×5120`, `split_k=3`, `50.14 MB`, `0 B` SMEM, `80 regs`) | `M1==M8 diff=0/17408`, `M1==M16 diff=0/17408` | `M=1..16`: `249.6–291.5 us` (`200.8 GB/s`, ~97% GB10 LPDDR5X roofline) |
 | `gdn_correction_replay_sm120` (`V14-T1`) | `Qwen3.8-27B` (`48L`, `nk=16, nv=48, D=128`) | `status=0`, `515.0 KB/L` 1D record vs `48.0 MB` 2D snapshot | `verify_1d`: `33.1 us/L` (`W=8`) / `40.6 us/L` (`W=16`); 48L `commit_1d`: `1.402 ms` (`215.4 GB/s R+W`) |
 
-### 3.2 Live GB10 End-to-End Serving Exactness (`Qwen3.8-Flash-Next`)
+### 3.2 Live GB10 End-to-End Serving Exactness (`Qwen3.8-Flash-Next` + `DFlash2 W=8`)
 
-| Serving Exactness Gate | Flux v1.4 Live GB10 Receipt (`arm1` Base & `arm2` Opt-In) | Status / v1.5 Action |
+| Serving Exactness Gate | Live GB10 Receipt (Flux v1.6 `ATLAS_DETERMINISTIC_BATCH=1` + `ATLAS_LM_HEAD_INT8_BLOCK32=1` + `ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1`) | Status |
 |---|---|---|
-| Cold-vs-warm prefix/GDN replay (`prefix_repeat_exact`) | **`4/4`** (`traj_code_ringbuf`, `traj_prose_nav`, `traj_code_dijkstra`, `traj_arith_seq`; 256-tok SHA-256 identical, `first_diff = null`) | **PASS (`4/4`)** |
-| Cold long-context needle recall | **`4/4`** (`needle_4k` 9,240 ptoks, `needle_8k` 18,467 ptoks, `needle_16k` 37,793 ptoks, plus `16,647`-ptok `FLUX-V12-KV-14336-9472` verbatim recall) | **PASS (`4/4`)** |
-| Cross-request canary isolation (`B=8`) | **`0` canary leaks** across every concurrent `B=8` batch | **PASS (`0` leaks)** |
-| Baseline `arm1` vs v1.4 opt-in `arm2` (`--compare`) | **`4/4` trajectory exact** (`diff = None`; matching SHA-256 `cb5977fdbf0df266`, `99e1b8bfb0a36534`, `c7bd29da45937832`, `352f3ac613aea27c`) | **PASS (`4/4`)** |
-| Mixed batch invariance (`batch_b1_vs_b8_exact`) | `1/4` under default dynamic-`M` routing (`arith_seq` exact; `diff=124/32/258` on `ringbuf/prose_nav/dijkstra`) | **Remediated in v1.5** via `ATLAS_DETERMINISTIC_BATCH=1` (target `4/4` under `--require-batch-invariance`) |
-| Raw `/v1/completions` cross-engine tokenization | Auto-prepended `<think></think>\n\n` shifted token `0` on raw string prompts | **Remediated in v1.5** via `--cross-engine-parity` (`--prompt-token-ids` / chat `enable_thinking=false`) & `ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1` |
+| Cold-vs-warm prefix/GDN replay (`prefix_repeat_exact`) | **`4/4`** (`traj_code_ringbuf`, `traj_prose_nav`, `traj_code_dijkstra`, `traj_arith_seq`; 256-tok SHA-256 identical, `first_diff = null`, `max_kl = 0.0`) | **PASS (`4/4`)** |
+| Cold long-context needle recall | **`4/4`** (`needle_4k` 9.2K, `needle_8k` 18.5K, `needle_16k` 37.8K, `needle_32k` 53.2K + `16,647`-ptok `FLUX-V12-KV-14336-9472` verbatim recall) | **PASS (`4/4`)** |
+| Mixed batch invariance (`B=1 == B=4` & `B=1 == B=8`) | **`4/4` `b1_vs_b4`** AND **`4/4` `b1_vs_b8`** (`first_diff = null` across all 4 trajectories on both certification harnesses!) | **PASS (`4/4` & `4/4`)** |
+| Cross-request canary isolation (`B=4` & `B=8`) | **`0` canary leaks** across every concurrent mixed batch | **PASS (`0` leaks)** |
+| Verbatim raw `/v1/completions` cross-engine parity | `ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1` skips `<think></think>\n\n` prepend and whitespace trim (`traj_arith_seq` 256-tok SHA-256 `748333d827a4b902` bit-exact across independent engines) | **PASS** |
 
 ---
 
