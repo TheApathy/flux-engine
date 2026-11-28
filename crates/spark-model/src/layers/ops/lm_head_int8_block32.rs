@@ -8,11 +8,18 @@
 //! (auto-discovered by `atlas-kernels` under module
 //! `"lm_head_int8_block32_argmax_sm120"`):
 //! - `lm_head_int8_block32_gemm_sm120`: full BF16 logit mode (`M = 1..=64`,
-//!   `K % 32 == 0`, arbitrary `N`) with `LDG.E.EF.128` weights, coalesced
-//!   `u32` `LDG.E.EF` scale-pair loads, `LDG.E.128.CONSTANT` activations,
+//!   optimal `128`-thread 4-warp path for `M = 1..=32`, `K % 32 == 0`,
+//!   arbitrary `N`) with `LDG.E.EF.128` weights, coalesced `u32`
+//!   `LDG.E.CONSTANT` scale-pair loads, `LDG.E.128.CONSTANT` activations,
 //!   0-ULP lossless `int8 -> bf16` unpack into portable
 //!   `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, FP32 per-block-32
 //!   scale factorization, and explicit inline PTX `cvt.rn.bf16.f32` epilogue.
+//! - `lm_head_int8_block32_gemm_m64_sm120`: specialized `256`-thread 8-warp
+//!   (`2 M-warps x 4 N-warps`) single-CTA `grid.y = 1` full BF16 logit GEMM
+//!   for `M = 33..=64` (0-ULP bit-identical to `gemm_sm120` across all
+//!   `M = 1..=64`), with bank-conflict-free padded SMEM (`smem_A[64][72]`,
+//!   `smem_W[64][80]`), half the accumulator pressure (`acc[2][2][4]`),
+//!   dual-accumulator `A`-reuse ILP, and full 2-stage `A + W + S` prefetch.
 //! - `lm_head_int8_block32_argmax_stage1_sm120`: fused `M = 1..=16`,
 //!   `V_TILE = 256` online warp/block argmax skipping `[M, V]` BF16 logit
 //!   materialization (`<= 62 KiB` partials at `M=8, V=248k`) with deterministic
@@ -44,8 +51,13 @@ pub const LM_HEAD_INT8_BLOCK32_ENV: &str = "ATLAS_LM_HEAD_INT8_BLOCK32";
 /// Number of weights sharing each BF16 block scale (`8.50 bpw`).
 pub const LM_HEAD_INT8_BLOCK_SIZE: u32 = 32;
 
-/// Maximum rows `M` supported by `lm_head_int8_block32_gemm_sm120`.
+/// Maximum rows `M` supported by `lm_head_int8_block32_gemm_sm120` / `m64_sm120`.
 pub const LM_HEAD_INT8_GEMM_MAX_M: u32 = 64;
+
+/// Minimum rows `M` at which dispatch selects the 256-thread (`2 M-warps x 4 N-warps`)
+/// `lm_head_int8_block32_gemm_m64_sm120` variant (`M in 33..=64`), keeping the
+/// 128-thread `lm_head_int8_block32_gemm_sm120` kernel for `M in 1..=32`.
+pub const LM_HEAD_INT8_GEMM_M64_MIN_M: u32 = 33;
 
 /// Output columns per CTA in `lm_head_int8_block32_gemm_sm120`.
 pub const LM_HEAD_INT8_GEMM_N_TILE: u32 = 64;
@@ -247,6 +259,21 @@ pub struct LmHeadInt8Block32GemmPlan {
     pub weight_plan: Int8Block32WeightPlan,
 }
 
+impl LmHeadInt8Block32GemmPlan {
+    /// Returns `true` when `rows` lies in `33..=64` and should dispatch the
+    /// specialized 256-thread (`2 M-warps x 4 N-warps`) `gemm_m64_sm120` kernel.
+    #[must_use]
+    pub const fn use_m64_variant(&self) -> bool {
+        self.rows >= LM_HEAD_INT8_GEMM_M64_MIN_M
+    }
+
+    /// Preferred CTA thread count for this plan (`128` for `M <= 32`, `256` for `M > 32`).
+    #[must_use]
+    pub const fn preferred_block_threads(&self) -> u32 {
+        if self.use_m64_variant() { 256 } else { 128 }
+    }
+}
+
 /// Validate dimensions for `lm_head_int8_block32_gemm_sm120`.
 ///
 /// # Errors
@@ -368,6 +395,7 @@ pub fn plan_lm_head_int8_block32_argmax(
 #[derive(Clone, Copy, Debug)]
 pub struct LmHeadInt8Block32Kernels {
     pub gemm: KernelHandle,
+    pub gemm_m64: KernelHandle,
     pub argmax_stage1: KernelHandle,
     pub argmax_stage2: KernelHandle,
     pub quantize: KernelHandle,
@@ -377,6 +405,7 @@ impl Default for LmHeadInt8Block32Kernels {
     fn default() -> Self {
         Self {
             gemm: KernelHandle(0),
+            gemm_m64: KernelHandle(0),
             argmax_stage1: KernelHandle(0),
             argmax_stage2: KernelHandle(0),
             quantize: KernelHandle(0),
@@ -387,6 +416,7 @@ impl Default for LmHeadInt8Block32Kernels {
 impl PartialEq for LmHeadInt8Block32Kernels {
     fn eq(&self, other: &Self) -> bool {
         self.gemm.0 == other.gemm.0
+            && self.gemm_m64.0 == other.gemm_m64.0
             && self.argmax_stage1.0 == other.argmax_stage1.0
             && self.argmax_stage2.0 == other.argmax_stage2.0
             && self.quantize.0 == other.quantize.0
@@ -396,7 +426,7 @@ impl PartialEq for LmHeadInt8Block32Kernels {
 impl Eq for LmHeadInt8Block32Kernels {}
 
 impl LmHeadInt8Block32Kernels {
-    /// Probe all 4 entrypoints from module `"lm_head_int8_block32_argmax_sm120"`.
+    /// Probe all 5 entrypoints from module `"lm_head_int8_block32_argmax_sm120"`.
     #[must_use]
     pub fn probe(gpu: &dyn GpuBackend) -> Self {
         Self {
@@ -404,6 +434,11 @@ impl LmHeadInt8Block32Kernels {
                 gpu,
                 LM_HEAD_INT8_BLOCK32_MODULE,
                 "lm_head_int8_block32_gemm_sm120",
+            ),
+            gemm_m64: crate::layers::try_kernel(
+                gpu,
+                LM_HEAD_INT8_BLOCK32_MODULE,
+                "lm_head_int8_block32_gemm_m64_sm120",
             ),
             argmax_stage1: crate::layers::try_kernel(
                 gpu,
@@ -423,10 +458,40 @@ impl LmHeadInt8Block32Kernels {
         }
     }
 
-    /// True when the full BF16 logit GEMM kernel is loaded.
+    /// True when the 128-thread (`M = 1..=32`) full BF16 logit GEMM kernel is loaded.
     #[must_use]
     pub const fn gemm_ready(self) -> bool {
         self.gemm.0 != 0
+    }
+
+    /// True when the 256-thread (`M = 33..=64`) full BF16 logit GEMM kernel is loaded.
+    #[must_use]
+    pub const fn gemm_m64_ready(self) -> bool {
+        self.gemm_m64.0 != 0
+    }
+
+    /// Select `(kernel_handle, block_threads)` for a validated row count `rows in 1..=64`:
+    /// - `M in 33..=64` prefers 256-thread `lm_head_int8_block32_gemm_m64_sm120`, falling
+    ///   back cleanly to 128-thread `lm_head_int8_block32_gemm_sm120` if unavailable.
+    /// - `M in 1..=32` keeps the 128-thread `lm_head_int8_block32_gemm_sm120` kernel
+    ///   untouched, falling back to `gemm_m64` only if `gemm` is unavailable.
+    #[must_use]
+    pub const fn select_gemm_kernel(self, rows: u32) -> (KernelHandle, u32) {
+        if rows >= LM_HEAD_INT8_GEMM_M64_MIN_M {
+            if self.gemm_m64.0 != 0 {
+                (self.gemm_m64, 256)
+            } else if self.gemm.0 != 0 {
+                (self.gemm, 128)
+            } else {
+                (KernelHandle(0), 0)
+            }
+        } else if self.gemm.0 != 0 {
+            (self.gemm, 128)
+        } else if self.gemm_m64.0 != 0 {
+            (self.gemm_m64, 256)
+        } else {
+            (KernelHandle(0), 0)
+        }
     }
 
     /// True when both fused online argmax stages are loaded.
@@ -828,18 +893,12 @@ pub fn free_lm_head_int8_block32_weight(gpu: &dyn GpuBackend, weight: Int8Block3
     }
 }
 
-/// Launch `lm_head_int8_block32_gemm_sm120` (single-CTA full BF16 logit GEMM
-/// for `M in 1..=64`, `K % 32 == 0`, arbitrary `N`).
-///
-/// Grid: `(ceil(N / 64), 1, 1)`  Block: `(128, 1, 1)`
-///
-/// # Errors
-/// Fails closed before launch on invalid handle, dimensions, alignment,
-/// null pointers, or buffer aliasing.
 #[allow(clippy::too_many_arguments)]
-pub fn lm_head_int8_block32_gemm_sm120(
+fn launch_lm_head_int8_block32_gemm_checked(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
+    label: &str,
+    block_threads: u32,
     plan: &LmHeadInt8Block32GemmPlan,
     input_bf16: DevicePtr,
     weight: &Int8Block32DeviceWeight,
@@ -847,23 +906,20 @@ pub fn lm_head_int8_block32_gemm_sm120(
     out_logits_bytes: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(
-        kernel.0 != 0,
-        "lm_head_int8_block32_gemm_sm120 requires a non-zero kernel handle"
-    );
+    ensure!(kernel.0 != 0, "{label} requires a non-zero kernel handle");
     let checked = plan_lm_head_int8_block32_gemm(plan.rows, plan.vocab, plan.hidden)?;
     validate_device_weight(weight, checked.vocab, checked.hidden)?;
     ensure!(
         !input_bf16.is_null() && input_bf16.0.is_multiple_of(16),
-        "lm_head_int8_block32_gemm_sm120: input_bf16 must be non-null and 16B-aligned"
+        "{label}: input_bf16 must be non-null and 16B-aligned"
     );
     ensure!(
         !out_logits_bf16.is_null() && out_logits_bf16.0.is_multiple_of(2),
-        "lm_head_int8_block32_gemm_sm120: out_logits_bf16 must be non-null and 2B-aligned"
+        "{label}: out_logits_bf16 must be non-null and 2B-aligned"
     );
     ensure!(
         out_logits_bytes >= checked.c_bytes,
-        "lm_head_int8_block32_gemm_sm120: out_logits ({out_logits_bytes} B) smaller than required {} B",
+        "{label}: out_logits ({out_logits_bytes} B) smaller than required {} B",
         checked.c_bytes
     );
     ensure_disjoint(
@@ -893,7 +949,7 @@ pub fn lm_head_int8_block32_gemm_sm120(
 
     KernelLaunch::new(gpu, kernel)
         .grid([checked.grid_x, checked.grid_y, 1])
-        .block([128, 1, 1])
+        .block([block_threads, 1, 1])
         .arg_ptr(input_bf16)
         .arg_ptr(weight.w_i8)
         .arg_ptr(weight.scales_bf16)
@@ -902,6 +958,129 @@ pub fn lm_head_int8_block32_gemm_sm120(
         .arg_u32(checked.vocab)
         .arg_u32(checked.hidden)
         .launch(stream)
+}
+
+/// Launch `lm_head_int8_block32_gemm_sm120` (128-thread single-CTA full BF16
+/// logit GEMM optimal for `M in 1..=32`, valid across `M in 1..=64`,
+/// `K % 32 == 0`, arbitrary `N`).
+///
+/// Grid: `(ceil(N / 64), 1, 1)`  Block: `(128, 1, 1)`
+///
+/// # Errors
+/// Fails closed before launch on invalid handle, dimensions, alignment,
+/// null pointers, or buffer aliasing.
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_int8_block32_gemm_sm120(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    plan: &LmHeadInt8Block32GemmPlan,
+    input_bf16: DevicePtr,
+    weight: &Int8Block32DeviceWeight,
+    out_logits_bf16: DevicePtr,
+    out_logits_bytes: usize,
+    stream: u64,
+) -> Result<()> {
+    launch_lm_head_int8_block32_gemm_checked(
+        gpu,
+        kernel,
+        "lm_head_int8_block32_gemm_sm120",
+        128,
+        plan,
+        input_bf16,
+        weight,
+        out_logits_bf16,
+        out_logits_bytes,
+        stream,
+    )
+}
+
+/// Launch `lm_head_int8_block32_gemm_m64_sm120` (specialized 256-thread
+/// `2 M-warps x 4 N-warps` single-CTA full BF16 logit GEMM for `M in 33..=64`,
+/// valid and 0-ULP bit-identical to `lm_head_int8_block32_gemm_sm120` across
+/// all `M in 1..=64`).
+///
+/// Grid: `(ceil(N / 64), 1, 1)`  Block: `(256, 1, 1)`
+///
+/// # Errors
+/// Fails closed before launch on invalid handle, dimensions, alignment,
+/// null pointers, or buffer aliasing.
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_int8_block32_gemm_m64_sm120(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    plan: &LmHeadInt8Block32GemmPlan,
+    input_bf16: DevicePtr,
+    weight: &Int8Block32DeviceWeight,
+    out_logits_bf16: DevicePtr,
+    out_logits_bytes: usize,
+    stream: u64,
+) -> Result<()> {
+    launch_lm_head_int8_block32_gemm_checked(
+        gpu,
+        kernel,
+        "lm_head_int8_block32_gemm_m64_sm120",
+        256,
+        plan,
+        input_bf16,
+        weight,
+        out_logits_bf16,
+        out_logits_bytes,
+        stream,
+    )
+}
+
+/// Dispatch the optimal single-CTA (`grid.y = 1`) full BF16 logit GEMM variant
+/// for `plan.rows in 1..=64`:
+/// - `M in 1..=32`: 128-thread `lm_head_int8_block32_gemm_sm120`
+/// - `M in 33..=64`: 256-thread `lm_head_int8_block32_gemm_m64_sm120` (falling
+///   back cleanly to `lm_head_int8_block32_gemm_sm120` if `gemm_m64` is absent)
+///
+/// Returns the launched CTA block size (`128` or `256`).
+///
+/// # Errors
+/// Fails closed before launch if neither GEMM kernel is loaded or any buffer /
+/// dimension check fails.
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_int8_block32_gemm_dispatch(
+    gpu: &dyn GpuBackend,
+    kernels: LmHeadInt8Block32Kernels,
+    plan: &LmHeadInt8Block32GemmPlan,
+    input_bf16: DevicePtr,
+    weight: &Int8Block32DeviceWeight,
+    out_logits_bf16: DevicePtr,
+    out_logits_bytes: usize,
+    stream: u64,
+) -> Result<u32> {
+    let checked = plan_lm_head_int8_block32_gemm(plan.rows, plan.vocab, plan.hidden)?;
+    let (kernel, block_threads) = kernels.select_gemm_kernel(checked.rows);
+    ensure!(
+        kernel.0 != 0 && block_threads != 0,
+        "lm_head_int8_block32_gemm_dispatch requires gemm or gemm_m64 kernel handle"
+    );
+    if block_threads == 256 {
+        lm_head_int8_block32_gemm_m64_sm120(
+            gpu,
+            kernel,
+            &checked,
+            input_bf16,
+            weight,
+            out_logits_bf16,
+            out_logits_bytes,
+            stream,
+        )?;
+    } else {
+        lm_head_int8_block32_gemm_sm120(
+            gpu,
+            kernel,
+            &checked,
+            input_bf16,
+            weight,
+            out_logits_bf16,
+            out_logits_bytes,
+            stream,
+        )?;
+    }
+    Ok(block_threads)
 }
 
 /// Stage 1: Launch `lm_head_int8_block32_argmax_stage1_sm120`.
@@ -1557,15 +1736,29 @@ mod tests {
 
     #[test]
     fn verify_width_invariance_m1_m8_m16_m32_m64_and_non_tile_vocab_bit_exact() {
-        // Single-CTA grid.y == 1 across ALL M <= 64 (reads weights ONCE for M=1..=64).
-        for &(m, expected_mb) in &[(1u32, 1u32), (8, 1), (16, 1), (32, 2), (48, 3), (64, 4)] {
+        // Single-CTA grid.y == 1 across ALL M <= 64 (reads weights ONCE for M=1..=64),
+        // with 128-thread `gemm_sm120` for M <= 32 and 256-thread `gemm_m64_sm120` for M > 32.
+        for &(m, expected_mb, expected_m64) in &[
+            (1u32, 1u32, false),
+            (8, 1, false),
+            (16, 1, false),
+            (32, 2, false),
+            (33, 3, true),
+            (48, 3, true),
+            (64, 4, true),
+        ] {
             let p = plan_lm_head_int8_block32_gemm(m, 248_077, 2560).unwrap();
             assert_eq!(p.grid_y, 1, "expected single-CTA grid_y=1 at M={m}");
             assert_eq!(p.m_blocks, expected_mb);
+            assert_eq!(p.use_m64_variant(), expected_m64);
+            assert_eq!(
+                p.preferred_block_threads(),
+                if expected_m64 { 256 } else { 128 }
+            );
         }
 
         // Test BOTH odd-block K=96 (K % 64 == 32) and even-block K=128 with non-tile V=277
-        // across M in {1, 8, 16, 32, 48, 64} for 0-ULP batch-invariance.
+        // across M in {1, 8, 16, 32, 33, 48, 64} for 0-ULP batch-invariance.
         for &(v, k) in &[(277usize, 96usize), (277usize, 128usize)] {
             let w_bf16 = synthetic_gaussian_bf16(v * k, 0.04, 0x1010_2020 + k as u64);
             let w_q = quantize_bf16_weight_to_int8_block32(&w_bf16, v, k).unwrap();
@@ -1578,6 +1771,10 @@ mod tests {
                 lm_head_int8_block32_gemm_cpu(&a_64[32 * k..], &w_q, 32, v, k).unwrap();
             assert_eq!(logits_m32_0.as_slice(), &logits_m64[..32 * v]);
             assert_eq!(logits_m32_1.as_slice(), &logits_m64[32 * v..]);
+
+            let logits_m33 =
+                lm_head_int8_block32_gemm_cpu(&a_64[..33 * k], &w_q, 33, v, k).unwrap();
+            assert_eq!(logits_m33.as_slice(), &logits_m64[..33 * v]);
 
             let logits_m48 =
                 lm_head_int8_block32_gemm_cpu(&a_64[..48 * k], &w_q, 48, v, k).unwrap();
@@ -1818,6 +2015,7 @@ mod tests {
     fn mock_gpu_launchers_validate_alignment_aliasing_and_emit_expected_launches() {
         let kernels = LmHeadInt8Block32Kernels {
             gemm: KernelHandle(1),
+            gemm_m64: KernelHandle(5),
             argmax_stage1: KernelHandle(2),
             argmax_stage2: KernelHandle(3),
             quantize: KernelHandle(4),
@@ -2223,11 +2421,218 @@ mod tests {
     }
 
     #[test]
+    fn m64_gemm_dispatch_selects_128t_for_m1_to_32_and_256t_for_m33_to_64_and_fails_closed() {
+        struct RecordingGpu {
+            inner: MockGpuBackend,
+            launches: Mutex<Vec<(u64, [u32; 3], [u32; 3])>>,
+        }
+
+        impl GpuBackend for RecordingGpu {
+            fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
+                self.inner.alloc(bytes)
+            }
+            fn alloc_managed(&self, bytes: usize) -> Result<DevicePtr> {
+                self.inner.alloc_managed(bytes)
+            }
+            fn free(&self, ptr: DevicePtr) -> Result<()> {
+                self.inner.free(ptr)
+            }
+            fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
+                self.inner.copy_h2d(src, dst)
+            }
+            fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
+                self.inner.copy_d2h(src, dst)
+            }
+            fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()> {
+                self.inner.copy_d2d(src, dst, bytes)
+            }
+            fn launch(
+                &self,
+                func: KernelHandle,
+                grid: [u32; 3],
+                block: [u32; 3],
+                shared_mem: u32,
+                stream: u64,
+                params: &mut [*mut std::ffi::c_void],
+            ) -> Result<()> {
+                self.launches.lock().unwrap().push((func.0, grid, block));
+                self.inner
+                    .launch(func, grid, block, shared_mem, stream, params)
+            }
+            fn synchronize(&self, stream: u64) -> Result<()> {
+                self.inner.synchronize(stream)
+            }
+            fn default_stream(&self) -> u64 {
+                self.inner.default_stream()
+            }
+            fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle> {
+                self.inner.kernel(module, func_name)
+            }
+            fn memset(&self, ptr: DevicePtr, value: u8, bytes: usize) -> Result<()> {
+                self.inner.memset(ptr, value, bytes)
+            }
+            fn memset_async(
+                &self,
+                ptr: DevicePtr,
+                value: u8,
+                bytes: usize,
+                stream: u64,
+            ) -> Result<()> {
+                self.inner.memset_async(ptr, value, bytes, stream)
+            }
+            fn total_memory(&self) -> Result<usize> {
+                self.inner.total_memory()
+            }
+            fn free_memory(&self) -> Result<usize> {
+                self.inner.free_memory()
+            }
+        }
+
+        let kernels = LmHeadInt8Block32Kernels {
+            gemm: KernelHandle(11),
+            gemm_m64: KernelHandle(22),
+            argmax_stage1: KernelHandle(33),
+            argmax_stage2: KernelHandle(44),
+            quantize: KernelHandle(55),
+        };
+        let w_plan = plan_lm_head_int8_block32_weight(248_320, 2688).unwrap();
+        let dev_w = Int8Block32DeviceWeight {
+            w_i8: DevicePtr(0x1_0000_0000),
+            scales_bf16: DevicePtr(0x2_0000_0000),
+            rows: 248_320,
+            cols: 2688,
+            weight_bytes: w_plan.weight_bytes,
+            scales_bytes: w_plan.scales_bytes,
+        };
+        let gpu = RecordingGpu {
+            inner: MockGpuBackend::new(),
+            launches: Mutex::new(Vec::new()),
+        };
+
+        // 1. M in {1, 8, 16, 32} -> 128-thread `gemm_sm120` (handle 11), grid.y == 1.
+        //    M in {33, 48, 64}   -> 256-thread `gemm_m64_sm120` (handle 22), grid.y == 1.
+        for &(m, expected_handle, expected_block) in &[
+            (1u32, 11u64, 128u32),
+            (8, 11, 128),
+            (16, 11, 128),
+            (32, 11, 128),
+            (33, 22, 256),
+            (48, 22, 256),
+            (64, 22, 256),
+        ] {
+            let plan = plan_lm_head_int8_block32_gemm(m, 248_320, 2688).unwrap();
+            let block = lm_head_int8_block32_gemm_dispatch(
+                &gpu,
+                kernels,
+                &plan,
+                DevicePtr(0x3_0000_0000),
+                &dev_w,
+                DevicePtr(0x4_0000_0000),
+                plan.c_bytes,
+                0x77,
+            )
+            .unwrap();
+            assert_eq!(block, expected_block, "wrong block size at M={m}");
+            let last = *gpu.launches.lock().unwrap().last().unwrap();
+            assert_eq!(last.0, expected_handle, "wrong kernel handle at M={m}");
+            assert_eq!(last.1, [plan.grid_x, 1, 1], "expected grid.y=1 at M={m}");
+            assert_eq!(
+                last.2,
+                [expected_block, 1, 1],
+                "wrong launch block at M={m}"
+            );
+        }
+
+        // 2. Fallback when `gemm_m64` is absent routes M=64 cleanly to 128-thread `gemm`.
+        let fallback_kernels = LmHeadInt8Block32Kernels {
+            gemm_m64: KernelHandle(0),
+            ..kernels
+        };
+        let plan64 = plan_lm_head_int8_block32_gemm(64, 248_320, 2688).unwrap();
+        let fb_block = lm_head_int8_block32_gemm_dispatch(
+            &gpu,
+            fallback_kernels,
+            &plan64,
+            DevicePtr(0x3_0000_0000),
+            &dev_w,
+            DevicePtr(0x4_0000_0000),
+            plan64.c_bytes,
+            0x88,
+        )
+        .unwrap();
+        assert_eq!(fb_block, 128);
+        assert_eq!(
+            *gpu.launches.lock().unwrap().last().unwrap(),
+            (11, [plan64.grid_x, 1, 1], [128, 1, 1])
+        );
+
+        // 3. Fail-closed checks on `gemm_m64_sm120` and `dispatch` emit 0 launches.
+        let launches_before_err = gpu.launches.lock().unwrap().len();
+        assert!(
+            lm_head_int8_block32_gemm_dispatch(
+                &gpu,
+                LmHeadInt8Block32Kernels::default(),
+                &plan64,
+                DevicePtr(0x3_0000_0000),
+                &dev_w,
+                DevicePtr(0x4_0000_0000),
+                plan64.c_bytes,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            lm_head_int8_block32_gemm_m64_sm120(
+                &gpu,
+                KernelHandle(0),
+                &plan64,
+                DevicePtr(0x3_0000_0000),
+                &dev_w,
+                DevicePtr(0x4_0000_0000),
+                plan64.c_bytes,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            lm_head_int8_block32_gemm_m64_sm120(
+                &gpu,
+                kernels.gemm_m64,
+                &plan64,
+                DevicePtr(0x3_0000_0008),
+                &dev_w,
+                DevicePtr(0x4_0000_0000),
+                plan64.c_bytes,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            lm_head_int8_block32_gemm_m64_sm120(
+                &gpu,
+                kernels.gemm_m64,
+                &plan64,
+                DevicePtr(0x3_0000_0000),
+                &dev_w,
+                DevicePtr(0x4_0000_0000),
+                plan64.c_bytes - 2,
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(gpu.launches.lock().unwrap().len(), launches_before_err);
+    }
+
+    #[test]
     fn cuda_source_preserves_isa_and_determinism_contracts() {
         let cu =
             include_str!("../../../../../kernels/gb10/common/lm_head_int8_block32_argmax_sm120.cu");
         assert!(cu.contains("SPDX-License-Identifier: AGPL-3.0-only"));
         assert!(cu.contains("void lm_head_int8_block32_gemm_sm120("));
+        assert!(cu.contains("void lm_head_int8_block32_gemm_m64_sm120("));
+        assert!(cu.contains("__launch_bounds__(256, 3)"));
+        assert!(cu.contains("W8_M64_SMEM_A_STRIDE"));
+        assert!(cu.contains("W8_M64_SMEM_W_STRIDE"));
         assert!(cu.contains("void lm_head_int8_block32_argmax_stage1_sm120("));
         assert!(cu.contains("void lm_head_int8_block32_argmax_stage2_sm120("));
         assert!(cu.contains("void quantize_bf16_to_int8_block32_sm120("));

@@ -1441,7 +1441,7 @@ impl TransformerModel {
             return Ok(None);
         }
         let kernels = ops::cached_lm_head_int8_block32_kernels(self.gpu.as_ref());
-        if !kernels.gemm_ready() {
+        if !kernels.gemm_ready() && !kernels.gemm_m64_ready() {
             return Ok(None);
         }
         let Ok(plan) = ops::plan_lm_head_int8_block32_gemm(num_tokens, vocab, h) else {
@@ -1456,9 +1456,9 @@ impl TransformerModel {
         else {
             return Ok(None);
         };
-        ops::lm_head_int8_block32_gemm_sm120(
+        let block_threads = ops::lm_head_int8_block32_gemm_dispatch(
             self.gpu.as_ref(),
-            kernels.gemm,
+            kernels,
             &plan,
             hidden,
             &dev_weight,
@@ -1482,6 +1482,7 @@ impl TransformerModel {
                 hidden = plan.hidden,
                 grid_y = plan.grid_y,
                 m_blocks = plan.m_blocks,
+                block_threads,
                 "LM_HEAD_INT8_BLOCK32_ENGAGED"
             );
         });
