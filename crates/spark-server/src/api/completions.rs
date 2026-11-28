@@ -297,16 +297,19 @@ fn validate_completion_input(req: &CompletionRequest) -> Result<(), Response> {
 /// Any other value (including non-UTF-8) fails closed with an error.
 const COMPLETIONS_RAW_NO_THINK_PREFIX_ENV: &str = "ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX";
 
-/// Policy governing whether raw `/v1/completions` text prompts auto-prepend
-/// `<think></think>\n\n` on thinking-capable models.
+/// Policy governing raw `/v1/completions` prompt prefixing and output cleanup
+/// on thinking-capable models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompletionsThinkPrefixPolicy {
     /// Default behavior: prepend `<think></think>\n\n` when the tokenizer
-    /// supports thinking and the raw text does not already contain `</think>`.
+    /// supports thinking and the raw text does not already contain `</think>`,
+    /// and apply `strip_thinking_tags` cleanup on blocking completion output.
     AutoPrepend,
-    /// Opt-in exact-token parity mode (`ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1`):
+    /// Opt-in exact-token verbatim parity mode (`ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1`):
     /// tokenize raw `/v1/completions` text verbatim without prepending
-    /// `<think></think>\n\n` or recording `completion_thinking_prefix`.
+    /// `<think></think>\n\n` or recording `completion_thinking_prefix`, and
+    /// skip `strip_thinking_tags` / whitespace trimming on completion output
+    /// (while keeping explicit `stop` sequences intact).
     RawNoThinkPrefix,
 }
 
@@ -353,7 +356,7 @@ fn completions_think_prefix_policy() -> Result<CompletionsThinkPrefixPolicy, Str
         RAW_NO_THINK_RECEIPT.call_once(|| {
             tracing::info!(
                 env = COMPLETIONS_RAW_NO_THINK_PREFIX_ENV,
-                "ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1 engaged (receipt): raw /v1/completions text prompts skip <think></think> auto-prepend"
+                "ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1 engaged (receipt): raw /v1/completions skips <think></think> prompt auto-prepend and output think-tag/whitespace cleanup"
             );
         });
     }
@@ -448,6 +451,20 @@ fn completion_output_with_audit(
     stops: &[String],
     ledger: Option<&crate::openai::SharedInterventionLedger>,
 ) -> String {
+    completion_output_with_audit_and_policy(
+        text,
+        stops,
+        ledger,
+        CompletionsThinkPrefixPolicy::AutoPrepend,
+    )
+}
+
+fn completion_output_with_audit_and_policy(
+    text: String,
+    stops: &[String],
+    ledger: Option<&crate::openai::SharedInterventionLedger>,
+    think_prefix_policy: CompletionsThinkPrefixPolicy,
+) -> String {
     let original = ledger.map(|_| text.clone());
     let stopped = strip_stop_sequences(text, stops);
     if original.as_ref().is_some_and(|text| *text != stopped) {
@@ -456,6 +473,9 @@ fn completion_output_with_audit(
             "completion_stop_sequence",
             "strip_output",
         );
+    }
+    if think_prefix_policy == CompletionsThinkPrefixPolicy::RawNoThinkPrefix {
+        return stopped;
     }
     let cleaned = strip_thinking_tags(&stopped);
     if cleaned != stopped {
@@ -804,8 +824,12 @@ pub(crate) async fn completions_with_policy(
             );
         }
     };
-    let output_text =
-        completion_output_with_audit(output_text, &req.stop, intervention_ledger.as_ref());
+    let output_text = completion_output_with_audit_and_policy(
+        output_text,
+        &req.stop,
+        intervention_ledger.as_ref(),
+        think_prefix_policy,
+    );
     let completion_token_ids = if req.return_token_ids {
         response.output_tokens.clone()
     } else {
@@ -1490,9 +1514,125 @@ mod completion_prompt_intervention_tests {
 
 #[cfg(test)]
 mod completion_output_intervention_tests {
-    use super::completion_output_with_audit;
-    use crate::openai::{InterventionLedger, snapshot_shared_interventions};
+    use super::{
+        CompletionsThinkPrefixPolicy, InferenceRequest, InferenceResponse, StreamEvent,
+        completion_output_with_audit, completion_output_with_audit_and_policy,
+        completions_with_policy,
+    };
+    use crate::AppState;
+    use crate::openai::{CompletionRequest, InterventionLedger, snapshot_shared_interventions};
+    use axum::Json;
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn verbatim_test_state() -> (Arc<AppState>, mpsc::Receiver<InferenceRequest>) {
+        let directory = tempfile::tempdir().unwrap();
+        let vocabulary = [
+            "[UNK]",
+            "hello",
+            " 1006, 1007",
+            "    # Initialize distances",
+            "##<stop>",
+            "##tail",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, token)| (token.to_string(), id as u32))
+        .collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocabulary)
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(tokenizers::decoders::wordpiece::WordPiece::new(
+            "##".into(),
+            false,
+        )));
+        tokenizer
+            .save(directory.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(
+            directory.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{{ messages }}"}"#,
+        )
+        .unwrap();
+        let tokenizer = crate::tokenizer::ChatTokenizer::from_model_dir(
+            directory.path(),
+            0,
+            true,
+            "verbatim-completion-fixture",
+            None,
+        )
+        .unwrap();
+        assert_eq!(tokenizer.decode(&[2]).unwrap(), " 1006, 1007");
+        assert_eq!(
+            tokenizer.decode(&[3]).unwrap(),
+            "    # Initialize distances"
+        );
+        assert_eq!(
+            tokenizer.decode(&[3, 4, 5]).unwrap(),
+            "    # Initialize distances<stop>tail"
+        );
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let state = Arc::new(AppState {
+            tokenizer,
+            model_name: "verbatim-completion-fixture".into(),
+            max_seq_len: 128,
+            max_batch_size: 1,
+            serving: serde_json::Value::Null,
+            yarn_context: false,
+            request_tx,
+            vision_config: None,
+            dsv41: false,
+            dsv41_vision: None,
+            default_temperature: 0.0,
+            default_top_k: 0,
+            default_top_p: 1.0,
+            default_top_n_sigma: 0.0,
+            default_min_p: 0.0,
+            tool_call_parser: None,
+            reasoning_parser: None,
+            think_end_token_id: None,
+            think_start_token_id: None,
+            tool_max_tokens: 16,
+            default_max_tokens: None,
+            sampling_presets: Default::default(),
+            tool_call_start_token_id: None,
+            auto_compact_threshold: None,
+            model_ready: Arc::new(AtomicBool::new(true)),
+            request_timeout: 0,
+            effective_context: 0,
+            behavior: Default::default(),
+            disable_thinking: false,
+            disable_simhash_watchdog: true,
+            default_chat_template_kwargs: None,
+            runtime: crate::runtime_settings::RuntimeSettings::for_tests(128),
+            response_store: crate::response_store::ResponseStore::with_config(
+                4,
+                Duration::from_secs(60),
+            ),
+            rate_limiter: crate::rate_limiter::RateLimiter::with_config(
+                crate::rate_limiter::RateLimitConfig {
+                    rpm: 0,
+                    tpm: 0,
+                    burst_rpm: 0,
+                    burst_tpm: 0,
+                },
+            ),
+            conversation_store: crate::conversation_store::ConversationStore::with_config(
+                4,
+                Duration::from_secs(60),
+            ),
+            dump_writer: None,
+            auth: None,
+        });
+        (state, request_rx)
+    }
 
     #[test]
     fn unchanged_completion_keeps_an_explicit_empty_ledger() {
@@ -1546,6 +1686,265 @@ mod completion_output_intervention_tests {
         assert_eq!(snapshot.events.len(), 2);
         assert_eq!(snapshot.events[0].code, "content_loop_watchdog");
         assert_eq!(snapshot.events[1].code, "completion_output_cleanup");
+    }
+
+    #[test]
+    fn raw_no_think_prefix_preserves_leading_spaces_and_raw_tags_while_auto_prepend_is_unchanged() {
+        for (sample, expected_auto_trimmed) in [
+            (" 1006, 1007, 1008", "1006, 1007, 1008"),
+            (
+                "    # Initialize distances\n    dist = {}",
+                "# Initialize distances\n    dist = {}",
+            ),
+            ("\n  return x", "return x"),
+            ("<think>private reasoning</think>answer", "answer"),
+        ] {
+            let raw_ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+            assert_eq!(
+                completion_output_with_audit_and_policy(
+                    sample.into(),
+                    &[],
+                    Some(&raw_ledger),
+                    CompletionsThinkPrefixPolicy::RawNoThinkPrefix,
+                ),
+                sample,
+                "RawNoThinkPrefix must preserve verbatim output for {sample:?}"
+            );
+            assert!(
+                snapshot_shared_interventions(Some(&raw_ledger))
+                    .unwrap()
+                    .events
+                    .is_empty(),
+                "RawNoThinkPrefix must not record completion_output_cleanup for {sample:?}"
+            );
+
+            let auto_ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+            let auto_out = completion_output_with_audit_and_policy(
+                sample.into(),
+                &[],
+                Some(&auto_ledger),
+                CompletionsThinkPrefixPolicy::AutoPrepend,
+            );
+            assert_eq!(auto_out, super::strip_thinking_tags(sample));
+            assert_eq!(
+                auto_out, expected_auto_trimmed,
+                "AutoPrepend baseline cleanup must remain byte-identical for {sample:?}"
+            );
+            let auto_events = snapshot_shared_interventions(Some(&auto_ledger))
+                .unwrap()
+                .events;
+            assert_eq!(auto_events.len(), 1);
+            assert_eq!(auto_events[0].code, "completion_output_cleanup");
+        }
+    }
+
+    #[test]
+    fn raw_no_think_prefix_keeps_stop_sequence_stripping_intact_without_trimming_indent() {
+        let stops = vec!["<stop>".to_string()];
+        let sample = "    # Initialize distances<stop>unpublished";
+
+        let raw_ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+        assert_eq!(
+            completion_output_with_audit_and_policy(
+                sample.into(),
+                &stops,
+                Some(&raw_ledger),
+                CompletionsThinkPrefixPolicy::RawNoThinkPrefix,
+            ),
+            "    # Initialize distances"
+        );
+        let raw_events = snapshot_shared_interventions(Some(&raw_ledger))
+            .unwrap()
+            .events;
+        assert_eq!(raw_events.len(), 1);
+        assert_eq!(raw_events[0].code, "completion_stop_sequence");
+
+        let auto_ledger = Arc::new(Mutex::new(InterventionLedger::default()));
+        assert_eq!(
+            completion_output_with_audit_and_policy(
+                sample.into(),
+                &stops,
+                Some(&auto_ledger),
+                CompletionsThinkPrefixPolicy::AutoPrepend,
+            ),
+            "# Initialize distances"
+        );
+        let auto_events = snapshot_shared_interventions(Some(&auto_ledger))
+            .unwrap()
+            .events;
+        assert_eq!(auto_events.len(), 2);
+        assert_eq!(auto_events[0].code, "completion_stop_sequence");
+        assert_eq!(auto_events[1].code, "completion_output_cleanup");
+    }
+
+    #[tokio::test]
+    async fn blocking_and_streaming_completions_preserve_leading_spaces_under_raw_no_think_prefix()
+    {
+        for (output_tokens, stop, expected_raw, expected_auto) in [
+            (vec![2u32], None, " 1006, 1007", "1006, 1007"),
+            (
+                vec![3u32],
+                None,
+                "    # Initialize distances",
+                "# Initialize distances",
+            ),
+            (
+                vec![3u32, 4, 5],
+                Some("<stop>"),
+                "    # Initialize distances",
+                "# Initialize distances",
+            ),
+        ] {
+            // Blocking RawNoThinkPrefix preserves exact leading whitespace and applies stops.
+            let (st_raw, mut rx_raw) = verbatim_test_state();
+            let mut payload = json!({
+                "prompt": "hello",
+                "max_tokens": 8,
+                "temperature": 0.0,
+                "report_interventions": true,
+            });
+            if let Some(s) = stop {
+                payload["stop"] = json!(s);
+            }
+            let req_raw: CompletionRequest = serde_json::from_value(payload.clone()).unwrap();
+            let toks = output_tokens.clone();
+            let handler = completions_with_policy(
+                st_raw,
+                Ok(Json(req_raw)),
+                Ok(CompletionsThinkPrefixPolicy::RawNoThinkPrefix),
+            );
+            let scheduler = async move {
+                let InferenceRequest::Blocking { response_tx, .. } = rx_raw.recv().await.unwrap()
+                else {
+                    panic!("expected blocking request");
+                };
+                assert!(
+                    response_tx
+                        .send(Ok(InferenceResponse {
+                            output_tokens: toks,
+                            thinking_output_boundary: None,
+                            finish_reason: "stop".into(),
+                            time_to_first_token_ms: 1.0,
+                            decode_time_ms: 1.0,
+                            logprobs: vec![],
+                            reasoning_tokens: 0,
+                            cached_prompt_tokens: 0,
+                            think_nudges: 0,
+                            stop_cause: None,
+                        }))
+                        .is_ok()
+                );
+            };
+            let (response, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(handler, scheduler)
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["choices"][0]["text"], expected_raw);
+            let expected_events = if stop.is_some() {
+                json!([{"code": "completion_stop_sequence", "action": "strip_output", "count": 1}])
+            } else {
+                json!([])
+            };
+            assert_eq!(parsed["interventions"]["events"], expected_events);
+
+            // Blocking AutoPrepend retains byte-identical default behavior.
+            let (st_auto, mut rx_auto) = verbatim_test_state();
+            let req_auto: CompletionRequest = serde_json::from_value(payload.clone()).unwrap();
+            let toks = output_tokens.clone();
+            let handler = completions_with_policy(
+                st_auto,
+                Ok(Json(req_auto)),
+                Ok(CompletionsThinkPrefixPolicy::AutoPrepend),
+            );
+            let scheduler = async move {
+                let InferenceRequest::Blocking { response_tx, .. } = rx_auto.recv().await.unwrap()
+                else {
+                    panic!("expected blocking request");
+                };
+                assert!(
+                    response_tx
+                        .send(Ok(InferenceResponse {
+                            output_tokens: toks,
+                            thinking_output_boundary: None,
+                            finish_reason: "stop".into(),
+                            time_to_first_token_ms: 1.0,
+                            decode_time_ms: 1.0,
+                            logprobs: vec![],
+                            reasoning_tokens: 0,
+                            cached_prompt_tokens: 0,
+                            think_nudges: 0,
+                            stop_cause: None,
+                        }))
+                        .is_ok()
+                );
+            };
+            let (response, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(handler, scheduler)
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["choices"][0]["text"], expected_auto);
+
+            // Streaming RawNoThinkPrefix also emits verbatim leading whitespace and applies stops.
+            let (st_stream, mut rx_stream) = verbatim_test_state();
+            payload["stream"] = json!(true);
+            let req_stream: CompletionRequest = serde_json::from_value(payload).unwrap();
+            let response = completions_with_policy(
+                st_stream,
+                Ok(Json(req_stream)),
+                Ok(CompletionsThinkPrefixPolicy::RawNoThinkPrefix),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let InferenceRequest::Streaming { token_tx, .. } = rx_stream.recv().await.unwrap()
+            else {
+                panic!("expected streaming request");
+            };
+            for &tok in &output_tokens {
+                assert!(token_tx.send(StreamEvent::Token(tok)).await.is_ok());
+            }
+            assert!(
+                token_tx
+                    .send(StreamEvent::Done {
+                        finish_reason: "stop".into(),
+                        prompt_tokens: 1,
+                        completion_token_ids: output_tokens.clone(),
+                        completion_tokens: output_tokens.len(),
+                        time_to_first_token_ms: 1.0,
+                        decode_time_ms: 1.0,
+                        reasoning_tokens: 0,
+                        cached_prompt_tokens: 0,
+                        think_nudges: 0,
+                        stop_cause: None,
+                    })
+                    .await
+                    .is_ok()
+            );
+            drop(token_tx);
+            let body = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let wire = std::str::from_utf8(&body).unwrap();
+            let streamed_text: String = wire
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|line| *line != "[DONE]")
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter_map(|chunk| chunk["choices"][0]["text"].as_str().map(str::to_owned))
+                .collect();
+            assert_eq!(streamed_text, expected_raw);
+        }
     }
 }
 
