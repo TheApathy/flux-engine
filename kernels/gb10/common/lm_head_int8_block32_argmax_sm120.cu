@@ -5,15 +5,26 @@
 //
 // Kernels:
 //   1. `lm_head_int8_block32_gemm_sm120`:
-//      Full BF16 logit GEMM (`M = 1..64`, `K % 32 == 0`, arbitrary `N`) using:
+//      Full BF16 logit GEMM (`M = 1..64`, optimal for `M = 1..32`, `K % 32 == 0`,
+//      arbitrary `N`, 128 threads = 4 warps) using:
 //      - `LDG.E.EF.128` (`L2::evict_first`) for `int8` weight vectors
-//      - Coalesced `u32` `LDG.E.EF` (`L2::evict_first`) scale-pair loads (2x BF16)
+//      - Coalesced `u32` `LDG.E.CONSTANT` scale-pair loads (2x BF16)
 //      - `LDG.E.128.CONSTANT` (`ld.global.nc`) for BF16 activations
 //      - 0-ULP lossless `int8 (-127..127) -> BF16` unpack into portable
 //        `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` with per-block-32
 //        FP32 scale factorization (zero BF16 dequant rounding loss)
 //      - 2-stage register pipeline overlapping global loads with Tensor Core MMA
 //      - Explicit inline PTX `cvt.rn.bf16.f32` on BF16 logit stores (0 atomicAdd)
+//   1b. `lm_head_int8_block32_gemm_m64_sm120`:
+//      Specialized 256-thread (8-warp: `2 M-warps x 4 N-warps`) single-CTA
+//      `grid.y == 1` full BF16 logit GEMM for `M = 33..64` (accepting all
+//      `M = 1..64` with 0-ULP bit-exact identity against `gemm_sm120`):
+//      - 1x `W_i8` (`LDG.E.EF.128`, 1 vector/thread) + 1x `S_bf16` read per CTA
+//      - Bank-conflict-free padded SMEM (`smem_A[64][72]`, `smem_W[64][80]`)
+//      - Half the accumulator pressure (`acc[2][2][4]` = 16 regs/thread) and
+//        half the inner MMA loop per warp vs 128-thread `gemm_sm120`
+//      - Full 2-stage `A + W + S` register prefetch overlapping global/L2 loads
+//        with zero-CVT `0x4300` magic-bias BF16x2 unpack + Tensor Core MMA.
 //   2. `lm_head_int8_block32_argmax_stage1_sm120`:
 //      Fused `M = 1..16`, `V_TILE = 256` INT8 Block-32 LM-head + online warp/block
 //      argmax skipping the full `[M, V]` BF16 logit write and emitting only compact
@@ -34,9 +45,11 @@
 #define W8_V_TILE_ARG  256u
 #define W8_K_STEP      64u
 #define W8_BLOCK_SIZE  32u
-#define W8_MAX_M_GEMM  64u
-#define W8_MAX_M_ARG   16u
-#define W8_INVALID_ID  0xFFFFFFFFu
+#define W8_MAX_M_GEMM        64u
+#define W8_MAX_M_ARG         16u
+#define W8_INVALID_ID        0xFFFFFFFFu
+#define W8_M64_SMEM_A_STRIDE 72u
+#define W8_M64_SMEM_W_STRIDE 80u
 
 // Explicit inline PTX FP32 -> BF16 round-to-nearest-even.
 __device__ __forceinline__ unsigned short w8_f32_to_bf16_rn(float x) {
@@ -360,6 +373,315 @@ void lm_head_int8_block32_gemm_sm120(
                 if (gr1 < M && gc1 < N) {
                     *(unsigned short*)&C_bf16[(int64_t)gr1 * N + gc1] =
                         w8_f32_to_bf16_rn(acc[mb][nt][3]);
+                }
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 1b. lm_head_int8_block32_gemm_m64_sm120
+//
+// Specialized 256-thread (8-warp: `2 M-warps x 4 N-warps`) single-CTA
+// `grid.y == 1` full BF16 logit GEMM for `M = 33..64` (also valid and 0-ULP
+// bit-identical to `lm_head_int8_block32_gemm_sm120` across all `M = 1..64`):
+//   C[M, N] = A[M, K] @ dequant(W_i8[N, K], S_bf16[N, K/32])^T
+//
+// Key SM121 roofline optimizations vs 4-warp `gemm_sm120`:
+// - 8 warps = `2 M-warps (32 rows/warp) x 4 N-warps (16 cols/warp)`:
+//   each thread holds only `acc[2][2][4]` (16 accumulators vs 32) and runs
+//   half the inner MMA loop per warp.
+// - Bank-conflict-free padded SMEM:
+//   `smem_A[64][72]` (144 B/row = 36 banks -> 0-way conflict on `LDS.32` + 16B `STS.128`)
+//   `smem_W[64][80]` ( 80 B/row = 20 banks -> 0-way conflict on `LDS.U16` + 16B `STS.128`)
+//   `smem_S[64][2]`  (  4 B/row = broadcast, 0-way conflict)
+// - 256 threads cooperatively issue 1 `LDG.E.EF.128` per thread for `W_i8`
+//   and 2 `LDG.E.128.CONSTANT` per thread for `A_bf16`, fully overlapped with
+//   zero-CVT `0x4300` magic-bias BF16x2 unpack + `HMMA.16816` in a 2-stage
+//   register pipeline (zero global loads between the two `__syncthreads()`).
+//
+// Grid:  (ceil(N / 64), 1, 1)
+// Block: (256, 1, 1) — 8 warps (`2 M-warps x 4 N-warps`)
+// SMEM:  14,592 B (`smem_A` 9,216 B + `smem_W` 5,120 B + `smem_S` 256 B)
+// =========================================================================
+extern "C" __global__
+__launch_bounds__(256, 3)
+void lm_head_int8_block32_gemm_m64_sm120(
+    const __nv_bfloat16*  __restrict__ A_bf16,   // [M, K] BF16
+    const signed char*    __restrict__ W_i8,     // [N, K] int8 (-127..127)
+    const unsigned short* __restrict__ S_bf16,   // [N, K/32] BF16 scales (raw u16 bits)
+    __nv_bfloat16*        __restrict__ C_bf16,   // [M, N] BF16 logits
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    if (M == 0u || M > W8_MAX_M_GEMM || N == 0u || K < W8_BLOCK_SIZE || (K & 31u) != 0u) return;
+
+    const unsigned int cta_n = blockIdx.x * W8_N_TILE_GEMM;
+    if (cta_n >= N) return;
+
+    const int64_t K64 = (int64_t)K;
+    const int64_t num_blocks = (int64_t)(K >> 5);
+    const bool k_even_blocks = ((K & 63u) == 0u);
+    const unsigned long long pol_ef = w8_l2_evict_first_policy();
+
+    __shared__ alignas(16) unsigned short smem_A[W8_MAX_M_GEMM][W8_M64_SMEM_A_STRIDE];
+    __shared__ alignas(16) signed char    smem_W[W8_N_TILE_GEMM][W8_M64_SMEM_W_STRIDE];
+    __shared__ alignas(4)  unsigned short smem_S[W8_N_TILE_GEMM][2];
+
+    const unsigned int warp_id  = threadIdx.x >> 5;   // 0..7
+    const unsigned int m_warp   = warp_id >> 2;       // 0 (rows 0..31) or 1 (rows 32..63)
+    const unsigned int n_warp   = warp_id & 3u;       // 0..3 (16 N-cols each)
+    const unsigned int lane_id  = threadIdx.x & 31u;
+    const unsigned int group_id = lane_id >> 2;       // 0..7
+    const unsigned int tid      = lane_id & 3u;       // 0..3
+    const unsigned int m_base   = m_warp * 32u;       // 0 or 32
+    const bool mb0_active = (m_base < M);
+    const bool mb1_active = (m_base + W8_M_TILE < M);
+
+    float acc[2][2][4];
+    #pragma unroll
+    for (int mb = 0; mb < 2; ++mb) {
+        acc[mb][0][0] = 0.0f; acc[mb][0][1] = 0.0f; acc[mb][0][2] = 0.0f; acc[mb][0][3] = 0.0f;
+        acc[mb][1][0] = 0.0f; acc[mb][1][1] = 0.0f; acc[mb][1][2] = 0.0f; acc[mb][1][3] = 0.0f;
+    }
+
+    // Cooperative 256-thread load coordinates:
+    //   A_bf16: 256 threads x 2 uint4 (rows 0..31 & 32..63, LDG.E.128.CONSTANT)
+    //   W_i8:   256 threads x 1 uint4 (rows 0..63,          LDG.E.EF.128)
+    //   S_bf16:  64 threads x 1 u32   (rows 0..63,          LDG.E.CONSTANT)
+    const unsigned int a_row0 = threadIdx.x >> 3;        // 0..31
+    const unsigned int a_row1 = a_row0 + 32u;            // 32..63
+    const unsigned int a_col  = (threadIdx.x & 7u) << 3; // 0, 8, ..., 56
+    const bool a0_row_valid = (a_row0 < M);
+    const bool a1_row_valid = (a_row1 < M);
+
+    const unsigned int w_row = threadIdx.x >> 2;         // 0..63
+    const unsigned int w_col = (threadIdx.x & 3u) << 4;  // 0, 16, 32, 48
+    const unsigned int w_gn  = cta_n + w_row;
+    const bool w_row_valid = (w_gn < N);
+
+    const unsigned int s_row = threadIdx.x;
+    const unsigned int s_gn  = cta_n + s_row;
+    const bool s_valid = (threadIdx.x < W8_N_TILE_GEMM) && (s_gn < N);
+
+    #define W8_M64_PREFETCH(kb, r_a0, r_a1, r_w, r_s) do { \
+        const bool a_col_valid = ((kb) + a_col < K); \
+        (r_a0) = make_uint4(0u, 0u, 0u, 0u); \
+        if (a0_row_valid && a_col_valid) { \
+            (r_a0) = w8_ldg_nc_128(A_bf16 + (int64_t)a_row0 * K64 + (int64_t)((kb) + a_col)); \
+        } \
+        (r_a1) = make_uint4(0u, 0u, 0u, 0u); \
+        if (a1_row_valid && a_col_valid) { \
+            (r_a1) = w8_ldg_nc_128(A_bf16 + (int64_t)a_row1 * K64 + (int64_t)((kb) + a_col)); \
+        } \
+        (r_w) = make_uint4(0u, 0u, 0u, 0u); \
+        if (w_row_valid && ((kb) + w_col < K)) { \
+            (r_w) = w8_ldg_ef_128(W_i8 + (int64_t)w_gn * K64 + (int64_t)((kb) + w_col), pol_ef); \
+        } \
+        (r_s) = 0u; \
+        if (s_valid) { \
+            const int64_t b_idx = (int64_t)((kb) >> 5); \
+            if (k_even_blocks) { \
+                (r_s) = w8_ldg_nc_32(S_bf16 + (int64_t)s_gn * num_blocks + b_idx); \
+            } else { \
+                const unsigned short s0 = w8_ldg_nc_16(S_bf16 + (int64_t)s_gn * num_blocks + b_idx); \
+                unsigned short s1 = 0u; \
+                if (b_idx + 1 < num_blocks) { \
+                    s1 = w8_ldg_nc_16(S_bf16 + (int64_t)s_gn * num_blocks + b_idx + 1); \
+                } \
+                (r_s) = (unsigned int)s0 | ((unsigned int)s1 << 16); \
+            } \
+        } \
+    } while (0)
+
+    #define W8_M64_COMMIT(r_a0, r_a1, r_w, r_s) do { \
+        *(uint4*)&smem_A[a_row0][a_col] = (r_a0); \
+        *(uint4*)&smem_A[a_row1][a_col] = (r_a1); \
+        *(uint4*)&smem_W[w_row][w_col]  = (r_w); \
+        if (threadIdx.x < W8_N_TILE_GEMM) { \
+            *(unsigned int*)&smem_S[s_row][0] = (r_s); \
+        } \
+    } while (0)
+
+    #define W8_M64_COMPUTE() do { \
+        if (mb0_active) { \
+            const unsigned int k_tid = tid * 2u; \
+            const unsigned int n0_base = n_warp * 16u; \
+            const unsigned int n1_base = n0_base + 8u; \
+            const unsigned int nc0 = n0_base + group_id; \
+            const unsigned int nc1 = n1_base + group_id; \
+            _Pragma("unroll") \
+            for (int blk = 0; blk < 2; ++blk) { \
+                const unsigned int kb_off = (unsigned int)blk * 32u; \
+                /* Unpack int8 -> bf16x2 ONCE per weight and reuse across mb=0 and mb=1! */ \
+                const unsigned int b0_n0_k0 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc0][kb_off + k_tid]); \
+                const unsigned int b1_n0_k0 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc0][kb_off + 8u + k_tid]); \
+                const unsigned int b0_n0_k1 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc0][kb_off + 16u + k_tid]); \
+                const unsigned int b1_n0_k1 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc0][kb_off + 24u + k_tid]); \
+                const unsigned int b0_n1_k0 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc1][kb_off + k_tid]); \
+                const unsigned int b1_n1_k0 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc1][kb_off + 8u + k_tid]); \
+                const unsigned int b0_n1_k1 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc1][kb_off + 16u + k_tid]); \
+                const unsigned int b1_n1_k1 = w8_u16_to_bf16x2_zero_cvt( \
+                    (unsigned int)*(const unsigned short*)&smem_W[nc1][kb_off + 24u + k_tid]); \
+                const float sc0_n0 = w8_bf16_bits_to_f32(smem_S[n0_base + tid * 2u][blk]); \
+                const float sc1_n0 = w8_bf16_bits_to_f32(smem_S[n0_base + tid * 2u + 1u][blk]); \
+                const float sc0_n1 = w8_bf16_bits_to_f32(smem_S[n1_base + tid * 2u][blk]); \
+                const float sc1_n1 = w8_bf16_bits_to_f32(smem_S[n1_base + tid * 2u + 1u][blk]); \
+                /* mb = 0: load A ONCE per kh and reuse across BOTH nt=0 and nt=1 (dual-acc ILP). */ \
+                { \
+                    const unsigned int r0 = m_base + group_id; \
+                    const unsigned int r1 = r0 + 8u; \
+                    float ba0_0 = 0.0f, ba0_1 = 0.0f, ba0_2 = 0.0f, ba0_3 = 0.0f; \
+                    float ba1_0 = 0.0f, ba1_1 = 0.0f, ba1_2 = 0.0f, ba1_3 = 0.0f; \
+                    { \
+                        const unsigned int a0 = *(const unsigned int*)&smem_A[r0][kb_off + k_tid]; \
+                        const unsigned int a1 = *(const unsigned int*)&smem_A[r1][kb_off + k_tid]; \
+                        const unsigned int a2 = *(const unsigned int*)&smem_A[r0][kb_off + 8u + k_tid]; \
+                        const unsigned int a3 = *(const unsigned int*)&smem_A[r1][kb_off + 8u + k_tid]; \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba0_0), "+f"(ba0_1), "+f"(ba0_2), "+f"(ba0_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n0_k0), "r"(b1_n0_k0)); \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba1_0), "+f"(ba1_1), "+f"(ba1_2), "+f"(ba1_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n1_k0), "r"(b1_n1_k0)); \
+                    } \
+                    { \
+                        const unsigned int a0 = *(const unsigned int*)&smem_A[r0][kb_off + 16u + k_tid]; \
+                        const unsigned int a1 = *(const unsigned int*)&smem_A[r1][kb_off + 16u + k_tid]; \
+                        const unsigned int a2 = *(const unsigned int*)&smem_A[r0][kb_off + 24u + k_tid]; \
+                        const unsigned int a3 = *(const unsigned int*)&smem_A[r1][kb_off + 24u + k_tid]; \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba0_0), "+f"(ba0_1), "+f"(ba0_2), "+f"(ba0_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n0_k1), "r"(b1_n0_k1)); \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba1_0), "+f"(ba1_1), "+f"(ba1_2), "+f"(ba1_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n1_k1), "r"(b1_n1_k1)); \
+                    } \
+                    acc[0][0][0] += ba0_0 * sc0_n0; \
+                    acc[0][0][1] += ba0_1 * sc1_n0; \
+                    acc[0][0][2] += ba0_2 * sc0_n0; \
+                    acc[0][0][3] += ba0_3 * sc1_n0; \
+                    acc[0][1][0] += ba1_0 * sc0_n1; \
+                    acc[0][1][1] += ba1_1 * sc1_n1; \
+                    acc[0][1][2] += ba1_2 * sc0_n1; \
+                    acc[0][1][3] += ba1_3 * sc1_n1; \
+                } \
+                /* mb = 1 (active when m_base + 16 < M) */ \
+                if (mb1_active) { \
+                    const unsigned int r0 = m_base + W8_M_TILE + group_id; \
+                    const unsigned int r1 = r0 + 8u; \
+                    float ba0_0 = 0.0f, ba0_1 = 0.0f, ba0_2 = 0.0f, ba0_3 = 0.0f; \
+                    float ba1_0 = 0.0f, ba1_1 = 0.0f, ba1_2 = 0.0f, ba1_3 = 0.0f; \
+                    { \
+                        const unsigned int a0 = *(const unsigned int*)&smem_A[r0][kb_off + k_tid]; \
+                        const unsigned int a1 = *(const unsigned int*)&smem_A[r1][kb_off + k_tid]; \
+                        const unsigned int a2 = *(const unsigned int*)&smem_A[r0][kb_off + 8u + k_tid]; \
+                        const unsigned int a3 = *(const unsigned int*)&smem_A[r1][kb_off + 8u + k_tid]; \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba0_0), "+f"(ba0_1), "+f"(ba0_2), "+f"(ba0_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n0_k0), "r"(b1_n0_k0)); \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba1_0), "+f"(ba1_1), "+f"(ba1_2), "+f"(ba1_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n1_k0), "r"(b1_n1_k0)); \
+                    } \
+                    { \
+                        const unsigned int a0 = *(const unsigned int*)&smem_A[r0][kb_off + 16u + k_tid]; \
+                        const unsigned int a1 = *(const unsigned int*)&smem_A[r1][kb_off + 16u + k_tid]; \
+                        const unsigned int a2 = *(const unsigned int*)&smem_A[r0][kb_off + 24u + k_tid]; \
+                        const unsigned int a3 = *(const unsigned int*)&smem_A[r1][kb_off + 24u + k_tid]; \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba0_0), "+f"(ba0_1), "+f"(ba0_2), "+f"(ba0_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n0_k1), "r"(b1_n0_k1)); \
+                        asm volatile( \
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+                            : "+f"(ba1_0), "+f"(ba1_1), "+f"(ba1_2), "+f"(ba1_3) \
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_n1_k1), "r"(b1_n1_k1)); \
+                    } \
+                    acc[1][0][0] += ba0_0 * sc0_n0; \
+                    acc[1][0][1] += ba0_1 * sc1_n0; \
+                    acc[1][0][2] += ba0_2 * sc0_n0; \
+                    acc[1][0][3] += ba0_3 * sc1_n0; \
+                    acc[1][1][0] += ba1_0 * sc0_n1; \
+                    acc[1][1][1] += ba1_1 * sc1_n1; \
+                    acc[1][1][2] += ba1_2 * sc0_n1; \
+                    acc[1][1][3] += ba1_3 * sc1_n1; \
+                } \
+            } \
+        } \
+    } while (0)
+
+    {
+        uint4 cur_a0, cur_a1, cur_w;
+        unsigned int cur_s;
+        W8_M64_PREFETCH(0u, cur_a0, cur_a1, cur_w, cur_s);
+        W8_M64_COMMIT(cur_a0, cur_a1, cur_w, cur_s);
+        __syncthreads();
+
+        for (unsigned int k_next = W8_K_STEP; k_next < K; k_next += W8_K_STEP) {
+            uint4 nxt_a0, nxt_a1, nxt_w;
+            unsigned int nxt_s;
+            W8_M64_PREFETCH(k_next, nxt_a0, nxt_a1, nxt_w, nxt_s);
+            W8_M64_COMPUTE();
+            __syncthreads();
+            W8_M64_COMMIT(nxt_a0, nxt_a1, nxt_w, nxt_s);
+            __syncthreads();
+        }
+        W8_M64_COMPUTE();
+    }
+
+    #undef W8_M64_PREFETCH
+    #undef W8_M64_COMMIT
+    #undef W8_M64_COMPUTE
+
+    if (mb0_active) {
+        #pragma unroll
+        for (unsigned int mb = 0u; mb < 2u; ++mb) {
+            if (mb == 0u || mb1_active) {
+                const unsigned int gr0 = m_base + mb * W8_M_TILE + group_id;
+                const unsigned int gr1 = gr0 + 8u;
+                #pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const unsigned int gc0 = cta_n + n_warp * 16u + (unsigned int)nt * 8u + tid * 2u;
+                    const unsigned int gc1 = gc0 + 1u;
+                    if (gr0 < M && gc0 < N) {
+                        *(unsigned short*)&C_bf16[(int64_t)gr0 * (int64_t)N + (int64_t)gc0] =
+                            w8_f32_to_bf16_rn(acc[mb][nt][0]);
+                    }
+                    if (gr0 < M && gc1 < N) {
+                        *(unsigned short*)&C_bf16[(int64_t)gr0 * (int64_t)N + (int64_t)gc1] =
+                            w8_f32_to_bf16_rn(acc[mb][nt][1]);
+                    }
+                    if (gr1 < M && gc0 < N) {
+                        *(unsigned short*)&C_bf16[(int64_t)gr1 * (int64_t)N + (int64_t)gc0] =
+                            w8_f32_to_bf16_rn(acc[mb][nt][2]);
+                    }
+                    if (gr1 < M && gc1 < N) {
+                        *(unsigned short*)&C_bf16[(int64_t)gr1 * (int64_t)N + (int64_t)gc1] =
+                            w8_f32_to_bf16_rn(acc[mb][nt][3]);
+                    }
                 }
             }
         }
