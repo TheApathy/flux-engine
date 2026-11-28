@@ -702,4 +702,55 @@ mod tests {
             8
         );
     }
+
+    #[test]
+    fn cross_seq_mlp_and_qsa_gates_enforce_canonical_b1_when_enabled() {
+        use crate::layers::qwen4_cross_seq_mlp::{
+            MoeTiling, batched_hc_fuse_inject_gn_enabled_with_policy, moe_tiling_with_policy,
+        };
+        use crate::layers::qwen4_qsa::{
+            batched_qsa_multi_enabled_with_policy,
+            native_batch::{NativeQsaMode, native_batch_qsa_mode_with_policy},
+            qwen4_qsa_fused_gate_enabled_with_policy, verify_rows_enabled_with_policy,
+            verify_stage_pool_fused_enabled_with_policy,
+        };
+
+        let on = DeterministicBatchPolicy::Enabled;
+        let off = DeterministicBatchPolicy::Disabled;
+
+        // Cross-seq MLP: unfused HC inject/GN and sequence-aligned MoE tiling.
+        assert!(!batched_hc_fuse_inject_gn_enabled_with_policy(on, true));
+        assert!(batched_hc_fuse_inject_gn_enabled_with_policy(off, true));
+        assert!(!batched_hc_fuse_inject_gn_enabled_with_policy(off, false));
+        assert_eq!(
+            moe_tiling_with_policy(on, MoeTiling::Frame),
+            MoeTiling::Sequence
+        );
+        assert_eq!(
+            moe_tiling_with_policy(off, MoeTiling::Frame),
+            MoeTiling::Frame
+        );
+        assert_eq!(
+            moe_tiling_with_policy(off, MoeTiling::Sequence),
+            MoeTiling::Sequence
+        );
+
+        // QSA multi-seq / multi-row / fused-gate / native-batch QSA gates.
+        assert!(!batched_qsa_multi_enabled_with_policy(on, true));
+        assert!(batched_qsa_multi_enabled_with_policy(off, true));
+        assert!(!verify_stage_pool_fused_enabled_with_policy(on, true));
+        assert!(verify_stage_pool_fused_enabled_with_policy(off, true));
+        assert!(!verify_rows_enabled_with_policy(on, true));
+        assert!(verify_rows_enabled_with_policy(off, true));
+        assert!(!qwen4_qsa_fused_gate_enabled_with_policy(on, true));
+        assert!(qwen4_qsa_fused_gate_enabled_with_policy(off, true));
+        assert_eq!(
+            native_batch_qsa_mode_with_policy(on, NativeQsaMode::PerRow),
+            NativeQsaMode::Off
+        );
+        assert_eq!(
+            native_batch_qsa_mode_with_policy(off, NativeQsaMode::PerRow),
+            NativeQsaMode::PerRow
+        );
+    }
 }

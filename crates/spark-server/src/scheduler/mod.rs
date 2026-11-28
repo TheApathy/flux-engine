@@ -24,6 +24,7 @@ mod decode_logits_step;
 mod decode_step;
 mod defer_emit;
 mod deferred_prefill_tail;
+mod deterministic_batch_route;
 mod device_topk_route;
 mod device_topk_spec;
 mod emit_step;
@@ -356,6 +357,45 @@ fn select_gate_arm(
     }
     spark_model::speculative::set_dflash_gamma_override(draft_cap);
     Ok(())
+}
+
+fn fail_closed_deterministic_batch_tick(
+    model: &dyn Model,
+    new_reqs: Vec<InferenceRequest>,
+    prefilling: &mut Vec<PrefillInProgress>,
+    active: &mut Vec<ActiveSeq>,
+    prefill_stream: u64,
+    error: &spark_model::layers::deterministic_batch::DeterministicBatchEnvError,
+) {
+    tracing::error!("invalid ATLAS_DETERMINISTIC_BATCH in scheduler tick: {error}");
+    let msg = format!("{error}");
+    for req in new_reqs {
+        let mut sink = match req {
+            InferenceRequest::Streaming { token_tx, .. } => ResponseSink::Streaming(token_tx),
+            InferenceRequest::Blocking { response_tx, .. } => {
+                ResponseSink::Blocking(Some(response_tx))
+            }
+        };
+        send_error_to_sink(&mut sink, &msg);
+    }
+    if !prefilling.is_empty() {
+        prefill_stream_barrier::drain_before_prefill_cleanup(
+            model,
+            prefill_stream,
+            "invalid ATLAS_DETERMINISTIC_BATCH scheduler tick",
+        );
+        for mut p in prefilling.drain(..) {
+            if let Err(free_err) = model.free_sequence(&mut p.seq) {
+                tracing::error!(
+                    "free_sequence after invalid ATLAS_DETERMINISTIC_BATCH: {free_err:#}"
+                );
+            }
+            send_error_to_sink(&mut p.sink, &msg);
+        }
+    }
+    for mut a in active.drain(..) {
+        send_error(model, &mut a, &msg);
+    }
 }
 
 fn fail_closed_scheduler_transition(
@@ -745,10 +785,18 @@ pub fn run(
     const SESSION_EVICTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     let mut ple_queue_prefetch = ple_queue_prefetch::QueuePrefetch::from_env();
     loop {
+        let det_batch_res = deterministic_batch_route::scheduler_deterministic_batch_policy();
+        let det_batch_preview = det_batch_res.as_ref().copied().unwrap_or(
+            spark_model::layers::deterministic_batch::DeterministicBatchPolicy::Disabled,
+        );
+        let prefill_sees_active = deterministic_batch_route::prefill_chunk_sees_active_decode(
+            det_batch_preview,
+            !active.is_empty(),
+        );
         let legacy_tick = legacy_interleave.is_enabled().then(|| {
             legacy_interleave.plan_tick(
                 Instant::now(),
-                active.len(),
+                if prefill_sees_active { active.len() } else { 0 },
                 prefilling.len(),
                 max_prefill_tokens,
             )
@@ -780,7 +828,7 @@ pub fn run(
             });
         let tick_plan = slo_interleave.plan_tick(
             slo_candidate,
-            !active.is_empty(),
+            prefill_sees_active,
             prefill_chunk_with_active_decode,
             tick_chunk_tokens,
             model.is_mla(),
@@ -833,6 +881,23 @@ pub fn run(
                 published_at: std::time::Instant::now(),
             });
         }
+        let det_batch = match det_batch_res {
+            Ok(policy) => policy,
+            Err(error) => {
+                if !new_reqs.is_empty() || !prefilling.is_empty() || !active.is_empty() {
+                    fail_closed_deterministic_batch_tick(
+                        &*model,
+                        new_reqs,
+                        &mut prefilling,
+                        &mut active,
+                        prefill_stream,
+                        &error,
+                    );
+                    continue;
+                }
+                spark_model::layers::deterministic_batch::DeterministicBatchPolicy::Disabled
+            }
+        };
         if new_reqs.is_empty() && active.is_empty() && prefilling.is_empty() {
             // Idle: report acceptance frames not yet summarized (no-op
             // unless ATLAS_MTP_ACCEPT_LOG=1 and new frames exist).
@@ -879,6 +944,21 @@ pub fn run(
         }
 
         // ── Start new requests ──
+        if det_batch.is_enabled()
+            && !new_reqs.is_empty()
+            && !active.is_empty()
+            && let Err(e) = model.sync_secondary()
+        {
+            tracing::error!("sync_secondary before deterministic batch prefill: {e:#}");
+            let mut active_cache = vec![false; active.len()];
+            fail_closed_scheduler_transition(
+                &mut active,
+                &mut active_cache,
+                "deterministic batch prefill sync_secondary",
+                &e,
+            );
+            retire_finished_sequences(&*model, &mut active, &mut active_cache);
+        }
         let tick_start = std::time::Instant::now();
         let chunk_plan = tick_plan.plan;
         let mut tick_ledger = prefill_slo::PrefillTickLedger::default();
@@ -949,7 +1029,7 @@ pub fn run(
         };
         // ATLAS_QWEN4_PLE_QUEUE_PREFETCH: while a request is running, start the
         // next one's chunk-0 PLE reads (same budget start_new_requests uses).
-        if ple_queue_prefetch.selected() {
+        if !det_batch.is_enabled() && ple_queue_prefetch.selected() {
             let budget = tick_chunk_tokens.min(max_batch_tokens);
             let pending_guard = pending.0.lock();
             ple_queue_prefetch.tick(
@@ -1003,66 +1083,56 @@ pub fn run(
                 );
             }
 
-            if use_internal_spec {
-                if active.len() == 1
-                    && internal_spec_eligible(&active[0], &*model, adaptive_sampling)
-                {
-                    // DeepSeek-V4.1 DSpark: model-owned draft/verify/rollback.
-                    step_internal_spec(
-                        &*model,
-                        &mut active,
-                        &mut cache_on_finish,
-                        think_end_token,
-                        think_start_token,
-                        code_fence_token,
-                        tool_call_start_token,
-                        tool_call_end_token,
-                        &reflection_suppress_ids,
-                        adaptive_sampling,
-                    );
-                } else {
-                    // Internal-spec models own their entire speculation mode.
-                    // Ineligible/sampled/batched requests HOLD on serial decode
-                    // and may never fall through to an unrelated external path.
-                    step_decode_only(
-                        &*model,
-                        &mut active,
-                        &mut cache_on_finish,
-                        think_end_token,
-                        think_start_token,
-                        code_fence_token,
-                        tool_call_start_token,
-                        tool_call_end_token,
-                        &reflection_suppress_ids,
-                        adaptive_sampling,
-                    );
+            // Under ATLAS_DETERMINISTIC_BATCH=1, execute each active sequence
+            // sequentially through the exact canonical B=1 (`active.len() == 1`)
+            // path with a secondary-stream barrier between slots so B=2/4/8/16
+            // follow the exact same kernels, draft widths, and sampler paths as B=1.
+            let per_slot =
+                deterministic_batch_route::decode_runs_canonical_per_slot(det_batch, active.len());
+            let rounds = if per_slot { active.len() } else { 1 };
+            let mut remaining_active = if per_slot {
+                std::mem::take(&mut active).into_iter()
+            } else {
+                Vec::new().into_iter()
+            };
+            let mut remaining_cache = if per_slot {
+                std::mem::take(&mut cache_on_finish).into_iter()
+            } else {
+                Vec::new().into_iter()
+            };
+            let mut completed_active = Vec::with_capacity(if per_slot { rounds } else { 0 });
+            let mut completed_cache = Vec::with_capacity(if per_slot { rounds } else { 0 });
+            for _ in 0..rounds {
+                if per_slot {
+                    let (Some(seq_item), Some(cache_flag)) =
+                        (remaining_active.next(), remaining_cache.next())
+                    else {
+                        break;
+                    };
+                    active.push(seq_item);
+                    cache_on_finish.push(cache_flag);
                 }
-            } else if use_ngram_speculative {
-                let eligible = active.len() == 1
-                    && active[0].grammar_state.is_none()
-                    && (!active[0].inside_thinking || think_ctx.enabled)
-                    && !think_nudge::injection_pending(&active[0]);
-                if eligible {
-                    // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
-                    if let Some(ref mut proposer) = ngram_proposer {
-                        let was_verify = !active[0].pending_drafts.is_empty();
-                        step_ngram(
+                if use_internal_spec {
+                    if active.len() == 1
+                        && internal_spec_eligible(&active[0], &*model, adaptive_sampling)
+                    {
+                        // DeepSeek-V4.1 DSpark: model-owned draft/verify/rollback.
+                        step_internal_spec(
                             &*model,
                             &mut active,
-                            proposer,
-                            &mut ngram_sync_pending,
-                            &think_ctx,
+                            &mut cache_on_finish,
+                            think_end_token,
+                            think_start_token,
+                            code_fence_token,
+                            tool_call_start_token,
+                            tool_call_end_token,
+                            &reflection_suppress_ids,
+                            adaptive_sampling,
                         );
-                        if was_verify && active[0].finished {
-                            cache_on_finish[0] = false;
-                        }
-                    }
-                } else {
-                    // Grammar, batching, or an unavailable thinking-policy
-                    // oracle makes this frame ineligible. Drop its proposal and
-                    // drain the paired async receipt before serial decode.
-                    let synced = abandon_ngram_frame(&*model, &mut active, &mut ngram_sync_pending);
-                    if synced {
+                    } else {
+                        // Internal-spec models own their entire speculation mode.
+                        // Ineligible/sampled/batched requests HOLD on serial decode
+                        // and may never fall through to an unrelated external path.
                         step_decode_only(
                             &*model,
                             &mut active,
@@ -1076,407 +1146,470 @@ pub fn run(
                             adaptive_sampling,
                         );
                     }
-                }
-                if active.iter().any(|a| a.finished) {
-                    abandon_ngram_frame(&*model, &mut active, &mut ngram_sync_pending);
-                }
-            } else if use_self_speculative {
-                let eligible = active.len() == 1
-                    && active[0].grammar_state.is_none()
-                    && (!active[0].inside_thinking || think_ctx.enabled)
-                    && !think_nudge::injection_pending(&active[0]);
-                if eligible {
-                    // Self-speculative: draft via layer-skipping, verify with
-                    // the full model, then commit recurrent state asynchronously.
-                    step_self_spec(
-                        &*model,
-                        &mut active,
-                        num_drafts,
-                        &mut self_spec_sync_pending,
-                        &think_ctx,
-                    );
-                } else if abandon_self_spec_frame(&*model, &mut active, &mut self_spec_sync_pending)
-                {
-                    // Grammar, batching, or an unavailable thinking-policy
-                    // oracle is a serial-only frame.  The async commit receipt
-                    // above must be ordered before that fallback may run.
-                    step_decode_only(
-                        &*model,
-                        &mut active,
-                        &mut cache_on_finish,
-                        think_end_token,
-                        think_start_token,
-                        code_fence_token,
-                        tool_call_start_token,
-                        tool_call_end_token,
-                        &reflection_suppress_ids,
-                        adaptive_sampling,
-                    );
-                }
-                if active.iter().any(|a| a.finished) {
-                    abandon_self_spec_frame(&*model, &mut active, &mut self_spec_sync_pending);
-                    // The self-spec helper may have over-planned a dense verify
-                    // frame before the terminal emission. Conservatively skip
-                    // final cache insertion for every finished request.
-                    for (a, cacheable) in active.iter().zip(cache_on_finish.iter_mut()) {
-                        if a.finished {
-                            *cacheable = false;
+                } else if use_ngram_speculative {
+                    let eligible = active.len() == 1
+                        && active[0].grammar_state.is_none()
+                        && (!active[0].inside_thinking || think_ctx.enabled)
+                        && !think_nudge::injection_pending(&active[0]);
+                    if eligible {
+                        // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
+                        if let Some(ref mut proposer) = ngram_proposer {
+                            let was_verify = !active[0].pending_drafts.is_empty();
+                            step_ngram(
+                                &*model,
+                                &mut active,
+                                proposer,
+                                &mut ngram_sync_pending,
+                                &think_ctx,
+                            );
+                            if was_verify && active[0].finished {
+                                cache_on_finish[0] = false;
+                            }
+                        }
+                    } else {
+                        // Grammar, batching, or an unavailable thinking-policy
+                        // oracle makes this frame ineligible. Drop its proposal and
+                        // drain the paired async receipt before serial decode.
+                        let synced =
+                            abandon_ngram_frame(&*model, &mut active, &mut ngram_sync_pending);
+                        if synced {
+                            step_decode_only(
+                                &*model,
+                                &mut active,
+                                &mut cache_on_finish,
+                                think_end_token,
+                                think_start_token,
+                                code_fence_token,
+                                tool_call_start_token,
+                                tool_call_end_token,
+                                &reflection_suppress_ids,
+                                adaptive_sampling,
+                            );
                         }
                     }
-                }
-            } else if use_mtp {
-                let thinking_step_allowed = if let Some(gate) = spec_gate.as_ref() {
-                    mtp_gate::arm_allows_thinking(
-                        gate.next_arm().kind,
-                        primary_proposer_is_dflash,
-                        dflash_spec_think,
-                        think_ctx.enabled,
-                    )
-                } else {
-                    let current = ArmKind::Spec {
-                        proposer_arm: if primary_proposer_is_dflash {
-                            mtp_gate::PROPOSER_ARM_PRIMARY
-                        } else {
-                            model.proposer_arm()
-                        },
-                        draft_cap: 0,
-                        num_drafts,
+                    if active.iter().any(|a| a.finished) {
+                        abandon_ngram_frame(&*model, &mut active, &mut ngram_sync_pending);
+                    }
+                } else if use_self_speculative {
+                    let eligible = active.len() == 1
+                        && active[0].grammar_state.is_none()
+                        && (!active[0].inside_thinking || think_ctx.enabled)
+                        && !think_nudge::injection_pending(&active[0]);
+                    if eligible {
+                        // Self-speculative: draft via layer-skipping, verify with
+                        // the full model, then commit recurrent state asynchronously.
+                        step_self_spec(
+                            &*model,
+                            &mut active,
+                            num_drafts,
+                            &mut self_spec_sync_pending,
+                            &think_ctx,
+                        );
+                    } else if abandon_self_spec_frame(
+                        &*model,
+                        &mut active,
+                        &mut self_spec_sync_pending,
+                    ) {
+                        // Grammar, batching, or an unavailable thinking-policy
+                        // oracle is a serial-only frame.  The async commit receipt
+                        // above must be ordered before that fallback may run.
+                        step_decode_only(
+                            &*model,
+                            &mut active,
+                            &mut cache_on_finish,
+                            think_end_token,
+                            think_start_token,
+                            code_fence_token,
+                            tool_call_start_token,
+                            tool_call_end_token,
+                            &reflection_suppress_ids,
+                            adaptive_sampling,
+                        );
+                    }
+                    if active.iter().any(|a| a.finished) {
+                        abandon_self_spec_frame(&*model, &mut active, &mut self_spec_sync_pending);
+                        // The self-spec helper may have over-planned a dense verify
+                        // frame before the terminal emission. Conservatively skip
+                        // final cache insertion for every finished request.
+                        for (a, cacheable) in active.iter().zip(cache_on_finish.iter_mut()) {
+                            if a.finished {
+                                *cacheable = false;
+                            }
+                        }
+                    }
+                } else if use_mtp {
+                    let thinking_step_allowed = if let Some(gate) = spec_gate.as_ref() {
+                        mtp_gate::arm_allows_thinking(
+                            gate.next_arm().kind,
+                            primary_proposer_is_dflash,
+                            dflash_spec_think,
+                            think_ctx.enabled,
+                        )
+                    } else {
+                        let current = ArmKind::Spec {
+                            proposer_arm: if primary_proposer_is_dflash {
+                                mtp_gate::PROPOSER_ARM_PRIMARY
+                            } else {
+                                model.proposer_arm()
+                            },
+                            draft_cap: 0,
+                            num_drafts,
+                        };
+                        mtp_gate::arm_allows_thinking(
+                            current,
+                            primary_proposer_is_dflash,
+                            dflash_spec_think,
+                            think_ctx.enabled,
+                        )
                     };
-                    mtp_gate::arm_allows_thinking(
-                        current,
-                        primary_proposer_is_dflash,
-                        dflash_spec_think,
-                        think_ctx.enabled,
-                    )
-                };
-                if active.iter().all(|a| {
-                    // Native MTP may verify while thinking; DFlash requires
-                    // ATLAS_THINK_SPEC=1. Both use the same post-verify policy
-                    // oracle (see think_spec_accept.rs). suppress_tool_call /
-                    // disable_mtp gates are unchanged.
-                    (!a.inside_thinking || thinking_step_allowed)
+                    if active.iter().all(|a| {
+                        // Native MTP may verify while thinking; DFlash requires
+                        // ATLAS_THINK_SPEC=1. Both use the same post-verify policy
+                        // oracle (see think_spec_accept.rs). suppress_tool_call /
+                        // disable_mtp gates are unchanged.
+                        (!a.inside_thinking || thinking_step_allowed)
                         && !a.suppress_tool_call
                         && !a.disable_mtp
                         // A thinking nudge is injected on plain decode only.
                         && !think_nudge::injection_pending(a)
-                }) {
-                    // MTP speculative decode for ALL active sequences.
-                    //
-                    // Concurrent-decode fix (2026-05-22): previously gated on
-                    // `active.len() == 1`, which forced n>=2 into
-                    // `step_decode_only`. That path runs the SSM
-                    // `decode_multi_seq_inner` which sequentially calls
-                    // per-seq `decode()` (see qwen3_ssm/trait_decode_multi_seq.rs
-                    // — comment: "delegate to per-sequence single decode") with
-                    // no CUDA graphs and no MTP, collapsing throughput to ~14
-                    // tok/s aggregate at c=2 (down from 28 at c=1).
-                    //
-                    // `step_mtp` already loops bootstrap+verify across all
-                    // active sequences (see mtp_step.rs lines 21,96). Each
-                    // sequence reuses its own per-slot CUDA graph for K=3
-                    // verify (graph cache is keyed on `seq.slot_idx` in
-                    // verify_c.rs), so n>=2 captures one graph per slot on
-                    // first iteration and replays on every subsequent step.
-                    //
-                    // Per-seq guards (inside_thinking / suppress_tool_call /
-                    // disable_mtp) are checked across ALL active sequences
-                    // because step_mtp doesn't conditionally bootstrap per
-                    // active flag; if any seq disables MTP we fall back to
-                    // batched decode_only for the whole batch this tick.
-                    //
-                    // ── Speculation gate (`--mtp-gate`) ──
-                    //
-                    // When armed, the gate picks which arm to run for THIS step —
-                    // the external DFlash/DDTree drafter, the native MTP head, a
-                    // γ-capped drafter, or plain decode — by comparing DELIVERED
-                    // tok/s per arm over 16-step windows with hysteresis and
-                    // periodic probing. Every arm emits real, correct tokens, so
-                    // arbitration never wastes work. See `mtp_gate` for why this
-                    // measures throughput and not draft acceptance.
-                    //
-                    // Disarmed (the default) this is exactly the previous call.
-                    if let Some(gate) = spec_gate.as_mut() {
-                        let arm_idx = gate.next_arm_index();
-                        let arm = gate.next_arm();
-                        let pin_active = matches!(arm.kind, ArmKind::Serial)
-                            && mtp_gate::entry_pin_active(
-                                entry_pin.tokens,
-                                active.iter().map(|a| {
-                                    (a.think_ended, a.inside_thinking, a.post_think_gate_steps)
-                                }),
-                            );
-                        let pinned_spec_width = mtp_gate::entry_pin_spec_width(
-                            arm.kind,
-                            pin_active,
-                            last_spec_num_drafts,
-                        );
-                        // Everything the gate measures exists to feed arbitration,
-                        // so a gate that cannot arbitrate must not pay for it. A
-                        // PINNED arm therefore skips the depth scan, both
-                        // `seq_len` scans, the `Instant` pair and the window
-                        // accounting, and what remains between it and the disarmed
-                        // path is one `Option` compare plus a `match` on a value
-                        // that never changes.
+                    }) {
+                        // MTP speculative decode for ALL active sequences.
                         //
-                        // `Some(before)` doubles as the "measure this step" flag.
-                        let measure = if gate_arbitrates && pinned_spec_width.is_none() {
-                            // One pass, two answers. Depth is the MAX `seq_len`
-                            // (arm economics are depth-dependent: weight-bound at
-                            // short context, KV/SSM-bound at depth). Delivered
-                            // tokens are the SUM of committed outputs. `seq_len`
-                            // is a target-input cursor and may include verify
-                            // rows later rejected or rolled back. Counting only
-                            // `active[0]` would
-                            // under-report a speculative arm by a factor of n and
-                            // bias the gate toward whichever arm is cheapest per
-                            // step rather than fastest per token.
-                            let width = active.len().max(1);
-                            let (depth, before) =
-                                active.iter().fold((0usize, 0usize), |(d, s), a| {
-                                    (d.max(a.seq.seq_len), s + a.output_tokens.len())
-                                });
-                            gate.observe_depth(depth);
-                            Some((before, width))
-                        } else {
-                            None
-                        };
-
-                        let mut transition_ok = true;
-                        let arm_changed = last_gate_arm != Some(arm_idx);
-                        if arm_changed {
-                            // Arm transition. Drafts in flight belong to the
-                            // OUTGOING arm and would be verified against the
-                            // incoming one's assumptions, so drop them (and the
-                            // paired DDTree payload) and order the previous
-                            // verify's async live-state restore before the next
-                            // step reads h_state/conv_state. The next speculative
-                            // step then re-enters through `step_mtp`'s bootstrap
-                            // phase, whose `trim_proposer_state(seq, 0, 0)` resets
-                            // the drafter's RoPE conditioning — which is what
-                            // makes re-entry lossless.
-                            for a in active.iter_mut() {
-                                proposal_lifecycle::clear(
-                                    &mut a.pending_drafts,
-                                    &mut a.pending_tree_payload,
-                                    &mut a.pending_dflash_sampled_proposal,
+                        // Concurrent-decode fix (2026-05-22): previously gated on
+                        // `active.len() == 1`, which forced n>=2 into
+                        // `step_decode_only`. That path runs the SSM
+                        // `decode_multi_seq_inner` which sequentially calls
+                        // per-seq `decode()` (see qwen3_ssm/trait_decode_multi_seq.rs
+                        // — comment: "delegate to per-sequence single decode") with
+                        // no CUDA graphs and no MTP, collapsing throughput to ~14
+                        // tok/s aggregate at c=2 (down from 28 at c=1).
+                        //
+                        // `step_mtp` already loops bootstrap+verify across all
+                        // active sequences (see mtp_step.rs lines 21,96). Each
+                        // sequence reuses its own per-slot CUDA graph for K=3
+                        // verify (graph cache is keyed on `seq.slot_idx` in
+                        // verify_c.rs), so n>=2 captures one graph per slot on
+                        // first iteration and replays on every subsequent step.
+                        //
+                        // Per-seq guards (inside_thinking / suppress_tool_call /
+                        // disable_mtp) are checked across ALL active sequences
+                        // because step_mtp doesn't conditionally bootstrap per
+                        // active flag; if any seq disables MTP we fall back to
+                        // batched decode_only for the whole batch this tick.
+                        //
+                        // ── Speculation gate (`--mtp-gate`) ──
+                        //
+                        // When armed, the gate picks which arm to run for THIS step —
+                        // the external DFlash/DDTree drafter, the native MTP head, a
+                        // γ-capped drafter, or plain decode — by comparing DELIVERED
+                        // tok/s per arm over 16-step windows with hysteresis and
+                        // periodic probing. Every arm emits real, correct tokens, so
+                        // arbitration never wastes work. See `mtp_gate` for why this
+                        // measures throughput and not draft acceptance.
+                        //
+                        // Disarmed (the default) this is exactly the previous call.
+                        if let Some(gate) = spec_gate.as_mut() {
+                            let arm_idx = gate.next_arm_index();
+                            let arm = gate.next_arm();
+                            let pin_active = matches!(arm.kind, ArmKind::Serial)
+                                && mtp_gate::entry_pin_active(
+                                    entry_pin.tokens,
+                                    active.iter().map(|a| {
+                                        (a.think_ended, a.inside_thinking, a.post_think_gate_steps)
+                                    }),
                                 );
-                            }
-                            if let Err(e) = model.sync_secondary() {
-                                fail_closed_scheduler_transition(
-                                    &mut active,
-                                    &mut cache_on_finish,
-                                    "gate arm switch sync_secondary",
-                                    &e,
-                                );
-                                transition_ok = false;
-                            } else if let Err(e) = select_gate_arm(&*model, &mut active, arm) {
-                                fail_closed_scheduler_transition(
-                                    &mut active,
-                                    &mut cache_on_finish,
-                                    "gate arm selection",
-                                    &e,
-                                );
-                                transition_ok = false;
-                            }
-                            if transition_ok {
-                                tracing::debug!(
-                                    "speculation gate: running arm {} ({})",
-                                    arm_idx,
-                                    gate.arm_name(arm_idx)
-                                );
-                                last_gate_arm = Some(arm_idx);
-                            }
-                        } else if mtp_gate::entry_pin_exits_to_serial(
-                            arm.kind,
-                            last_step_was_entry_pin,
-                            pinned_spec_width,
-                        ) {
-                            // The gate stayed on Serial while the entry pin ran the
-                            // installed proposer, so no arm transition exists to
-                            // drop that last pinned step's drafts or order its
-                            // async recurrent-state restore.
-                            for a in active.iter_mut() {
-                                proposal_lifecycle::clear(
-                                    &mut a.pending_drafts,
-                                    &mut a.pending_tree_payload,
-                                    &mut a.pending_dflash_sampled_proposal,
-                                );
-                            }
-                            if let Err(e) = model.sync_secondary() {
-                                fail_closed_scheduler_transition(
-                                    &mut active,
-                                    &mut cache_on_finish,
-                                    "entry-pin→serial sync_secondary",
-                                    &e,
-                                );
-                                transition_ok = false;
-                            }
-                        }
-
-                        // Taken as late as possible so the one-shot transition
-                        // work above is not charged to the arm being switched TO.
-                        let t0 = if transition_ok {
-                            measure.map(|_| Instant::now())
-                        } else {
-                            None
-                        };
-                        if !transition_ok {
-                            // The sequences were finished above. Do not execute
-                            // or credit the arm whose transition failed.
-                        } else if let Some(nd) = pinned_spec_width {
-                            // Entry pins are correctness dispatches, not samples of
-                            // the Serial arm. Run the proposer which remains selected
-                            // across the serial dwell and leave gate statistics
-                            // untouched. `step_mtp`'s post-think policy gate routes
-                            // both native short drafts and DFlash γ blocks through
-                            // the row-by-row sampler oracle.
-                            if glm_policy {
-                                glm53_policy_driver::step(
-                                    &*model,
-                                    &mut active,
-                                    &mut cache_on_finish,
-                                    nd,
-                                    &glm_settings,
-                                );
+                            let pinned_spec_width = mtp_gate::entry_pin_spec_width(
+                                arm.kind,
+                                pin_active,
+                                last_spec_num_drafts,
+                            );
+                            // Everything the gate measures exists to feed arbitration,
+                            // so a gate that cannot arbitrate must not pay for it. A
+                            // PINNED arm therefore skips the depth scan, both
+                            // `seq_len` scans, the `Instant` pair and the window
+                            // accounting, and what remains between it and the disarmed
+                            // path is one `Option` compare plus a `match` on a value
+                            // that never changes.
+                            //
+                            // `Some(before)` doubles as the "measure this step" flag.
+                            let measure = if gate_arbitrates && pinned_spec_width.is_none() {
+                                // One pass, two answers. Depth is the MAX `seq_len`
+                                // (arm economics are depth-dependent: weight-bound at
+                                // short context, KV/SSM-bound at depth). Delivered
+                                // tokens are the SUM of committed outputs. `seq_len`
+                                // is a target-input cursor and may include verify
+                                // rows later rejected or rolled back. Counting only
+                                // `active[0]` would
+                                // under-report a speculative arm by a factor of n and
+                                // bias the gate toward whichever arm is cheapest per
+                                // step rather than fastest per token.
+                                let width = active.len().max(1);
+                                let (depth, before) =
+                                    active.iter().fold((0usize, 0usize), |(d, s), a| {
+                                        (d.max(a.seq.seq_len), s + a.output_tokens.len())
+                                    });
+                                gate.observe_depth(depth);
+                                Some((before, width))
                             } else {
-                                step_mtp(
-                                    &*model,
-                                    &mut active,
-                                    nd,
-                                    &think_ctx,
-                                    &mut cache_on_finish,
-                                );
+                                None
+                            };
+
+                            let mut transition_ok = true;
+                            let arm_changed = last_gate_arm != Some(arm_idx);
+                            if arm_changed {
+                                // Arm transition. Drafts in flight belong to the
+                                // OUTGOING arm and would be verified against the
+                                // incoming one's assumptions, so drop them (and the
+                                // paired DDTree payload) and order the previous
+                                // verify's async live-state restore before the next
+                                // step reads h_state/conv_state. The next speculative
+                                // step then re-enters through `step_mtp`'s bootstrap
+                                // phase, whose `trim_proposer_state(seq, 0, 0)` resets
+                                // the drafter's RoPE conditioning — which is what
+                                // makes re-entry lossless.
+                                for a in active.iter_mut() {
+                                    proposal_lifecycle::clear(
+                                        &mut a.pending_drafts,
+                                        &mut a.pending_tree_payload,
+                                        &mut a.pending_dflash_sampled_proposal,
+                                    );
+                                }
+                                if let Err(e) = model.sync_secondary() {
+                                    fail_closed_scheduler_transition(
+                                        &mut active,
+                                        &mut cache_on_finish,
+                                        "gate arm switch sync_secondary",
+                                        &e,
+                                    );
+                                    transition_ok = false;
+                                } else if let Err(e) = select_gate_arm(&*model, &mut active, arm) {
+                                    fail_closed_scheduler_transition(
+                                        &mut active,
+                                        &mut cache_on_finish,
+                                        "gate arm selection",
+                                        &e,
+                                    );
+                                    transition_ok = false;
+                                }
+                                if transition_ok {
+                                    tracing::debug!(
+                                        "speculation gate: running arm {} ({})",
+                                        arm_idx,
+                                        gate.arm_name(arm_idx)
+                                    );
+                                    last_gate_arm = Some(arm_idx);
+                                }
+                            } else if mtp_gate::entry_pin_exits_to_serial(
+                                arm.kind,
+                                last_step_was_entry_pin,
+                                pinned_spec_width,
+                            ) {
+                                // The gate stayed on Serial while the entry pin ran the
+                                // installed proposer, so no arm transition exists to
+                                // drop that last pinned step's drafts or order its
+                                // async recurrent-state restore.
+                                for a in active.iter_mut() {
+                                    proposal_lifecycle::clear(
+                                        &mut a.pending_drafts,
+                                        &mut a.pending_tree_payload,
+                                        &mut a.pending_dflash_sampled_proposal,
+                                    );
+                                }
+                                if let Err(e) = model.sync_secondary() {
+                                    fail_closed_scheduler_transition(
+                                        &mut active,
+                                        &mut cache_on_finish,
+                                        "entry-pin→serial sync_secondary",
+                                        &e,
+                                    );
+                                    transition_ok = false;
+                                }
                             }
-                        } else {
-                            match arm.kind {
-                                ArmKind::Serial => {
-                                    step_decode_only(
+
+                            // Taken as late as possible so the one-shot transition
+                            // work above is not charged to the arm being switched TO.
+                            let t0 = if transition_ok {
+                                measure.map(|_| Instant::now())
+                            } else {
+                                None
+                            };
+                            if !transition_ok {
+                                // The sequences were finished above. Do not execute
+                                // or credit the arm whose transition failed.
+                            } else if let Some(nd) = pinned_spec_width {
+                                // Entry pins are correctness dispatches, not samples of
+                                // the Serial arm. Run the proposer which remains selected
+                                // across the serial dwell and leave gate statistics
+                                // untouched. `step_mtp`'s post-think policy gate routes
+                                // both native short drafts and DFlash γ blocks through
+                                // the row-by-row sampler oracle.
+                                if glm_policy {
+                                    glm53_policy_driver::step(
                                         &*model,
                                         &mut active,
                                         &mut cache_on_finish,
-                                        think_end_token,
-                                        think_start_token,
-                                        code_fence_token,
-                                        tool_call_start_token,
-                                        tool_call_end_token,
-                                        &reflection_suppress_ids,
-                                        adaptive_sampling,
+                                        nd,
+                                        &glm_settings,
+                                    );
+                                } else {
+                                    step_mtp(
+                                        &*model,
+                                        &mut active,
+                                        nd,
+                                        &think_ctx,
+                                        &mut cache_on_finish,
                                     );
                                 }
-                                ArmKind::Spec {
-                                    num_drafts: arm_drafts,
-                                    ..
-                                } => {
-                                    // 0 means "the run's configured value" — the
-                                    // DFlash arm — so only the alternate arm departs
-                                    // from it.
-                                    let nd = if arm_drafts == 0 {
-                                        num_drafts
-                                    } else {
-                                        arm_drafts
-                                    };
-                                    last_spec_num_drafts = nd;
-                                    if glm_policy {
-                                        glm53_policy_driver::step(
+                            } else {
+                                match arm.kind {
+                                    ArmKind::Serial => {
+                                        step_decode_only(
                                             &*model,
                                             &mut active,
                                             &mut cache_on_finish,
-                                            nd,
-                                            &glm_settings,
+                                            think_end_token,
+                                            think_start_token,
+                                            code_fence_token,
+                                            tool_call_start_token,
+                                            tool_call_end_token,
+                                            &reflection_suppress_ids,
+                                            adaptive_sampling,
                                         );
-                                    } else {
-                                        step_mtp(
-                                            &*model,
-                                            &mut active,
-                                            nd,
-                                            &think_ctx,
-                                            &mut cache_on_finish,
-                                        );
+                                    }
+                                    ArmKind::Spec {
+                                        num_drafts: arm_drafts,
+                                        ..
+                                    } => {
+                                        // 0 means "the run's configured value" — the
+                                        // DFlash arm — so only the alternate arm departs
+                                        // from it.
+                                        let nd = if arm_drafts == 0 {
+                                            num_drafts
+                                        } else {
+                                            arm_drafts
+                                        };
+                                        last_spec_num_drafts = nd;
+                                        if glm_policy {
+                                            glm53_policy_driver::step(
+                                                &*model,
+                                                &mut active,
+                                                &mut cache_on_finish,
+                                                nd,
+                                                &glm_settings,
+                                            );
+                                        } else {
+                                            step_mtp(
+                                                &*model,
+                                                &mut active,
+                                                nd,
+                                                &think_ctx,
+                                                &mut cache_on_finish,
+                                            );
+                                        }
                                     }
                                 }
                             }
+                            if let (Some((before, width)), Some(t0)) = (measure, t0) {
+                                let after: usize =
+                                    active.iter().map(|a| a.output_tokens.len()).sum();
+                                gate.record_step(t0.elapsed(), after.saturating_sub(before), width);
+                                // Drained rather than acted on: the arm change is
+                                // applied from `next_arm_index` at the top of the next
+                                // step (which also covers probe excursions, where no
+                                // "switch" is reported). Taking it here keeps the
+                                // one-shot from going stale and gives the switch a
+                                // single owner. Only reachable when arbitrating —
+                                // a pinned gate never produces a switch to drain.
+                                let _ = gate.take_fresh_switch();
+                            }
+                            last_step_was_entry_pin = pinned_spec_width.is_some();
+                        } else if glm_policy {
+                            glm53_policy_driver::step(
+                                &*model,
+                                &mut active,
+                                &mut cache_on_finish,
+                                num_drafts,
+                                &glm_settings,
+                            );
+                        } else {
+                            step_mtp(
+                                &*model,
+                                &mut active,
+                                num_drafts,
+                                &think_ctx,
+                                &mut cache_on_finish,
+                            );
                         }
-                        if let (Some((before, width)), Some(t0)) = (measure, t0) {
-                            let after: usize = active.iter().map(|a| a.output_tokens.len()).sum();
-                            gate.record_step(t0.elapsed(), after.saturating_sub(before), width);
-                            // Drained rather than acted on: the arm change is
-                            // applied from `next_arm_index` at the top of the next
-                            // step (which also covers probe excursions, where no
-                            // "switch" is reported). Taking it here keeps the
-                            // one-shot from going stale and gives the switch a
-                            // single owner. Only reachable when arbitrating —
-                            // a pinned gate never produces a switch to drain.
-                            let _ = gate.take_fresh_switch();
-                        }
-                        last_step_was_entry_pin = pinned_spec_width.is_some();
-                    } else if glm_policy {
-                        glm53_policy_driver::step(
-                            &*model,
-                            &mut active,
-                            &mut cache_on_finish,
-                            num_drafts,
-                            &glm_settings,
-                        );
                     } else {
-                        step_mtp(
-                            &*model,
-                            &mut active,
-                            num_drafts,
-                            &think_ctx,
-                            &mut cache_on_finish,
-                        );
+                        // Fall through to the ordinary decode path below (`use_mtp` is true here).
+                        // Clear stale drafts and order the async verify-commit secondary-stream
+                        // restore before plain decode reads h_state/conv_state.
+                        let mut transition_ok = true;
+                        for a in active.iter_mut() {
+                            proposal_lifecycle::clear(
+                                &mut a.pending_drafts,
+                                &mut a.pending_tree_payload,
+                                &mut a.pending_dflash_sampled_proposal,
+                            );
+                        }
+                        if let Err(e) = model.sync_secondary() {
+                            fail_closed_scheduler_transition(
+                                &mut active,
+                                &mut cache_on_finish,
+                                "mtp→decode sync_secondary",
+                                &e,
+                            );
+                            transition_ok = false;
+                        }
+                        last_step_was_entry_pin = false;
+                        if transition_ok {
+                            step_decode_only(
+                                &*model,
+                                &mut active,
+                                &mut cache_on_finish,
+                                think_end_token,
+                                think_start_token,
+                                code_fence_token,
+                                tool_call_start_token,
+                                tool_call_end_token,
+                                &reflection_suppress_ids,
+                                adaptive_sampling,
+                            );
+                        }
                     }
                 } else {
-                    // Fall through to the ordinary decode path below (`use_mtp` is true here).
-                    // Clear stale drafts and order the async verify-commit secondary-stream
-                    // restore before plain decode reads h_state/conv_state.
-                    let mut transition_ok = true;
-                    for a in active.iter_mut() {
-                        proposal_lifecycle::clear(
-                            &mut a.pending_drafts,
-                            &mut a.pending_tree_payload,
-                            &mut a.pending_dflash_sampled_proposal,
-                        );
-                    }
-                    if let Err(e) = model.sync_secondary() {
+                    // Batch decode (no MTP).
+                    step_decode_only(
+                        &*model,
+                        &mut active,
+                        &mut cache_on_finish,
+                        think_end_token,
+                        think_start_token,
+                        code_fence_token,
+                        tool_call_start_token,
+                        tool_call_end_token,
+                        &reflection_suppress_ids,
+                        adaptive_sampling,
+                    );
+                }
+                if per_slot {
+                    if !active.is_empty()
+                        && let Err(e) = model.sync_secondary()
+                    {
                         fail_closed_scheduler_transition(
                             &mut active,
                             &mut cache_on_finish,
-                            "mtp→decode sync_secondary",
+                            "deterministic batch per-slot sync_secondary",
                             &e,
                         );
-                        transition_ok = false;
                     }
-                    last_step_was_entry_pin = false;
-                    if transition_ok {
-                        step_decode_only(
-                            &*model,
-                            &mut active,
-                            &mut cache_on_finish,
-                            think_end_token,
-                            think_start_token,
-                            code_fence_token,
-                            tool_call_start_token,
-                            tool_call_end_token,
-                            &reflection_suppress_ids,
-                            adaptive_sampling,
-                        );
-                    }
+                    completed_active.append(&mut active);
+                    completed_cache.append(&mut cache_on_finish);
                 }
-            } else {
-                // Batch decode (no MTP).
-                step_decode_only(
-                    &*model,
-                    &mut active,
-                    &mut cache_on_finish,
-                    think_end_token,
-                    think_start_token,
-                    code_fence_token,
-                    tool_call_start_token,
-                    tool_call_end_token,
-                    &reflection_suppress_ids,
-                    adaptive_sampling,
-                );
+            }
+            if per_slot {
+                active = completed_active;
+                cache_on_finish = completed_cache;
             }
         }
 

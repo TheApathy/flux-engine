@@ -37,6 +37,25 @@ pub(in super::super) fn step_verify_qwen4_batched(
     if frames.is_empty() || !batched_verify_proposer_eligible(model) {
         return false;
     }
+    let det_batch =
+        match crate::scheduler::deterministic_batch_route::scheduler_deterministic_batch_policy() {
+            Ok(policy) => policy,
+            Err(error) => {
+                for &idx in frames.iter().flatten() {
+                    if let Some(a) = active.get_mut(idx) {
+                        fail_speculative_step(
+                            a,
+                            "batched verify deterministic batch policy",
+                            &error,
+                        );
+                    }
+                }
+                return true;
+            }
+        };
+    if !crate::scheduler::deterministic_batch_route::mtp_cross_seq_verify_allowed(det_batch, true) {
+        return false;
+    }
     let cohort_owned: Vec<usize>;
     let cohort: &[usize] = if frames.len() == 1 {
         &frames[0]

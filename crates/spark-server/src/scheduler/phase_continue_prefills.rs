@@ -101,6 +101,29 @@ pub(super) fn continue_in_progress_prefills(
         return did_mixed_step;
     }
 
+    let det_batch = match super::deterministic_batch_route::scheduler_deterministic_batch_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            drain_before_prefill_cleanup(
+                model,
+                prefill_stream,
+                "invalid ATLAS_DETERMINISTIC_BATCH in continue_in_progress_prefills",
+            );
+            tracing::error!(
+                "invalid ATLAS_DETERMINISTIC_BATCH in continue_in_progress_prefills: {error}"
+            );
+            for mut p in prefilling.drain(..) {
+                if let Err(free_err) = model.free_sequence(&mut p.seq) {
+                    tracing::error!(
+                        "free_sequence after invalid ATLAS_DETERMINISTIC_BATCH: {free_err:#}"
+                    );
+                }
+                super::send_error_to_sink(&mut p.sink, &format!("{error}"));
+            }
+            return did_mixed_step;
+        }
+    };
+
     // Check policy: skip chunks if active sequences are near TBT deadline.
     let timings: Vec<ActiveSeqTiming> = active
         .iter()
@@ -135,7 +158,10 @@ pub(super) fn continue_in_progress_prefills(
     // (pre-Q12 behavior) so we can isolate whether the chunked-prefill +
     // concurrent-decode crash originates in the Q12 batched-prefill
     // dispatch or pre-existing chunked-prefill state mutation.
-    let q12_dispatch_disabled = q12_dispatch_disabled();
+    let q12_dispatch_disabled = !super::deterministic_batch_route::prefill_q12_batch_allowed(
+        det_batch,
+        !q12_dispatch_disabled(),
+    );
     // mHC/Qwen4 prefill owns slot-local PLE and highway state, while the Q12
     // batched path still uses ordinary residual semantics.  Advance one
     // prompt at a time until that path has explicit highway support.

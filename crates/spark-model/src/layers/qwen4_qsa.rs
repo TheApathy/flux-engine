@@ -378,6 +378,18 @@ pub(crate) fn select_v3_enabled() -> bool {
     })
 }
 
+/// Resolve `ATLAS_QWEN4_QSA_VERIFY_ROWS` under `det_batch`:
+/// `DeterministicBatchPolicy::Enabled` disables multi-row QSA verify indexing
+/// so every row follows the canonical single-row QSA path.
+#[inline]
+#[must_use]
+pub(crate) const fn verify_rows_enabled_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
+}
+
 /// Multi-row QSA verify (K11-D2): runs ring stage/pool/store for rows 0..k-1,
 /// then scores all k rows in ONE pass over `compressed_keys` and selects top-512
 /// in ONE parallel `grid = [1, k, 1]` launch. Enabled when `ATLAS_QWEN4_QSA_VERIFY_ROWS=1`
@@ -385,7 +397,7 @@ pub(crate) fn select_v3_enabled() -> bool {
 /// (unless `ATLAS_QWEN4_QSA_VERIFY_ROWS=0`).
 pub(crate) fn verify_rows_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    let env_enabled = *ON.get_or_init(|| {
         let explicit = std::env::var("ATLAS_QWEN4_QSA_VERIFY_ROWS").ok();
         let on = match explicit.as_deref() {
             Some("1") => true,
@@ -396,19 +408,37 @@ pub(crate) fn verify_rows_enabled() -> bool {
             tracing::info!("QSA_VERIFY_ROWS_ENGAGED selector=ATLAS_QWEN4_QSA_VERIFY_ROWS");
         }
         on
-    })
+    });
+    verify_rows_enabled_with_policy(
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        env_enabled,
+    )
+}
+
+/// Resolve `ATLAS_QWEN4_QSA_VERIFY_STAGE_POOL_FUSED` under `det_batch`.
+#[inline]
+#[must_use]
+pub(crate) const fn verify_stage_pool_fused_enabled_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
 }
 
 /// `ATLAS_QWEN4_QSA_VERIFY_STAGE_POOL_FUSED` (default on unless `"0"`):
 /// fuse QSA verify-row stage/pool/RoPE/store into a single kernel launch.
 fn verify_stage_pool_fused_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let env_enabled = *ON.get_or_init(|| {
         std::env::var("ATLAS_QWEN4_QSA_VERIFY_STAGE_POOL_FUSED")
             .ok()
             .as_deref()
             != Some("0")
-    })
+    });
+    verify_stage_pool_fused_enabled_with_policy(
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        env_enabled,
+    )
 }
 
 /// Qwen4 switches from dense attention to sparse QSA at position 2048.
@@ -418,17 +448,33 @@ fn verify_stage_pool_fused_enabled() -> bool {
 /// (`seq_len < 2048 && endpoint > 2048`) falls back to row-by-row execution.
 pub(crate) const VERIFY_ROWS_DENSE_ENDPOINT: usize = 2_048;
 
+/// Resolve `ATLAS_QWEN4_BATCHED_QSA_MULTI` under `det_batch`:
+/// `DeterministicBatchPolicy::Enabled` disables cross-sequence multi-seq QSA
+/// verify launches.
+#[inline]
+#[must_use]
+pub(crate) const fn batched_qsa_multi_enabled_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
+}
+
 /// `ATLAS_QWEN4_BATCHED_QSA_MULTI` (default on unless `"0"`): run cross-sequence
 /// verify QSA stage/pool/RoPE/store, score, select-expand, and sparse attention
 /// as batched multi-sequence launches across all active sequences in the frame.
 pub(crate) fn batched_qsa_multi_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let env_enabled = *ON.get_or_init(|| {
         std::env::var("ATLAS_QWEN4_BATCHED_QSA_MULTI")
             .ok()
             .as_deref()
             != Some("0")
-    })
+    });
+    batched_qsa_multi_enabled_with_policy(
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        env_enabled,
+    )
 }
 
 /// Flag bits on [`QsaBatchSeqDesc::flags`], matching `qwen4_qsa.cu` and `qwen4_qsa_wave2.cu`.
@@ -1363,9 +1409,24 @@ pub struct Qwen4QsaIndexer {
     cache: OnceLock<QsaCache>,
 }
 
+/// Resolve `ATLAS_QWEN4_QSA_FUSED_GATE` under `det_batch`.
+#[inline]
+#[must_use]
+pub const fn qwen4_qsa_fused_gate_enabled_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
+}
+
 pub fn qwen4_qsa_fused_gate_enabled() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| std::env::var("ATLAS_QWEN4_QSA_FUSED_GATE").ok().as_deref() != Some("0"))
+    let env_enabled = *GATE
+        .get_or_init(|| std::env::var("ATLAS_QWEN4_QSA_FUSED_GATE").ok().as_deref() != Some("0"));
+    qwen4_qsa_fused_gate_enabled_with_policy(
+        crate::layers::deterministic_batch::deterministic_batch_policy_or_disabled(),
+        env_enabled,
+    )
 }
 
 impl Qwen4QsaIndexer {

@@ -51,6 +51,18 @@ pub(super) fn parse_short_batch_enabled(raw: Option<&str>) -> bool {
     raw.map(str::trim) != Some("0")
 }
 
+/// Resolve Qwen4 batched short-prefill under `det_batch`:
+/// `DeterministicBatchPolicy::Enabled` disables multi-prompt short-batch
+/// packing so every prompt takes the canonical single-sequence prefill path.
+#[inline]
+#[must_use]
+pub(super) const fn short_batch_enabled_with_policy(
+    det_batch: crate::layers::deterministic_batch::DeterministicBatchPolicy,
+    env_enabled: bool,
+) -> bool {
+    !det_batch.is_enabled() && env_enabled
+}
+
 #[must_use]
 fn short_batch_enabled() -> bool {
     parse_short_batch_enabled(std::env::var(SHORT_BATCH_ENV).ok().as_deref())
@@ -625,7 +637,8 @@ impl TransformerModel {
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
     ) -> Result<Option<Vec<DevicePtr>>> {
-        if !short_batch_enabled() {
+        let det_batch = crate::layers::deterministic_batch::deterministic_batch_policy()?;
+        if !short_batch_enabled_with_policy(det_batch, short_batch_enabled()) {
             return Ok(None);
         }
         if self.profile
@@ -1999,5 +2012,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn deterministic_batch_disables_qwen4_short_batch_and_q12_kernel_batch() {
+        use super::super::q12_batched_enabled_with_policy;
+        use crate::layers::deterministic_batch::DeterministicBatchPolicy;
+
+        assert!(!short_batch_enabled_with_policy(
+            DeterministicBatchPolicy::Enabled,
+            true
+        ));
+        assert!(short_batch_enabled_with_policy(
+            DeterministicBatchPolicy::Disabled,
+            true
+        ));
+        assert!(!short_batch_enabled_with_policy(
+            DeterministicBatchPolicy::Disabled,
+            false
+        ));
+
+        assert!(!q12_batched_enabled_with_policy(
+            DeterministicBatchPolicy::Enabled,
+            true
+        ));
+        assert!(q12_batched_enabled_with_policy(
+            DeterministicBatchPolicy::Disabled,
+            true
+        ));
+        assert!(!q12_batched_enabled_with_policy(
+            DeterministicBatchPolicy::Disabled,
+            false
+        ));
     }
 }
