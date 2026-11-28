@@ -4,7 +4,7 @@
 
 This document defines the seven non-negotiable engineering exactness guarantees enforced across Flux Engine's Blackwell (`sm_121a`/`sm_121f`/`sm_120a`/`sm_103a`) CUDA kernels, Rust runtime/scheduler control plane, and offline quantization & serving certification harnesses.
 
-Every performance optimization introduced across Flux v1.2, v1.3, v1.4, and v1.5 MUST preserve these seven guarantees simultaneously—fast paths are never permitted to trade silent numerical drift, cross-request leakage, or non-deterministic speculative divergence for throughput.
+Every performance optimization introduced across Flux v1.2, v1.3, v1.4, v1.5, and v1.6 MUST preserve these seven guarantees simultaneously—fast paths are never permitted to trade silent numerical drift, cross-request leakage, or non-deterministic speculative divergence for throughput.
 
 ---
 
@@ -70,7 +70,7 @@ Every performance optimization introduced across Flux v1.2, v1.3, v1.4, and v1.5
   - Because cross-engine OpenAI-API exactness benchmarks feeding raw text to `/v1/completions` diverge at token `0` if one engine prepends `<think></think>\n\n` and another does not, cross-engine exactness certification MUST use one of three sanctioned exact-tokenization paths:
     1. **Pre-tokenized `/v1/completions` via `"prompt_token_ids"`** (`tools/flux_exactness_cert.py --cross-engine-parity --endpoint /v1/completions --prompt-token-ids <path.json>`): bypasses both BPE tokenization and `<think></think>\n\n` injection verbatim.
     2. **Chat endpoint with thinking explicitly disabled** (`tools/flux_exactness_cert.py --cross-engine-parity --endpoint /v1/chat/completions --enable-thinking false`): sends both `"enable_thinking": false` and `"chat_template_kwargs": {"enable_thinking": false}` so engines render the exact same non-thinking chat template.
-    3. **Opt-in raw-text server toggle (`ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1`, `ZERO_OR_ONE`, default OFF):** disables the automatic `<think></think>\n\n` prepend on raw `/v1/completions` text prompts when explicitly armed by the operator.
+    3. **Opt-in raw-text server toggle (`ATLAS_COMPLETIONS_RAW_NO_THINK_PREFIX=1`, `ZERO_OR_ONE`, default OFF):** disables both the automatic `<think></think>\n\n` input prepend and `strip_thinking_tags` output leading-whitespace trimming on raw `/v1/completions` text prompts when explicitly armed by the operator (preserving stop-sequence stripping).
 - **Strict Environment Parsing:**
   - Every new control reads via `std::env::var_os` (never silently dropping `VarError::NotUnicode`) and fails closed on invalid tokens or partial multi-variable configurations.
   - Every env var is registered in `repro-kit/tools/env_inventory_overrides.tsv`, synced into `crates/spark-server/src/recipe_contract/env_catalog.tsv`, and (for `ATLAS_DFLASH_*`) classified in `cli_dflash_environment_rules.rs` + `cli_dflash_environment_census_tests.rs`.
@@ -131,10 +131,10 @@ Measured directly on **NVIDIA GB10** (`SM 12.1`, `48 SMs`, `24.0 MiB` L2) at ver
 
 | Kernel / Track | Live GB10 Shape | Exactness Proof (`0-ULP`) | Observed GB10 Telemetry |
 |---|---|---|---|
-| `lm_head_int8_block32` (`V14-T5`) | `Qwen3.8-Flash-Next` (`V=248320, K=2560`, `675.4 MB` vs `1,271.4 MB` BF16) | `M1==M8 diff=0/248320`, `M1==M16 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `3.36–3.56 ms` (`190–201 GB/s`, `I2F=0`) |
-| `lm_head_int8_block32` (`V14-T5`) | `Qwen3.8-27B` (`V=248320, K=5120`, `1,350.9 MB` vs `2,542.8 MB` BF16) | `M1==M8 diff=0/248320`, `M1==M16 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `6.93–7.34 ms` (`184–195 GB/s`, `I2F=0`) |
-| `w4a4_decode_roofline_sm120` (`V14-T4A`) | `Qwen3.8-27B` `down_proj` (`5120×17408`, `split_k=3`, `50.14 MB`) | `M1==M8 diff=0/5120`, `M1==M16 diff=0/5120` | `M=1..16`: `402–478 us` (v1.5 register-direct targets `<= 215 us`) |
-| `w4a4_decode_roofline_sm120` (`V14-T4A`) | `Qwen3.8-27B` `gate_proj` (`17408×5120`, `split_k=3`, `50.14 MB`) | `M1==M8 diff=0/17408`, `M1==M16 diff=0/17408` | `M=1..16`: `440–471 us` (v1.5 register-direct targets `<= 215 us`) |
+| `lm_head_int8_block32` (`V14-T5` / `V15-T2` / `V16-T3`) | `Qwen3.8-Flash-Next` (`V=248320, K=2560`, `675.4 MB` vs `1,271.4 MB` BF16) | `M1==M8==M16==M32==M64 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `3.23–3.29 ms` (`206.9 GB/s`, `I2F=0`); `M=32`: `3.45 ms` (`192.1 GB/s`, `1.89x`); `M=64`: `5.54 ms` (v1.5 `128t`) / `256t` bank-conflict-free `80-reg` in v1.6 |
+| `lm_head_int8_block32` (`V14-T5` / `V15-T2` / `V16-T3`) | `Qwen3.8-27B` (`V=248320, K=5120`, `1,350.9 MB` vs `2,542.8 MB` BF16) | `M1==M8==M16==M32==M64 diff=0/248320`, `gemm_argmax == fused_argmax == 12345` | `M=1..16`: `6.81–7.11 ms` (`196.7 GB/s`, `I2F=0`); `M=32`: `7.36 ms` (`177.2 GB/s`) |
+| `w4a4_decode_roofline_sm120` v2 (`V14-T4A` / `V15-T3`) | `Qwen3.8-27B` `down_proj` (`5120×17408`, `split_k=3`, `50.14 MB`, `0 B` SMEM, `80 regs`) | `M1==M8 diff=0/5120`, `M1==M16 diff=0/5120` | `M=1..16`: `254.7–277.2 us` (`196.9 GB/s`, `1.63x` vs v1.4 `420 us`) |
+| `w4a4_decode_roofline_sm120` v2 (`V14-T4A` / `V15-T3`) | `Qwen3.8-27B` `gate_proj` (`17408×5120`, `split_k=3`, `50.14 MB`, `0 B` SMEM, `80 regs`) | `M1==M8 diff=0/17408`, `M1==M16 diff=0/17408` | `M=1..16`: `249.6–291.5 us` (`200.8 GB/s`, ~97% GB10 LPDDR5X roofline) |
 | `gdn_correction_replay_sm120` (`V14-T1`) | `Qwen3.8-27B` (`48L`, `nk=16, nv=48, D=128`) | `status=0`, `515.0 KB/L` 1D record vs `48.0 MB` 2D snapshot | `verify_1d`: `33.1 us/L` (`W=8`) / `40.6 us/L` (`W=16`); 48L `commit_1d`: `1.402 ms` (`215.4 GB/s R+W`) |
 
 ### 3.2 Live GB10 End-to-End Serving Exactness (`Qwen3.8-Flash-Next`)
@@ -227,6 +227,6 @@ CUDA_VISIBLE_DEVICES="" python3 tools/certify_quant_exactness.py \
 CUDA_VISIBLE_DEVICES="" python3 tools/certify_quant_exactness.py \
   --weights /path/to/lm_head_weight.npy --min-sqnr-db 45.0 --max-kl 1e-4
 
-# Mechanical PTX + SASS contract verification on sm_121a (serialized under build lock)
-flock /tmp/atlas_v14_build.lock python3 repro-kit/formal/verify_ptx_isa_contracts.py
+# Mechanical PTX + SASS contract verification on sm_121a
+python3 repro-kit/formal/verify_ptx_isa_contracts.py
 ```

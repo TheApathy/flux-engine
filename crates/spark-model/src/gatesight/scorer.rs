@@ -42,8 +42,11 @@ pub struct ZeroTrainingBlockScorer {
 
 impl Default for ZeroTrainingBlockScorer {
     fn default() -> Self {
-        Self::new(GATESIGHT_BLOCK_SIZE, DecayWeighting::PureWriteNorm)
-            .expect("default block size is non-zero")
+        const { assert!(GATESIGHT_BLOCK_SIZE > 0) };
+        Self {
+            block_size: GATESIGHT_BLOCK_SIZE,
+            decay_weighting: DecayWeighting::PureWriteNorm,
+        }
     }
 }
 

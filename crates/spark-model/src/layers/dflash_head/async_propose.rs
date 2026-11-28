@@ -1655,10 +1655,7 @@ impl BlockDiffusionDraftHead {
         }
 
         let mut guard = self.async_inflight.lock();
-        let matches = guard
-            .as_ref()
-            .is_some_and(|inf| inf.owner == dstate_id(dstate));
-        if !matches {
+        let Some(inflight) = guard.take_if(|inf| inf.owner == dstate_id(dstate)) else {
             // A foreign in-flight handle (owner died / rerouted): resolve it
             // here so shared scratch is quiescent before this sequence's
             // verify/decode work touches the GPU.
@@ -1676,8 +1673,7 @@ impl BlockDiffusionDraftHead {
                 return Ok(Some(Vec::new()));
             }
             return Ok(None);
-        }
-        let inflight = guard.take().expect("checked above");
+        };
         drop(guard);
 
         // Single stream sync covers both forward_block and (if present) top-K.
